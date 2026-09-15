@@ -22,7 +22,22 @@ static void send_with_content_type(Response *res, const char *content_type, cons
 
     const size_t body_len = strlen(body);
 
+    /*
+     * Ownership: this buffer is handed to the event loop. On the keep-alive
+     * path it's freed once fully written in flush_connection(); on any
+     * error/close path it's freed in connection_close(). Exactly one of
+     * those runs for every connection, so exactly one free matches this
+     * malloc.
+     */
     conn->out_buf = malloc((size_t)header_len + body_len);
+    if (conn->out_buf == NULL) {
+        /* Out of memory: nothing safe to send back. Drop the connection
+         * rather than write through a NULL pointer. */
+        conn->out_len = 0;
+        conn->out_sent = 0;
+        conn->keep_alive = 0;
+        return;
+    }
     memcpy(conn->out_buf, header, (size_t)header_len);
     memcpy(conn->out_buf + header_len, body, body_len);
     conn->out_len = (size_t)header_len + body_len;

@@ -44,7 +44,8 @@ typedef struct {
     int status;
 } Response;
 
-typedef void (*Handler)(Request *req, Response *res);
+/* req is never mutated by a handler once routing has filled in its params. */
+typedef void (*Handler)(const Request *req, Response *res);
 
 typedef struct {
     char method[8];

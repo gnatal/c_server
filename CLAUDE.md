@@ -1,7 +1,11 @@
 # Project: C-Express HTTP Server
 
 ## What is this project?
-This project is an attempt to create an HTTP server with a developer experience similar to Express.js, but written entirely in C. We are choosing C for maximum performance, minimal footprint, and fine-grained control over memory and networking. Target OS: [Insert Linux/macOS/POSIX here].
+This project is an attempt to create an HTTP server with a developer experience similar to Express.js, but written entirely in C. We are choosing C for maximum performance, minimal footprint, and fine-grained control over memory and networking.
+
+## Workflow & Context Maintenance
+- **Continuous Documentation:** After completing a task or significant update within any folder, you must automatically summarize the technical findings and update/create the nested `CLAUDE.md` file for that specific directory.
+- **Strictly Technical Findings:** When updating folder-level `CLAUDE.md` files, document *only* architectural decisions, state management, data flow, and memory lifecycle rules. Never write coding styles, formatting guidelines, or developer preferences in these local files.
 
 ## Coding Standards & Patterns
 - **Type Definitions:** All `typedef` and `struct` definitions must live in dedicated header files (e.g., `appTypes.h`). Do not declare them in `.c` files.

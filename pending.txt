@@ -18,16 +18,22 @@ Gaps vs. an Express-like C framework
 
 3. Request parsing
 - Headers are one opaque blob scanned with strcasestr - no req_get_header(name) map
-- Whole request (headers+body) lives in one fixed BUF_SIZE=8192 buffer - no streaming,
-  body over 8KB is silently truncated instead of rejected with 413
+- Whole request (headers+body) lives in one fixed BUF_SIZE=8192 buffer - no streaming
+- [DONE] Negative/oversized Content-Length is now rejected with 400 instead of silently
+  truncated or trusted (extract_content_length bounds it to [0, BUF_SIZE-1])
+- [DONE] Headers (or a request) that can never fit in BUF_SIZE now get a 431 and the
+  connection is closed, instead of hanging forever waiting for bytes that can't arrive
+  (was the slowloris-shaped gap noted below)
 - No chunked transfer-encoding, no multipart/form-data, no x-www-form-urlencoded, no cookies
-- No idle/read timeout (slowloris-shaped gap)
+- No idle/read timeout for a slow client that trickles a request in a byte at a time
+  within the buffer limit (distinct from the now-fixed buffer-overflow hang above)
 
 4. Response
 - Only res_send/res_json; no generic res_set_header, no streaming/chunked response,
   no static file serving, no res_redirect, no cookie helper
-- status_text() only covers 6 codes
-- malloc in response.c (conn->out_buf) isn't null-checked
+- status_text() only covers 7 codes (200/201/204/400/404/431/500)
+- [DONE] malloc in response.c (conn->out_buf) is now null-checked; on OOM the
+  connection is dropped instead of writing through a NULL pointer
 
 5. Concurrency & portability
 - kqueue ties the engine to macOS/BSD; no epoll/IOCP backend
@@ -37,8 +43,9 @@ Gaps vs. an Express-like C framework
 
 6. Security
 - No TLS/HTTPS
-- No max-header/body guard beyond BUF_SIZE (no proper 413/431)
-- Content-Length parsing is naive atoi, no Transfer-Encoding awareness
+- [DONE] Max-header/body guard: BUF_SIZE overflow now returns 431, invalid
+  Content-Length now returns 400 (see section 3)
+- No Transfer-Encoding awareness (chunked bodies aren't supported at all yet)
 
 7. Testing & DX
 - Only lib/json/json_test.c is a real test; router, parser, connection logic untested

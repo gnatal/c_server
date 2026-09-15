@@ -1,0 +1,56 @@
+# --- Build artifacts ---
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.out
+
+# --- Project binaries ---
+httpServer
+hello
+lib/json/json_test
+
+# --- Debug / profiling ---
+*.dSYM/
+*.su
+*.idb
+*.pdb
+*.gcno
+*.gcda
+*.gcov
+*.stackdump
+core
+core.*
+vgcore.*
+callgrind.out.*
+perf.data*
+
+# --- Build directories ---
+build/
+out/
+bin/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Local env / logs ---
+*.log
+.env
+
+# --- VCS internals ---
+.git/

@@ -3,12 +3,6 @@
 #include <string.h>
 #include "json.h"
 
-typedef struct {
-    char *data;
-    size_t len;
-    size_t cap;
-} StrBuf;
-
 static int buf_reserve(StrBuf *buf, size_t extra) {
     if (buf->len + extra + 1 <= buf->cap) {
         return 1;

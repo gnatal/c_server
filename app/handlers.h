@@ -3,9 +3,9 @@
 
 #include "appTypes.h"
 
-void handler_home(Request *req, Response *res);
-void handler_get_user(Request *req, Response *res);
-void handler_echo(Request *req, Response *res);
-void handler_echo_json(Request *req, Response *res);
+void handler_home(const Request *req, Response *res);
+void handler_get_user(const Request *req, Response *res);
+void handler_echo(const Request *req, Response *res);
+void handler_echo_json(const Request *req, Response *res);
 
 #endif /* HANDLERS_H */

@@ -186,6 +186,23 @@ void handle_readable(App *app, Connection *conn) {
             return;
         }
     }
+
+    if (conn->in_len >= BUF_SIZE - 1) {
+        /*
+         * The buffer is full and still doesn't hold a complete request:
+         * either the headers alone exceed our hard 8KB limit, or a
+         * declared Content-Length can never fit. Reject explicitly instead
+         * of leaving the connection open forever waiting on bytes that
+         * will never arrive - the classic Slowloris/oversized-header DoS
+         * shape.
+         */
+        Response res;
+        res.conn = conn;
+        conn->keep_alive = 0;
+        res_status(&res, 431);
+        res_send(&res, "Request Header Fields Too Large");
+        flush_connection(app, conn);
+    }
 }
 
 void app_listen(App *app, int port) {

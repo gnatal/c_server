@@ -45,4 +45,11 @@ typedef struct {
     char error[128];
 } JsonParser;
 
+/* Growable byte buffer used internally by jsonWriter.c while serializing. */
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} StrBuf;
+
 #endif /* JSON_TYPES_H */

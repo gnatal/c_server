@@ -4,7 +4,11 @@
 #include <stddef.h>
 #include "appTypes.h"
 
-/* Parses the "Content-Length:" value out of a header block, or 0 if absent. */
+/*
+ * Parses the "Content-Length:" value out of a header block: 0 if absent,
+ * -1 if present but negative or larger than the server will ever buffer
+ * (BUF_SIZE - 1), otherwise the value.
+ */
 int extract_content_length(const char *header_block);
 
 /*

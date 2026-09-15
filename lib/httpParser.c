@@ -8,7 +8,11 @@ int extract_content_length(const char *header_block) {
     if (cl_header == NULL) {
         return 0;
     }
-    return atoi(cl_header + strlen("Content-Length:"));
+    const long value = atol(cl_header + strlen("Content-Length:"));
+    if (value < 0 || value > BUF_SIZE - 1) {
+        return -1;
+    }
+    return (int)value;
 }
 
 int request_is_complete(const char *buf, size_t len) {
@@ -20,8 +24,14 @@ int request_is_complete(const char *buf, size_t len) {
     size_t header_len = (size_t)((header_end + 4) - buf);
     size_t body_have = len - header_len;
     const int content_length = extract_content_length(buf);
+    if (content_length < 0) {
+        /* Invalid Content-Length: stop buffering and let parse_http_request
+         * reject it as a 400 rather than waiting for bytes that were never
+         * validated to arrive. */
+        return 1;
+    }
 
-    return (long)body_have >= content_length;
+    return body_have >= (size_t)content_length;
 }
 
 int request_wants_close(const Request *req) {
@@ -64,6 +74,9 @@ int parse_http_request(const char *raw, Request *req) {
     req->headers[header_len] = '\0';
 
     req->content_length = extract_content_length(req->headers);
+    if (req->content_length < 0) {
+        return -1;
+    }
 
     char *body_start = header_end + 4;
     size_t available = strlen(body_start);
@@ -87,6 +100,7 @@ const char *status_text(int status) {
         case 204: return "No Content";
         case 400: return "Bad Request";
         case 404: return "Not Found";
+        case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         default:  return "Unknown";
     }
