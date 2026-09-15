@@ -71,9 +71,18 @@ Gaps vs. an Express-like C framework
 - No Transfer-Encoding awareness (chunked bodies aren't supported at all yet)
 
 7. Testing & DX
-- Only lib/json/json_test.c is a real test; router, parser, connection logic untested
-- No request logging middleware (morgan-style)
-- No runtime config (timeouts, buffer sizes, port) beyond compile-time constants in appTypes.h
+- Two real test binaries now: lib/json/json_test.c and lib/middleware_test.c (the
+  latter covers the middleware pipeline - ordering, short-circuiting, 404 fallthrough,
+  chain_error/ErrorHandler). Still untested directly: router.c's own matching logic
+  (match_path/match_route pattern behavior), httpParser.c's parsing/edge cases
+  (extract_content_length, request_is_complete, parse_http_request), and all of
+  connection.c (needs socket I/O, so harder to unit test as-is).
+- [DONE] Request logging middleware (morgan-style): mw_logger (app/middlewares.c),
+  registered via app_use in app/main.c, logs "METHOD PATH -> STATUS" once the rest
+  of the pipeline has produced a final response.
+- No runtime config (timeouts, buffer sizes, port) beyond compile-time constants in
+  appTypes.h. app/middlewares.c's api_key is another instance of this - hard-coded
+  in source (static const char *) rather than loaded from env/config at startup.
 
 Suggested order: [DONE] middleware system, then routing/request/response improvements
 that build on top of it, then the rest as needed.
