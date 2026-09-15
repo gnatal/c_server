@@ -1,0 +1,49 @@
+Gaps vs. an Express-like C framework
+=====================================
+
+[DONE] Lib/app separation
+- lib/ = engine (connection, router, httpParser, response, json), builds to lib/libcserver.a
+- app/ = application (main.c, handlers.c/h), links against the lib
+
+1. Middleware
+- No app_use() / next() chaining - handlers are single terminal functions, no pipeline
+- No centralized error-handling middleware equivalent ((err, req, res, next))
+
+2. Routing
+- No sub-routers / route mounting at a prefix (Router() + app.use('/api', router))
+- Only app_get/app_post wrappers exist; no app_put/app_delete/app_patch, no HEAD/OPTIONS
+- Path matches but method doesn't -> still 404, not 405
+- No wildcards, no query-string parser (req->query is a raw string, no req_get_query(name))
+- No URL-decoding of path/params/query
+
+3. Request parsing
+- Headers are one opaque blob scanned with strcasestr - no req_get_header(name) map
+- Whole request (headers+body) lives in one fixed BUF_SIZE=8192 buffer - no streaming,
+  body over 8KB is silently truncated instead of rejected with 413
+- No chunked transfer-encoding, no multipart/form-data, no x-www-form-urlencoded, no cookies
+- No idle/read timeout (slowloris-shaped gap)
+
+4. Response
+- Only res_send/res_json; no generic res_set_header, no streaming/chunked response,
+  no static file serving, no res_redirect, no cookie helper
+- status_text() only covers 6 codes
+- malloc in response.c (conn->out_buf) isn't null-checked
+
+5. Concurrency & portability
+- kqueue ties the engine to macOS/BSD; no epoll/IOCP backend
+- Single-threaded, single-process - no worker/multi-core model
+- app->connections[MAX_CONNECTIONS] indexes by raw fd number - wasteful, assumes fd < 16384
+- No graceful shutdown (SIGTERM draining in-flight connections)
+
+6. Security
+- No TLS/HTTPS
+- No max-header/body guard beyond BUF_SIZE (no proper 413/431)
+- Content-Length parsing is naive atoi, no Transfer-Encoding awareness
+
+7. Testing & DX
+- Only lib/json/json_test.c is a real test; router, parser, connection logic untested
+- No request logging middleware (morgan-style)
+- No runtime config (timeouts, buffer sizes, port) beyond compile-time constants in appTypes.h
+
+Suggested order: middleware system next, then routing/request/response improvements
+that build on top of it, then the rest as needed.

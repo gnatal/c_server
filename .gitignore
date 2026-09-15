@@ -1,0 +1,5 @@
+*.o
+*.a
+httpServer
+hello
+lib/json/json_test
