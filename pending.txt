@@ -71,18 +71,19 @@ Gaps vs. an Express-like C framework
 - No Transfer-Encoding awareness (chunked bodies aren't supported at all yet)
 
 7. Testing & DX
-- Two real test binaries now: lib/json/json_test.c and lib/middleware_test.c (the
-  latter covers the middleware pipeline - ordering, short-circuiting, 404 fallthrough,
-  chain_error/ErrorHandler). Still untested directly: router.c's own matching logic
-  (match_path/match_route pattern behavior), httpParser.c's parsing/edge cases
-  (extract_content_length, request_is_complete, parse_http_request), and all of
-  connection.c (needs socket I/O, so harder to unit test as-is).
+- [DONE] Comprehensive test binaries across all engine components (run via `make test`):
+  - lib/json/json_test.c: JSON parser, value types, and serializer
+  - lib/middleware_test.c: middleware pipeline (ordering, short-circuiting, 404 fallthrough, chain_error/ErrorHandler)
+  - lib/router_test.c: router matching logic (literal paths, param capture, max params, route matching order, max routes)
+  - lib/http_parser_test.c: HTTP parsing & edge cases (extract_content_length, request_is_complete, request_wants_close, parse_http_request, status_text)
+  - lib/connection_test.c: connection handling & socket I/O using socketpair(2) (round-trips, keep-alive persistence, partial reads, 400 Bad Request, 431 Request Header Fields Too Large, Connection: close)
 - [DONE] Request logging middleware (morgan-style): mw_logger (app/middlewares.c),
   registered via app_use in app/main.c, logs "METHOD PATH -> STATUS" once the rest
   of the pipeline has produced a final response.
-- No runtime config (timeouts, buffer sizes, port) beyond compile-time constants in
-  appTypes.h. app/middlewares.c's api_key is another instance of this - hard-coded
-  in source (static const char *) rather than loaded from env/config at startup.
+- [DONE] Runtime config: server port is configurable via PORT environment variable
+  (stored in App.config.port, falling back to DEFAULT_PORT 8080); API authentication
+  key is configurable via API_KEY environment variable or mw_authenticate_set_key()
+  (falling back to default secret).
 
 Suggested order: [DONE] middleware system, then routing/request/response improvements
 that build on top of it, then the rest as needed.

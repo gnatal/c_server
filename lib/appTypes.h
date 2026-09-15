@@ -83,6 +83,11 @@ struct MiddlewareChain {
 };
 
 typedef struct {
+    int port;
+} ServerConfig;
+
+typedef struct {
+    ServerConfig config;
     Route routes[MAX_ROUTES];
     int route_count;
     Middleware middlewares[MAX_MIDDLEWARES];

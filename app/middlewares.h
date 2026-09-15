@@ -25,4 +25,9 @@ void error_handler_json(int status, const char *message, const Request *req, Res
  * API key, with a 401 via chain_error(), before it reaches a handler. */
 void mw_authenticate(const Request *req, Response *res, MiddlewareChain *chain);
 
+/* Configures the secret API key used by mw_authenticate. If not explicitly set,
+ * falls back to the API_KEY environment variable, or a default fallback key. */
+void mw_authenticate_set_key(const char *key);
+const char *mw_authenticate_get_key(void);
+
 #endif /* APP_MIDDLEWARES_H */

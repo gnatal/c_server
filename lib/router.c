@@ -3,6 +3,7 @@
 #include "router.h"
 
 void app_init(App *app) {
+    app->config.port = DEFAULT_PORT;
     app->route_count = 0;
     app->middleware_count = 0;
     app->error_handler = NULL;

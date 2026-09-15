@@ -1,13 +1,28 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "middlewares.h"
 #include "router.h"
 #include "response.h"
 #include "middleware.h"
 
-/* In a real application this should come from config/environment, not be
- * hard-coded in source. */
-static const char *api_key = "my-secret-api-key";
+static const char *default_api_key = "my-secret-api-key";
+static const char *configured_api_key = NULL;
+
+void mw_authenticate_set_key(const char *key) {
+    configured_api_key = key;
+}
+
+const char *mw_authenticate_get_key(void) {
+    if (configured_api_key != NULL) {
+        return configured_api_key;
+    }
+    const char *env_key = getenv("API_KEY");
+    if (env_key != NULL && env_key[0] != '\0') {
+        return env_key;
+    }
+    return default_api_key;
+}
 
 void mw_logger(const Request *req, Response *res, MiddlewareChain *chain) {
     chain_next(chain);
@@ -70,7 +85,8 @@ void mw_authenticate(const Request *req, Response *res, MiddlewareChain *chain) 
     const char *token_end = strstr(value, "\r\n");
     const size_t token_len = token_end != NULL ? (size_t)(token_end - value) : strlen(value);
 
-    if (!keys_match(value, token_len, api_key, strlen(api_key))) {
+    const char *expected_key = mw_authenticate_get_key();
+    if (!keys_match(value, token_len, expected_key, strlen(expected_key))) {
         chain_error(chain, 401, "Unauthorized: Invalid API key");
         return;
     }
