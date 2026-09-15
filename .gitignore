@@ -13,6 +13,7 @@
 httpServer
 hello
 lib/json/json_test
+lib/middleware_test
 
 # --- Debug / profiling ---
 *.dSYM/

@@ -1,11 +1,28 @@
 # app/ — application layer
 
 ## Architecture
-Thin layer on top of `lib/libcserver.a`: `main.c` builds one `App`, registers routes
-via `app_get`/`app_post` (each binds a method + path pattern to a `Handler`), and
-calls `app_listen` to hand control to the engine's event loop permanently — nothing
-here runs after that call. `handlers.c` holds the actual route bodies; each one is a
-terminal function (no middleware/`next()` chaining exists in the engine).
+Thin layer on top of `lib/libcserver.a`: `main.c` builds one `App`, registers
+app-wide middleware via `app_use`/`app_use_error` (`middlewares.c`), registers
+routes via `app_get`/`app_post` (each binds a method + path pattern to a
+`Handler`), and calls `app_listen` to hand control to the engine's event loop
+permanently — nothing here runs after that call. `handlers.c` holds the actual
+route bodies; each one is a terminal function — the engine's `Middleware` pipeline
+(`lib/middleware.h`) runs ahead of it, but route handlers themselves don't
+participate in chaining (no `next` access), so they still just call
+`res_send`/`res_json`/`res_status` directly as before.
+
+`middlewares.c` holds this app's concrete middleware/error-handler instances,
+registered in `main.c` in this order — `mw_logger`, then `mw_body_size_guard`, then
+`error_handler_json` as the error handler:
+- `mw_logger` calls `chain_next` first and logs `METHOD PATH -> STATUS` after it
+  returns, once the rest of the pipeline has produced a final `res->status`.
+- `mw_body_size_guard` rejects any request whose `req->content_length` exceeds this
+  app's own `MAX_APP_BODY_SIZE` (4096, independent of and tighter than the engine's
+  hard per-connection `BUF_SIZE` cap) via `chain_error(chain, 400, ...)` instead of
+  calling `chain_next`.
+- `error_handler_json` is the app's single `ErrorHandler`: anything routed to
+  `chain_error` (currently just the body-size guard) comes back as
+  `{"error": "..."}` instead of the engine's default plain-text fallback.
 
 ## Data flow / state
 A `Handler` receives a `const Request *` (already routed and, for pattern routes

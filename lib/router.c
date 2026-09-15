@@ -4,6 +4,8 @@
 
 void app_init(App *app) {
     app->route_count = 0;
+    app->middleware_count = 0;
+    app->error_handler = NULL;
     app->server_fd = -1;
     app->kq = -1;
     memset(app->connections, 0, sizeof(app->connections));

@@ -12,6 +12,7 @@
 #include "httpParser.h"
 #include "router.h"
 #include "response.h"
+#include "middleware.h"
 
 int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -174,12 +175,7 @@ void handle_readable(App *app, Connection *conn) {
             } else {
                 conn->keep_alive = !request_wants_close(&req);
                 const Route *route = match_route(app, &req);
-                if (route != NULL) {
-                    route->handler(&req, &res);
-                } else {
-                    res_status(&res, 404);
-                    res_send(&res, "Not Found");
-                }
+                dispatch(app, route, &req, &res);
             }
 
             flush_connection(app, conn);

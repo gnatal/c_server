@@ -40,9 +40,10 @@ void flush_connection(App *app, Connection *conn);
 
 /*
  * Non-blocking read of whatever's available on the socket. Once a full
- * request has accumulated in conn->in_buf, parses it, routes it, and lets
- * the handler build a response via res_send() - then hands off to
- * flush_connection() to actually put it on the wire.
+ * request has accumulated in conn->in_buf, parses it, routes it, and runs
+ * the app's middleware pipeline (dispatch(), lib/middleware.h) ending at the
+ * matched handler, which builds a response via res_send() - then hands off
+ * to flush_connection() to actually put it on the wire.
  */
 void handle_readable(App *app, Connection *conn);
 

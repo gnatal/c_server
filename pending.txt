@@ -6,8 +6,31 @@ Gaps vs. an Express-like C framework
 - app/ = application (main.c, handlers.c/h), links against the lib
 
 1. Middleware
-- No app_use() / next() chaining - handlers are single terminal functions, no pipeline
-- No centralized error-handling middleware equivalent ((err, req, res, next))
+- [DONE] app_use() / next() chaining: app-wide middleware pipeline (lib/middleware.h,
+  MiddlewareChain in appTypes.h) runs ahead of route dispatch; each Middleware gets
+  the chain and calls chain_next() to continue. Route Handlers remain terminal (no
+  next access) - only app_use()-registered middleware participates in chaining.
+  Still no path-scoping (app_use middleware is app-wide, runs on every request,
+  including ones that end up 404ing) - that needs sub-router mounting (section 2).
+- [DONE] Centralized error-handling middleware equivalent: chain_error(chain, status,
+  message) is the ((err, req, res, next)) analogue - hands off to the app's single
+  ErrorHandler (app_use_error), or falls back to res_status+res_send if none is
+  registered. Only one error handler per app, not a chain of them.
+  See lib/middleware_test.c for pipeline/error-handler tests, and
+  app/middlewares.c (mw_logger, mw_body_size_guard, error_handler_json) for a real
+  usage example wired up in app/main.c.
+- No per-route middleware: app_use() only registers app-wide middleware, so there's
+  no way to require e.g. mw_authenticate on just /echo/json without also gating /.
+  Planned shape: attach an explicit array + count to a Route at registration time -
+  app_get_mw(&app, path, handler, (Middleware[]){mw1, mw2}, 2) - stored in a fixed
+  Middleware[MAX_ROUTE_MIDDLEWARES] on Route, run in dispatch() after the app-wide
+  ones and before the handler. Preferred over a NULL-terminated variadic
+  (app_get_mw(..., mw1, mw2, NULL)) since a forgotten sentinel there is a silent
+  footgun, and this codebase already favors explicit bounded arrays+counts
+  (route_count, param_count, middleware_count) over that pattern.
+- Prefix-scoped middleware (app_use(&app, "/api", mw), only runs when req->path
+  starts with that prefix) is the more Express-idiomatic alternative/complement -
+  effectively the same work as sub-router mounting below, so tackle them together.
 
 2. Routing
 - No sub-routers / route mounting at a prefix (Router() + app.use('/api', router))
@@ -52,5 +75,5 @@ Gaps vs. an Express-like C framework
 - No request logging middleware (morgan-style)
 - No runtime config (timeouts, buffer sizes, port) beyond compile-time constants in appTypes.h
 
-Suggested order: middleware system next, then routing/request/response improvements
+Suggested order: [DONE] middleware system, then routing/request/response improvements
 that build on top of it, then the rest as needed.

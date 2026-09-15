@@ -9,12 +9,41 @@ directly by fd value — this bounds the server to fds below `MAX_CONNECTIONS`).
 Data flow per request: `handle_readable` (I/O) accumulates bytes into
 `conn->in_buf` → `request_is_complete` (pure, `httpParser.c`) checks the buffer
 without mutating it → `parse_http_request` (pure) fills a `Request` → `match_route`
-(pure, `router.c`) looks up a `Handler` → the handler calls `res_send`/`res_json`
-(`response.c`), which only builds bytes into `conn->out_buf` and never touches the
-socket → `flush_connection` (I/O) is what actually writes. This split exists so the
-parsing/routing/response-building layer stays pure and unit-testable independent of
-sockets — see `lib/json/json_test.c` for the pattern; `httpParser`/`router`/`response`
-have no equivalent tests yet (tracked in `../pending.txt`).
+(pure, `router.c`) looks up a `Handler` (or returns `NULL`) → `dispatch`
+(`middleware.c`) runs the middleware pipeline ending at that handler (or a 404) →
+the handler calls `res_send`/`res_json` (`response.c`), which only builds bytes into
+`conn->out_buf` and never touches the socket → `flush_connection` (I/O) is what
+actually writes. This split exists so the parsing/routing/dispatch/response-building
+layer stays pure and unit-testable independent of sockets — see `lib/json/json_test.c`
+and `lib/middleware_test.c` for the pattern; `httpParser`/`router`/`response` have no
+equivalent tests yet (tracked in `../pending.txt`).
+
+## Middleware pipeline
+`dispatch(app, route, req, res)` (`middleware.c`) builds one `MiddlewareChain` per
+request — the app's `middlewares[]` array (registered via `app_use`, run in
+registration order) plus the already-matched `route->handler` (or `NULL`) as the
+chain's `final_handler` — and calls `chain_next` once to start it:
+- Every `Middleware` receives the live `MiddlewareChain *` and must either call
+  `chain_next(chain)` to continue (advances `chain->index`, then either invokes the
+  next middleware or, once exhausted, `final_handler`/a default 404), write a
+  response directly and *not* call `chain_next` (terminates the pipeline there), or
+  call `chain_error(chain, status, message)`.
+- `chain_error` is the C analogue of Express's `(err, req, res, next)`: it hands off
+  to the app's single registered `ErrorHandler` (`app_use_error`), or — if none is
+  registered — falls back to `res_status`+`res_send` with the given status/message
+  directly. There is only one error handler per app (last `app_use_error` call wins),
+  not a chain of them.
+- Middleware is app-wide only — there is no path-scoping yet (`app_use` middleware
+  runs on every request, including ones that end up 404ing). Path-scoped/mounted
+  middleware is future work (`../pending.txt`, section 2 — sub-routers).
+- Because `chain_next` is a plain synchronous call (no deferred/async dispatch
+  anywhere in this engine), a middleware that calls `chain_next(chain)` and then does
+  more work afterward (e.g. logging) runs that code *after* the entire rest of the
+  pipeline — including the handler — has already finished building the response, so
+  `res->status` is final by then. See `app/middlewares.c: mw_logger`.
+- Route `Handler`s themselves are not given a `MiddlewareChain *` and so cannot call
+  `chain_next`/`chain_error` — they remain the terminal node of the pipeline exactly
+  as before; only middleware registered via `app_use` participates in chaining.
 
 ## Deny-by-default routing
 `match_route` returns `NULL` on no match; `handle_readable` turns that into a 404.
