@@ -1,10 +1,10 @@
-# C-Express HTTP Server
+# CExpress
 
 A lightweight, high-performance, single-threaded HTTP/1.1 server and web framework written entirely in C (C11), designed with a developer experience inspired by [Express.js](https://expressjs.com/).
 
 > [!NOTE]
 > **Future Library Architecture:**
-> The code in `lib/` compiles to a reusable static library (`lib/libcserver.a`). In future releases, this engine will be decoupled and distributed as an independent, embeddable C library. The code in `app/` is strictly a reference implementation and demo application showcasing how to consume the library.
+> The code in `lib/` compiles to a reusable static library (`lib/libcexpress.a`). In future releases, this engine will be decoupled and distributed as an independent, embeddable C library. The code in `app/` is strictly a reference implementation and demo application showcasing how to consume the library.
 
 ---
 
@@ -45,7 +45,7 @@ The codebase is split into two distinct tiers:
 └───────────────────────────┬────────────────────────────┘
                             │ links against
 ┌───────────────────────────▼────────────────────────────┐
-│              lib/ (Core Engine - libcserver.a)         │
+│              lib/ (Core Engine - libcexpress.a)        │
 │   - connection.c : kqueue event loop & socket I/O      │
 │   - httpParser.c : HTTP/1.1 parsing & buffer guards    │
 │   - router.c     : Trie/segment pattern matcher        │
@@ -115,12 +115,12 @@ The codebase is split into two distinct tiers:
 make
 ```
 This produces:
-- `lib/libcserver.a`: The core engine static library.
-- `httpServer`: The executable demo application.
+- `lib/libcexpress.a`: The core engine static library.
+- `cexpress`: The executable demo application.
 
 ### 2. Start the Server
 ```bash
-./httpServer
+./cexpress
 # or
 make run
 ```
@@ -156,7 +156,7 @@ The server supports both runtime environment variables and programmatic configur
 
 ### Running with Custom Configuration
 ```bash
-PORT=3000 API_KEY=super-secret-token ./httpServer
+PORT=3000 API_KEY=super-secret-token ./cexpress
 ```
 
 ### Programmatic Configuration
@@ -175,7 +175,7 @@ PORT=3000 API_KEY=super-secret-token ./httpServer
 
 Start the server:
 ```bash
-PORT=8080 ./httpServer
+PORT=8080 ./cexpress
 ```
 
 In another terminal, test the demo routes:
@@ -254,7 +254,7 @@ Connection: keep-alive
 ├── README.md             # Project documentation
 ├── CLAUDE.md             # Project standards, coding guidelines, and workflow rules
 ├── pending.txt           # Feature tracking and architectural backlog
-├── lib/                  # Reusable C-Express engine (builds to libcserver.a)
+├── lib/                  # Reusable CExpress engine (builds to libcexpress.a)
 │   ├── appTypes.h        # Struct definitions, function pointer signatures, and limits
 │   ├── connection.h/c    # kqueue event loop, non-blocking socket I/O & lifecycle
 │   ├── httpParser.h/c    # Pure HTTP/1.1 parser, query string and header parsing
@@ -275,7 +275,7 @@ Connection: keep-alive
 
 ## Roadmap
 
-Check [pending.txt](file:///Users/guilhermenatal/Documents/CodingProjects/c_server/pending.txt) for the full architectural roadmap:
+Check [pending.txt](pending.txt) for the full architectural roadmap:
 - [ ] Sub-routers / prefix-scoped mounting (`app.use("/api", subrouter)`)
 - [ ] Additional HTTP verbs (`PUT`, `DELETE`, `PATCH`, `OPTIONS`, `HEAD`)
 - [ ] 405 Method Not Allowed support

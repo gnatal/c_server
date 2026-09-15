@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -std=c11 -Ilib
 LIB_SRCS = lib/connection.c lib/httpParser.c lib/router.c lib/response.c lib/middleware.c \
            lib/json/jsonParser.c lib/json/jsonValue.c lib/json/jsonWriter.c
 LIB_OBJS = $(LIB_SRCS:.c=.o)
-LIB = lib/libcserver.a
+LIB = lib/libcexpress.a
 
 # --- app: the application built on top of the lib ---
 APP_SRCS = app/main.c app/handlers.c app/middlewares.c
@@ -31,7 +31,7 @@ TEST_BINS = $(JSON_TEST_BIN) $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PA
 
 .PHONY: all run test clean
 
-all: httpServer
+all: cexpress
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -39,11 +39,11 @@ all: httpServer
 $(LIB): $(LIB_OBJS)
 	$(AR) rcs $@ $(LIB_OBJS)
 
-httpServer: $(APP_OBJS) $(LIB)
+cexpress: $(APP_OBJS) $(LIB)
 	$(CC) $(CFLAGS) -o $@ $(APP_OBJS) $(LIB)
 
-run: httpServer
-	./httpServer
+run: cexpress
+	./cexpress
 
 $(JSON_TEST_BIN): $(JSON_TEST_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(JSON_TEST_SRCS)
@@ -68,4 +68,4 @@ test: $(TEST_BINS)
 	./$(CONNECTION_TEST_BIN)
 
 clean:
-	rm -f httpServer $(TEST_BINS) $(LIB) $(LIB_OBJS) $(APP_OBJS)
+	rm -f cexpress httpServer $(TEST_BINS) $(LIB) $(LIB_OBJS) $(APP_OBJS)

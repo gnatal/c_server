@@ -11,9 +11,13 @@
 
 # --- Project binaries ---
 httpServer
+cexpress
 hello
 lib/json/json_test
 lib/middleware_test
+lib/router_test
+lib/http_parser_test
+lib/connection_test
 
 # --- Debug / profiling ---
 *.dSYM/

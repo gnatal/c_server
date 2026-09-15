@@ -1,7 +1,7 @@
 # app/ — application layer
 
 ## Architecture
-Thin layer on top of `lib/libcserver.a`: `main.c` builds one `App`, registers
+Thin layer on top of `lib/libcexpress.a`: `main.c` builds one `App`, registers
 app-wide middleware via `app_use`/`app_use_error` (`middlewares.c`), registers
 routes via `app_get`/`app_post` (each binds a method + path pattern to a
 `Handler`), and calls `app_listen` to hand control to the engine's event loop

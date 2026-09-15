@@ -2,7 +2,7 @@ Gaps vs. an Express-like C framework
 =====================================
 
 [DONE] Lib/app separation
-- lib/ = engine (connection, router, httpParser, response, json), builds to lib/libcserver.a
+- lib/ = engine (connection, router, httpParser, response, json), builds to lib/libcexpress.a
 - app/ = application (main.c, handlers.c/h), links against the lib
 
 1. Middleware

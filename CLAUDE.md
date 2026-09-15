@@ -1,4 +1,4 @@
-# Project: C-Express HTTP Server
+# Project: CExpress HTTP Server
 
 ## What is this project?
 This project is an attempt to create an HTTP server with a developer experience similar to Express.js, but written entirely in C. We are choosing C for maximum performance, minimal footprint, and fine-grained control over memory and networking.

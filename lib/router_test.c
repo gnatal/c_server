@@ -44,12 +44,12 @@ static void test_match_path_params(void) {
 
     /* Multiple parameters */
     memset(&req, 0, sizeof(req));
-    assert(match_path("/orgs/:orgId/repos/:repoName", "/orgs/google/repos/c_server", &req) == 1);
+    assert(match_path("/orgs/:orgId/repos/:repoName", "/orgs/google/repos/CExpress", &req) == 1);
     assert(req.param_count == 2);
     const char *org_val = req_get_param(&req, "orgId");
     const char *repo_val = req_get_param(&req, "repoName");
     assert(org_val != NULL && strcmp(org_val, "google") == 0);
-    assert(repo_val != NULL && strcmp(repo_val, "c_server") == 0);
+    assert(repo_val != NULL && strcmp(repo_val, "CExpress") == 0);
 
     /* Non-existent param returns NULL */
     assert(req_get_param(&req, "nonexistent") == NULL);
