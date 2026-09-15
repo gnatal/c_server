@@ -1,19 +1,16 @@
-***what is this project*** 
+# Project: C-Express HTTP Server
 
-This project is an attempt to create an HTTP server much like express 
-but In C, why cause C is faster C is cool C is the best performance that we can
-achieve.
+## What is this project?
+This project is an attempt to create an HTTP server with a developer experience similar to Express.js, but written entirely in C. We are choosing C for maximum performance, minimal footprint, and fine-grained control over memory and networking. Target OS: [Insert Linux/macOS/POSIX here].
 
-***Coding instructions for this project***
+## Coding Standards & Patterns
+- **Type Definitions:** All `typedef` and `struct` definitions must live in dedicated header files (e.g., `appTypes.h`). Do not declare them in `.c` files.
+- **File Size Limits:** No file may exceed 1,000 lines of code. If a file approaches this limit, proactively refactor and split the logic into two files.
+- **Const Correctness:** Apply `const` aggressively to variables and pointer arguments to simulate immutability wherever possible.
+- **Isolate Side Effects:** Separate I/O operations (reading/writing to sockets) from data processing. HTTP parsing functions should be pure, testable, and take `const char*` buffers as input.
 
-Coding patterns: 
-- Type definitions should always be in a header file e.g appTypes.h 
-- No file should go over 1000 lines, if for some reason some file goes over we should split into 2 files 
-- We should always write pure functions that are testable 
-- We should strive to use immutable variables when ever is possible
-
-***Security considerations***
-
-- Only make secure functions
-- use denied by default policies for the project 
-- Always limit user input and output
+## Security & Memory Considerations
+- **Ban Unsafe Functions:** Never use `strcpy`, `strcat`, `sprintf`, or `gets`. Always use their bounded equivalents (`strncpy`, `strncat`, `snprintf`).
+- **Deny by Default:** Network routers and file servers must use a deny-by-default policy. Return 403/404 unless a route or resource is explicitly matched.
+- **Strict I/O Limits:** Always validate and bound user input. Enforce hard limits on HTTP header sizes (e.g., max 8KB) and payload bodies to prevent buffer overflows and DOS attacks.
+- **Memory Management:** Every `malloc` or `calloc` must have a clearly documented and matching `free`.
