@@ -12,6 +12,7 @@ This project is an attempt to create an HTTP server with a developer experience 
 - **File Size Limits:** No file may exceed 1,000 lines of code. If a file approaches this limit, proactively refactor and split the logic into two files.
 - **Const Correctness:** Apply `const` aggressively to variables and pointer arguments to simulate immutability wherever possible.
 - **Isolate Side Effects:** Separate I/O operations (reading/writing to sockets) from data processing. HTTP parsing functions should be pure, testable, and take `const char*` buffers as input.
+- **Write Tests for all new code:** Separate I/O operations (reading/writing to sockets) from data processing. HTTP parsing functions should be pure, testable, and take `const char*` buffers as input.
 
 ## Security & Memory Considerations
 - **Ban Unsafe Functions:** Never use `strcpy`, `strcat`, `sprintf`, or `gets`. Always use their bounded equivalents (`strncpy`, `strncat`, `snprintf`).
