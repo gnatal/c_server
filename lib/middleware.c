@@ -2,6 +2,7 @@
 #include <string.h>
 #include "middleware.h"
 #include "response.h"
+#include "router.h"
 
 /* prefix "" or "/" is treated as unscoped (matches every path), same as an
  * app_use() call before prefix-scoping existed. Otherwise path must start
@@ -61,6 +62,10 @@ void chain_next(MiddlewareChain *chain) {
 
     if (chain->final_handler != NULL) {
         chain->final_handler(chain->req, chain->res);
+    } else if (chain->method_not_allowed) {
+        res_set_header(chain->res, "Allow", chain->allowed_methods);
+        res_status(chain->res, 405);
+        res_send(chain->res, "Method Not Allowed");
     } else {
         res_status(chain->res, 404);
         res_send(chain->res, "Not Found");
@@ -77,6 +82,12 @@ void chain_error(MiddlewareChain *chain, int status, const char *message) {
 }
 
 void dispatch(App *app, const Route *route, const Request *req, Response *res) {
+    char allowed_methods[64] = "";
+    int method_not_allowed = 0;
+    if (route == NULL) {
+        method_not_allowed = match_route_allowed_methods(app, req, allowed_methods, sizeof(allowed_methods)) > 0;
+    }
+
     MiddlewareChain chain = {
         .middlewares = app->middlewares,
         .count = app->middleware_count,
@@ -87,6 +98,8 @@ void dispatch(App *app, const Route *route, const Request *req, Response *res) {
         .error_handler = app->error_handler,
         .req = req,
         .res = res,
+        .method_not_allowed = method_not_allowed,
+        .allowed_methods = allowed_methods,
     };
     chain_next(&chain);
 }

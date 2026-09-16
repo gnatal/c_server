@@ -134,6 +134,45 @@ static void test_match_route(void) {
     assert(match_route(&app, &req) == NULL);
 }
 
+static void test_match_route_allowed_methods(void) {
+    App app;
+    app_init(&app);
+
+    app_get(&app, "/users", dummy_handler_a);
+    app_post(&app, "/users", dummy_handler_b);
+    app_get(&app, "/users/:id", dummy_handler_b);
+
+    char allowed[64];
+
+    /* Path matches two routes under different methods - both listed, in
+     * registration order, deduplicated. */
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "DELETE", sizeof(req.method) - 1);
+    strncpy(req.path, "/users", sizeof(req.path) - 1);
+    int count = match_route_allowed_methods(&app, &req, allowed, sizeof(allowed));
+    assert(count == 2);
+    assert(strcmp(allowed, "GET, POST") == 0);
+    /* req itself is untouched (no stray param_count side effect). */
+    assert(req.param_count == 0);
+
+    /* Path matches exactly one route under a different method. */
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "DELETE", sizeof(req.method) - 1);
+    strncpy(req.path, "/users/42", sizeof(req.path) - 1);
+    count = match_route_allowed_methods(&app, &req, allowed, sizeof(allowed));
+    assert(count == 1);
+    assert(strcmp(allowed, "GET") == 0);
+
+    /* Completely unknown path matches nothing - a real 404. */
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/notfound", sizeof(req.path) - 1);
+    count = match_route_allowed_methods(&app, &req, allowed, sizeof(allowed));
+    assert(count == 0);
+    assert(allowed[0] == '\0');
+}
+
 static void test_app_add_route_overflow(void) {
     App app;
     app_init(&app);
@@ -388,6 +427,7 @@ int main(void) {
     test_match_path_params();
     test_match_path_max_params();
     test_match_route();
+    test_match_route_allowed_methods();
     test_app_add_route_overflow();
     test_app_get_mw_stores_route_middleware();
     test_app_post_mw_stores_route_middleware();

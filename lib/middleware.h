@@ -31,8 +31,10 @@ void app_use_error(App *app, ErrorHandler handler);
 
 /*
  * Advances the pipeline by one step: runs the next unrun middleware, or -
- * once all middleware have run - the matched route's handler, or a 404 if
- * no route matched. Middleware calls this to continue the chain.
+ * once all middleware have run - the matched route's handler, or (if no
+ * route matched) a 404 if nothing registered matches req->path at all, or a
+ * 405 + Allow header if req->path matches a registered route under a
+ * different method. Middleware calls this to continue the chain.
  */
 void chain_next(MiddlewareChain *chain);
 

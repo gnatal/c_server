@@ -80,6 +80,18 @@ int match_path(const char *pattern, const char *path, Request *req);
 /* Finds the first registered route whose method and path pattern match the request. */
 const Route *match_route(const App *app, Request *req);
 
+/*
+ * Scans every registered route for one whose path pattern matches req->path,
+ * regardless of method, and writes a deduplicated, comma-separated list of
+ * their methods (in route-registration order) into allowed. Used to tell a
+ * true 404 (no route matches this path at all) apart from a 405 (path
+ * matches, just not with this method) once match_route has already returned
+ * NULL. Does not mutate req - match_path's param-capture writes go into a
+ * scratch copy. Returns how many distinct methods were found (0 means no
+ * route matches this path, i.e. a real 404).
+ */
+int match_route_allowed_methods(const App *app, const Request *req, char *allowed, size_t allowed_size);
+
 /* Looks up a captured path param by name (e.g. req_get_param(req, "id")). */
 const char *req_get_param(const Request *req, const char *name);
 

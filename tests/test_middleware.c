@@ -40,6 +40,11 @@ static void mw_b(const Request *req, Response *res, MiddlewareChain *chain) {
     chain_next(chain);
 }
 
+static void dummy_handler_unused(const Request *req, Response *res) {
+    (void)req;
+    (void)res;
+}
+
 static void handler_ok(const Request *req, Response *res) {
     (void)req;
     record(3);
@@ -123,6 +128,53 @@ static void test_dispatch_falls_through_to_404_without_route(void) {
 
     assert(res.status == 404);
     assert(strstr(conn->out_buf, "Not Found") != NULL);
+
+    free_conn(conn);
+}
+
+static void test_dispatch_returns_405_when_path_matches_other_method(void) {
+    App app;
+    app_init(&app);
+    app_use(&app, mw_passthrough);
+    app_get(&app, "/users", dummy_handler_unused);
+    app_post(&app, "/users", dummy_handler_unused);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "DELETE", sizeof(req.method) - 1);
+    strncpy(req.path, "/users", sizeof(req.path) - 1);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    /* Mirrors handle_readable: match_route finds nothing for DELETE, so
+     * route is NULL going into dispatch even though the path is registered
+     * under other methods. */
+    dispatch(&app, NULL, &req, &res);
+
+    assert(res.status == 405);
+    assert(strstr(conn->out_buf, "Method Not Allowed") != NULL);
+    assert(strstr(conn->out_buf, "Allow: GET, POST") != NULL);
+
+    free_conn(conn);
+}
+
+static void test_dispatch_returns_404_when_path_matches_nothing(void) {
+    App app;
+    app_init(&app);
+    app_get(&app, "/users", dummy_handler_unused);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/notfound", sizeof(req.path) - 1);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    dispatch(&app, NULL, &req, &res);
+
+    assert(res.status == 404);
+    assert(strstr(conn->out_buf, "Not Found") != NULL);
+    assert(strstr(conn->out_buf, "Allow:") == NULL);
 
     free_conn(conn);
 }
@@ -368,6 +420,8 @@ int main(void) {
     test_middlewares_run_in_order_then_handler();
     test_middleware_can_short_circuit();
     test_dispatch_falls_through_to_404_without_route();
+    test_dispatch_returns_405_when_path_matches_other_method();
+    test_dispatch_returns_404_when_path_matches_nothing();
     test_chain_error_invokes_registered_error_handler();
     test_chain_error_default_fallback_without_handler();
     test_route_middleware_runs_after_app_wide_before_handler();

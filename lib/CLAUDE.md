@@ -10,7 +10,8 @@ Data flow per request: `handle_readable` (I/O) accumulates bytes into
 `conn->in_buf` → `request_is_complete` (pure, `http_parser.c`) checks the buffer
 without mutating it → `parse_http_request` (pure) fills a `Request` → `match_route`
 (pure, `router.c`) looks up a `Handler` (or returns `NULL`) → `dispatch`
-(`middleware.c`) runs the middleware pipeline ending at that handler (or a 404) →
+(`middleware.c`) runs the middleware pipeline ending at that handler (or a 404/405,
+see "Deny-by-default routing" below) →
 the handler calls `res_send`/`res_json` (`response.c`), which only builds bytes into
 `conn->out_buf` and never touches the socket → `flush_connection` (I/O) is what
 actually writes. This split exists so the parsing/routing/dispatch/response-building
@@ -128,13 +129,29 @@ takes effect once mounted into an `App` via `app_mount(app, prefix, router)`
   `MAX_ROUTES` truncation coverage.
 
 ## Deny-by-default routing
-`match_route` returns `NULL` on no match; `handle_readable` turns that into a 404.
-There is no fallback/wildcard handler, so an unregistered path or method is always
-rejected rather than silently served. `match_route` requires an exact `Route.method`
-string match (`router.c`), so registering `GET /users/:id` does not make `PUT
-/users/:id` match it — a path matching but the method not matching still falls
-through to the same 404 as a completely unknown path (no 405 Method Not Allowed
-distinction). Convenience wrappers exist for `GET`/`POST`/`PUT`/`PATCH`/`DELETE`
+`match_route` returns `NULL` on no match; there is no fallback/wildcard handler, so
+an unregistered path or method is always rejected rather than silently served.
+`match_route` requires an exact `Route.method` string match (`router.c`), so
+registering `GET /users/:id` does not make `PUT /users/:id` match it — `match_route`
+itself returns `NULL` either way, regardless of *why* nothing matched.
+
+`dispatch` (`middleware.c`) is what turns a `NULL` route into an actual response,
+and it tells the two `NULL` cases apart before building the `MiddlewareChain`: it
+calls `match_route_allowed_methods` (`router.c`) — which walks every registered
+route checking `match_path` only (method-agnostic) and collects a deduplicated,
+registration-ordered, comma-separated method list — and stores the result on the
+chain (`method_not_allowed` + `allowed_methods`). `chain_next`'s final fallback
+(after every app-wide and route middleware has run, same as the plain-404 path)
+then sends 404 when nothing matches the path at all, or 405 + an `Allow:
+<methods>` response header when the path matches at least one route under a
+different method. `match_route_allowed_methods` never mutates the caller's
+`Request` (it runs `match_path` against a local scratch copy), so it's safe to
+call speculatively even though `match_route` already tried and failed. See
+`tests/test_middleware.c` (`test_dispatch_returns_405_*`,
+`test_dispatch_returns_404_*`) and `tests/test_router.c`
+(`test_match_route_allowed_methods_*`).
+
+Convenience wrappers exist for `GET`/`POST`/`PUT`/`PATCH`/`DELETE`
 (`app_get`/`app_post`/`app_put`/`app_patch`/`app_delete`, each with an `_mw`
 variant, plus the `router_*` equivalents) — `HEAD`/`OPTIONS` have no wrapper yet,
 though `app_add_route`/`router_add_route` would take any method string directly.

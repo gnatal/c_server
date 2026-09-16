@@ -3,8 +3,8 @@
 ## Architecture
 Standalone unit and integration test suites compiled independently into `build/bin/test_*`. Tests run without third-party test frameworks using standard C `<assert.h>` assertions and return exit code 0 on complete pass:
 - `test_json.c`: Pure data-structure tests covering JSON parsing, primitive tokens, nested arrays/objects, string escaping, and stringification round-trips.
-- `test_middleware.c`: Middleware chain dispatching, synchronous execution ordering, termination by early response, 404 fallthrough, and error propagation via `chain_error`.
-- `test_router.c`: Route registration limits (`MAX_ROUTES`), literal pattern matching, parameter tokenization (`:id`), and route param lookup (`req_get_param`).
+- `test_middleware.c`: Middleware chain dispatching, synchronous execution ordering, termination by early response, 404/405 fallthrough (unmatched path vs. path matched under a different method), and error propagation via `chain_error`.
+- `test_router.c`: Route registration limits (`MAX_ROUTES`), literal pattern matching, parameter tokenization (`:id`), route param lookup (`req_get_param`), and `match_route_allowed_methods` (the method list behind a 405 response).
 - `test_http_parser.c`: Pure buffer parsing of HTTP/1.1 request lines, header scanning, Content-Length bounds enforcement, and keep-alive header determination.
 - `test_connection.c`: Non-blocking socket I/O, `handle_readable` buffer progression, keep-alive connection reuse, partial buffer reads, and buffer overflow cutoff (431 Request Header Fields Too Large / 400 Bad Request) via POSIX `socketpair(2)` connected to an isolated `kqueue()` instance without binding to physical network ports.
 - `test_response.c`: `res_set_header` behavior - custom headers appear in the built

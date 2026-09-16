@@ -257,6 +257,41 @@ const Route *match_route(const App *app, Request *req) {
     return NULL;
 }
 
+int match_route_allowed_methods(const App *app, const Request *req, char *allowed, size_t allowed_size) {
+    Request scratch = *req;
+    char seen[MAX_ROUTES][8];
+    int seen_count = 0;
+    allowed[0] = '\0';
+
+    for (int i = 0; i < app->route_count; i++) {
+        const Route *route = &app->routes[i];
+        if (!match_path(route->path, req->path, &scratch)) {
+            continue;
+        }
+
+        int already_seen = 0;
+        for (int j = 0; j < seen_count; j++) {
+            if (strcmp(seen[j], route->method) == 0) {
+                already_seen = 1;
+                break;
+            }
+        }
+        if (already_seen) {
+            continue;
+        }
+        strncpy(seen[seen_count], route->method, sizeof(seen[0]) - 1);
+        seen[seen_count][sizeof(seen[0]) - 1] = '\0';
+        seen_count++;
+
+        if (allowed[0] != '\0') {
+            strncat(allowed, ", ", allowed_size - strlen(allowed) - 1);
+        }
+        strncat(allowed, route->method, allowed_size - strlen(allowed) - 1);
+    }
+
+    return seen_count;
+}
+
 const char *req_get_param(const Request *req, const char *name) {
     for (int i = 0; i < req->param_count; i++) {
         if (strcmp(req->param_names[i], name) == 0) {

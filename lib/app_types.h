@@ -120,11 +120,12 @@ typedef struct {
 typedef void (*ErrorHandler)(int status, const char *message, const Request *req, Response *res);
 
 /* One request's walk through the app-wide middlewares, then the matched
- * route's own middlewares, ending at its Handler (or a 404 if route is
- * NULL). Built fresh per request by dispatch(); middleware advances it via
- * chain_next(). chain->index counts continuously across both arrays - it
- * first exhausts middlewares[0..count), then route_middlewares[0..
- * route_middleware_count), then falls through to final_handler. */
+ * route's own middlewares, ending at its Handler (or a 404/405 if route is
+ * NULL - see method_not_allowed below). Built fresh per request by
+ * dispatch(); middleware advances it via chain_next(). chain->index counts
+ * continuously across both arrays - it first exhausts middlewares[0..count),
+ * then route_middlewares[0..route_middleware_count), then falls through to
+ * final_handler. */
 struct MiddlewareChain {
     const MiddlewareEntry *middlewares;
     int count;
@@ -135,6 +136,18 @@ struct MiddlewareChain {
     ErrorHandler error_handler;
     const Request *req;
     Response *res;
+
+    /* Only meaningful when final_handler is NULL (no route matched).
+     * dispatch() sets these from match_route_allowed_methods() ahead of
+     * time: method_not_allowed is nonzero when req->path matches at least
+     * one registered route under a different method, in which case
+     * allowed_methods holds that comma-separated method list and
+     * chain_next's fallback sends 405 (with an Allow header) instead of
+     * 404. allowed_methods points at a buffer owned by dispatch()'s stack
+     * frame - valid because chain_next always runs synchronously within
+     * that same call, never deferred. */
+    int method_not_allowed;
+    const char *allowed_methods;
 };
 
 typedef struct {

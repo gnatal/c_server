@@ -57,13 +57,25 @@ Gaps vs. an Express-like C framework
   router_patch/router_delete (+ _mw) equivalents (router.c/h) - thin wrappers
   around app_add_route(_mw)/router_add_route(_mw) exactly like app_get/app_post,
   so PUT/PATCH/DELETE routes register and dispatch (incl. per-route middleware,
-  path params, and mounting via app_mount) identically to GET/POST. No
-  app_head/app_options wrapper yet - HEAD/OPTIONS aren't handled specially
-  (no auto-HEAD-from-GET, no auto-OPTIONS), though app_add_route/
-  router_add_route would take either method string directly if registered by
-  hand. See tests/test_router.c (test_app_put_patch_delete_*,
-  test_router_put_patch_delete_*) and lib/CLAUDE.md ("Deny-by-default routing").
-- Path matches but method doesn't -> still 404, not 405
+  path params, and mounting via app_mount) identically to GET/POST. See
+  tests/test_router.c (test_app_put_patch_delete_*, test_router_put_patch_delete_*)
+  and lib/CLAUDE.md ("Deny-by-default routing").
+- No app_head/app_options wrapper - HEAD/OPTIONS aren't handled specially (no
+  auto-HEAD-from-GET, no auto-OPTIONS), though app_add_route/router_add_route
+  would take either method string directly if registered by hand.
+- [DONE] Path matches but method doesn't -> now 405, not 404: match_route
+  (router.c) is unchanged (still requires an exact method match, still returns
+  NULL on mismatch), but dispatch() (middleware.c) now calls the new
+  match_route_allowed_methods (router.c/h) whenever route is NULL to tell the
+  two NULL cases apart - a completely unmatched path (0 other routes match)
+  still falls through to the existing 404, while a path that matches at least
+  one route under a different method now gets a 405 with an Allow: <methods>
+  response header (comma-separated, deduplicated, in route-registration order)
+  instead. This runs in chain_next's final fallback (after all app-wide/
+  route middleware), so app-wide middleware still observes/logs the real
+  eventual status. See tests/test_middleware.c
+  (test_dispatch_returns_405_*) and tests/test_router.c
+  (test_match_route_allowed_methods_*).
 - No wildcards, no query-string parser (req->query is a raw string, no req_get_query(name))
 - No URL-decoding of path/params/query
 
