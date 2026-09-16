@@ -18,6 +18,13 @@ static void ping_handler(const Request *req, Response *res) {
     res_send(res, "pong");
 }
 
+static void echo_len_handler(const Request *req, Response *res) {
+    char body[64];
+    snprintf(body, sizeof(body), "received %d bytes", req->content_length);
+    res_status(res, 200);
+    res_send(res, body);
+}
+
 static void setup_test_connection(App *app, int fds[2], Connection **conn) {
     app_init(app);
     app->kq = kqueue();
@@ -54,10 +61,13 @@ static void test_set_nonblocking_and_create(void) {
     Connection *c = connection_create(p[0]);
     assert(c != NULL);
     assert(c->fd == p[0]);
+    assert(c->in_buf != NULL);
+    assert(c->in_cap == BUF_SIZE);
     assert(c->out_buf == NULL);
     assert(c->in_len == 0);
     assert(c->out_len == 0);
 
+    free(c->in_buf);
     free(c);
     close(p[0]);
     close(p[1]);
@@ -229,6 +239,95 @@ static void test_handle_readable_header_overflow_431(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+static void test_handle_readable_large_body_grows_buffer(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_post(&app, "/upload", echo_len_handler);
+
+    /* Well beyond the original BUF_SIZE (8192), comfortably under
+     * MAX_BODY_SIZE - this body cannot possibly fit in in_buf's starting
+     * capacity, so completing this request requires handle_readable to grow
+     * conn->in_buf partway through (see lib/CLAUDE.md, "Body buffering"). */
+    const size_t body_len = 20000;
+    char *body = malloc(body_len);
+    assert(body != NULL);
+    memset(body, 'x', body_len);
+
+    char head[128];
+    snprintf(head, sizeof(head),
+             "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: %zu\r\n\r\n", body_len);
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    handle_readable(&app, conn);
+    /* Headers alone fit easily in the starting BUF_SIZE capacity, so no
+     * growth should have happened yet - still waiting on the body. */
+    assert(conn->in_cap == BUF_SIZE);
+    assert(app.connections[fds[0]] == conn);
+
+    /* Stream the body in chunks, like a real socket would deliver it, until
+     * the whole thing has been written and handled. */
+    int saw_growth = 0;
+    size_t sent = 0;
+    while (sent < body_len) {
+        size_t remaining = body_len - sent;
+        size_t chunk = remaining < 4096 ? remaining : 4096;
+        ssize_t n = write(fds[1], body + sent, chunk);
+        assert(n > 0);
+        sent += (size_t)n;
+        handle_readable(&app, conn);
+        if (conn->in_cap > BUF_SIZE) {
+            saw_growth = 1;
+        }
+    }
+    assert(saw_growth);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(resp, "received 20000 bytes") != NULL);
+
+    /* Keep-alive connection stays open, and in_buf was shrunk back down to
+     * BUF_SIZE now that it's idle again (flush_connection). */
+    assert(app.connections[fds[0]] == conn);
+    assert(conn->in_cap == BUF_SIZE);
+
+    free(body);
+    teardown_test_connection(&app, fds, conn);
+}
+
+static void test_handle_readable_body_too_large_413(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    int client_fd = fds[0];
+
+    /* A well-formed but too-large Content-Length is rejected the moment
+     * headers complete - no need to actually send MAX_BODY_SIZE+ bytes of
+     * body to trigger this (see lib/CLAUDE.md, "Body buffering"). */
+    char req_line[128];
+    snprintf(req_line, sizeof(req_line),
+             "POST /upload HTTP/1.1\r\nContent-Length: %d\r\n\r\n", MAX_BODY_SIZE + 1);
+    assert(write(fds[1], req_line, strlen(req_line)) == (ssize_t)strlen(req_line));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 413 Payload Too Large") != NULL);
+
+    /* Connection should have been closed */
+    assert(app.connections[client_fd] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_connection_close(void) {
     App app;
     int fds[2];
@@ -264,6 +363,8 @@ int main(void) {
     test_handle_readable_malformed_400();
     test_handle_readable_unmatched_route_404();
     test_handle_readable_header_overflow_431();
+    test_handle_readable_large_body_grows_buffer();
+    test_handle_readable_body_too_large_413();
     test_handle_readable_connection_close();
 
     printf("all connection tests passed\n");

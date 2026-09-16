@@ -77,8 +77,13 @@ scoping mechanisms in `lib/`:
   returns, once the rest of the pipeline has produced a final `res->status`.
 - `mw_body_size_guard` rejects any request whose `req->content_length` exceeds this
   app's own `MAX_APP_BODY_SIZE` (4096, independent of and tighter than the engine's
-  hard per-connection `BUF_SIZE` cap) via `chain_error(chain, 400, ...)` instead of
-  calling `chain_next`.
+  hard per-connection `MAX_BODY_SIZE` cap - 1 MiB, `lib/CLAUDE.md`, "Body buffering")
+  via `chain_error(chain, 400, ...)` instead of calling `chain_next`. Since this runs
+  as middleware (after the engine has already fully received the body), a body
+  between 4096 bytes and `MAX_BODY_SIZE` is still received in full before this
+  middleware gets a chance to reject it - an engine-level cap rejects earlier and
+  cheaper, at the cost of being fixed for every app built on this engine rather than
+  being this app's own configurable policy.
 - `mw_authenticate` enforces Bearer token authentication via `Authorization: Bearer <token>`,
   read via `req_get_header(req, "Authorization")` (`lib/http_parser.c`) rather than an
   ad-hoc `strstr` scan over `req->headers` - `req_get_header`'s lookup is

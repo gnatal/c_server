@@ -10,8 +10,11 @@ int extract_content_length(const char *header_block) {
         return 0;
     }
     const long value = atol(cl_header + strlen("Content-Length:"));
-    if (value < 0 || value > BUF_SIZE - 1) {
+    if (value < 0) {
         return -1;
+    }
+    if (value > MAX_BODY_SIZE) {
+        return -2;
     }
     return (int)value;
 }
@@ -102,14 +105,19 @@ int parse_http_request(const char *raw, Request *req) {
         return -1;
     }
 
+    /* body_start may hold more than content_length bytes (e.g. a pipelined
+     * next request already sitting in the same buffer) - take exactly
+     * content_length of it, never more, same as before this was heap-backed. */
     char *body_start = header_end + 4;
     size_t available = strlen(body_start);
     size_t body_len = (size_t)req->content_length;
     if (body_len > available) {
         body_len = available;
     }
-    if (body_len >= sizeof(req->body)) {
-        body_len = sizeof(req->body) - 1;
+
+    req->body = malloc(body_len + 1);
+    if (req->body == NULL) {
+        return -1;
     }
     memcpy(req->body, body_start, body_len);
     req->body[body_len] = '\0';
@@ -212,6 +220,7 @@ const char *status_text(int status) {
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 413: return "Payload Too Large";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         default:  return "Unknown";

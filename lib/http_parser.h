@@ -6,8 +6,13 @@
 
 /*
  * Parses the "Content-Length:" value out of a header block: 0 if absent,
- * -1 if present but negative or larger than the server will ever buffer
- * (BUF_SIZE - 1), otherwise the value.
+ * the value otherwise - except two distinct rejection sentinels callers use
+ * to pick an HTTP status: -1 for a malformed (negative) value (-> 400 Bad
+ * Request), -2 for a well-formed value that exceeds MAX_BODY_SIZE (-> 413
+ * Payload Too Large). Both are negative, so request_is_complete/
+ * parse_http_request's generic "content_length < 0" checks still treat
+ * either the same way (stop buffering / reject); connection.c is what
+ * distinguishes -1 from -2 to choose the response status.
  */
 int extract_content_length(const char *header_block);
 
@@ -35,6 +40,14 @@ int request_wants_close(const Request *req);
  * all see decoded bytes; req->query stays the raw, unparsed string, but the
  * req->query_names/query_values arrays parse_query_string fills from it are
  * decoded (see parse_query_string).
+ *
+ * req->body is malloc'd here, sized to exactly content_length + 1 bytes
+ * (never more, even if raw holds trailing bytes past the declared body -
+ * e.g. a pipelined next request) - the caller owns it and must free() it
+ * once done with the Request, on every return path (a failed parse, return
+ * -1, still guarantees req->body is NULL - safe to free unconditionally).
+ * raw itself is never modified (this stays a pure function only reading raw
+ * bytes and writing out fields on req).
  */
 int parse_http_request(const char *raw, Request *req);
 

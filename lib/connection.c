@@ -63,6 +63,15 @@ int create_server_socket(int port) {
 
 Connection *connection_create(int fd) {
     Connection *conn = calloc(1, sizeof(Connection));
+    if (conn == NULL) {
+        return NULL;
+    }
+    conn->in_buf = malloc(BUF_SIZE);
+    if (conn->in_buf == NULL) {
+        free(conn);
+        return NULL;
+    }
+    conn->in_cap = BUF_SIZE;
     conn->fd = fd;
     return conn;
 }
@@ -75,6 +84,7 @@ void connection_close(App *app, Connection *conn) {
 
     close(conn->fd);
     app->connections[conn->fd] = NULL;
+    free(conn->in_buf);
     free(conn->out_buf);
     free(conn);
 }
@@ -110,6 +120,10 @@ void accept_connections(App *app) {
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
         Connection *conn = connection_create(client_fd);
+        if (conn == NULL) {
+            close(client_fd);
+            continue;
+        }
         app->connections[client_fd] = conn;
         kq_watch(app->kq, client_fd, EVFILT_READ, conn);
     }
@@ -139,14 +153,28 @@ void flush_connection(App *app, Connection *conn) {
         conn->out_len = 0;
         conn->out_sent = 0;
         conn->in_len = 0;
+
+        /* If handle_readable grew in_buf to fit a large body (in_cap >
+         * BUF_SIZE), shrink it back down now that the connection is idle -
+         * otherwise one big request would permanently inflate this
+         * connection's memory footprint for as long as it stays open. A
+         * failed shrink isn't fatal (realloc leaves the original block
+         * untouched on failure) - just keep using the larger buffer. */
+        if (conn->in_cap > BUF_SIZE) {
+            char *shrunk = realloc(conn->in_buf, BUF_SIZE);
+            if (shrunk != NULL) {
+                conn->in_buf = shrunk;
+                conn->in_cap = BUF_SIZE;
+            }
+        }
     } else {
         connection_close(app, conn);
     }
 }
 
 void handle_readable(App *app, Connection *conn) {
-    while (conn->in_len < BUF_SIZE - 1) {
-        ssize_t n = recv(conn->fd, conn->in_buf + conn->in_len, BUF_SIZE - 1 - conn->in_len, 0);
+    while (conn->in_len < conn->in_cap - 1) {
+        ssize_t n = recv(conn->fd, conn->in_buf + conn->in_len, conn->in_cap - 1 - conn->in_len, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -171,34 +199,81 @@ void handle_readable(App *app, Connection *conn) {
 
             if (parse_http_request(conn->in_buf, &req) != 0) {
                 conn->keep_alive = 0;
-                res_status(&res, 400);
-                res_send(&res, "Bad Request");
+                /* parse_http_request folds every parse failure into one -1,
+                 * but a Content-Length that's merely too large (rather than
+                 * malformed/negative) deserves 413, not 400 - re-check the
+                 * same pure function connection.c already relies on
+                 * elsewhere for status-code decisions (cheap: a strcasestr +
+                 * atol scan over headers already sitting in conn->in_buf). */
+                if (extract_content_length(conn->in_buf) == -2) {
+                    res_status(&res, 413);
+                    res_send(&res, "Payload Too Large");
+                } else {
+                    res_status(&res, 400);
+                    res_send(&res, "Bad Request");
+                }
             } else {
                 conn->keep_alive = !request_wants_close(&req);
                 const Route *route = match_route(app, &req);
                 dispatch(app, route, &req, &res);
             }
+            free(req.body);
 
             flush_connection(app, conn);
             return;
         }
     }
 
-    if (conn->in_len >= BUF_SIZE - 1) {
+    if (conn->in_len >= conn->in_cap - 1) {
         /*
-         * The buffer is full and still doesn't hold a complete request:
-         * either the headers alone exceed our hard 8KB limit, or a
-         * declared Content-Length can never fit. Reject explicitly instead
-         * of leaving the connection open forever waiting on bytes that
-         * will never arrive - the classic Slowloris/oversized-header DoS
-         * shape.
+         * The buffer is full and still doesn't hold a complete request.
+         * Before rejecting outright, tell apart two very different cases:
+         *   - The header block itself hasn't finished arriving yet (no
+         *     "\r\n\r\n" seen) - this is the original oversized-header/
+         *     Slowloris shape, unaffected by body growth below, since
+         *     growth only ever happens once headers are already complete.
+         *     Reject with 431, same as always.
+         *   - Headers ARE complete and this is purely a body that doesn't
+         *     fit in the current capacity yet. A Content-Length beyond
+         *     MAX_BODY_SIZE can never reach this branch in the first place -
+         *     request_is_complete (called on every recv() above, including
+         *     the one that completed the header block) already caught that
+         *     and dispatched a 413 the moment headers arrived (see the
+         *     extract_content_length == -2 check above). So content_length
+         *     here is always valid and within MAX_BODY_SIZE - grow in_buf
+         *     via realloc to exactly header+body+NUL and keep waiting for
+         *     more EVFILT_READ events instead of rejecting - this is what
+         *     lets a body exceed BUF_SIZE (see pending.txt, "no streaming",
+         *     and lib/CLAUDE.md, "Body buffering"). Only a failed realloc
+         *     (genuine server-side OOM, not a client-declared size problem)
+         *     falls through to a rejection below, as 500.
          */
+        const char *header_end = strstr(conn->in_buf, "\r\n\r\n");
+        if (header_end != NULL) {
+            const int content_length = extract_content_length(conn->in_buf);
+            if (content_length >= 0) {
+                const size_t header_len = (size_t)(header_end + 4 - conn->in_buf);
+                const size_t needed = header_len + (size_t)content_length + 1;
+                char *grown = realloc(conn->in_buf, needed);
+                if (grown != NULL) {
+                    conn->in_buf = grown;
+                    conn->in_cap = needed;
+                    return; /* wait for more EVFILT_READ events */
+                }
+            }
+        }
+
         Response res;
         res.conn = conn;
         res.header_count = 0;
         conn->keep_alive = 0;
-        res_status(&res, 431);
-        res_send(&res, "Request Header Fields Too Large");
+        if (header_end == NULL) {
+            res_status(&res, 431);
+            res_send(&res, "Request Header Fields Too Large");
+        } else {
+            res_status(&res, 500);
+            res_send(&res, "Internal Server Error");
+        }
         flush_connection(app, conn);
     }
 }

@@ -16,6 +16,17 @@
 #define BACKLOG 128
 #define MAX_RESPONSE_HEADERS 16
 
+/*
+ * Hard ceiling on a request body's size (Content-Length), independent of and
+ * much larger than BUF_SIZE - BUF_SIZE now only bounds the headers (see
+ * Connection.in_buf below). A body up to this size is received into a
+ * connection's own growable buffer rather than being rejected just for not
+ * fitting in BUF_SIZE. 1 MiB, matching a typical small-to-medium JSON API
+ * payload limit - an app wanting a tighter cap can still enforce one via
+ * middleware (see app/middlewares.c: mw_body_size_guard).
+ */
+#define MAX_BODY_SIZE (1024 * 1024)
+
 typedef struct {
     char method[8];
     char path[256];
@@ -50,7 +61,17 @@ typedef struct {
     int header_count;
 
     int content_length;
-    char body[BUF_SIZE];
+
+    /* Heap-allocated by parse_http_request (http_parser.c), sized to exactly
+     * content_length + 1 bytes and owned by whoever called parse_http_request
+     * - NULL if content_length is 0 (still points at a valid 1-byte "" in
+     * that case, never NULL after a successful parse). Unlike every other
+     * Request field, this is not a fixed array: a body can be far larger
+     * than any of the engine's other fixed buffers (bounded instead by
+     * MAX_BODY_SIZE), so copying it into a BUF_SIZE-capped array the way
+     * headers/query/params are would defeat the point. See
+     * lib/CLAUDE.md ("Body buffering"). */
+    char *body;
 } Request;
 
 /* Per-connection state that persists across event-loop turns. */
@@ -58,7 +79,15 @@ typedef struct Connection {
     int fd;
     int keep_alive;
 
-    char in_buf[BUF_SIZE];
+    /* Heap-allocated (connection_create), starting at BUF_SIZE and grown via
+     * realloc up to header_len + MAX_BODY_SIZE + 1 when a request's declared
+     * Content-Length doesn't fit in the current capacity (handle_readable,
+     * connection.c) - shrunk back to BUF_SIZE once the connection goes idle
+     * again (flush_connection) so one large request doesn't permanently
+     * inflate a long-lived keep-alive connection's footprint. in_cap tracks
+     * the current allocated size; BUF_SIZE alone no longer bounds it. */
+    char *in_buf;
+    size_t in_cap;
     size_t in_len;
 
     char *out_buf;

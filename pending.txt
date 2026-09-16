@@ -145,15 +145,49 @@ Gaps vs. an Express-like C framework
   different Content-Type) skips validation entirely and behaves exactly as
   before, so a client sending plain text or form data doesn't get an incorrect
   400. See app/CLAUDE.md.
-- Whole request (headers+body) lives in one fixed BUF_SIZE=8192 buffer - no streaming
-- [DONE] Negative/oversized Content-Length is now rejected with 400 instead of silently
-  truncated or trusted (extract_content_length bounds it to [0, BUF_SIZE-1])
+- [DONE] Whole request no longer lives in one fixed BUF_SIZE=8192 buffer: headers
+  and body are now bounded independently. Connection.in_buf (app_types.h) is
+  heap-allocated (connection_create) rather than a fixed array - it starts at
+  BUF_SIZE (still the hard cap on headers alone, unchanged - see the 431 entry
+  below) and handle_readable (connection.c) grows it via realloc, once, straight to
+  the exact capacity a request's declared Content-Length needs, whenever that
+  capacity is exhausted AND a complete header block has already been seen (so
+  growth can never mask an oversized-header attack). The new MAX_BODY_SIZE
+  (app_types.h, 1 MiB) is the hard cap on how large a body can grow to - a
+  Content-Length beyond it is rejected immediately (413, see below) without ever
+  growing the buffer. Request.body (app_types.h) is now char* rather than a fixed
+  array - parse_http_request (http_parser.c) mallocs it sized to exactly
+  content_length+1 bytes; the caller (handle_readable) frees it right after
+  dispatch returns. flush_connection shrinks in_buf back down to BUF_SIZE once a
+  keep-alive connection goes idle again, so one large request doesn't permanently
+  inflate a long-lived connection's memory footprint. This is NOT true incremental
+  streaming to the handler - Handler is unchanged, still synchronous, still gets a
+  fully-buffered req->body - it's the same shape as how express.json()/
+  express.urlencoded() behave in a real Express app (buffer the whole body up to a
+  configurable limit, then hand it to the route handler as one materialized value).
+  See improvements.md for what true streaming would additionally require, and
+  lib/CLAUDE.md ("Body buffering") for the full design. See
+  tests/test_http_parser.c (the large-body case in test_parse_http_request) and
+  tests/test_connection.c (test_handle_readable_large_body_grows_buffer,
+  test_handle_readable_body_too_large_413).
+- [DONE] Negative Content-Length is rejected with 400; a well-formed Content-Length
+  that exceeds MAX_BODY_SIZE is now a distinct case, rejected with 413 Payload Too
+  Large instead of being folded into the same 400 as a malformed one -
+  extract_content_length (http_parser.c) returns two different negative sentinels
+  (-1 malformed, -2 too large) so connection.c can tell them apart when picking a
+  status. See lib/CLAUDE.md ("Body buffering").
 - [DONE] Headers (or a request) that can never fit in BUF_SIZE now get a 431 and the
   connection is closed, instead of hanging forever waiting for bytes that can't arrive
-  (was the slowloris-shaped gap noted below)
+  (was the slowloris-shaped gap noted below). This guard is specifically about
+  headers now (see the buffer-decoupling entry above) - a body that's merely large
+  (but within MAX_BODY_SIZE) no longer hits this at all, it grows the buffer instead.
 - No chunked transfer-encoding, no multipart/form-data, no x-www-form-urlencoded, no cookies
 - No idle/read timeout for a slow client that trickles a request in a byte at a time
-  within the buffer limit (distinct from the now-fixed buffer-overflow hang above)
+  within the buffer limit (distinct from the now-fixed buffer-overflow hang above).
+  This matters more now than it used to: a slow client can hold open up to
+  MAX_BODY_SIZE (1 MiB) of server-side buffer per connection instead of BUF_SIZE
+  (8KB), since a Content-Length within that range is never rejected purely for
+  being large.
 
 4. Response
 - [DONE] res_set_header(res, name, value): generic response header API (lib/response.c/h).
@@ -164,7 +198,7 @@ Gaps vs. an Express-like C framework
   cap are dropped rather than overflowing. See tests/test_response.c.
 - Still no streaming/chunked response, no static file serving, no res_redirect, no
   cookie helper
-- status_text() only covers 7 codes (200/201/204/400/404/431/500)
+- status_text() only covers 11 codes (200/201/204/400/401/403/404/405/413/431/500)
 - [DONE] malloc in response.c (conn->out_buf) is now null-checked; on OOM the
   connection is dropped instead of writing through a NULL pointer
 
@@ -176,8 +210,10 @@ Gaps vs. an Express-like C framework
 
 6. Security
 - No TLS/HTTPS
-- [DONE] Max-header/body guard: BUF_SIZE overflow now returns 431, invalid
-  Content-Length now returns 400 (see section 3)
+- [DONE] Max-header/body guard: header-only BUF_SIZE overflow now returns 431, a
+  malformed (negative) Content-Length returns 400, and a well-formed Content-Length
+  beyond the new MAX_BODY_SIZE cap (1 MiB, decoupled from BUF_SIZE) returns 413
+  (see section 3)
 - No Transfer-Encoding awareness (chunked bodies aren't supported at all yet)
 
 7. Testing & DX

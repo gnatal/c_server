@@ -20,7 +20,7 @@ layer stays pure and unit-testable independent of sockets:
 - `tests/test_middleware.c` tests pipeline ordering, short-circuiting, 404 fallthrough, and error handlers.
 - `tests/test_router.c` tests segment-by-segment tokenization, `:param` extraction, bounded param limits, `*` wildcard matching, and route table resolution.
 - `tests/test_http_parser.c` tests pure request line, query-string splitting/lookup, header, Content-Length boundary extraction, and keep-alive parsing.
-- `tests/test_connection.c` tests non-blocking socket I/O, `handle_readable` state progression, keep-alive persistence, partial buffer reads, 400 Bad Request on malformed inputs, and 431 on header overflow via POSIX `socketpair(2)` with a dedicated `kqueue()` instance without opening live TCP ports.
+- `tests/test_connection.c` tests non-blocking socket I/O, `handle_readable` state progression, keep-alive persistence, partial buffer reads, 400 Bad Request on malformed inputs, 431 on header overflow, `in_buf` growth/shrink for a body beyond `BUF_SIZE`, and 413 on a `Content-Length` beyond `MAX_BODY_SIZE`, via POSIX `socketpair(2)` with a dedicated `kqueue()` instance without opening live TCP ports.
 
 `App` carries `ServerConfig config` (`app_types.h`), storing runtime parameters such as `config.port` (defaulting to `DEFAULT_PORT` in `app_init`).
 
@@ -259,20 +259,81 @@ See `tests/test_http_parser.c` (`test_parse_headers`) and `app/CLAUDE.md`
 ("Content-Type-gated body validation").
 
 ## Request size limits
-The whole request (headers + body) shares one `BUF_SIZE` (8192-byte) buffer,
-`conn->in_buf`. Two independent guards enforce this hard limit instead of letting a
-malformed or hostile client stall a connection slot forever:
-- `extract_content_length` (`http_parser.c`) returns `-1` for a negative or
-  oversized (`> BUF_SIZE - 1`) `Content-Length`; `parse_http_request` turns that into
-  a 400 rather than trusting or truncating it.
+Headers and body are now bounded independently, at very different sizes - see
+"Body buffering" below for the body side. Headers alone are still hard-capped at
+`BUF_SIZE` (8192 bytes), `conn->in_buf`'s starting capacity, which body growth never
+touches (growth only happens once a complete header block has already been seen -
+see below):
+- `extract_content_length` (`http_parser.c`) returns a negative sentinel for a
+  negative (`-1`) or oversized (`> MAX_BODY_SIZE`, `-2`) `Content-Length`;
+  `parse_http_request` turns either into a parse failure (`-1`) rather than trusting
+  or truncating it, and `connection.c` re-checks which sentinel it was to answer 400
+  vs 413 (see "Body buffering").
 - `handle_readable` (`connection.c`) detects when `in_buf` fills up
-  (`in_len >= BUF_SIZE - 1`) without ever producing a complete request — headers
-  with no `\r\n\r\n` terminator, or a body that can never arrive — and responds 431 +
+  (`in_len >= in_cap - 1`) with no `"\r\n\r\n"` header terminator ever having
+  appeared - i.e. the headers themselves don't fit in `BUF_SIZE` - and responds 431 +
   closes instead of leaving the connection open indefinitely (the Slowloris-shaped
-  gap noted in `../pending.txt`).
+  gap noted in `../pending.txt`). This is unaffected by body growth: growth only
+  ever triggers once headers are already complete.
 
 There is still no idle/read *timeout* for a slow client trickling bytes in below
-these limits — only the hard buffer-size cutoff above is enforced.
+these limits — only the hard buffer-size cutoffs above are enforced. This matters
+more now than it used to: a slow client can hold open up to `MAX_BODY_SIZE` (1 MiB)
+of server-side buffer per connection instead of `BUF_SIZE` (8KB), since a
+Content-Length within that range is never rejected purely for being large - see
+`../pending.txt`.
+
+## Body buffering
+A request body can be far larger than `BUF_SIZE` without being rejected, as long as
+it's within `MAX_BODY_SIZE` (1 MiB, `app_types.h`) - this is what closes the
+`../pending.txt` gap "Whole request (headers+body) lives in one fixed BUF_SIZE=8192
+buffer - no streaming". This is *not* true incremental streaming to the handler
+(`Handler` is unchanged - still synchronous, still gets a fully-buffered `req->body`)
+- it's closer to how `express.json()`/`express.urlencoded()` behave in a real
+Express app: the whole body is buffered up to a configurable size limit, then handed
+to the route handler synchronously as one already-materialized value. See
+`improvements.md` for what *true* streaming (the body delivered to a handler
+incrementally, off a `Transfer-Encoding: chunked` request) would additionally
+require.
+- **`conn->in_buf` (`Connection`, `app_types.h`) is heap-allocated**
+  (`connection_create`), not a fixed array - it starts at `BUF_SIZE` and
+  `handle_readable` (`connection.c`) grows it via `realloc` only when both (a) the
+  current capacity is exhausted (`in_len >= in_cap - 1`) and (b) a complete header
+  block has already been seen (so growth can never mask an oversized-*header*
+  attack - that's still always 431, see "Request size limits"). When it grows, it
+  grows once, straight to the *exact* capacity the declared `Content-Length` needs
+  (`header_len + content_length + 1`), not incrementally - the declared length is
+  already known by that point, so there's no need to double-and-retry the way a
+  general-purpose growable buffer normally would. A failed `realloc` (genuine
+  server-side OOM - a client-declared size that's merely too large never reaches
+  this far, see below) responds 500 and closes the connection; the original block is
+  left untouched by a failed `realloc`, so nothing is corrupted, there's just no
+  more room to grow into.
+- **A `Content-Length` beyond `MAX_BODY_SIZE` never reaches the growth logic at
+  all** - `request_is_complete` (`http_parser.c`, called after every `recv()`
+  already, unchanged by this) treats `extract_content_length`'s `-2` sentinel the
+  same as `-1` (any negative value means "stop buffering, let the caller reject
+  it"), so the request is dispatched as soon as headers complete, and
+  `handle_readable`'s failure branch re-checks `extract_content_length` itself to
+  tell `-1` (malformed → 400) apart from `-2` (too large → 413) — see
+  `tests/test_connection.c` (`test_handle_readable_body_too_large_413`).
+- **`Request.body` (`app_types.h`) is `char *`, not a fixed array** - unlike every
+  other `Request` field, it's `malloc`'d by `parse_http_request` (`http_parser.c`),
+  sized to exactly `content_length + 1` bytes and `memcpy`'d out of `raw` (never
+  aliased/pointer-shared with `conn->in_buf`, and never more than `content_length`
+  bytes even if `raw` holds trailing bytes past the body - e.g. a pipelined next
+  request already sitting in the same buffer). `raw` itself is never mutated -
+  `parse_http_request` stays a pure function. The caller owns the result and must
+  `free()` it - `handle_readable` does so right after `dispatch` returns, on every
+  path (a failed parse still leaves `req->body` at `NULL` via `parse_http_request`'s
+  initial `memset`, so `free(NULL)` there is always safe). See
+  `tests/test_http_parser.c` (the large-body case in `test_parse_http_request`) and
+  `tests/test_connection.c` (`test_handle_readable_large_body_grows_buffer`).
+- **`in_buf` shrinks back down once idle.** `flush_connection`'s keep-alive reset
+  (`connection.c`) `realloc`s `in_buf` back to `BUF_SIZE` whenever `in_cap` grew past
+  it, so one large request doesn't permanently inflate a long-lived keep-alive
+  connection's memory footprint. A failed shrink isn't fatal (`realloc` leaves the
+  larger block untouched) - the connection just keeps using the bigger buffer.
 
 ## Response headers
 `Response` (`app_types.h`) carries a fixed `headers[MAX_RESPONSE_HEADERS]` array +
@@ -302,7 +363,16 @@ handled, rather than sending a truncated/malformed response.
 ## Memory lifecycle
 - `Connection` (`connection_create`/`connection_close`): one `calloc` per accepted
   fd, freed exactly once in `connection_close`, which also deregisters the fd from
-  kqueue and closes the socket first.
+  kqueue and closes the socket first. `connection_create` also `malloc`s
+  `conn->in_buf` at that same point (see "Body buffering") - a failed `malloc` for
+  either frees whatever did succeed and returns `NULL`, and `accept_connections`
+  (`connection.c`) closes the fd without registering the connection rather than
+  dereferencing a `NULL` `Connection *`.
+- `conn->in_buf` (`connection_create`/`connection_close`/`connection.c: handle_readable`,
+  `flush_connection`): one `malloc` per connection (not per request), `realloc`'d
+  larger by `handle_readable` to fit an oversized body and back down to `BUF_SIZE`
+  by `flush_connection` once idle (see "Body buffering") - freed exactly once, in
+  `connection_close`, regardless of its capacity at that point.
 - `conn->out_buf` (`response.c: send_with_content_type`): one `malloc` per response,
   built by a handler via `res_send`/`res_json`. Freed in exactly one of two places —
   `flush_connection` once a keep-alive connection finishes writing it, or
@@ -311,8 +381,13 @@ handled, rather than sending a truncated/malformed response.
   of those two paths. If the `malloc` itself fails, `send_with_content_type` leaves
   `out_len` at 0 and marks the connection for close rather than writing through a
   NULL pointer.
-- `Request` and the per-connection `in_buf` are fixed-size (`app_types.h`), never
-  heap-allocated.
+- `req->body` (`http_parser.c: parse_http_request`): one `malloc` per request (see
+  "Body buffering"), freed by `handle_readable` (`connection.c`) right after
+  `dispatch` returns, on every path - success or a failed parse (`req->body` is
+  guaranteed `NULL` on failure via `parse_http_request`'s initial `memset`, so
+  `free(NULL)` there is always safe).
+- Every other `Request` field is fixed-size (`app_types.h`), never heap-allocated -
+  `req->body` is the one exception, and the *why* is covered in "Body buffering".
 
 ## Const correctness
 `Handler` (`app_types.h`) takes `const Request *`: routing (`match_path`/`match_route`)

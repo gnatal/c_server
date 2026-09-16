@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "app_types.h"
 #include "http_parser.h"
@@ -16,16 +17,29 @@ static void test_extract_content_length(void) {
     assert(extract_content_length("content-length: 123\r\n") == 123);
     assert(extract_content_length("CONTENT-LENGTH: 99\r\n") == 99);
 
-    /* Negative value rejected */
+    /* Negative value: malformed, sentinel -1 (-> 400 Bad Request) */
     assert(extract_content_length("Content-Length: -1\r\n") == -1);
     assert(extract_content_length("Content-Length: -100\r\n") == -1);
 
-    /* Exceeding BUF_SIZE - 1 rejected */
-    assert(extract_content_length("Content-Length: 8192\r\n") == -1);
-    assert(extract_content_length("Content-Length: 999999\r\n") == -1);
+    /* A body well beyond the old BUF_SIZE is fine now - body storage is
+     * decoupled from BUF_SIZE (see lib/CLAUDE.md, "Body buffering"). */
+    assert(extract_content_length("Content-Length: 8192\r\n") == 8192);
+    assert(extract_content_length("Content-Length: 100000\r\n") == 100000);
 
-    /* Boundary: exact max allowed BUF_SIZE - 1 */
-    assert(extract_content_length("Content-Length: 8191\r\n") == BUF_SIZE - 1);
+    /* Exceeding MAX_BODY_SIZE: well-formed but too large, distinct sentinel
+     * -2 (-> 413 Payload Too Large, not 400 - see connection.c) */
+    char over[64];
+    snprintf(over, sizeof(over), "Content-Length: %d\r\n", MAX_BODY_SIZE + 1);
+    assert(extract_content_length(over) == -2);
+
+    char way_over[64];
+    snprintf(way_over, sizeof(way_over), "Content-Length: %d\r\n", MAX_BODY_SIZE * 4);
+    assert(extract_content_length(way_over) == -2);
+
+    /* Boundary: exact max allowed MAX_BODY_SIZE */
+    char at_max[64];
+    snprintf(at_max, sizeof(at_max), "Content-Length: %d\r\n", MAX_BODY_SIZE);
+    assert(extract_content_length(at_max) == MAX_BODY_SIZE);
 }
 
 static void test_request_is_complete(void) {
@@ -98,8 +112,10 @@ static void test_parse_http_request(void) {
     assert(strcmp(req.query, "") == 0);
     assert(strcmp(req.version, "HTTP/1.1") == 0);
     assert(req.content_length == 0);
+    assert(req.body != NULL);
     assert(strcmp(req.body, "") == 0);
     assert(strstr(req.headers, "Host: example.com") != NULL);
+    free(req.body);
 
     /* GET with query string */
     const char *raw_query = "GET /search?q=test&page=2 HTTP/1.1\r\nHost: example.com\r\n\r\n";
@@ -110,6 +126,7 @@ static void test_parse_http_request(void) {
     /* parse_http_request also populates the parsed query-param arrays. */
     assert(strcmp(req_get_query(&req, "q"), "test") == 0);
     assert(strcmp(req_get_query(&req, "page"), "2") == 0);
+    free(req.body);
 
     /* Percent-encoded path segment is URL-decoded; req->query stays raw
      * (unparsed), only the parsed query-param arrays are decoded. */
@@ -118,6 +135,7 @@ static void test_parse_http_request(void) {
     assert(strcmp(req.path, "/a b/caf\xC3\xA9") == 0);
     assert(strcmp(req.query, "name=a%20b") == 0);
     assert(strcmp(req_get_query(&req, "name"), "a b") == 0);
+    free(req.body);
 
     /* POST with body and Content-Length */
     const char *raw_post =
@@ -135,6 +153,29 @@ static void test_parse_http_request(void) {
     assert(strcmp(req_get_header(&req, "Host"), "localhost") == 0);
     assert(strcmp(req_get_header(&req, "content-length"), "13") == 0);
     assert(req_get_header(&req, "X-Missing") == NULL);
+    free(req.body);
+
+    /* A body well beyond the old BUF_SIZE (8192) now parses cleanly -
+     * req->body is heap-allocated to fit it exactly rather than being
+     * copied into a BUF_SIZE-capped fixed array (see lib/CLAUDE.md,
+     * "Body buffering"). */
+    const size_t big_len = 20000;
+    char *big_body = malloc(big_len + 1);
+    memset(big_body, 'x', big_len);
+    big_body[big_len] = '\0';
+    char big_head[128];
+    snprintf(big_head, sizeof(big_head), "POST /upload HTTP/1.1\r\nContent-Length: %zu\r\n\r\n", big_len);
+    size_t big_head_len = strlen(big_head);
+    char *big_raw = malloc(big_head_len + big_len + 1);
+    memcpy(big_raw, big_head, big_head_len);
+    memcpy(big_raw + big_head_len, big_body, big_len + 1);
+    assert(parse_http_request(big_raw, &req) == 0);
+    assert(req.content_length == (int)big_len);
+    assert(strlen(req.body) == big_len);
+    assert(strcmp(req.body, big_body) == 0);
+    free(req.body);
+    free(big_raw);
+    free(big_body);
 
     /* Malformed request line */
     const char *malformed_line = "INVALID\r\n\r\n";
@@ -148,9 +189,11 @@ static void test_parse_http_request(void) {
     const char *bad_cl = "POST / HTTP/1.1\r\nContent-Length: -5\r\n\r\nbody";
     assert(parse_http_request(bad_cl, &req) == -1);
 
-    /* Content-Length exceeding buffer */
-    const char *huge_cl = "POST / HTTP/1.1\r\nContent-Length: 90000\r\n\r\nbody";
-    assert(parse_http_request(huge_cl, &req) == -1);
+    /* Content-Length exceeding MAX_BODY_SIZE is still rejected, just at a
+     * much higher ceiling than the old BUF_SIZE-based one. */
+    char over_head[64];
+    snprintf(over_head, sizeof(over_head), "POST / HTTP/1.1\r\nContent-Length: %d\r\n\r\nbody", MAX_BODY_SIZE + 1);
+    assert(parse_http_request(over_head, &req) == -1);
 }
 
 static void test_status_text(void) {
@@ -162,6 +205,7 @@ static void test_status_text(void) {
     assert(strcmp(status_text(403), "Forbidden") == 0);
     assert(strcmp(status_text(404), "Not Found") == 0);
     assert(strcmp(status_text(405), "Method Not Allowed") == 0);
+    assert(strcmp(status_text(413), "Payload Too Large") == 0);
     assert(strcmp(status_text(431), "Request Header Fields Too Large") == 0);
     assert(strcmp(status_text(500), "Internal Server Error") == 0);
     assert(strcmp(status_text(418), "Unknown") == 0);
