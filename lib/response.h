@@ -1,7 +1,7 @@
 #ifndef RESPONSE_H
 #define RESPONSE_H
 
-#include "appTypes.h"
+#include "app_types.h"
 
 /* Sets the status code that res_send() will report. */
 void res_status(Response *res, int status);

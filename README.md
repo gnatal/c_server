@@ -115,8 +115,8 @@ The codebase is split into two distinct tiers:
 make
 ```
 This produces:
-- `lib/libcexpress.a`: The core engine static library.
-- `cexpress`: The executable demo application.
+- `build/lib/libcexpress.a`: The core engine static library.
+- `build/bin/cexpress`: The executable demo application (symlinked to `./cexpress`).
 
 ### 2. Start the Server
 ```bash
@@ -137,11 +137,11 @@ make test
 ```
 
 This compiles and executes:
-1. `lib/json/json_test`: JSON tokenizer, AST building, and serialization.
-2. `lib/middleware_test`: Pipeline ordering, short-circuiting, 404 fallthrough, and error handlers.
-3. `lib/router_test`: Literal paths, parameter extraction, and route table bounds.
-4. `lib/http_parser_test`: Header parsing, bounds validation, and connection keep-alive determination.
-5. `lib/connection_test`: Non-blocking socket I/O, partial reads, buffer overflow guards, and keep-alive lifecycle using POSIX `socketpair(2)` and isolated `kqueue`.
+1. `build/bin/test_json`: JSON tokenizer, AST building, and serialization.
+2. `build/bin/test_middleware`: Pipeline ordering, short-circuiting, 404 fallthrough, and error handlers.
+3. `build/bin/test_router`: Literal paths, parameter extraction, and route table bounds.
+4. `build/bin/test_http_parser`: Header parsing, bounds validation, and connection keep-alive determination.
+5. `build/bin/test_connection`: Non-blocking socket I/O, partial reads, buffer overflow guards, and keep-alive lifecycle using POSIX `socketpair(2)` and isolated `kqueue`.
 
 ---
 
@@ -162,7 +162,7 @@ PORT=3000 API_KEY=super-secret-token ./cexpress
 ### Programmatic Configuration
 - **Port**: Set `app.config.port = 3000;` before calling `app_listen(&app, app.config.port);`.
 - **API Key**: Call `mw_authenticate_set_key("my-token");` at startup.
-- **Engine Limits**: Compile-time constants in `lib/appTypes.h`:
+- **Engine Limits**: Compile-time constants in `lib/app_types.h`:
   - `BUF_SIZE`: Fixed buffer per connection (default: `8192` bytes).
   - `MAX_ROUTES`: Maximum registered routes (default: `32`).
   - `MAX_MIDDLEWARES`: Maximum app-wide middlewares (default: `16`).
@@ -253,22 +253,40 @@ Connection: keep-alive
 ├── Makefile              # Build rules for lib, demo app, and all test suites
 ├── README.md             # Project documentation
 ├── CLAUDE.md             # Project standards, coding guidelines, and workflow rules
+├── AGENTS.md             # Agent context and workflow guidelines
 ├── pending.txt           # Feature tracking and architectural backlog
-├── lib/                  # Reusable CExpress engine (builds to libcexpress.a)
-│   ├── appTypes.h        # Struct definitions, function pointer signatures, and limits
+├── lib/                  # Reusable CExpress engine (builds to build/lib/libcexpress.a)
+│   ├── CLAUDE.md         # Engine architecture, data flow, and memory lifecycle
+│   ├── app_types.h       # Struct definitions, function pointer signatures, and limits
 │   ├── connection.h/c    # kqueue event loop, non-blocking socket I/O & lifecycle
-│   ├── httpParser.h/c    # Pure HTTP/1.1 parser, query string and header parsing
+│   ├── http_parser.h/c   # Pure HTTP/1.1 parser, query string and header parsing
 │   ├── router.h/c        # Path pattern matching and route table dispatch
 │   ├── response.h/c      # Response construction (res_send, res_json, res_status)
 │   ├── middleware.h/c    # MiddlewareChain and dispatch pipeline
-│   ├── json/             # JSON parsing and AST generation subsystem
-│   ├── router_test.c     # Unit tests for router pattern matching
-│   ├── http_parser_test.c# Unit tests for HTTP parser
-│   └── connection_test.c # Socket I/O and lifecycle tests via socketpair(2)
-└── app/                  # Reference demo application
-    ├── main.c            # Application entrypoint and route definitions
-    ├── handlers.h/c      # Route handlers
-    └── middlewares.h/c   # Logger, body size guard, and authentication middlewares
+│   └── json/             # JSON parsing and AST generation subsystem
+│       ├── CLAUDE.md     # JSON subsystem architecture and StrBuf memory rules
+│       ├── json.h        # Public JSON API
+│       ├── json_types.h  # AST enum and node structs
+│       └── json_*.c      # Parser, value accessors, and stringifier
+├── app/                  # Reference demo application
+│   ├── CLAUDE.md         # Application wiring and middleware architecture
+│   ├── main.c            # Application entrypoint and route definitions
+│   ├── handlers.h/c      # Route handlers
+│   └── middlewares.h/c   # Logger, body size guard, and authentication middlewares
+├── tests/                # Isolated test suites (built into build/bin/test_*)
+│   ├── CLAUDE.md         # Test harness architecture and socket mocking strategy
+│   ├── test_connection.c # Socket I/O and lifecycle tests via socketpair(2)
+│   ├── test_http_parser.c# Unit tests for HTTP parser
+│   ├── test_middleware.c # Middleware chain dispatching and error handling
+│   ├── test_router.c     # Unit tests for router pattern matching
+│   └── test_json.c       # JSON tokenizer, AST building, and serialization tests
+├── scripts/              # Benchmarking and utility scripts
+│   ├── CLAUDE.md         # Benchmarking tools documentation
+│   └── wrk_echo_json.lua # wrk load-testing script
+└── build/                # Out-of-source build outputs (gitignored)
+    ├── bin/              # cexpress executable and test runners
+    ├── lib/              # libcexpress.a static library
+    └── obj/              # Object files (*.o)
 ```
 
 ---

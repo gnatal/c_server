@@ -1,7 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-#include "appTypes.h"
+#include "app_types.h"
 #include "router.h"
 
 static void dummy_handler_a(const Request *req, Response *res) {

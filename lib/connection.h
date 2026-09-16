@@ -2,7 +2,7 @@
 #define CONNECTION_H
 
 #include <stdint.h>
-#include "appTypes.h"
+#include "app_types.h"
 
 /* Puts a socket into non-blocking mode so recv()/send()/accept() never stall the single thread. */
 int set_nonblocking(int fd);

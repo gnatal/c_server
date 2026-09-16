@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "json.h"
+#include "json/json.h"
 
 static void test_primitives(void) {
     JsonValue *n = json_parse("null", NULL, 0);

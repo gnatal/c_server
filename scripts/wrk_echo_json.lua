@@ -4,3 +4,4 @@
 wrk.method = "POST"
 wrk.body   = '{"name":"Ada","active":true,"tags":["x","y","z"],"meta":{"age":36,"note":null}}'
 wrk.headers["Content-Type"] = "application/json"
+wrk.headers["Authorization"] = "Bearer my-secret-api-key"

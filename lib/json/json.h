@@ -2,7 +2,7 @@
 #define JSON_H
 
 #include <stddef.h>
-#include "jsonTypes.h"
+#include "json_types.h"
 
 /*
  * Parses a NUL-terminated JSON document. Returns NULL on failure; if err is

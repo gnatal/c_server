@@ -1,7 +1,7 @@
 #ifndef ROUTER_H
 #define ROUTER_H
 
-#include "appTypes.h"
+#include "app_types.h"
 
 /* Resets an App to have zero registered routes and no open connections. */
 void app_init(App *app);

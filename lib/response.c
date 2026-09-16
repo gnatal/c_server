@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "response.h"
-#include "httpParser.h"
+#include "http_parser.h"
 
 void res_status(Response *res, int status) {
     res->status = status;

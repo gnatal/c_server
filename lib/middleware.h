@@ -1,7 +1,7 @@
 #ifndef MIDDLEWARE_H
 #define MIDDLEWARE_H
 
-#include "appTypes.h"
+#include "app_types.h"
 
 /*
  * Registers app-wide middleware, run in registration order before every

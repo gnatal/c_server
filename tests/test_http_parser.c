@@ -1,8 +1,8 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-#include "appTypes.h"
-#include "httpParser.h"
+#include "app_types.h"
+#include "http_parser.h"
 
 static void test_extract_content_length(void) {
     /* Absent Content-Length returns 0 */

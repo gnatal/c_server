@@ -1,12 +1,12 @@
 # lib/json/ — JSON value, parser, writer
 
 ## Architecture
-Three-file split around one recursive `JsonValue` tree (`jsonTypes.h`):
-`jsonParser.c` (bytes → tree), `jsonValue.c` (tree accessors + `json_free`),
-`jsonWriter.c` (tree → bytes). `json.h` is the only public surface; `jsonTypes.h`
+Three-file split around one recursive `JsonValue` tree (`json_types.h`):
+`json_parser.c` (bytes → tree), `json_value.c` (tree accessors + `json_free`),
+`json_writer.c` (tree → bytes). `json.h` is the only public surface; `json_types.h`
 holds every `typedef`/`struct` the three `.c` files share or use internally
-(including `StrBuf`, the growable buffer `jsonWriter.c` serializes into — kept in
-the header rather than the `.c` file even though nothing outside `jsonWriter.c`
+(including `StrBuf`, the growable buffer `json_writer.c` serializes into — kept in
+the header rather than the `.c` file even though nothing outside `json_writer.c`
 uses it).
 
 `json_parse` is a single-pass recursive-descent parser over a `JsonParser` cursor
@@ -33,7 +33,5 @@ first.
   declaration in `json.h`).
 
 ## Testing
-`json_test.c` is the only unit-tested module in the codebase — pure input/output,
-no sockets — covering primitives, nested structures, a parse→stringify→parse round
-trip, and syntax-error rejection. `httpParser`/`router`/`response` follow the same
-"pure function over a buffer" shape but don't have equivalent tests yet.
+`tests/test_json.c` covers primitives, nested structures, a parse→stringify→parse round
+trip, and syntax-error rejection.

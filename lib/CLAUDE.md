@@ -7,7 +7,7 @@ a `Connection *` slot per possible fd (`app->connections[MAX_CONNECTIONS]`, inde
 directly by fd value — this bounds the server to fds below `MAX_CONNECTIONS`).
 
 Data flow per request: `handle_readable` (I/O) accumulates bytes into
-`conn->in_buf` → `request_is_complete` (pure, `httpParser.c`) checks the buffer
+`conn->in_buf` → `request_is_complete` (pure, `http_parser.c`) checks the buffer
 without mutating it → `parse_http_request` (pure) fills a `Request` → `match_route`
 (pure, `router.c`) looks up a `Handler` (or returns `NULL`) → `dispatch`
 (`middleware.c`) runs the middleware pipeline ending at that handler (or a 404) →
@@ -15,13 +15,13 @@ the handler calls `res_send`/`res_json` (`response.c`), which only builds bytes 
 `conn->out_buf` and never touches the socket → `flush_connection` (I/O) is what
 actually writes. This split exists so the parsing/routing/dispatch/response-building
 layer stays pure and unit-testable independent of sockets:
-- `lib/json/json_test.c` tests parsing, AST representation, and stringification.
-- `lib/middleware_test.c` tests pipeline ordering, short-circuiting, 404 fallthrough, and error handlers.
-- `lib/router_test.c` tests segment-by-segment tokenization, `:param` extraction, bounded param limits, and route table resolution.
-- `lib/http_parser_test.c` tests pure request line, query, header, Content-Length boundary extraction, and keep-alive parsing.
-- `lib/connection_test.c` tests non-blocking socket I/O, `handle_readable` state progression, keep-alive persistence, partial buffer reads, 400 Bad Request on malformed inputs, and 431 on header overflow via POSIX `socketpair(2)` with a dedicated `kqueue()` instance without opening live TCP ports.
+- `tests/test_json.c` tests parsing, AST representation, and stringification.
+- `tests/test_middleware.c` tests pipeline ordering, short-circuiting, 404 fallthrough, and error handlers.
+- `tests/test_router.c` tests segment-by-segment tokenization, `:param` extraction, bounded param limits, and route table resolution.
+- `tests/test_http_parser.c` tests pure request line, query, header, Content-Length boundary extraction, and keep-alive parsing.
+- `tests/test_connection.c` tests non-blocking socket I/O, `handle_readable` state progression, keep-alive persistence, partial buffer reads, 400 Bad Request on malformed inputs, and 431 on header overflow via POSIX `socketpair(2)` with a dedicated `kqueue()` instance without opening live TCP ports.
 
-`App` carries `ServerConfig config` (`appTypes.h`), storing runtime parameters such as `config.port` (defaulting to `DEFAULT_PORT` in `app_init`).
+`App` carries `ServerConfig config` (`app_types.h`), storing runtime parameters such as `config.port` (defaulting to `DEFAULT_PORT` in `app_init`).
 
 ## Middleware pipeline
 `dispatch(app, route, req, res)` (`middleware.c`) builds one `MiddlewareChain` per
@@ -59,7 +59,7 @@ rejected rather than silently served.
 The whole request (headers + body) shares one `BUF_SIZE` (8192-byte) buffer,
 `conn->in_buf`. Two independent guards enforce this hard limit instead of letting a
 malformed or hostile client stall a connection slot forever:
-- `extract_content_length` (`httpParser.c`) returns `-1` for a negative or
+- `extract_content_length` (`http_parser.c`) returns `-1` for a negative or
   oversized (`> BUF_SIZE - 1`) `Content-Length`; `parse_http_request` turns that into
   a 400 rather than trusting or truncating it.
 - `handle_readable` (`connection.c`) detects when `in_buf` fills up
@@ -83,10 +83,10 @@ these limits — only the hard buffer-size cutoff above is enforced.
   of those two paths. If the `malloc` itself fails, `send_with_content_type` leaves
   `out_len` at 0 and marks the connection for close rather than writing through a
   NULL pointer.
-- `Request` and the per-connection `in_buf` are fixed-size (`appTypes.h`), never
+- `Request` and the per-connection `in_buf` are fixed-size (`app_types.h`), never
   heap-allocated.
 
 ## Const correctness
-`Handler` (`appTypes.h`) takes `const Request *`: routing (`match_path`/`match_route`)
+`Handler` (`app_types.h`) takes `const Request *`: routing (`match_path`/`match_route`)
 is the only code that mutates a `Request` (filling in path params before dispatch);
 once a handler runs, the request is read-only for the rest of its lifetime.

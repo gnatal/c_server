@@ -1,7 +1,7 @@
 #ifndef HANDLERS_H
 #define HANDLERS_H
 
-#include "appTypes.h"
+#include "app_types.h"
 
 void handler_home(const Request *req, Response *res);
 void handler_get_user(const Request *req, Response *res);

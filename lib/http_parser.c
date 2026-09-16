@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "httpParser.h"
+#include "http_parser.h"
 
 int extract_content_length(const char *header_block) {
     const char *cl_header = strcasestr(header_block, "Content-Length:");
