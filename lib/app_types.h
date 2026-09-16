@@ -29,8 +29,8 @@ typedef struct {
      * request-parse time, the same fixed-array-plus-count shape as
      * param_names/param_values above - bounded by MAX_QUERY_PARAMS rather
      * than growing, extra pairs past the cap are dropped. A key with no '='
-     * gets an empty-string value. Values are NOT URL-decoded (%XX and '+'
-     * pass through literally) - see req_get_query, http_parser.c. */
+     * gets an empty-string value. Both name and value are URL-decoded
+     * (%XX and '+' -> space) - see req_get_query, http_parser.c. */
     char query_names[MAX_QUERY_PARAMS][64];
     char query_values[MAX_QUERY_PARAMS][64];
     int query_count;

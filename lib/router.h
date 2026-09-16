@@ -98,7 +98,10 @@ const Route *match_route(const App *app, Request *req);
  */
 int match_route_allowed_methods(const App *app, const Request *req, char *allowed, size_t allowed_size);
 
-/* Looks up a captured path param by name (e.g. req_get_param(req, "id")). */
+/* Looks up a captured path param by name (e.g. req_get_param(req, "id")).
+ * Captured values are URL-decoded, since match_path always runs against
+ * req->path, which parse_http_request already decoded (http_parser.c) before
+ * routing ever sees it - match_path itself does no decoding of its own. */
 const char *req_get_param(const Request *req, const char *name);
 
 /* Resets a Router to have zero registered routes and zero router-level

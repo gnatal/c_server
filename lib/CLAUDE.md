@@ -198,12 +198,41 @@ delimiters, same as `match_path` does for repeated `/`). Pairs beyond
 `MAX_QUERY_PARAMS` are dropped rather than overflowing the fixed arrays, same
 pattern as `MAX_ROUTES`/`MAX_PARAMS` elsewhere. `req_get_query(req, name)`
 (`http_parser.c`) looks the parsed array up linearly and returns the *first*
-matching value, mirroring `req_get_param`. **No URL-decoding is performed** —
-`%XX` escapes and `+` (space-as-plus) pass through to the caller as literal
-bytes; a caller that needs decoded values has to decode them itself (see
-`pending.txt`, "No URL-decoding of path/params/query"). See
-`tests/test_http_parser.c` (`test_parse_query_string`) and `app/main.c`
-(`GET /search?q=...` → `handler_search`, via `req_get_query(req, "q")`).
+matching value, mirroring `req_get_param`. Both the key and value of every
+pair are URL-decoded (see "URL decoding" below) before being stored, so
+`req_get_query`/`req->query_names`/`req->query_values` all see decoded bytes
+even though `req->query` itself stays raw. See `tests/test_http_parser.c`
+(`test_parse_query_string`) and `app/main.c` (`GET /search?q=...` →
+`handler_search`, via `req_get_query(req, "q")`).
+
+## URL decoding
+`url_decode(src, dst, dst_size, decode_plus)` (`http_parser.c`) is a pure
+percent-decoder: `%XX` hex escapes always decode to the literal byte, and
+`+` decodes to a space only when `decode_plus` is set — the
+`application/x-www-form-urlencoded` convention for query-string keys/values,
+not path segments. A `%` not followed by two hex digits is copied through
+literally rather than decoded or dropped, so a caller never has to guard
+against a malformed escape shrinking or corrupting unrelated bytes. Decoded
+output is never longer than the input, so every call site decodes in place
+(`dst == src`) rather than needing a second buffer.
+- `parse_http_request` runs `url_decode(req->path, req->path, ..., 0)` right
+  after splitting the query string off the request-line path, and before
+  `parse_query_string`/routing ever run — so `req->path`, `match_path`'s
+  segment comparisons, and `req_get_param` (which captures straight from
+  `req->path`) all operate on decoded bytes. `match_path`/`req_get_param`
+  themselves do no decoding of their own; decoding only ever happens once,
+  at parse time.
+- `parse_query_string` runs `url_decode(..., 1)` over both the key and value
+  of each pair it splits out, so `req_get_query` returns decoded values (see
+  "Query-string parsing" above). `req->query` (the raw string the pairs were
+  split from) is left untouched.
+- **Known gap:** decoding `req->path` happens before `match_path` tokenizes
+  it on `/`, so a client-encoded `%2F` decodes to a literal `/` ahead of
+  segment splitting and can merge two path segments the client intended to
+  keep separate into one. There's no special-casing of `%2F` to avoid this
+  (see `pending.txt`).
+See `tests/test_http_parser.c` (`test_url_decode`, the encoded-path case in
+`test_parse_http_request`).
 
 ## Request size limits
 The whole request (headers + body) shares one `BUF_SIZE` (8192-byte) buffer,

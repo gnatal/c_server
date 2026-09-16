@@ -28,7 +28,14 @@ int request_is_complete(const char *buf, size_t len);
  */
 int request_wants_close(const Request *req);
 
-/* Parses a raw HTTP request buffer into method, path, query, headers and body. */
+/*
+ * Parses a raw HTTP request buffer into method, path, query, headers and
+ * body. req->path is URL-decoded in place (decode_plus = 0) after the query
+ * string is split off, so route matching/req_get_param and req->path itself
+ * all see decoded bytes; req->query stays the raw, unparsed string, but the
+ * req->query_names/query_values arrays parse_query_string fills from it are
+ * decoded (see parse_query_string).
+ */
 int parse_http_request(const char *raw, Request *req);
 
 /*
@@ -36,11 +43,26 @@ int parse_http_request(const char *raw, Request *req);
  * req->query_names/query_values, bounded by MAX_QUERY_PARAMS (extra pairs
  * are dropped rather than overflowing the fixed arrays, same as
  * MAX_ROUTES/MAX_PARAMS elsewhere). A pair with no '=' (e.g. "flag") gets an
- * empty-string value. Does not URL-decode %XX sequences or '+' - callers get
- * the raw bytes. Called by parse_http_request; exposed separately so it can
- * be unit-tested against a query string directly.
+ * empty-string value. Each name and value is then run through url_decode
+ * (decode_plus = 1, the application/x-www-form-urlencoded convention), so
+ * "a%20b=c%2Bd" comes back as name "a b", value "c+d". Called by
+ * parse_http_request; exposed separately so it can be unit-tested against a
+ * query string directly.
  */
 void parse_query_string(const char *query, Request *req);
+
+/*
+ * Pure percent-decoding of one URL component: "%XX" hex escapes become the
+ * literal byte, and - when decode_plus is set - '+' becomes a literal space
+ * (the application/x-www-form-urlencoded convention used for query-string
+ * keys/values, not path segments, which is why parse_http_request decodes
+ * req->path with decode_plus = 0). A '%' not followed by two hex digits is
+ * copied through as-is rather than decoded. Decoded output is never longer
+ * than src, so it's always safe to call with dst == src (in-place decode);
+ * dst_size still bounds the write and truncates on overflow, same as
+ * strncpy elsewhere.
+ */
+void url_decode(const char *src, char *dst, size_t dst_size, int decode_plus);
 
 /* Looks up a parsed query-string value by key (e.g. req_get_query(req, "q")
  * for "?q=cats"), or NULL if that key wasn't present. */

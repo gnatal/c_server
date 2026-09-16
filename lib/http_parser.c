@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,26 @@ int extract_content_length(const char *header_block) {
         return -1;
     }
     return (int)value;
+}
+
+void url_decode(const char *src, char *dst, size_t dst_size, int decode_plus) {
+    if (dst_size == 0) {
+        return;
+    }
+
+    size_t out = 0;
+    for (size_t i = 0; src[i] != '\0' && out + 1 < dst_size; i++) {
+        if (src[i] == '%' && isxdigit((unsigned char)src[i + 1]) && isxdigit((unsigned char)src[i + 2])) {
+            const char hex[3] = { src[i + 1], src[i + 2], '\0' };
+            dst[out++] = (char)strtol(hex, NULL, 16);
+            i += 2;
+        } else if (src[i] == '+' && decode_plus) {
+            dst[out++] = ' ';
+        } else {
+            dst[out++] = src[i];
+        }
+    }
+    dst[out] = '\0';
 }
 
 int request_is_complete(const char *buf, size_t len) {
@@ -58,6 +79,7 @@ int parse_http_request(const char *raw, Request *req) {
         strncpy(req->query, qmark + 1, sizeof(req->query) - 1);
     }
     strncpy(req->path, full_path, sizeof(req->path) - 1);
+    url_decode(req->path, req->path, sizeof(req->path), 0);
     parse_query_string(req->query, req);
 
     char *header_start = strstr(raw, "\r\n");
@@ -120,6 +142,8 @@ void parse_query_string(const char *query, Request *req) {
         name_slot[sizeof(req->query_names[0]) - 1] = '\0';
         strncpy(value_slot, value, sizeof(req->query_values[0]) - 1);
         value_slot[sizeof(req->query_values[0]) - 1] = '\0';
+        url_decode(name_slot, name_slot, sizeof(req->query_names[0]), 1);
+        url_decode(value_slot, value_slot, sizeof(req->query_values[0]), 1);
         req->query_count++;
 
         pair = strtok_r(NULL, "&", &saveptr);

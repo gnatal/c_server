@@ -99,10 +99,26 @@ Gaps vs. an Express-like C framework
     tests/test_http_parser.c (test_parse_query_string), lib/CLAUDE.md
     ("Query-string parsing"), and app/main.c (GET /search?q=... ->
     handler_search).
-- No URL-decoding of path/params/query: req_get_query/req_get_param/req->path
-  all hand back raw bytes - a "%20"/"+" in a query value or path segment is
-  not decoded to a space, so a client sending percent-encoded params still
-  gets them back encoded.
+- [DONE] URL-decoding of path/params/query: the new pure url_decode(src, dst,
+  dst_size, decode_plus) (lib/http_parser.c/h) decodes %XX hex escapes always,
+  and '+' to a space only when decode_plus is set (the
+  application/x-www-form-urlencoded convention for query strings, not path
+  segments). parse_http_request runs it over req->path (decode_plus = 0)
+  right after the query string is split off, so req->path, route matching,
+  and req_get_param (which captures from the already-decoded req->path) all
+  see decoded bytes; req->query itself is unchanged (still the raw string),
+  but parse_query_string now runs url_decode (decode_plus = 1) over both the
+  key and value of every parsed pair, so req_get_query returns decoded
+  values too. A malformed '%' escape (not followed by two hex digits) is
+  copied through literally rather than decoded or dropped. Output is never
+  longer than input, so decoding is done in place (dst == src) with no extra
+  buffer. See tests/test_http_parser.c (test_url_decode, the encoded-path
+  case in test_parse_http_request, and the decoded/malformed-escape cases in
+  test_parse_query_string) and lib/CLAUDE.md ("URL decoding"). Does not
+  attempt to special-case %2F in a path segment (it decodes to a literal '/'
+  like any other escape, ahead of route-pattern tokenization on '/') - a
+  request path containing an encoded slash can merge what the client intended
+  as two segments into one before match_path ever sees it.
 
 3. Request parsing
 - Headers are one opaque blob scanned with strcasestr - no req_get_header(name) map

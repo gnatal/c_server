@@ -111,6 +111,14 @@ static void test_parse_http_request(void) {
     assert(strcmp(req_get_query(&req, "q"), "test") == 0);
     assert(strcmp(req_get_query(&req, "page"), "2") == 0);
 
+    /* Percent-encoded path segment is URL-decoded; req->query stays raw
+     * (unparsed), only the parsed query-param arrays are decoded. */
+    const char *raw_encoded = "GET /a%20b/caf%C3%A9?name=a%20b HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    assert(parse_http_request(raw_encoded, &req) == 0);
+    assert(strcmp(req.path, "/a b/caf\xC3\xA9") == 0);
+    assert(strcmp(req.query, "name=a%20b") == 0);
+    assert(strcmp(req_get_query(&req, "name"), "a b") == 0);
+
     /* POST with body and Content-Length */
     const char *raw_post =
         "POST /echo HTTP/1.1\r\n"
@@ -156,6 +164,44 @@ static void test_status_text(void) {
     assert(strcmp(status_text(0), "Unknown") == 0);
 }
 
+static void test_url_decode(void) {
+    char dst[64];
+
+    /* Plain string with nothing to decode */
+    url_decode("hello", dst, sizeof(dst), 0);
+    assert(strcmp(dst, "hello") == 0);
+
+    /* %XX hex escapes */
+    url_decode("a%20b%2Fc", dst, sizeof(dst), 0);
+    assert(strcmp(dst, "a b/c") == 0);
+
+    /* '+' only decodes to space when decode_plus is set */
+    url_decode("a+b", dst, sizeof(dst), 0);
+    assert(strcmp(dst, "a+b") == 0);
+    url_decode("a+b", dst, sizeof(dst), 1);
+    assert(strcmp(dst, "a b") == 0);
+
+    /* Malformed escape (missing/short hex digits) passes through literally */
+    url_decode("100%done", dst, sizeof(dst), 0);
+    assert(strcmp(dst, "100%done") == 0);
+    url_decode("trailing%", dst, sizeof(dst), 0);
+    assert(strcmp(dst, "trailing%") == 0);
+    url_decode("bad%2gvalue", dst, sizeof(dst), 0);
+    assert(strcmp(dst, "bad%2gvalue") == 0);
+
+    /* In-place decode (dst == src) is safe since output never grows */
+    char inplace[32];
+    strncpy(inplace, "a%20b%20c", sizeof(inplace) - 1);
+    inplace[sizeof(inplace) - 1] = '\0';
+    url_decode(inplace, inplace, sizeof(inplace), 0);
+    assert(strcmp(inplace, "a b c") == 0);
+
+    /* dst_size truncates rather than overflowing */
+    char small[4];
+    url_decode("abcdef", small, sizeof(small), 0);
+    assert(strcmp(small, "abc") == 0);
+}
+
 static void test_parse_query_string(void) {
     Request req;
     memset(&req, 0, sizeof(req));
@@ -190,10 +236,21 @@ static void test_parse_query_string(void) {
     assert(strcmp(req_get_query(&req, "a"), "1") == 0);
     assert(strcmp(req_get_query(&req, "b"), "2") == 0);
 
-    /* No URL-decoding: '%XX' and '+' pass through as raw bytes. */
-    parse_query_string("name=a%20b&tag=c%2Bd", &req);
-    assert(strcmp(req_get_query(&req, "name"), "a%20b") == 0);
-    assert(strcmp(req_get_query(&req, "tag"), "c%2Bd") == 0);
+    /* URL-decoding: '%XX' escapes and '+' both decode to their real bytes. */
+    parse_query_string("name=a%20b&tag=c%2Bd&plus=a+b", &req);
+    assert(strcmp(req_get_query(&req, "name"), "a b") == 0);
+    assert(strcmp(req_get_query(&req, "tag"), "c+d") == 0);
+    assert(strcmp(req_get_query(&req, "plus"), "a b") == 0);
+
+    /* A malformed '%' escape (not followed by two hex digits) passes through
+     * literally rather than being decoded or dropped. */
+    parse_query_string("bad=100%25done&worse=a%2gb", &req);
+    assert(strcmp(req_get_query(&req, "bad"), "100%done") == 0);
+    assert(strcmp(req_get_query(&req, "worse"), "a%2gb") == 0);
+
+    /* Percent-encoded key names are decoded too. */
+    parse_query_string("a%20b=1", &req);
+    assert(strcmp(req_get_query(&req, "a b"), "1") == 0);
 
     /* Overflow: pairs past MAX_QUERY_PARAMS are dropped, not overflowed. */
     char many[512] = "";
@@ -212,6 +269,7 @@ int main(void) {
     test_request_wants_close();
     test_parse_http_request();
     test_status_text();
+    test_url_decode();
     test_parse_query_string();
 
     printf("all http parser tests passed\n");
