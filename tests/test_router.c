@@ -196,6 +196,79 @@ static void test_app_add_route_mw_truncates_overflow(void) {
     assert(app.routes[0].middleware_count == MAX_ROUTE_MIDDLEWARES);
 }
 
+static void test_app_put_patch_delete_register_correct_methods(void) {
+    App app;
+    app_init(&app);
+
+    app_put(&app, "/users/:id", dummy_handler_a);
+    app_patch(&app, "/users/:id", dummy_handler_a);
+    app_delete(&app, "/users/:id", dummy_handler_a);
+
+    assert(app.route_count == 3);
+    assert(strcmp(app.routes[0].method, "PUT") == 0);
+    assert(strcmp(app.routes[1].method, "PATCH") == 0);
+    assert(strcmp(app.routes[2].method, "DELETE") == 0);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "DELETE", sizeof(req.method) - 1);
+    strncpy(req.path, "/users/7", sizeof(req.path) - 1);
+    const Route *matched = match_route(&app, &req);
+    assert(matched != NULL && matched->handler == dummy_handler_a);
+    assert(strcmp(req_get_param(&req, "id"), "7") == 0);
+
+    /* PUT to a DELETE-only path still 404s - method matters, not just path. */
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "PUT", sizeof(req.method) - 1);
+    strncpy(req.path, "/users/7", sizeof(req.path) - 1);
+    matched = match_route(&app, &req);
+    assert(matched != NULL && strcmp(matched->method, "PUT") == 0);
+}
+
+static void test_app_put_patch_delete_mw_store_route_middleware(void) {
+    App app;
+    app_init(&app);
+
+    Middleware mws[] = { dummy_mw_a };
+    app_put_mw(&app, "/users/:id", dummy_handler_a, mws, 1);
+    app_patch_mw(&app, "/users/:id", dummy_handler_a, mws, 1);
+    app_delete_mw(&app, "/users/:id", dummy_handler_a, mws, 1);
+
+    assert(app.route_count == 3);
+    for (int i = 0; i < 3; i++) {
+        assert(app.routes[i].middleware_count == 1);
+        assert(app.routes[i].middlewares[0] == dummy_mw_a);
+    }
+}
+
+static void test_router_put_patch_delete_register_correct_methods(void) {
+    Router router;
+    router_init(&router);
+
+    router_put(&router, "/users/:id", dummy_handler_a);
+    router_patch(&router, "/users/:id", dummy_handler_a);
+    router_delete(&router, "/users/:id", dummy_handler_a);
+
+    Middleware mws[] = { dummy_mw_b };
+    router_put_mw(&router, "/protected", dummy_handler_b, mws, 1);
+    router_patch_mw(&router, "/protected", dummy_handler_b, mws, 1);
+    router_delete_mw(&router, "/protected", dummy_handler_b, mws, 1);
+
+    assert(router.route_count == 6);
+    assert(strcmp(router.routes[0].method, "PUT") == 0);
+    assert(strcmp(router.routes[1].method, "PATCH") == 0);
+    assert(strcmp(router.routes[2].method, "DELETE") == 0);
+    assert(strcmp(router.routes[3].method, "PUT") == 0 && router.routes[3].middleware_count == 1);
+    assert(strcmp(router.routes[4].method, "PATCH") == 0 && router.routes[4].middleware_count == 1);
+    assert(strcmp(router.routes[5].method, "DELETE") == 0 && router.routes[5].middleware_count == 1);
+
+    App app;
+    app_init(&app);
+    app_mount(&app, "/api", &router);
+    assert(app.route_count == 6);
+    assert(strcmp(app.routes[0].path, "/api/users/:id") == 0);
+}
+
 static void test_app_mount_prefixes_router_routes(void) {
     App app;
     app_init(&app);
@@ -319,6 +392,9 @@ int main(void) {
     test_app_get_mw_stores_route_middleware();
     test_app_post_mw_stores_route_middleware();
     test_app_add_route_mw_truncates_overflow();
+    test_app_put_patch_delete_register_correct_methods();
+    test_app_put_patch_delete_mw_store_route_middleware();
+    test_router_put_patch_delete_register_correct_methods();
     test_app_mount_prefixes_router_routes();
     test_app_mount_carries_route_middleware();
     test_app_mount_scopes_router_middleware_to_prefix();

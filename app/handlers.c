@@ -26,6 +26,28 @@ void handler_api_status(const Request *req, Response *res) {
     res_json(res, "{\"status\":\"ok\"}");
 }
 
+void handler_update_user(const Request *req, Response *res) {
+    const char *id = req_get_param(req, "id");
+    char body[128];
+    snprintf(body, sizeof(body), "User %s replaced (PUT)\n", id != NULL ? id : "unknown");
+    res_send(res, body);
+}
+
+void handler_patch_user(const Request *req, Response *res) {
+    const char *id = req_get_param(req, "id");
+    char body[128];
+    snprintf(body, sizeof(body), "User %s patched (PATCH)\n", id != NULL ? id : "unknown");
+    res_send(res, body);
+}
+
+void handler_delete_user(const Request *req, Response *res) {
+    (void)req;
+    /* 204 No Content: DELETE succeeded, nothing to return - status_text()
+     * (lib/http_parser.c) already covers 204. */
+    res_status(res, 204);
+    res_send(res, "");
+}
+
 void handler_echo_json(const Request *req, Response *res) {
     char err[128];
     JsonValue *body = json_parse(req->body, err, sizeof(err));

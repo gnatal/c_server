@@ -86,9 +86,10 @@ app-wide middleware and *before* the handler, regardless of registration order.
 `Router` (`app_types.h`) is a standalone route table — its own
 `Route routes[MAX_ROUTES]` + `route_count` and its own router-level
 `Middleware middlewares[MAX_MIDDLEWARES]` + `middleware_count` — built up via
-`router_get`/`router_post`/`router_get_mw`/`router_post_mw`/`router_use`
-(`router.c`), the exact `Router` analogues of `app_get`/`app_post`/`app_get_mw`/
-`app_post_mw`/`app_use`. A `Router` has no effect on dispatch by itself; it only
+`router_get`/`router_post`/`router_put`/`router_patch`/`router_delete` (plus
+their `_mw` variants) and `router_use` (`router.c`), the exact `Router`
+analogues of `app_get`/`app_post`/`app_put`/`app_patch`/`app_delete`/`app_use`.
+A `Router` has no effect on dispatch by itself; it only
 takes effect once mounted into an `App` via `app_mount(app, prefix, router)`
 (the C analogue of Express's `app.use('/api', router)`):
 - **Routes are flattened, not nested.** `app_mount` copies each of the router's
@@ -129,7 +130,14 @@ takes effect once mounted into an `App` via `app_mount(app, prefix, router)`
 ## Deny-by-default routing
 `match_route` returns `NULL` on no match; `handle_readable` turns that into a 404.
 There is no fallback/wildcard handler, so an unregistered path or method is always
-rejected rather than silently served.
+rejected rather than silently served. `match_route` requires an exact `Route.method`
+string match (`router.c`), so registering `GET /users/:id` does not make `PUT
+/users/:id` match it — a path matching but the method not matching still falls
+through to the same 404 as a completely unknown path (no 405 Method Not Allowed
+distinction). Convenience wrappers exist for `GET`/`POST`/`PUT`/`PATCH`/`DELETE`
+(`app_get`/`app_post`/`app_put`/`app_patch`/`app_delete`, each with an `_mw`
+variant, plus the `router_*` equivalents) — `HEAD`/`OPTIONS` have no wrapper yet,
+though `app_add_route`/`router_add_route` would take any method string directly.
 
 ## Request size limits
 The whole request (headers + body) shares one `BUF_SIZE` (8192-byte) buffer,

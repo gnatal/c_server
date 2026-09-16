@@ -40,6 +40,36 @@ void app_get_mw(App *app, const char *path, Handler handler,
 void app_post_mw(App *app, const char *path, Handler handler,
                   const Middleware *middlewares, int middleware_count);
 
+/* Express-style convenience wrapper: app_put(app, "/users/:id", handler). */
+void app_put(App *app, const char *path, Handler handler);
+
+/* Express-style convenience wrapper: app_patch(app, "/users/:id", handler). */
+void app_patch(App *app, const char *path, Handler handler);
+
+/* Express-style convenience wrapper: app_delete(app, "/users/:id", handler). */
+void app_delete(App *app, const char *path, Handler handler);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * app_put_mw(app, "/users/:id", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void app_put_mw(App *app, const char *path, Handler handler,
+                 const Middleware *middlewares, int middleware_count);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * app_patch_mw(app, "/users/:id", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void app_patch_mw(App *app, const char *path, Handler handler,
+                   const Middleware *middlewares, int middleware_count);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * app_delete_mw(app, "/users/:id", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void app_delete_mw(App *app, const char *path, Handler handler,
+                    const Middleware *middlewares, int middleware_count);
+
 /*
  * Compares a route pattern (e.g. "/users/:id") against an actual request
  * path segment by segment. Literal segments must match exactly; segments
@@ -88,6 +118,36 @@ void router_get_mw(Router *router, const char *path, Handler handler,
  */
 void router_post_mw(Router *router, const char *path, Handler handler,
                      const Middleware *middlewares, int middleware_count);
+
+/* Express-style convenience wrapper: router_put(router, "/users/:id", handler). */
+void router_put(Router *router, const char *path, Handler handler);
+
+/* Express-style convenience wrapper: router_patch(router, "/users/:id", handler). */
+void router_patch(Router *router, const char *path, Handler handler);
+
+/* Express-style convenience wrapper: router_delete(router, "/users/:id", handler). */
+void router_delete(Router *router, const char *path, Handler handler);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * router_put_mw(router, "/users/:id", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void router_put_mw(Router *router, const char *path, Handler handler,
+                    const Middleware *middlewares, int middleware_count);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * router_patch_mw(router, "/users/:id", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void router_patch_mw(Router *router, const char *path, Handler handler,
+                      const Middleware *middlewares, int middleware_count);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * router_delete_mw(router, "/users/:id", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void router_delete_mw(Router *router, const char *path, Handler handler,
+                       const Middleware *middlewares, int middleware_count);
 
 /*
  * Registers router-level middleware (the Router analogue of app_use): once

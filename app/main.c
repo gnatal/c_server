@@ -48,6 +48,15 @@ int main(void) {
   router_use(&api_router, mw_authenticate);
   router_get(&api_router, "/status", handler_api_status);
   router_get(&api_router, "/users/:id", handler_get_user);
+  /* PUT/PATCH/DELETE demo: app_put/app_patch/app_delete (and their router_*
+   * equivalents) are thin wrappers around app_add_route(_mw)/router_add_route(_mw)
+   * that register a different HTTP method against the same "/users/:id"
+   * pattern - a path match alone isn't enough, the method has to match too
+   * (lib/CLAUDE.md, "Deny-by-default routing"), so these coexist with the
+   * GET above without conflicting. */
+  router_put(&api_router, "/users/:id", handler_update_user);
+  router_patch(&api_router, "/users/:id", handler_patch_user);
+  router_delete(&api_router, "/users/:id", handler_delete_user);
   app_mount(&app, "/api", &api_router);
 
   app_listen(&app, app.config.port);

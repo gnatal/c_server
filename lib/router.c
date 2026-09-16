@@ -65,6 +65,33 @@ void app_post_mw(App *app, const char *path, Handler handler,
     app_add_route_mw(app, "POST", path, handler, middlewares, middleware_count);
 }
 
+void app_put(App *app, const char *path, Handler handler) {
+    app_add_route(app, "PUT", path, handler);
+}
+
+void app_patch(App *app, const char *path, Handler handler) {
+    app_add_route(app, "PATCH", path, handler);
+}
+
+void app_delete(App *app, const char *path, Handler handler) {
+    app_add_route(app, "DELETE", path, handler);
+}
+
+void app_put_mw(App *app, const char *path, Handler handler,
+                 const Middleware *middlewares, int middleware_count) {
+    app_add_route_mw(app, "PUT", path, handler, middlewares, middleware_count);
+}
+
+void app_patch_mw(App *app, const char *path, Handler handler,
+                   const Middleware *middlewares, int middleware_count) {
+    app_add_route_mw(app, "PATCH", path, handler, middlewares, middleware_count);
+}
+
+void app_delete_mw(App *app, const char *path, Handler handler,
+                    const Middleware *middlewares, int middleware_count) {
+    app_add_route_mw(app, "DELETE", path, handler, middlewares, middleware_count);
+}
+
 void router_init(Router *router) {
     router->route_count = 0;
     router->middleware_count = 0;
@@ -99,6 +126,33 @@ void router_get_mw(Router *router, const char *path, Handler handler,
 void router_post_mw(Router *router, const char *path, Handler handler,
                      const Middleware *middlewares, int middleware_count) {
     router_add_route_mw(router, "POST", path, handler, middlewares, middleware_count);
+}
+
+void router_put(Router *router, const char *path, Handler handler) {
+    router_add_route(router, "PUT", path, handler);
+}
+
+void router_patch(Router *router, const char *path, Handler handler) {
+    router_add_route(router, "PATCH", path, handler);
+}
+
+void router_delete(Router *router, const char *path, Handler handler) {
+    router_add_route(router, "DELETE", path, handler);
+}
+
+void router_put_mw(Router *router, const char *path, Handler handler,
+                    const Middleware *middlewares, int middleware_count) {
+    router_add_route_mw(router, "PUT", path, handler, middlewares, middleware_count);
+}
+
+void router_patch_mw(Router *router, const char *path, Handler handler,
+                      const Middleware *middlewares, int middleware_count) {
+    router_add_route_mw(router, "PATCH", path, handler, middlewares, middleware_count);
+}
+
+void router_delete_mw(Router *router, const char *path, Handler handler,
+                       const Middleware *middlewares, int middleware_count) {
+    router_add_route_mw(router, "DELETE", path, handler, middlewares, middleware_count);
 }
 
 void router_use(Router *router, Middleware mw) {

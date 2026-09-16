@@ -34,6 +34,16 @@ scoping mechanisms in `lib/`:
   (`lib/CLAUDE.md`, "Sub-router mounting"), auth is enforced for *any* request
   under `/api` — including `GET /api/nope`, which 401s rather than 404ing,
   since the prefix-scoped middleware runs ahead of route dispatch.
+  `router_put`/`router_patch`/`router_delete` register `handler_update_user`/
+  `handler_patch_user`/`handler_delete_user` against that same `/users/:id`
+  pattern (`PUT`/`PATCH`/`DELETE /api/users/:id`) — since `match_route`
+  requires an exact method match on top of the path match (`lib/CLAUDE.md`,
+  "Deny-by-default routing"), these coexist with the `GET` on the identical
+  path without conflicting, and all three inherit `mw_authenticate` from the
+  same `router_use` call rather than needing their own `_mw` middleware list.
+  `handler_delete_user` responds `204 No Content` with an empty body, the
+  one handler in this app that doesn't call `res_json`/plain `res_send` with
+  a non-empty body.
 - `mw_logger` calls `chain_next` first and logs `METHOD PATH -> STATUS` after it
   returns, once the rest of the pipeline has produced a final `res->status`.
 - `mw_body_size_guard` rejects any request whose `req->content_length` exceeds this

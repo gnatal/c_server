@@ -53,13 +53,34 @@ Gaps vs. an Express-like C framework
   copied at mount time (flattened, not nested) - match_route/dispatch are
   unchanged, no nested-router support yet. See tests/test_router.c
   (test_app_mount_*) and lib/CLAUDE.md ("Sub-router mounting").
-- Only app_get/app_post wrappers exist; no app_put/app_delete/app_patch, no HEAD/OPTIONS
+- [DONE] app_put/app_patch/app_delete (+ _mw variants) and their router_put/
+  router_patch/router_delete (+ _mw) equivalents (router.c/h) - thin wrappers
+  around app_add_route(_mw)/router_add_route(_mw) exactly like app_get/app_post,
+  so PUT/PATCH/DELETE routes register and dispatch (incl. per-route middleware,
+  path params, and mounting via app_mount) identically to GET/POST. No
+  app_head/app_options wrapper yet - HEAD/OPTIONS aren't handled specially
+  (no auto-HEAD-from-GET, no auto-OPTIONS), though app_add_route/
+  router_add_route would take either method string directly if registered by
+  hand. See tests/test_router.c (test_app_put_patch_delete_*,
+  test_router_put_patch_delete_*) and lib/CLAUDE.md ("Deny-by-default routing").
 - Path matches but method doesn't -> still 404, not 405
 - No wildcards, no query-string parser (req->query is a raw string, no req_get_query(name))
 - No URL-decoding of path/params/query
 
 3. Request parsing
 - Headers are one opaque blob scanned with strcasestr - no req_get_header(name) map
+- Once req_get_header(name) exists: no Content-Type/body validation on mutating
+  requests. Currently the PUT/PATCH demo handlers (app/handlers.c:
+  handler_update_user, handler_patch_user) never look at req->body at all, so a
+  malformed/garbage body (e.g. broken JSON) is silently accepted (200) instead
+  of rejected - a client can't tell the server ignored their payload from the
+  response alone. Fixing this properly means gating body parsing/validation on
+  the request actually declaring Content-Type: application/json (via
+  req_get_header, not another ad-hoc strcasestr scan) before attempting
+  json_parse + 400 on failure, the same pattern handler_echo_json already uses
+  for POST /echo/json - don't add JSON validation to a handler without first
+  checking Content-Type, or a client sending a non-JSON body (plain text, form
+  data) would get an incorrect 400.
 - Whole request (headers+body) lives in one fixed BUF_SIZE=8192 buffer - no streaming
 - [DONE] Negative/oversized Content-Length is now rejected with 400 instead of silently
   truncated or trusted (extract_content_length bounds it to [0, BUF_SIZE-1])
