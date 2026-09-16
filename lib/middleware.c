@@ -20,6 +20,24 @@ static int middleware_prefix_matches(const char *prefix, const char *path) {
     return next == '\0' || next == '/';
 }
 
+/* Checks whether method (e.g. "HEAD") appears as its own comma-separated
+ * token in list (e.g. "GET, POST"), not just as a substring - used below to
+ * decide whether to append an implicit method to an auto-OPTIONS Allow
+ * header without double-adding one a route already registered explicitly. */
+static int method_list_contains(const char *list, const char *method) {
+    const size_t method_len = strlen(method);
+    const char *p = list;
+    while ((p = strstr(p, method)) != NULL) {
+        const int start_ok = (p == list) || (p[-1] == ' ');
+        const int end_ok = (p[method_len] == '\0') || (p[method_len] == ',');
+        if (start_ok && end_ok) {
+            return 1;
+        }
+        p += method_len;
+    }
+    return 0;
+}
+
 void app_use(App *app, Middleware mw) {
     app_use_prefix(app, "", mw);
 }
@@ -62,6 +80,30 @@ void chain_next(MiddlewareChain *chain) {
 
     if (chain->final_handler != NULL) {
         chain->final_handler(chain->req, chain->res);
+    } else if (chain->method_not_allowed && strcmp(chain->req->method, "OPTIONS") == 0) {
+        /* Auto-OPTIONS: mirrors Express, which answers OPTIONS for any path
+         * that has at least one route registered (under any method) without
+         * needing an explicit app_options() handler for it - an explicit one
+         * still wins, since match_route (router.c) tries an exact method
+         * match first and only leaves final_handler NULL when that fails.
+         * chain->allowed_methods was already computed by dispatch() via
+         * match_route_allowed_methods for the 405 branch below; reused here
+         * instead. HEAD is folded in whenever GET is registered (it works
+         * via match_route's auto-HEAD-from-GET fallback even without its own
+         * route), and OPTIONS itself is always implicitly supported once
+         * we've reached this branch. */
+        char allow[96];
+        strncpy(allow, chain->allowed_methods, sizeof(allow) - 1);
+        allow[sizeof(allow) - 1] = '\0';
+        if (method_list_contains(allow, "GET") && !method_list_contains(allow, "HEAD")) {
+            strncat(allow, ", HEAD", sizeof(allow) - strlen(allow) - 1);
+        }
+        if (!method_list_contains(allow, "OPTIONS")) {
+            strncat(allow, ", OPTIONS", sizeof(allow) - strlen(allow) - 1);
+        }
+        res_set_header(chain->res, "Allow", allow);
+        res_status(chain->res, 200);
+        res_send(chain->res, "");
     } else if (chain->method_not_allowed) {
         res_set_header(chain->res, "Allow", chain->allowed_methods);
         res_status(chain->res, 405);

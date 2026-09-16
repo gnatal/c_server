@@ -32,9 +32,12 @@ void app_use_error(App *app, ErrorHandler handler);
 /*
  * Advances the pipeline by one step: runs the next unrun middleware, or -
  * once all middleware have run - the matched route's handler, or (if no
- * route matched) a 404 if nothing registered matches req->path at all, or a
- * 405 + Allow header if req->path matches a registered route under a
- * different method. Middleware calls this to continue the chain.
+ * route matched) a 404 if nothing registered matches req->path at all, an
+ * auto-OPTIONS 200 + Allow header if the request method is OPTIONS and
+ * req->path matches a registered route under some other method (no explicit
+ * app_options() route needed), or a 405 + Allow header for any other method
+ * in that same "path matches, method doesn't" situation. Middleware calls
+ * this to continue the chain.
  */
 void chain_next(MiddlewareChain *chain);
 

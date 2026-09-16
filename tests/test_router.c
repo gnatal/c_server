@@ -454,6 +454,86 @@ static void test_app_mount_respects_max_routes(void) {
     assert(app.route_count == MAX_ROUTES);
 }
 
+static void test_app_head_options_register_correct_methods(void) {
+    App app;
+    app_init(&app);
+
+    app_head(&app, "/users/:id", dummy_handler_a);
+    app_options(&app, "/users/:id", dummy_handler_a);
+
+    assert(app.route_count == 2);
+    assert(strcmp(app.routes[0].method, "HEAD") == 0);
+    assert(strcmp(app.routes[1].method, "OPTIONS") == 0);
+
+    Middleware mws[] = { dummy_mw_a };
+    app_head_mw(&app, "/protected", dummy_handler_b, mws, 1);
+    app_options_mw(&app, "/protected", dummy_handler_b, mws, 1);
+    assert(app.route_count == 4);
+    assert(app.routes[2].middleware_count == 1 && app.routes[2].middlewares[0] == dummy_mw_a);
+    assert(app.routes[3].middleware_count == 1 && app.routes[3].middlewares[0] == dummy_mw_a);
+}
+
+static void test_router_head_options_register_correct_methods(void) {
+    Router router;
+    router_init(&router);
+
+    router_head(&router, "/users/:id", dummy_handler_a);
+    router_options(&router, "/users/:id", dummy_handler_a);
+
+    Middleware mws[] = { dummy_mw_b };
+    router_head_mw(&router, "/protected", dummy_handler_b, mws, 1);
+    router_options_mw(&router, "/protected", dummy_handler_b, mws, 1);
+
+    assert(router.route_count == 4);
+    assert(strcmp(router.routes[0].method, "HEAD") == 0);
+    assert(strcmp(router.routes[1].method, "OPTIONS") == 0);
+    assert(strcmp(router.routes[2].method, "HEAD") == 0 && router.routes[2].middleware_count == 1);
+    assert(strcmp(router.routes[3].method, "OPTIONS") == 0 && router.routes[3].middleware_count == 1);
+}
+
+static void test_match_route_head_falls_back_to_get(void) {
+    App app;
+    app_init(&app);
+
+    app_get(&app, "/users/:id", dummy_handler_a);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "HEAD", sizeof(req.method) - 1);
+    strncpy(req.path, "/users/42", sizeof(req.path) - 1);
+
+    const Route *matched = match_route(&app, &req);
+    assert(matched != NULL);
+    assert(matched->handler == dummy_handler_a);
+    assert(strcmp(matched->method, "GET") == 0);
+    assert(strcmp(req_get_param(&req, "id"), "42") == 0);
+
+    /* A HEAD request to a path with no GET (or HEAD) route still misses. */
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "HEAD", sizeof(req.method) - 1);
+    strncpy(req.path, "/notfound", sizeof(req.path) - 1);
+    assert(match_route(&app, &req) == NULL);
+}
+
+static void test_match_route_explicit_head_wins_over_get_fallback(void) {
+    App app;
+    app_init(&app);
+
+    app_get(&app, "/users", dummy_handler_a);
+    app_head(&app, "/users", dummy_handler_b);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "HEAD", sizeof(req.method) - 1);
+    strncpy(req.path, "/users", sizeof(req.path) - 1);
+
+    const Route *matched = match_route(&app, &req);
+    assert(matched != NULL);
+    /* The explicit HEAD route, not the GET fallback. */
+    assert(matched->handler == dummy_handler_b);
+    assert(strcmp(matched->method, "HEAD") == 0);
+}
+
 int main(void) {
     test_match_path_exact_literals();
     test_match_path_params();
@@ -474,6 +554,10 @@ int main(void) {
     test_app_mount_strips_trailing_slash_from_prefix();
     test_app_mount_root_prefix_is_unscoped();
     test_app_mount_respects_max_routes();
+    test_app_head_options_register_correct_methods();
+    test_router_head_options_register_correct_methods();
+    test_match_route_head_falls_back_to_get();
+    test_match_route_explicit_head_wins_over_get_fallback();
 
     printf("all router tests passed\n");
     return 0;

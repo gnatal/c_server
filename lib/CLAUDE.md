@@ -153,10 +153,65 @@ call speculatively even though `match_route` already tried and failed. See
 `test_dispatch_returns_404_*`) and `tests/test_router.c`
 (`test_match_route_allowed_methods_*`).
 
-Convenience wrappers exist for `GET`/`POST`/`PUT`/`PATCH`/`DELETE`
-(`app_get`/`app_post`/`app_put`/`app_patch`/`app_delete`, each with an `_mw`
-variant, plus the `router_*` equivalents) — `HEAD`/`OPTIONS` have no wrapper yet,
-though `app_add_route`/`router_add_route` would take any method string directly.
+Convenience wrappers exist for `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`HEAD`/`OPTIONS`
+(`app_get`/`app_post`/`app_put`/`app_patch`/`app_delete`/`app_head`/`app_options`,
+each with an `_mw` variant, plus the `router_*` equivalents) — see "HEAD/OPTIONS
+auto-handling" below for what happens when a path has no explicit `HEAD`/`OPTIONS`
+route registered at all.
+
+## HEAD/OPTIONS auto-handling
+An explicit `app_head`/`app_options`/`router_head`/`router_options` route (plus
+their `_mw` variants, `router.c/h`) always wins when registered — both are thin
+wrappers around `app_add_route(_mw)`/`router_add_route(_mw)` exactly like
+`app_put`/`app_patch`/`app_delete`, and `match_route` (below) always tries an
+exact method match before either fallback described here kicks in. Without an
+explicit registration, two auto-behaviors mirror Express:
+- **Auto-HEAD-from-GET** lives in `match_route` (`router.c`): once the loop over
+  every registered route finds no exact `HEAD` match, a second pass looks for
+  the first route matching the same path under `GET` and returns that instead.
+  The `GET` handler then runs completely normally — same middleware, same
+  `res_send`/`res_json` call building a real body — nothing downstream of
+  `match_route` knows this was a fallback.
+- **Body suppression** is what actually makes a `HEAD` response spec-correct
+  (RFC 7231 4.3.2: a `HEAD` response must carry the same headers, including
+  `Content-Length`, a `GET` would have, but never a body — for *any* status,
+  not just when the auto-fallback above is involved). `Response.is_head_request`
+  (`app_types.h`) is set by `handle_readable` (`connection.c`) from
+  `req->method` right after a successful parse, *before* `dispatch()` runs —
+  so it's already in place whether the pipeline ends at a matched handler or
+  at chain_next's 404/405 fallback. `send_with_content_type` (`response.c`)
+  still computes `Content-Length` from the handler's full body string either
+  way, it just skips copying those bytes into `conn->out_buf` when the flag is
+  set — the one-`malloc`-sized-to-header+body pattern becomes
+  header-only. Every other `Response` local in `connection.c` (the
+  431/500/408 rejection paths, which run ahead of or without a full parse)
+  explicitly leaves this at `0` — those responses have no real body worth
+  suppressing anyway.
+- **Auto-OPTIONS** lives in `chain_next`'s final fallback (`middleware.c`),
+  the same spot the 404-vs-405 decision (below) is made: when `route` is
+  `NULL` (no exact match, no `HEAD`→`GET` fallback applicable) and the
+  request method is `OPTIONS`, and `match_route_allowed_methods` (already
+  computed by `dispatch()` for the 405 case) shows the path matches at least
+  one route under some other method, `chain_next` sends `200` + an `Allow`
+  header instead of `405` — an `OPTIONS` request to a path matching nothing
+  at all still falls through to the ordinary `404`. The `Allow` list reuses
+  `match_route_allowed_methods`' registration-ordered, deduplicated string
+  and augments it with two implicit entries via `method_list_contains` (a
+  small token-exact substring check, `middleware.c`): `HEAD` is added
+  whenever `GET` is present and `HEAD` isn't already explicit (since `HEAD`
+  works there via the fallback above even with no route of its own), and
+  `OPTIONS` is always added, since reaching this branch means it's
+  implicitly supported for that path.
+See `tests/test_router.c` (`test_app_head_options_register_correct_methods`,
+`test_router_head_options_register_correct_methods`,
+`test_match_route_head_falls_back_to_get`,
+`test_match_route_explicit_head_wins_over_get_fallback`),
+`tests/test_middleware.c` (`test_dispatch_auto_options_*`,
+`test_dispatch_options_still_404s_unknown_path`,
+`test_dispatch_explicit_options_route_wins_over_auto`),
+`tests/test_response.c` (`test_head_response_omits_body_but_keeps_content_length`),
+and `tests/test_connection.c` (`test_handle_readable_head_request_omits_body`,
+`test_handle_readable_auto_options_response`).
 
 ## Route wildcards
 `match_path` (`router.c`) tokenizes both the route pattern and the request path on

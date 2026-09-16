@@ -107,6 +107,10 @@ static void send_with_content_type(Response *res, const char *content_type, cons
 
     const size_t header_len = offset;
     const size_t body_len = strlen(body);
+    /* Content-Length above is always computed from the full body - a HEAD
+     * response must report the same length a GET would have (RFC 7231
+     * 4.3.2), it just never actually sends those bytes. */
+    const size_t sent_body_len = res->is_head_request ? 0 : body_len;
 
     /*
      * Ownership: this buffer is handed to the event loop. On the keep-alive
@@ -115,7 +119,7 @@ static void send_with_content_type(Response *res, const char *content_type, cons
      * those runs for every connection, so exactly one free matches this
      * malloc.
      */
-    conn->out_buf = malloc(header_len + body_len);
+    conn->out_buf = malloc(header_len + sent_body_len);
     if (conn->out_buf == NULL) {
         /* Out of memory: nothing safe to send back. Drop the connection
          * rather than write through a NULL pointer. */
@@ -125,8 +129,10 @@ static void send_with_content_type(Response *res, const char *content_type, cons
         return;
     }
     memcpy(conn->out_buf, header, header_len);
-    memcpy(conn->out_buf + header_len, body, body_len);
-    conn->out_len = header_len + body_len;
+    if (sent_body_len > 0) {
+        memcpy(conn->out_buf + header_len, body, sent_body_len);
+    }
+    conn->out_len = header_len + sent_body_len;
     conn->out_sent = 0;
 }
 

@@ -140,6 +140,18 @@ typedef struct {
      * attempts to override them. */
     ResponseHeader headers[MAX_RESPONSE_HEADERS];
     int header_count;
+
+    /* Set by handle_readable (connection.c) from req->method before dispatch
+     * runs, whenever a request was successfully parsed. HTTP requires a HEAD
+     * response to carry the same headers (including Content-Length) a GET
+     * would have produced, but never a body, regardless of status (RFC 7231
+     * 4.3.2) - send_with_content_type (response.c) still computes
+     * Content-Length from the handler's body string, it just skips copying
+     * those bytes into conn->out_buf. Left at 0 (default) on paths that
+     * never reach a full parse (e.g. the 431/408 rejections in
+     * connection.c), which is safe - those responses have no real body to
+     * suppress either way. */
+    int is_head_request;
 } Response;
 
 /* req is never mutated by a handler once routing has filled in its params. */

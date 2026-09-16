@@ -92,6 +92,24 @@ void app_delete_mw(App *app, const char *path, Handler handler,
     app_add_route_mw(app, "DELETE", path, handler, middlewares, middleware_count);
 }
 
+void app_head(App *app, const char *path, Handler handler) {
+    app_add_route(app, "HEAD", path, handler);
+}
+
+void app_options(App *app, const char *path, Handler handler) {
+    app_add_route(app, "OPTIONS", path, handler);
+}
+
+void app_head_mw(App *app, const char *path, Handler handler,
+                  const Middleware *middlewares, int middleware_count) {
+    app_add_route_mw(app, "HEAD", path, handler, middlewares, middleware_count);
+}
+
+void app_options_mw(App *app, const char *path, Handler handler,
+                     const Middleware *middlewares, int middleware_count) {
+    app_add_route_mw(app, "OPTIONS", path, handler, middlewares, middleware_count);
+}
+
 void router_init(Router *router) {
     router->route_count = 0;
     router->middleware_count = 0;
@@ -153,6 +171,24 @@ void router_patch_mw(Router *router, const char *path, Handler handler,
 void router_delete_mw(Router *router, const char *path, Handler handler,
                        const Middleware *middlewares, int middleware_count) {
     router_add_route_mw(router, "DELETE", path, handler, middlewares, middleware_count);
+}
+
+void router_head(Router *router, const char *path, Handler handler) {
+    router_add_route(router, "HEAD", path, handler);
+}
+
+void router_options(Router *router, const char *path, Handler handler) {
+    router_add_route(router, "OPTIONS", path, handler);
+}
+
+void router_head_mw(Router *router, const char *path, Handler handler,
+                     const Middleware *middlewares, int middleware_count) {
+    router_add_route_mw(router, "HEAD", path, handler, middlewares, middleware_count);
+}
+
+void router_options_mw(Router *router, const char *path, Handler handler,
+                        const Middleware *middlewares, int middleware_count) {
+    router_add_route_mw(router, "OPTIONS", path, handler, middlewares, middleware_count);
 }
 
 void router_use(Router *router, Middleware mw) {
@@ -271,6 +307,25 @@ const Route *match_route(const App *app, Request *req) {
             return route;
         }
     }
+
+    /* Auto-HEAD-from-GET: only reached when no explicit HEAD route matched
+     * above. HTTP requires a HEAD response to look like the equivalent GET
+     * response minus the body (RFC 7231 4.3.2) - falling back to the GET
+     * route here means its handler runs normally (building a body as usual),
+     * and Response.is_head_request (set by handle_readable, connection.c)
+     * is what actually keeps that body off the wire (response.c). */
+    if (strcmp(req->method, "HEAD") == 0) {
+        for (int i = 0; i < app->route_count; i++) {
+            const Route *route = &app->routes[i];
+            if (strcmp(route->method, "GET") != 0) {
+                continue;
+            }
+            if (match_path(route->path, req->path, req)) {
+                return route;
+            }
+        }
+    }
+
     return NULL;
 }
 

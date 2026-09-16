@@ -71,6 +71,35 @@ void app_delete_mw(App *app, const char *path, Handler handler,
                     const Middleware *middlewares, int middleware_count);
 
 /*
+ * Express-style convenience wrapper: app_head(app, "/users", handler).
+ * Registering an explicit HEAD route always takes priority over the
+ * auto-HEAD-from-GET fallback in match_route (router.c) for the same path.
+ */
+void app_head(App *app, const char *path, Handler handler);
+
+/*
+ * Express-style convenience wrapper: app_options(app, "/users", handler).
+ * Registering an explicit OPTIONS route always takes priority over the
+ * auto-OPTIONS fallback in dispatch/chain_next (middleware.c) for the same
+ * path.
+ */
+void app_options(App *app, const char *path, Handler handler);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * app_head_mw(app, "/users", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void app_head_mw(App *app, const char *path, Handler handler,
+                  const Middleware *middlewares, int middleware_count);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * app_options_mw(app, "/users", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void app_options_mw(App *app, const char *path, Handler handler,
+                     const Middleware *middlewares, int middleware_count);
+
+/*
  * Compares a route pattern (e.g. "/users/:id") against an actual request
  * path segment by segment. Literal segments must match exactly; segments
  * starting with ':' capture the corresponding path segment into req->params.
@@ -83,7 +112,14 @@ void app_delete_mw(App *app, const char *path, Handler handler,
  */
 int match_path(const char *pattern, const char *path, Request *req);
 
-/* Finds the first registered route whose method and path pattern match the request. */
+/*
+ * Finds the first registered route whose method and path pattern match the
+ * request. If req->method is "HEAD" and no route matches under "HEAD"
+ * itself, falls back to the first route matching the same path under "GET"
+ * (auto-HEAD-from-GET, mirroring Express - app_get() implicitly makes HEAD
+ * work too, unless an explicit app_head() route for that path exists, which
+ * always wins since it's tried first).
+ */
 const Route *match_route(const App *app, Request *req);
 
 /*
@@ -169,6 +205,26 @@ void router_patch_mw(Router *router, const char *path, Handler handler,
  */
 void router_delete_mw(Router *router, const char *path, Handler handler,
                        const Middleware *middlewares, int middleware_count);
+
+/* Express-style convenience wrapper: router_head(router, "/users", handler). */
+void router_head(Router *router, const char *path, Handler handler);
+
+/* Express-style convenience wrapper: router_options(router, "/users", handler). */
+void router_options(Router *router, const char *path, Handler handler);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * router_head_mw(router, "/users", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void router_head_mw(Router *router, const char *path, Handler handler,
+                     const Middleware *middlewares, int middleware_count);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * router_options_mw(router, "/users", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void router_options_mw(Router *router, const char *path, Handler handler,
+                        const Middleware *middlewares, int middleware_count);
 
 /*
  * Registers router-level middleware (the Router analogue of app_use): once

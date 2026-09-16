@@ -482,6 +482,63 @@ static void test_close_idle_connections_skips_pending_write(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+static void test_handle_readable_head_request_omits_body(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    /* No app_head() route registered - this exercises match_route's
+     * auto-HEAD-from-GET fallback end to end, not just an explicitly
+     * registered HEAD handler. */
+    app_get(&app, "/ping", ping_handler);
+
+    const char *raw_req = "HEAD /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert(write(fds[1], raw_req, strlen(raw_req)) == (ssize_t)strlen(raw_req));
+
+    handle_readable(&app, conn);
+
+    char resp[1024];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    /* Content-Length reflects "pong" (4 bytes) - what the equivalent GET
+     * would have sent - even though the body itself never went out. */
+    assert(strstr(resp, "Content-Length: 4\r\n") != NULL);
+    const char *header_end = strstr(resp, "\r\n\r\n");
+    assert(header_end != NULL);
+    /* Nothing was written to the wire past the header block. */
+    assert(header_end + 4 == resp + n);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+static void test_handle_readable_auto_options_response(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_get(&app, "/ping", ping_handler);
+    app_post(&app, "/ping", ping_handler);
+
+    const char *raw_req = "OPTIONS /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert(write(fds[1], raw_req, strlen(raw_req)) == (ssize_t)strlen(raw_req));
+
+    handle_readable(&app, conn);
+
+    char resp[1024];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(resp, "Allow: GET, POST, HEAD, OPTIONS\r\n") != NULL);
+    assert(strstr(resp, "Content-Length: 0\r\n") != NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 int main(void) {
     test_set_nonblocking_and_create();
     test_handle_readable_round_trip_success();
@@ -498,6 +555,8 @@ int main(void) {
     test_close_idle_connections_408s_stalled_partial_request();
     test_close_idle_connections_leaves_recent_activity_alone();
     test_close_idle_connections_skips_pending_write();
+    test_handle_readable_head_request_omits_body();
+    test_handle_readable_auto_options_response();
 
     printf("all connection tests passed\n");
     return 0;

@@ -416,6 +416,104 @@ static void test_prefixed_middleware_does_not_match_similar_sibling_path(void) {
     free_conn(conn);
 }
 
+static void test_dispatch_auto_options_lists_allowed_methods(void) {
+    App app;
+    app_init(&app);
+    app_get(&app, "/users", dummy_handler_unused);
+    app_post(&app, "/users", dummy_handler_unused);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "OPTIONS", sizeof(req.method) - 1);
+    req.method[sizeof(req.method) - 1] = '\0';
+    strncpy(req.path, "/users", sizeof(req.path) - 1);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    /* Mirrors handle_readable: no explicit OPTIONS route, so match_route
+     * returns NULL even though /users matches under GET/POST. */
+    dispatch(&app, NULL, &req, &res);
+
+    assert(res.status == 200);
+    /* GET implies HEAD via match_route's auto fallback, and OPTIONS itself
+     * is always implicitly supported once this branch runs - both get
+     * folded into the Allow header alongside the explicitly registered
+     * methods. */
+    assert(strstr(conn->out_buf, "Allow: GET, POST, HEAD, OPTIONS") != NULL);
+    assert(strstr(conn->out_buf, "Content-Length: 0") != NULL);
+
+    free_conn(conn);
+}
+
+static void test_dispatch_auto_options_without_get_omits_head(void) {
+    App app;
+    app_init(&app);
+    app_post(&app, "/echo", dummy_handler_unused);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "OPTIONS", sizeof(req.method) - 1);
+    req.method[sizeof(req.method) - 1] = '\0';
+    strncpy(req.path, "/echo", sizeof(req.path) - 1);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    dispatch(&app, NULL, &req, &res);
+
+    assert(res.status == 200);
+    assert(strstr(conn->out_buf, "Allow: POST, OPTIONS") != NULL);
+    assert(strstr(conn->out_buf, "HEAD") == NULL);
+
+    free_conn(conn);
+}
+
+static void test_dispatch_options_still_404s_unknown_path(void) {
+    App app;
+    app_init(&app);
+    app_get(&app, "/users", dummy_handler_unused);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "OPTIONS", sizeof(req.method) - 1);
+    req.method[sizeof(req.method) - 1] = '\0';
+    strncpy(req.path, "/notfound", sizeof(req.path) - 1);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    dispatch(&app, NULL, &req, &res);
+
+    assert(res.status == 404);
+
+    free_conn(conn);
+}
+
+static void test_dispatch_explicit_options_route_wins_over_auto(void) {
+    g_handler_called = 0;
+
+    App app;
+    app_init(&app);
+    app_get(&app, "/users", dummy_handler_unused);
+
+    Route route = { "OPTIONS", "/users", handler_ok, { 0 }, 0 };
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "OPTIONS", sizeof(req.method) - 1);
+    req.method[sizeof(req.method) - 1] = '\0';
+    strncpy(req.path, "/users", sizeof(req.path) - 1);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    /* Mirrors handle_readable: match_route finds the explicit OPTIONS route
+     * directly, so dispatch is called with a non-NULL route - the auto
+     * fallback (route == NULL) never comes into play. */
+    dispatch(&app, &route, &req, &res);
+
+    assert(g_handler_called == 1);
+    assert(strstr(conn->out_buf, "ok") != NULL);
+
+    free_conn(conn);
+}
+
 int main(void) {
     test_middlewares_run_in_order_then_handler();
     test_middleware_can_short_circuit();
@@ -430,6 +528,10 @@ int main(void) {
     test_prefixed_middleware_runs_when_path_matches();
     test_prefixed_middleware_skipped_when_path_does_not_match();
     test_prefixed_middleware_does_not_match_similar_sibling_path();
+    test_dispatch_auto_options_lists_allowed_methods();
+    test_dispatch_auto_options_without_get_omits_head();
+    test_dispatch_options_still_404s_unknown_path();
+    test_dispatch_explicit_options_route_wins_over_auto();
 
     printf("All middleware tests passed.\n");
     return 0;

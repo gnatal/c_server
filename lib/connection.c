@@ -199,6 +199,7 @@ void handle_readable(App *app, Connection *conn) {
             res.conn = conn;
             res.status = 200;
             res.header_count = 0;
+            res.is_head_request = 0;
 
             const int parse_status = parse_http_request(conn->in_buf, &req);
             if (parse_status != 0) {
@@ -223,6 +224,12 @@ void handle_readable(App *app, Connection *conn) {
                 }
             } else {
                 conn->keep_alive = !request_wants_close(&req);
+                /* HTTP forbids a body in any response to HEAD, regardless of
+                 * status (see response.c: send_with_content_type). Set ahead
+                 * of dispatch() so it applies uniformly whether the request
+                 * resolves to a route's handler or to a 404/405 built by
+                 * chain_next's fallback. */
+                res.is_head_request = strcmp(req.method, "HEAD") == 0;
                 const Route *route = match_route(app, &req);
                 dispatch(app, route, &req, &res);
             }
@@ -275,6 +282,7 @@ void handle_readable(App *app, Connection *conn) {
         Response res;
         res.conn = conn;
         res.header_count = 0;
+        res.is_head_request = 0;
         conn->keep_alive = 0;
         if (header_end == NULL) {
             res_status(&res, 431);
@@ -314,6 +322,7 @@ void close_idle_connections(App *app) {
             Response res;
             res.conn = conn;
             res.header_count = 0;
+            res.is_head_request = 0;
             conn->keep_alive = 0;
             res_status(&res, 408);
             res_send(&res, "Request Timeout");

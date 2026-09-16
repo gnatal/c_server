@@ -60,9 +60,47 @@ Gaps vs. an Express-like C framework
   path params, and mounting via app_mount) identically to GET/POST. See
   tests/test_router.c (test_app_put_patch_delete_*, test_router_put_patch_delete_*)
   and lib/CLAUDE.md ("Deny-by-default routing").
-- No app_head/app_options wrapper - HEAD/OPTIONS aren't handled specially (no
-  auto-HEAD-from-GET, no auto-OPTIONS), though app_add_route/router_add_route
-  would take either method string directly if registered by hand.
+- [DONE] app_head/app_options (+ _mw variants) and their router_head/
+  router_options (+ _mw) equivalents (router.c/h) - thin wrappers around
+  app_add_route(_mw)/router_add_route(_mw) exactly like app_put/app_patch/
+  app_delete, so an app can still register an explicit HEAD or OPTIONS
+  handler by hand when it wants one. Two auto-behaviors on top of that, both
+  overridden by an explicit registration for the same path (match_route
+  always tries an exact method match first):
+  - Auto-HEAD-from-GET: match_route (router.c) falls back to the first
+    matching GET route whenever a HEAD request has no explicit HEAD route
+    for that path - the GET handler runs completely normally (building a
+    body as usual), and the new Response.is_head_request flag (app_types.h,
+    set by handle_readable right after a successful parse, based on
+    req->method) is what actually keeps that body off the wire:
+    send_with_content_type (response.c) still computes Content-Length from
+    the full body string either way (a HEAD response must report the same
+    length the equivalent GET would have, RFC 7231 4.3.2), it just skips
+    copying those bytes into conn->out_buf. This applies to whatever the
+    pipeline eventually produces for a HEAD request - a matched handler, or
+    a 404/405 - not just the auto-GET-fallback case, since is_head_request is
+    set on Response before dispatch() runs.
+  - Auto-OPTIONS: chain_next's final fallback (middleware.c) - reached when
+    route is NULL, i.e. no route, explicit or HEAD/GET-implicit, matched -
+    answers an OPTIONS request with 200 + an Allow header instead of falling
+    through to 405, whenever match_route_allowed_methods (already computed
+    by dispatch() for the 405 case) shows the path matches at least one
+    route under some other method. "HEAD" is folded into that Allow list
+    when "GET" is present and "HEAD" isn't already explicit, and "OPTIONS"
+    itself is always added, since reaching this branch means it's
+    implicitly supported. An OPTIONS request to a path matching nothing at
+    all still 404s, same as any other method.
+  See tests/test_router.c (test_app_head_options_register_correct_methods,
+  test_router_head_options_register_correct_methods,
+  test_match_route_head_falls_back_to_get,
+  test_match_route_explicit_head_wins_over_get_fallback),
+  tests/test_middleware.c (test_dispatch_auto_options_*,
+  test_dispatch_options_still_404s_unknown_path,
+  test_dispatch_explicit_options_route_wins_over_auto),
+  tests/test_response.c (test_head_response_omits_body_but_keeps_content_length),
+  tests/test_connection.c (test_handle_readable_head_request_omits_body,
+  test_handle_readable_auto_options_response), and lib/CLAUDE.md
+  ("HEAD/OPTIONS auto-handling").
 - [DONE] Path matches but method doesn't -> now 405, not 404: match_route
   (router.c) is unchanged (still requires an exact method match, still returns
   NULL on mismatch), but dispatch() (middleware.c) now calls the new
