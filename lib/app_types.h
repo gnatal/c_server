@@ -16,17 +16,26 @@
 #define DEFAULT_PORT 8080
 #define BACKLOG 128
 #define MAX_RESPONSE_HEADERS 16
+#define MAX_MULTIPART_PARTS 16
+
+/* RFC 2046 caps a boundary delimiter at 70 characters; this is that cap
+ * plus room for the NUL terminator, used to size boundary buffers
+ * (lib/multipart.h) - a Content-Type declaring a longer boundary is
+ * rejected by multipart_parse_boundary rather than truncated. */
+#define MAX_BOUNDARY_LEN 71
 
 /*
  * Hard ceiling on a request body's size (Content-Length), independent of and
  * much larger than BUF_SIZE - BUF_SIZE now only bounds the headers (see
  * Connection.in_buf below). A body up to this size is received into a
  * connection's own growable buffer rather than being rejected just for not
- * fitting in BUF_SIZE. 1 MiB, matching a typical small-to-medium JSON API
- * payload limit - an app wanting a tighter cap can still enforce one via
- * middleware (see app/middlewares.c: mw_body_size_guard).
+ * fitting in BUF_SIZE. 10 MiB, comfortably fitting an ordinary file upload
+ * (multipart/form-data, lib/multipart.h) alongside the small-to-medium JSON
+ * API payloads this was originally sized for - an app wanting a tighter cap
+ * can still enforce one via middleware (see app/middlewares.c:
+ * mw_body_size_guard).
  */
-#define MAX_BODY_SIZE (1024 * 1024)
+#define MAX_BODY_SIZE (10 * 1024 * 1024)
 
 /*
  * Idle/read timeout: a connection - mid-request (headers or body trickling
@@ -95,6 +104,34 @@ typedef struct {
      * lib/CLAUDE.md ("Body buffering"). */
     char *body;
 } Request;
+
+/*
+ * One part of a body parsed by parse_multipart_body (lib/multipart.h) out of
+ * a multipart/form-data Request.body. `data` points directly into the
+ * buffer that was passed to parse_multipart_body (typically req->body) -
+ * it is never copied, so it's only valid as long as that buffer is, and it
+ * is NOT NUL-terminated (a file part's payload can contain arbitrary bytes,
+ * including embedded NULs) - callers must use data_len, never strlen, to
+ * read it. `filename` is left as the empty string ("") for a plain form
+ * field and non-empty for a file upload part; `content_type` is likewise
+ * empty when the part carried no Content-Type header of its own.
+ */
+typedef struct {
+    char name[128];
+    char filename[256];
+    char content_type[128];
+    const char *data;
+    size_t data_len;
+} MultipartPart;
+
+/* A parsed multipart/form-data body: a bounded array of parts (see
+ * MAX_MULTIPART_PARTS above) - extra parts past the cap are dropped rather
+ * than overflowing the fixed array, same convention as
+ * MAX_HEADERS/MAX_QUERY_PARAMS elsewhere. */
+typedef struct {
+    MultipartPart parts[MAX_MULTIPART_PARTS];
+    int part_count;
+} MultipartForm;
 
 /* Per-connection state that persists across event-loop turns. */
 typedef struct Connection {

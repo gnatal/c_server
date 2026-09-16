@@ -68,7 +68,7 @@ int request_wants_close(const Request *req) {
     return strcmp(req->version, "HTTP/1.1") != 0;
 }
 
-int parse_http_request(const char *raw, Request *req) {
+int parse_http_request(const char *raw, size_t raw_len, Request *req) {
     memset(req, 0, sizeof(*req));
 
     char full_path[512];
@@ -130,9 +130,14 @@ int parse_http_request(const char *raw, Request *req) {
 
     /* body_start may hold more than content_length bytes (e.g. a pipelined
      * next request already sitting in the same buffer) - take exactly
-     * content_length of it, never more, same as before this was heap-backed. */
+     * content_length of it, never more, same as before this was heap-backed.
+     * available comes from raw_len, not strlen(body_start): a body can
+     * contain embedded NUL bytes (a binary file part in a multipart/
+     * form-data body, lib/multipart.h) that strlen would stop at early,
+     * silently truncating a request that was received in full. */
     char *body_start = header_end + 4;
-    size_t available = strlen(body_start);
+    size_t consumed = (size_t)(body_start - raw);
+    size_t available = raw_len > consumed ? raw_len - consumed : 0;
     size_t body_len = (size_t)req->content_length;
     if (body_len > available) {
         body_len = available;

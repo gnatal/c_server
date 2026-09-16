@@ -219,7 +219,28 @@ Gaps vs. an Express-like C framework
   (was the slowloris-shaped gap noted below). This guard is specifically about
   headers now (see the buffer-decoupling entry above) - a body that's merely large
   (but within MAX_BODY_SIZE) no longer hits this at all, it grows the buffer instead.
-- No chunked transfer-encoding, no multipart/form-data, no x-www-form-urlencoded, no cookies
+- No chunked transfer-encoding
+- [DONE] multipart/form-data: the new pure multipart_parse_boundary(content_type,
+  boundary_out, size) and parse_multipart_body(body, body_len, boundary, form)
+  (lib/multipart.c/h) parse a multipart/form-data Request.body into a
+  MultipartForm (app_types.h): a bounded MAX_MULTIPART_PARTS array of
+  MultipartPart{name, filename, content_type, data, data_len}, looked up via
+  multipart_get_part(form, name) mirroring req_get_header/req_get_query's
+  first-match convention. filename is empty for a plain form field,
+  non-empty for a file part. MultipartPart.data points directly into the
+  buffer passed in (no copy) and is NOT NUL-terminated - callers must use
+  data_len, never strlen, since a file part's payload can contain arbitrary
+  bytes including embedded NULs. This also fixed a latent truncation bug:
+  parse_http_request (http_parser.c) used to size req->body via
+  strlen(body_start), which would silently cut a body short at its first
+  embedded NUL byte - it now takes an explicit raw_len (e.g. conn->in_len)
+  instead, so a binary body (a file upload) is copied in full. See
+  tests/test_multipart.c, the binary-body case in
+  tests/test_http_parser.c: test_parse_http_request, lib/CLAUDE.md
+  ("multipart/form-data parsing" and "Body buffering"), and app/handlers.c
+  (handler_upload, POST /upload) for a real usage example.
+- No x-www-form-urlencoded
+- No cookies
 - [DONE] Idle/read timeout for a slow client that trickles a request in a byte at a
   time within the buffer limit (distinct from the buffer-overflow hang, which was
   already fixed above). Connection.last_activity (app_types.h) is set at

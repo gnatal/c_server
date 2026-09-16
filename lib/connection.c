@@ -201,7 +201,7 @@ void handle_readable(App *app, Connection *conn) {
             res.header_count = 0;
             res.is_head_request = 0;
 
-            const int parse_status = parse_http_request(conn->in_buf, &req);
+            const int parse_status = parse_http_request(conn->in_buf, conn->in_len, &req);
             if (parse_status != 0) {
                 conn->keep_alive = 0;
                 /* parse_http_request distinguishes -2 (request-line path too

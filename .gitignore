@@ -56,3 +56,7 @@ Thumbs.db
 # --- Local env / logs ---
 *.log
 .env
+
+# --- Runtime test artifacts ---
+# handler_upload (app/handlers.c) writes uploaded files here for manual testing.
+temp.txt

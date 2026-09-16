@@ -106,7 +106,7 @@ static void test_parse_http_request(void) {
 
     /* Simple GET without query */
     const char *raw_get = "GET /items HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
-    assert(parse_http_request(raw_get, &req) == 0);
+    assert(parse_http_request(raw_get, strlen(raw_get), &req) == 0);
     assert(strcmp(req.method, "GET") == 0);
     assert(strcmp(req.path, "/items") == 0);
     assert(strcmp(req.query, "") == 0);
@@ -126,7 +126,7 @@ static void test_parse_http_request(void) {
      * (found via ASan) - a header-less request is unusual but perfectly
      * legal to receive and must not crash/over-read. */
     const char *raw_no_headers = "GET /ping HTTP/1.1\r\n\r\n";
-    assert(parse_http_request(raw_no_headers, &req) == 0);
+    assert(parse_http_request(raw_no_headers, strlen(raw_no_headers), &req) == 0);
     assert(strcmp(req.path, "/ping") == 0);
     assert(strcmp(req.headers, "") == 0);
     assert(req.header_count == 0);
@@ -134,7 +134,7 @@ static void test_parse_http_request(void) {
 
     /* GET with query string */
     const char *raw_query = "GET /search?q=test&page=2 HTTP/1.1\r\nHost: example.com\r\n\r\n";
-    assert(parse_http_request(raw_query, &req) == 0);
+    assert(parse_http_request(raw_query, strlen(raw_query), &req) == 0);
     assert(strcmp(req.method, "GET") == 0);
     assert(strcmp(req.path, "/search") == 0);
     assert(strcmp(req.query, "q=test&page=2") == 0);
@@ -146,7 +146,7 @@ static void test_parse_http_request(void) {
     /* Percent-encoded path segment is URL-decoded; req->query stays raw
      * (unparsed), only the parsed query-param arrays are decoded. */
     const char *raw_encoded = "GET /a%20b/caf%C3%A9?name=a%20b HTTP/1.1\r\nHost: example.com\r\n\r\n";
-    assert(parse_http_request(raw_encoded, &req) == 0);
+    assert(parse_http_request(raw_encoded, strlen(raw_encoded), &req) == 0);
     assert(strcmp(req.path, "/a b/caf\xC3\xA9") == 0);
     assert(strcmp(req.query, "name=a%20b") == 0);
     assert(strcmp(req_get_query(&req, "name"), "a b") == 0);
@@ -159,7 +159,7 @@ static void test_parse_http_request(void) {
         "Content-Length: 13\r\n"
         "\r\n"
         "Hello, World!";
-    assert(parse_http_request(raw_post, &req) == 0);
+    assert(parse_http_request(raw_post, strlen(raw_post), &req) == 0);
     assert(strcmp(req.method, "POST") == 0);
     assert(strcmp(req.path, "/echo") == 0);
     assert(req.content_length == 13);
@@ -184,7 +184,7 @@ static void test_parse_http_request(void) {
     char *big_raw = malloc(big_head_len + big_len + 1);
     memcpy(big_raw, big_head, big_head_len);
     memcpy(big_raw + big_head_len, big_body, big_len + 1);
-    assert(parse_http_request(big_raw, &req) == 0);
+    assert(parse_http_request(big_raw, big_head_len + big_len, &req) == 0);
     assert(req.content_length == (int)big_len);
     assert(strlen(req.body) == big_len);
     assert(strcmp(req.body, big_body) == 0);
@@ -194,21 +194,21 @@ static void test_parse_http_request(void) {
 
     /* Malformed request line */
     const char *malformed_line = "INVALID\r\n\r\n";
-    assert(parse_http_request(malformed_line, &req) == -1);
+    assert(parse_http_request(malformed_line, strlen(malformed_line), &req) == -1);
 
     /* Missing header terminator */
     const char *no_term = "GET / HTTP/1.1\r\nHost: example.com";
-    assert(parse_http_request(no_term, &req) == -1);
+    assert(parse_http_request(no_term, strlen(no_term), &req) == -1);
 
     /* Negative Content-Length */
     const char *bad_cl = "POST / HTTP/1.1\r\nContent-Length: -5\r\n\r\nbody";
-    assert(parse_http_request(bad_cl, &req) == -1);
+    assert(parse_http_request(bad_cl, strlen(bad_cl), &req) == -1);
 
     /* Content-Length exceeding MAX_BODY_SIZE is still rejected, just at a
      * much higher ceiling than the old BUF_SIZE-based one. */
     char over_head[64];
     snprintf(over_head, sizeof(over_head), "POST / HTTP/1.1\r\nContent-Length: %d\r\n\r\nbody", MAX_BODY_SIZE + 1);
-    assert(parse_http_request(over_head, &req) == -1);
+    assert(parse_http_request(over_head, strlen(over_head), &req) == -1);
 
     /* A request-line path longer than req->path (256 bytes) can hold is
      * rejected with the distinct -2 sentinel (-> 414 URI Too Long,
@@ -222,7 +222,7 @@ static void test_parse_http_request(void) {
     long_path[long_path_len] = '\0';
     char *long_raw = malloc(4 + long_path_len + 13 + 1);
     snprintf(long_raw, 4 + long_path_len + 13 + 1, "GET %s HTTP/1.1\r\n\r\n", long_path);
-    assert(parse_http_request(long_raw, &req) == -2);
+    assert(parse_http_request(long_raw, strlen(long_raw), &req) == -2);
     free(long_path);
     free(long_raw);
 
@@ -235,11 +235,30 @@ static void test_parse_http_request(void) {
     fit_path[fit_path_len] = '\0';
     char *fit_raw = malloc(4 + fit_path_len + 13 + 1);
     snprintf(fit_raw, 4 + fit_path_len + 13 + 1, "GET %s HTTP/1.1\r\n\r\n", fit_path);
-    assert(parse_http_request(fit_raw, &req) == 0);
+    assert(parse_http_request(fit_raw, strlen(fit_raw), &req) == 0);
     assert(strlen(req.path) == fit_path_len);
     free(req.body);
     free(fit_path);
     free(fit_raw);
+
+    /* Binary-safe body: a body containing an embedded NUL byte (e.g. a
+     * binary file inside a multipart/form-data part, lib/multipart.h) must
+     * be copied in full, not truncated at the first NUL the way
+     * strlen(body_start) would - raw_len (not strlen(raw)) is what bounds
+     * how many body bytes parse_http_request copies. */
+    const char binary_body[6] = { 'a', 'b', '\0', 'c', 'd', 'e' };
+    char binary_head[64];
+    snprintf(binary_head, sizeof(binary_head), "POST /upload HTTP/1.1\r\nContent-Length: %d\r\n\r\n",
+             (int)sizeof(binary_body));
+    size_t binary_head_len = strlen(binary_head);
+    char *binary_raw = malloc(binary_head_len + sizeof(binary_body));
+    memcpy(binary_raw, binary_head, binary_head_len);
+    memcpy(binary_raw + binary_head_len, binary_body, sizeof(binary_body));
+    assert(parse_http_request(binary_raw, binary_head_len + sizeof(binary_body), &req) == 0);
+    assert(req.content_length == (int)sizeof(binary_body));
+    assert(memcmp(req.body, binary_body, sizeof(binary_body)) == 0);
+    free(req.body);
+    free(binary_raw);
 }
 
 static void test_status_text(void) {

@@ -41,6 +41,15 @@ int request_wants_close(const Request *req);
  * req->query_names/query_values arrays parse_query_string fills from it are
  * decoded (see parse_query_string).
  *
+ * raw_len is the number of real bytes sitting in raw (e.g. conn->in_len),
+ * not derived from strlen(raw) internally - the request line and headers are
+ * still located via the NUL-terminated string functions (strstr/sscanf,
+ * legitimate since a request line/header block can't contain embedded NULs),
+ * but the body is sized off raw_len so a body containing arbitrary bytes -
+ * including embedded NULs, e.g. a binary file in a multipart/form-data part,
+ * lib/multipart.h - is copied in full rather than being truncated at the
+ * first NUL byte the way strlen(body_start) would.
+ *
  * Returns 0 on success, -1 for most parse failures (malformed request line,
  * missing headers, invalid Content-Length -> connection.c sends 400, except
  * where it re-checks extract_content_length itself for -> 413), and -2
@@ -56,7 +65,7 @@ int request_wants_close(const Request *req);
  * is never modified (this stays a pure function only reading raw bytes and
  * writing out fields on req).
  */
-int parse_http_request(const char *raw, Request *req);
+int parse_http_request(const char *raw, size_t raw_len, Request *req);
 
 /*
  * Pure: splits a raw query string ("a=1&b=2") on '&' then '=' into

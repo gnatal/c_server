@@ -21,6 +21,10 @@ layer stays pure and unit-testable independent of sockets:
 - `tests/test_router.c` tests segment-by-segment tokenization, `:param` extraction, bounded param limits, `*` wildcard matching, and route table resolution.
 - `tests/test_http_parser.c` tests pure request line, query-string splitting/lookup, header, Content-Length boundary extraction, and keep-alive parsing.
 - `tests/test_connection.c` tests non-blocking socket I/O, `handle_readable` state progression, keep-alive persistence, partial buffer reads, 400 Bad Request on malformed inputs, 431 on header overflow, `in_buf` growth/shrink for a body beyond `BUF_SIZE`, and 413 on a `Content-Length` beyond `MAX_BODY_SIZE`, via POSIX `socketpair(2)` with a dedicated `kqueue()` instance without opening live TCP ports.
+- `tests/test_multipart.c` tests `Content-Type` boundary extraction (quoted/unquoted,
+  trailing parameters, non-multipart rejection), part splitting (fields, file parts,
+  a binary payload with an embedded NUL byte), malformed/nameless parts being
+  skipped, and the `MAX_MULTIPART_PARTS` truncation cap.
 
 `App` carries `ServerConfig config` (`app_types.h`), storing runtime parameters such as `config.port` (defaulting to `DEFAULT_PORT` in `app_init`).
 
@@ -387,7 +391,7 @@ a synthetic past `last_activity` rather than sleeping in real time.
 
 ## Body buffering
 A request body can be far larger than `BUF_SIZE` without being rejected, as long as
-it's within `MAX_BODY_SIZE` (1 MiB, `app_types.h`) - this is what closes the
+it's within `MAX_BODY_SIZE` (10 MiB, `app_types.h`) - this is what closes the
 `../pending.txt` gap "Whole request (headers+body) lives in one fixed BUF_SIZE=8192
 buffer - no streaming". This is *not* true incremental streaming to the handler
 (`Handler` is unchanged - still synchronous, still gets a fully-buffered `req->body`)
@@ -431,11 +435,75 @@ require.
   initial `memset`, so `free(NULL)` there is always safe). See
   `tests/test_http_parser.c` (the large-body case in `test_parse_http_request`) and
   `tests/test_connection.c` (`test_handle_readable_large_body_grows_buffer`).
+- **`parse_http_request` takes an explicit `raw_len`, not just `raw`** - the request
+  line and headers are still located via NUL-terminated-string functions
+  (`sscanf`/`strstr`, legitimate since neither can contain embedded NULs), but how
+  many body bytes are available past `header_end + 4` is computed from `raw_len`
+  (`connection.c` passes `conn->in_len`), not `strlen(body_start)`. A body can
+  contain arbitrary bytes - a binary file inside a `multipart/form-data` part (see
+  "multipart/form-data parsing" below) - and `strlen` would stop at the first
+  embedded NUL, silently truncating a request that arrived in full. This was a
+  latent bug even before multipart support existed; nothing previously sent a body
+  with a real NUL byte in it, so it never surfaced. See the embedded-NUL case in
+  `tests/test_http_parser.c: test_parse_http_request`.
 - **`in_buf` shrinks back down once idle.** `flush_connection`'s keep-alive reset
   (`connection.c`) `realloc`s `in_buf` back to `BUF_SIZE` whenever `in_cap` grew past
   it, so one large request doesn't permanently inflate a long-lived keep-alive
   connection's memory footprint. A failed shrink isn't fatal (`realloc` leaves the
   larger block untouched) - the connection just keeps using the bigger buffer.
+
+## multipart/form-data parsing
+`multipart_parse_boundary`/`parse_multipart_body`/`multipart_get_part`
+(`lib/multipart.c/h`) parse a `multipart/form-data` `Request.body` the same way
+`parse_query_string`/`parse_headers` parse the query string/header block - pure
+functions over a `const char *` buffer, called explicitly by a handler rather
+than run automatically by `parse_http_request` (unlike headers/query, which every
+request has; multipart is one specific `Content-Type` a handler opts into
+checking for, the same way `app/handlers.c: has_json_content_type` gates
+`json_parse` on `req->body`).
+- **`multipart_parse_boundary(content_type, boundary_out, size)`** checks
+  `content_type` (from `req_get_header(req, "Content-Type")`) is
+  `multipart/form-data` (prefix match, case-insensitive) and extracts its
+  `boundary=` parameter - bare or double-quoted (RFC 2046 permits either) - into
+  `boundary_out`. Returns `0` (not `1`) for a non-multipart `Content-Type`, a
+  missing boundary parameter, or a boundary longer than `boundary_out` (capped at
+  `MAX_BOUNDARY_LEN`, `app_types.h` - RFC 2046's own 70-character limit on a
+  boundary delimiter) can hold - a handler treats any of these identically to a
+  malformed request, same as `has_json_content_type` finding no JSON.
+- **`parse_multipart_body(body, body_len, boundary, form)`** splits `body` on the
+  RFC 2046 delimiters (`"--boundary\r\n"` between parts, `"--boundary--"` after
+  the last one) using `memmem` rather than `strstr` throughout - `body` is
+  `body_len` raw bytes, not assumed to be a NUL-terminated C string, since a file
+  part's payload can contain arbitrary bytes including embedded NULs (this is why
+  `parse_http_request`'s `raw_len` fix above exists: `body`/`body_len` here is
+  usually `req->body`/`req->content_length`, and `req->body` must actually contain
+  every byte the client sent for this to work). Each part's own small header block
+  (`Content-Disposition`, optionally `Content-Type`) is parsed with the same
+  `extract_param` helper for both `Content-Disposition`'s `name=`/`filename=` and
+  `multipart_parse_boundary`'s own `boundary=` - one quoted-or-bare
+  parameter-value extractor shared by both call sites. A part with no
+  `Content-Disposition name=` is skipped outright (malformed - there's no form
+  field to key it by); parts are collected into `form->parts`, bounded by
+  `MAX_MULTIPART_PARTS` (`app_types.h`) - extra parts past the cap are dropped
+  with a stderr warning rather than overflowing the fixed array, same convention
+  as `MAX_ROUTES`/`MAX_HEADERS` elsewhere (`router.c`).
+- **`MultipartPart.data` (`app_types.h`) points directly into `body` - it is never
+  copied, and it is NOT NUL-terminated.** A `filename` present (non-empty) marks a
+  file part; callers must use `data_len`, never `strlen`, to read `data` either
+  way, since a plain text field's value happens to not contain a NUL in the
+  common case but is still not NUL-terminated at the byte after it (that byte is
+  the start of the next delimiter's `\r`, not a `\0`). `multipart_get_part(form,
+  name)` looks the array up by `Content-Disposition name=`, mirroring
+  `req_get_header`/`req_get_query`'s first-match lookup convention.
+- **No copy, no separate `free()`.** Because every `MultipartPart.data` aliases
+  the caller-owned `body` buffer, `MultipartForm` itself owns no heap memory - a
+  caller frees only what it already owned going in (typically `req->body`, freed
+  by `handle_readable` as usual), same as `Request.header_names`/`query_names`
+  pointing at fixed arrays needing no separate release.
+- See `tests/test_multipart.c` (boundary extraction, field/file-part splitting,
+  the embedded-NUL binary-payload case, nameless-part skipping, and the
+  `MAX_MULTIPART_PARTS` truncation cap) and `app/handlers.c: handler_upload`
+  (`POST /upload`, `app/CLAUDE.md`) for a real usage example.
 
 ## Response headers
 `Response` (`app_types.h`) carries a fixed `headers[MAX_RESPONSE_HEADERS]` array +

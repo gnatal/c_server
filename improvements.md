@@ -7,7 +7,7 @@ bullet point, or where a real follow-up improvement was deliberately deferred.
 
 ## Body buffering vs. true streaming
 
-**What this server does today:** a request body can be up to `MAX_BODY_SIZE` (1 MiB,
+**What this server does today:** a request body can be up to `MAX_BODY_SIZE` (10 MiB,
 `lib/app_types.h`) without being rejected — `Connection.in_buf` grows via `realloc`
 to fit it, and `Request.body` is a `malloc`'d buffer sized to the body's exact
 length. But the `Handler` a route registers still only runs once the *entire* body

@@ -10,6 +10,7 @@ LIB_DIR   = $(BUILD_DIR)/lib
 
 # --- lib: the reusable engine ---
 LIB_SRCS = lib/connection.c lib/http_parser.c lib/router.c lib/response.c lib/middleware.c \
+           lib/multipart.c \
            lib/json/json_parser.c lib/json/json_value.c lib/json/json_writer.c
 LIB_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(LIB_SRCS))
 LIB      = $(LIB_DIR)/libcexpress.a
@@ -26,8 +27,9 @@ ROUTER_TEST_BIN      = $(BIN_DIR)/test_router
 HTTP_PARSER_TEST_BIN = $(BIN_DIR)/test_http_parser
 CONNECTION_TEST_BIN  = $(BIN_DIR)/test_connection
 RESPONSE_TEST_BIN    = $(BIN_DIR)/test_response
+MULTIPART_TEST_BIN   = $(BIN_DIR)/test_multipart
 
-TEST_BINS = $(JSON_TEST_BIN) $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN)
+TEST_BINS = $(JSON_TEST_BIN) $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN)
 
 .PHONY: all run test clean
 
@@ -76,6 +78,10 @@ $(RESPONSE_TEST_BIN): $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(O
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(MULTIPART_TEST_BIN): $(OBJ_DIR)/lib/multipart.o $(OBJ_DIR)/tests/test_multipart.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^
+
 test: $(TEST_BINS)
 	./$(JSON_TEST_BIN)
 	./$(MIDDLEWARE_TEST_BIN)
@@ -83,6 +89,7 @@ test: $(TEST_BINS)
 	./$(HTTP_PARSER_TEST_BIN)
 	./$(CONNECTION_TEST_BIN)
 	./$(RESPONSE_TEST_BIN)
+	./$(MULTIPART_TEST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer

@@ -39,6 +39,10 @@ int main(void) {
    * not serve actual files, just echoes req->path to show the match. */
   app_get(&app, "/files/*", handler_files);
   app_post(&app, "/echo", handler_echo);
+  /* multipart/form-data demo: POST /upload with fields and/or file parts -
+   * handler_upload (lib/multipart.h) echoes each part back as JSON, file
+   * parts as {filename, content_type, size} rather than raw bytes. */
+  app_post(&app, "/upload", handler_upload);
   /* Only this route requires auth - mw_authenticate is per-route middleware,
    * not app-wide, so it doesn't gate "/" or the other routes above. */
   app_post_mw(&app, "/echo/json", handler_echo_json, (Middleware[]){mw_authenticate}, 1);

@@ -3,13 +3,17 @@
 
 #include "app_types.h"
 
-/* This application's own cap on request bodies, independent of and tighter
- * than the engine's hard per-connection body limit (MAX_BODY_SIZE, 1 MiB -
- * see app_types.h). A body between this and MAX_BODY_SIZE is still fully
+/* This application's own cap on request bodies, independent of the engine's
+ * hard per-connection body limit (MAX_BODY_SIZE, 10 MiB - see app_types.h).
+ * Set equal to MAX_BODY_SIZE so a file upload (multipart/form-data,
+ * lib/multipart.h, e.g. POST /upload) isn't rejected by this app-level
+ * policy before the engine's own cap would apply - an app wanting a
+ * tighter app-specific limit can still lower this independently of
+ * MAX_BODY_SIZE. A body between this and MAX_BODY_SIZE is still fully
  * received by the engine (lib/CLAUDE.md, "Body buffering") before this
  * middleware ever gets a chance to reject it - to reject earlier, cheaper,
  * this would need to be an engine-level policy rather than app middleware. */
-#define MAX_APP_BODY_SIZE 4096
+#define MAX_APP_BODY_SIZE MAX_BODY_SIZE
 
 /* Logs "METHOD PATH -> STATUS" once the rest of the pipeline has produced a
  * response (morgan-style access log). */

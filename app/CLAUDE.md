@@ -69,6 +69,25 @@ scoping mechanisms in `lib/`:
   takes ownership of the `JsonValue *` it's given either way (attached on
   success, freed on failure), so the loop doesn't need to check
   `json_new_string`'s return before passing it in.
+- `POST /upload` (`handler_upload`) demonstrates `multipart/form-data` parsing
+  (`lib/CLAUDE.md`, "multipart/form-data parsing"): `multipart_parse_boundary`
+  (`lib/multipart.h`) gates on `Content-Type` the same way `has_json_content_type`
+  gates JSON validation, responding `400` when it's missing/not multipart/has no
+  boundary, then `parse_multipart_body` fills a `MultipartForm` the handler walks
+  to build a JSON echo - a plain field becomes a JSON string of its value, a file
+  part (non-empty `filename`) becomes `{"filename", "content_type", "size"}`
+  instead of its raw bytes, since `MultipartPart.data` isn't NUL-terminated and a
+  file's payload isn't valid to embed as a JSON string as-is. The one `memcpy` in
+  this handler (copying a field's value into a bounded, NUL-terminated stack
+  buffer before `json_new_string`, which expects a C string) truncates past 255
+  bytes - a deliberate demo-sized cap, not an engine limit. Every file part is
+  also written to disk at a fixed path (`temp.txt`, in the server's working
+  directory, overwritten on each request) via `save_part_to_temp_file` - purely
+  to exercise upload handling by hand, not a real storage feature. The path is a
+  hardcoded constant, never `part->filename`, so no client-controlled name ever
+  reaches the filesystem; a successful write adds `"saved_as": "temp.txt"` to
+  that part's JSON entry, a failed one (`fopen`/`fwrite` error) is silently
+  omitted rather than failing the whole request.
 - `GET /files/*` (`handler_files`) demonstrates a trailing route wildcard
   (`lib/CLAUDE.md`, "Route wildcards"): one registration answers any path under
   `/files/`, echoing `req->path` back rather than actually serving a file — there's
@@ -76,14 +95,16 @@ scoping mechanisms in `lib/`:
 - `mw_logger` calls `chain_next` first and logs `METHOD PATH -> STATUS` after it
   returns, once the rest of the pipeline has produced a final `res->status`.
 - `mw_body_size_guard` rejects any request whose `req->content_length` exceeds this
-  app's own `MAX_APP_BODY_SIZE` (4096, independent of and tighter than the engine's
-  hard per-connection `MAX_BODY_SIZE` cap - 1 MiB, `lib/CLAUDE.md`, "Body buffering")
-  via `chain_error(chain, 400, ...)` instead of calling `chain_next`. Since this runs
-  as middleware (after the engine has already fully received the body), a body
-  between 4096 bytes and `MAX_BODY_SIZE` is still received in full before this
-  middleware gets a chance to reject it - an engine-level cap rejects earlier and
-  cheaper, at the cost of being fixed for every app built on this engine rather than
-  being this app's own configurable policy.
+  app's own `MAX_APP_BODY_SIZE` (`app/middlewares.h`, set equal to the engine's hard
+  per-connection `MAX_BODY_SIZE` cap - 10 MiB, `lib/CLAUDE.md`, "Body buffering" -
+  so a file upload via `POST /upload` isn't rejected by this app-level policy
+  before the engine's own cap would apply anyway) via `chain_error(chain, 400,
+  ...)` instead of calling `chain_next`. Since this runs as middleware (after the
+  engine has already fully received the body), this guard only ever rejects what
+  the engine's own `Content-Length` check (413, `lib/CLAUDE.md`, "Body buffering")
+  would already have rejected - it exists as a worked example of an app enforcing
+  its own (potentially tighter) body-size policy independently of the engine's,
+  not because the two currently differ.
 - `mw_authenticate` enforces Bearer token authentication via `Authorization: Bearer <token>`,
   read via `req_get_header(req, "Authorization")` (`lib/http_parser.c`) rather than an
   ad-hoc `strstr` scan over `req->headers` - `req_get_header`'s lookup is
