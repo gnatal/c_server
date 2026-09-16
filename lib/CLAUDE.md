@@ -18,8 +18,8 @@ actually writes. This split exists so the parsing/routing/dispatch/response-buil
 layer stays pure and unit-testable independent of sockets:
 - `tests/test_json.c` tests parsing, AST representation, and stringification.
 - `tests/test_middleware.c` tests pipeline ordering, short-circuiting, 404 fallthrough, and error handlers.
-- `tests/test_router.c` tests segment-by-segment tokenization, `:param` extraction, bounded param limits, and route table resolution.
-- `tests/test_http_parser.c` tests pure request line, query, header, Content-Length boundary extraction, and keep-alive parsing.
+- `tests/test_router.c` tests segment-by-segment tokenization, `:param` extraction, bounded param limits, `*` wildcard matching, and route table resolution.
+- `tests/test_http_parser.c` tests pure request line, query-string splitting/lookup, header, Content-Length boundary extraction, and keep-alive parsing.
 - `tests/test_connection.c` tests non-blocking socket I/O, `handle_readable` state progression, keep-alive persistence, partial buffer reads, 400 Bad Request on malformed inputs, and 431 on header overflow via POSIX `socketpair(2)` with a dedicated `kqueue()` instance without opening live TCP ports.
 
 `App` carries `ServerConfig config` (`app_types.h`), storing runtime parameters such as `config.port` (defaulting to `DEFAULT_PORT` in `app_init`).
@@ -129,9 +129,11 @@ takes effect once mounted into an `App` via `app_mount(app, prefix, router)`
   `MAX_ROUTES` truncation coverage.
 
 ## Deny-by-default routing
-`match_route` returns `NULL` on no match; there is no fallback/wildcard handler, so
-an unregistered path or method is always rejected rather than silently served.
-`match_route` requires an exact `Route.method` string match (`router.c`), so
+`match_route` returns `NULL` on no match; there is no implicit fallback handler, so
+an unregistered path or method is always rejected rather than silently served (a
+route can opt into acting as an explicit catch-all via a trailing `*` pattern —
+see "Route wildcards" below — but that's an app author's deliberate choice, not a
+built-in default). `match_route` requires an exact `Route.method` string match (`router.c`), so
 registering `GET /users/:id` does not make `PUT /users/:id` match it — `match_route`
 itself returns `NULL` either way, regardless of *why* nothing matched.
 
@@ -155,6 +157,53 @@ Convenience wrappers exist for `GET`/`POST`/`PUT`/`PATCH`/`DELETE`
 (`app_get`/`app_post`/`app_put`/`app_patch`/`app_delete`, each with an `_mw`
 variant, plus the `router_*` equivalents) — `HEAD`/`OPTIONS` have no wrapper yet,
 though `app_add_route`/`router_add_route` would take any method string directly.
+
+## Route wildcards
+`match_path` (`router.c`) tokenizes both the route pattern and the request path on
+`/` and compares them segment by segment, same as it always has for literal
+segments and `:name` params. A pattern segment that is exactly `*` is a wildcard,
+handled differently depending on where it falls:
+- **Mid-pattern** (any `*` segment with more pattern segments after it): matches
+  exactly one path segment, like `:name` but without capturing anything into
+  `req->param_*` — there's no name to capture under. Matching then resumes
+  normally against the rest of the pattern, so a pattern with a literal segment
+  after the `*` still requires that literal to match at the same position.
+- **Trailing** (a `*` segment with nothing after it in the pattern): matches that
+  segment *and* everything remaining in the path, so the loop returns a match
+  immediately without consuming the rest of `path`'s tokens one by one. This is
+  the "catch-all" shape (`app_get(&app, "/files/*", handler)` matches
+  `/files/report.pdf` and `/files/2024/q1/report.pdf` alike) — but it still
+  requires at least one path segment after the literal prefix, so it does *not*
+  match the prefix alone (`/files/*` does not match plain `/files`, since there's
+  no segment there for `*` to match against).
+`*` and `:name` segments can be mixed on the same pattern (`/users/:id/*`).
+Wildcards participate in ordinary `match_route`/`dispatch` resolution exactly like
+any other route — including the 405-vs-404 distinction above, since
+`match_route_allowed_methods` also runs `match_path` under the hood. See
+`tests/test_router.c` (`test_match_path_wildcards`) and `app/main.c`
+(`GET /files/*` → `handler_files`).
+
+## Query-string parsing
+`parse_http_request` (`http_parser.c`) still stores the raw query string as-is in
+`req->query` (everything after `?` in the request line, unparsed), but now also
+calls `parse_query_string(req->query, req)` — a pure function taking the query
+string as a `const char *` buffer, per this project's parsing-function
+convention — to split it into `req->query_names`/`req->query_values` (fixed
+`MAX_QUERY_PARAMS`-sized arrays + `query_count`, the same shape as
+`param_names`/`param_values`/`param_count` for route params). Splitting rule: `&`
+separates pairs, `=` separates a pair's key from its value; a pair with no `=`
+(e.g. a bare `flag`) gets an empty-string value rather than being dropped.
+Consecutive `&`s don't produce empty pairs (`strtok_r` skips repeated
+delimiters, same as `match_path` does for repeated `/`). Pairs beyond
+`MAX_QUERY_PARAMS` are dropped rather than overflowing the fixed arrays, same
+pattern as `MAX_ROUTES`/`MAX_PARAMS` elsewhere. `req_get_query(req, name)`
+(`http_parser.c`) looks the parsed array up linearly and returns the *first*
+matching value, mirroring `req_get_param`. **No URL-decoding is performed** —
+`%XX` escapes and `+` (space-as-plus) pass through to the caller as literal
+bytes; a caller that needs decoded values has to decode them itself (see
+`pending.txt`, "No URL-decoding of path/params/query"). See
+`tests/test_http_parser.c` (`test_parse_query_string`) and `app/main.c`
+(`GET /search?q=...` → `handler_search`, via `req_get_query(req, "q")`).
 
 ## Request size limits
 The whole request (headers + body) shares one `BUF_SIZE` (8192-byte) buffer,

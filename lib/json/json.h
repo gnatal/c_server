@@ -15,6 +15,26 @@ JsonValue *json_parse(const char *input, char *err, size_t err_size);
 /* Recursively releases a value returned by json_parse. Safe to call with NULL. */
 void json_free(JsonValue *value);
 
+/*
+ * Builders: construct a JsonValue tree by hand instead of parsing one, for
+ * callers that need to serialize data they already have in memory (e.g.
+ * echoing parsed query-string params back as JSON). Returns NULL on
+ * allocation failure. json_new_string copies value, so the caller's own
+ * buffer doesn't need to outlive the returned JsonValue.
+ */
+JsonValue *json_new_string(const char *value);
+JsonValue *json_new_object(void);
+
+/*
+ * Attaches value under key on object (which must be a JSON_OBJECT, e.g. from
+ * json_new_object), copying key. Takes ownership of value on both success and
+ * failure - json_free(value) has already been called if this returns 0
+ * (out of memory, object is NULL/not an object, or key is NULL), so the
+ * caller must not touch or free value again either way. Once attached,
+ * value is released only as part of object's own json_free.
+ */
+int json_object_set(JsonValue *object, const char *key, JsonValue *value);
+
 /* Accessors: return the given default/NULL when value is NULL or the wrong type, never crash. */
 const JsonValue *json_object_get(const JsonValue *object, const char *key);
 const JsonValue *json_array_get(const JsonValue *array, size_t index);

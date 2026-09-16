@@ -225,6 +225,23 @@ int match_path(const char *pattern, const char *path, Request *req) {
     req->param_count = 0;
 
     while (pattern_tok != NULL && path_tok != NULL) {
+        if (strcmp(pattern_tok, "*") == 0) {
+            char *next_pattern_tok = strtok_r(NULL, "/", &pattern_saveptr);
+            if (next_pattern_tok == NULL) {
+                /* Trailing wildcard (a pattern ending in "/files/" plus a
+                 * trailing "*"): matches this segment and every segment
+                 * after it, so the rest of path never needs checking. Not
+                 * captured as a param - unlike ":name", "*" has no name to
+                 * capture under. */
+                return 1;
+            }
+            /* Mid-path wildcard (e.g. "/users/", "*", "/edit"): matches
+             * exactly this one segment, then matching resumes normally
+             * against the rest of the pattern. */
+            pattern_tok = next_pattern_tok;
+            path_tok = strtok_r(NULL, "/", &path_saveptr);
+            continue;
+        }
         if (pattern_tok[0] == ':') {
             if (req->param_count < MAX_PARAMS) {
                 strncpy(req->param_names[req->param_count], pattern_tok + 1,

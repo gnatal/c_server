@@ -48,6 +48,29 @@ void handler_delete_user(const Request *req, Response *res) {
     res_send(res, "");
 }
 
+void handler_search(const Request *req, Response *res) {
+    /* Echoes every query-string param back as a JSON object, e.g.
+     * ?name=natal&age=32 -> {"name":"natal","age":"32"}. Values are taken
+     * as-is from req->query_values - no URL-decoding (pending.txt) and no
+     * type coercion, everything comes back as a JSON string. */
+    JsonValue *body = json_new_object();
+    for (int i = 0; i < req->query_count && body != NULL; i++) {
+        json_object_set(body, req->query_names[i], json_new_string(req->query_values[i]));
+    }
+
+    char *out = json_stringify(body);
+    res_json(res, out != NULL ? out : "null");
+
+    free(out);
+    json_free(body);
+}
+
+void handler_files(const Request *req, Response *res) {
+    char body[300];
+    snprintf(body, sizeof(body), "Serving: %s\n", req->path);
+    res_send(res, body);
+}
+
 void handler_echo_json(const Request *req, Response *res) {
     char err[128];
     JsonValue *body = json_parse(req->body, err, sizeof(err));

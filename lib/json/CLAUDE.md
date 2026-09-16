@@ -14,12 +14,32 @@ uses it).
 (`app/handlers.c`) are responsible for getting bytes into a NUL-terminated buffer
 first.
 
+## Building a tree by hand
+`json_new_string`/`json_new_object`/`json_object_set` (`json_value.c`) let a caller
+construct a `JsonValue` tree without going through `json_parse` - for serializing
+data the app already has in memory (e.g. `app/handlers.c: handler_search` turning
+parsed query-string params, `lib/http_parser.c`, into a JSON object). They follow
+the same allocation shape as the parser's internal `value_new`/growth pattern
+(`json_parser.c`) but are a separate, independent implementation - `value_new` is
+`static` to `json_parser.c` and not shared - since keeping the builders in
+`json_value.c` alongside the other tree-level operations reads better than
+reaching into the parser file for them. `json_object_set` always consumes the
+`value` it's given, attaching it on success or calling `json_free(value)` on
+failure (bad `object`/`key`, or an allocation failure) - a caller never frees a
+`JsonValue` it has already handed to `json_object_set`, checking the return value
+for success/failure only. Neither builder function ever needs `key`/`value` to
+stay alive past the call - both `json_new_string` and `json_object_set` copy their
+string input rather than retaining the caller's pointer (`copy_string`, a
+malloc+memcpy helper used in place of `strdup` - a POSIX extension, not portable
+libc - or `strcpy`, banned project-wide).
+
 ## Memory lifecycle
-- Every `JsonValue` (root or nested) is heap-allocated (`value_new` → `calloc`) and
-  owned by its parent container once attached; the whole tree is released by one
-  `json_free(root)` call, which recurses into `JSON_ARRAY`/`JSON_OBJECT` children
-  and frees `JSON_STRING` payloads and object member keys along the way. Callers
-  never free nested values directly.
+- Every `JsonValue` (root or nested) is heap-allocated (`value_new` in
+  `json_parser.c`, or the builders above in `json_value.c` - both just `calloc`)
+  and owned by its parent container once attached; the whole tree is released by
+  one `json_free(root)` call, which recurses into `JSON_ARRAY`/`JSON_OBJECT`
+  children and frees `JSON_STRING` payloads and object member keys along the way.
+  Callers never free nested values directly.
 - On a parse error partway through an array/object, the partially-built parent
   `JsonValue` (which already owns everything parsed so far) is passed to
   `json_free` before returning `NULL`, so a failed parse never leaks the nodes it

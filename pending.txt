@@ -76,8 +76,33 @@ Gaps vs. an Express-like C framework
   eventual status. See tests/test_middleware.c
   (test_dispatch_returns_405_*) and tests/test_router.c
   (test_match_route_allowed_methods_*).
-- No wildcards, no query-string parser (req->query is a raw string, no req_get_query(name))
-- No URL-decoding of path/params/query
+- [DONE] Wildcards and a query-string parser:
+  - match_path (router.c) now treats a "*" pattern segment as a wildcard.
+    Mid-pattern it matches exactly one path segment without capturing it
+    (unlike ":name"); as the pattern's last segment it matches that segment
+    and everything after it (a trailing catch-all), so a route registered at
+    "/files/" plus a trailing "*" answers any path under "/files/" without
+    matching "/files" itself (no segment there for "*" to match against).
+    Wildcards go through the same match_route/dispatch path as any other
+    route, including the 404-vs-405 split above. See tests/test_router.c
+    (test_match_path_wildcards), lib/CLAUDE.md ("Route wildcards"), and
+    app/main.c (GET /files/* -> handler_files).
+  - req->query is still the raw, unparsed string (unchanged), but
+    parse_http_request (http_parser.c) now also calls the new
+    parse_query_string(req->query, req) - a pure function taking the query
+    string as a const char* buffer - which splits it on '&' then '=' into
+    fixed req->query_names/query_values arrays (MAX_QUERY_PARAMS cap, extra
+    pairs dropped rather than overflowed, same pattern as MAX_ROUTES/
+    MAX_PARAMS elsewhere; a key with no '=' gets an empty-string value
+    instead of being dropped). req_get_query(req, name) (http_parser.c) then
+    looks that array up by key, mirroring req_get_param. See
+    tests/test_http_parser.c (test_parse_query_string), lib/CLAUDE.md
+    ("Query-string parsing"), and app/main.c (GET /search?q=... ->
+    handler_search).
+- No URL-decoding of path/params/query: req_get_query/req_get_param/req->path
+  all hand back raw bytes - a "%20"/"+" in a query value or path segment is
+  not decoded to a space, so a client sending percent-encoded params still
+  gets them back encoded.
 
 3. Request parsing
 - Headers are one opaque blob scanned with strcasestr - no req_get_header(name) map

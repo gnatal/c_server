@@ -67,6 +67,48 @@ static void test_round_trip(void) {
     json_free(reparsed);
 }
 
+static void test_builders(void) {
+    JsonValue *obj = json_new_object();
+    assert(obj != NULL);
+
+    assert(json_object_set(obj, "name", json_new_string("natal")) == 1);
+    assert(json_object_set(obj, "quote", json_new_string("say \"hi\"")) == 1);
+
+    assert(strcmp(json_as_string(json_object_get(obj, "name"), ""), "natal") == 0);
+    assert(strcmp(json_as_string(json_object_get(obj, "quote"), ""), "say \"hi\"") == 0);
+
+    /* Round-trips through json_stringify with correct escaping - a raw '"'
+     * in the value doesn't corrupt the surrounding JSON syntax. */
+    char *out = json_stringify(obj);
+    assert(out != NULL);
+    assert(strstr(out, "\"quote\":\"say \\\"hi\\\"\"") != NULL);
+
+    JsonValue *reparsed = json_parse(out, NULL, 0);
+    assert(reparsed != NULL);
+    assert(strcmp(json_as_string(json_object_get(reparsed, "quote"), ""), "say \"hi\"") == 0);
+
+    free(out);
+    json_free(reparsed);
+    json_free(obj);
+
+    /* json_new_string copies its input - mutating the caller's buffer
+     * afterward doesn't affect the JsonValue. */
+    char scratch[16];
+    strncpy(scratch, "original", sizeof(scratch) - 1);
+    scratch[sizeof(scratch) - 1] = '\0';
+    JsonValue *copied = json_new_string(scratch);
+    strncpy(scratch, "mutated!", sizeof(scratch) - 1);
+    assert(strcmp(json_as_string(copied, ""), "original") == 0);
+    json_free(copied);
+
+    /* json_object_set rejects a non-object target and still frees value
+     * (no leak, verified via ASan/valgrind in CI rather than an assertion
+     * here) rather than silently doing nothing. */
+    JsonValue *not_an_object = json_parse("42", NULL, 0);
+    assert(json_object_set(not_an_object, "x", json_new_string("y")) == 0);
+    json_free(not_an_object);
+}
+
 static void test_syntax_errors(void) {
     char err[128];
 
@@ -81,6 +123,7 @@ int main(void) {
     test_primitives();
     test_nested_structure();
     test_round_trip();
+    test_builders();
     test_syntax_errors();
     printf("all json tests passed\n");
     return 0;

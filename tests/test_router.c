@@ -87,6 +87,38 @@ static void test_match_path_max_params(void) {
     assert(req_get_param(&req, "p9") == NULL);
 }
 
+static void test_match_path_wildcards(void) {
+    Request req;
+
+    /* Trailing wildcard matches one or many remaining segments. */
+    memset(&req, 0, sizeof(req));
+    assert(match_path("/files/*", "/files/a", &req) == 1);
+    memset(&req, 0, sizeof(req));
+    assert(match_path("/files/*", "/files/a/b/c", &req) == 1);
+
+    /* But not the prefix alone - there's no trailing segment to match "*" against. */
+    memset(&req, 0, sizeof(req));
+    assert(match_path("/files/*", "/files", &req) == 0);
+
+    /* Sibling paths that merely share a prefix don't match. */
+    memset(&req, 0, sizeof(req));
+    assert(match_path("/files/*", "/other/a", &req) == 0);
+
+    /* Mid-path wildcard matches exactly one segment, not capturing a param. */
+    memset(&req, 0, sizeof(req));
+    assert(match_path("/users/*/edit", "/users/42/edit", &req) == 1);
+    assert(req.param_count == 0);
+    memset(&req, 0, sizeof(req));
+    assert(match_path("/users/*/edit", "/users/42/43/edit", &req) == 0);
+    memset(&req, 0, sizeof(req));
+    assert(match_path("/users/*/edit", "/users/42/view", &req) == 0);
+
+    /* Wildcard and named params can combine on the same pattern. */
+    memset(&req, 0, sizeof(req));
+    assert(match_path("/users/:id/*", "/users/42/anything/nested", &req) == 1);
+    assert(strcmp(req_get_param(&req, "id"), "42") == 0);
+}
+
 static void test_match_route(void) {
     App app;
     app_init(&app);
@@ -426,6 +458,7 @@ int main(void) {
     test_match_path_exact_literals();
     test_match_path_params();
     test_match_path_max_params();
+    test_match_path_wildcards();
     test_match_route();
     test_match_route_allowed_methods();
     test_app_add_route_overflow();

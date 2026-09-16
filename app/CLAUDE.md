@@ -44,6 +44,22 @@ scoping mechanisms in `lib/`:
   `handler_delete_user` responds `204 No Content` with an empty body, the
   one handler in this app that doesn't call `res_json`/plain `res_send` with
   a non-empty body.
+- `GET /search` (`handler_search`) echoes every query-string param back as a JSON
+  object (e.g. `?name=natal&age=32` -> `{"name":"natal","age":"32"}`), built via
+  the JSON builder API (`json_new_object`/`json_new_string`/`json_object_set`,
+  `lib/json/json.h`) over `req->query_names`/`query_values`
+  (`req->query_count` entries, populated by `parse_query_string`,
+  `lib/http_parser.c`) rather than `req_get_query` - that accessor is for
+  looking up one known key, not iterating all of them. Every value comes back
+  as a JSON string with no type coercion, and unescaped/undecoded exactly as
+  the client sent it (`lib/CLAUDE.md`, "Query-string parsing"). `json_object_set`
+  takes ownership of the `JsonValue *` it's given either way (attached on
+  success, freed on failure), so the loop doesn't need to check
+  `json_new_string`'s return before passing it in.
+- `GET /files/*` (`handler_files`) demonstrates a trailing route wildcard
+  (`lib/CLAUDE.md`, "Route wildcards"): one registration answers any path under
+  `/files/`, echoing `req->path` back rather than actually serving a file — there's
+  still no static file server (`pending.txt`).
 - `mw_logger` calls `chain_next` first and logs `METHOD PATH -> STATUS` after it
   returns, once the rest of the pipeline has produced a final `res->status`.
 - `mw_body_size_guard` rejects any request whose `req->content_length` exceeds this

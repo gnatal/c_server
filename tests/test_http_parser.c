@@ -107,6 +107,9 @@ static void test_parse_http_request(void) {
     assert(strcmp(req.method, "GET") == 0);
     assert(strcmp(req.path, "/search") == 0);
     assert(strcmp(req.query, "q=test&page=2") == 0);
+    /* parse_http_request also populates the parsed query-param arrays. */
+    assert(strcmp(req_get_query(&req, "q"), "test") == 0);
+    assert(strcmp(req_get_query(&req, "page"), "2") == 0);
 
     /* POST with body and Content-Length */
     const char *raw_post =
@@ -146,10 +149,61 @@ static void test_status_text(void) {
     assert(strcmp(status_text(401), "Unauthorized") == 0);
     assert(strcmp(status_text(403), "Forbidden") == 0);
     assert(strcmp(status_text(404), "Not Found") == 0);
+    assert(strcmp(status_text(405), "Method Not Allowed") == 0);
     assert(strcmp(status_text(431), "Request Header Fields Too Large") == 0);
     assert(strcmp(status_text(500), "Internal Server Error") == 0);
     assert(strcmp(status_text(418), "Unknown") == 0);
     assert(strcmp(status_text(0), "Unknown") == 0);
+}
+
+static void test_parse_query_string(void) {
+    Request req;
+    memset(&req, 0, sizeof(req));
+
+    /* Empty query string yields zero pairs */
+    parse_query_string("", &req);
+    assert(req.query_count == 0);
+    assert(req_get_query(&req, "q") == NULL);
+
+    /* Basic key=value pairs */
+    parse_query_string("q=cats&page=2", &req);
+    assert(req.query_count == 2);
+    assert(strcmp(req_get_query(&req, "q"), "cats") == 0);
+    assert(strcmp(req_get_query(&req, "page"), "2") == 0);
+    assert(req_get_query(&req, "missing") == NULL);
+
+    /* A key with no '=' gets an empty-string value rather than being dropped */
+    parse_query_string("flag&q=cats", &req);
+    assert(req.query_count == 2);
+    assert(strcmp(req_get_query(&req, "flag"), "") == 0);
+    assert(strcmp(req_get_query(&req, "q"), "cats") == 0);
+
+    /* Duplicate key: lookup returns the first occurrence */
+    parse_query_string("q=first&q=second", &req);
+    assert(req.query_count == 2);
+    assert(strcmp(req_get_query(&req, "q"), "first") == 0);
+
+    /* Consecutive '&'s don't produce a spurious empty pair (strtok_r skips
+     * repeated delimiters, same as match_path does for repeated '/'). */
+    parse_query_string("a=1&&b=2", &req);
+    assert(req.query_count == 2);
+    assert(strcmp(req_get_query(&req, "a"), "1") == 0);
+    assert(strcmp(req_get_query(&req, "b"), "2") == 0);
+
+    /* No URL-decoding: '%XX' and '+' pass through as raw bytes. */
+    parse_query_string("name=a%20b&tag=c%2Bd", &req);
+    assert(strcmp(req_get_query(&req, "name"), "a%20b") == 0);
+    assert(strcmp(req_get_query(&req, "tag"), "c%2Bd") == 0);
+
+    /* Overflow: pairs past MAX_QUERY_PARAMS are dropped, not overflowed. */
+    char many[512] = "";
+    for (int i = 0; i < MAX_QUERY_PARAMS + 5; i++) {
+        char pair[16];
+        snprintf(pair, sizeof(pair), "k%d=%d&", i, i);
+        strncat(many, pair, sizeof(many) - strlen(many) - 1);
+    }
+    parse_query_string(many, &req);
+    assert(req.query_count == MAX_QUERY_PARAMS);
 }
 
 int main(void) {
@@ -158,6 +212,7 @@ int main(void) {
     test_request_wants_close();
     test_parse_http_request();
     test_status_text();
+    test_parse_query_string();
 
     printf("all http parser tests passed\n");
     return 0;

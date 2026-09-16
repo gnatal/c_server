@@ -31,6 +31,21 @@ int request_wants_close(const Request *req);
 /* Parses a raw HTTP request buffer into method, path, query, headers and body. */
 int parse_http_request(const char *raw, Request *req);
 
+/*
+ * Pure: splits a raw query string ("a=1&b=2") on '&' then '=' into
+ * req->query_names/query_values, bounded by MAX_QUERY_PARAMS (extra pairs
+ * are dropped rather than overflowing the fixed arrays, same as
+ * MAX_ROUTES/MAX_PARAMS elsewhere). A pair with no '=' (e.g. "flag") gets an
+ * empty-string value. Does not URL-decode %XX sequences or '+' - callers get
+ * the raw bytes. Called by parse_http_request; exposed separately so it can
+ * be unit-tested against a query string directly.
+ */
+void parse_query_string(const char *query, Request *req);
+
+/* Looks up a parsed query-string value by key (e.g. req_get_query(req, "q")
+ * for "?q=cats"), or NULL if that key wasn't present. */
+const char *req_get_query(const Request *req, const char *name);
+
 const char *status_text(int status);
 
 #endif /* HTTP_PARSER_H */

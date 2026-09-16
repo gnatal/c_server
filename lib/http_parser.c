@@ -58,6 +58,7 @@ int parse_http_request(const char *raw, Request *req) {
         strncpy(req->query, qmark + 1, sizeof(req->query) - 1);
     }
     strncpy(req->path, full_path, sizeof(req->path) - 1);
+    parse_query_string(req->query, req);
 
     char *header_start = strstr(raw, "\r\n");
     char *header_end = strstr(raw, "\r\n\r\n");
@@ -91,6 +92,47 @@ int parse_http_request(const char *raw, Request *req) {
     req->body[body_len] = '\0';
 
     return 0;
+}
+
+void parse_query_string(const char *query, Request *req) {
+    req->query_count = 0;
+    if (query[0] == '\0') {
+        return;
+    }
+
+    char buf[sizeof(req->query)];
+    strncpy(buf, query, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *saveptr;
+    char *pair = strtok_r(buf, "&", &saveptr);
+    while (pair != NULL && req->query_count < MAX_QUERY_PARAMS) {
+        char *eq = strchr(pair, '=');
+        const char *value = "";
+        if (eq != NULL) {
+            *eq = '\0';
+            value = eq + 1;
+        }
+
+        char *name_slot = req->query_names[req->query_count];
+        char *value_slot = req->query_values[req->query_count];
+        strncpy(name_slot, pair, sizeof(req->query_names[0]) - 1);
+        name_slot[sizeof(req->query_names[0]) - 1] = '\0';
+        strncpy(value_slot, value, sizeof(req->query_values[0]) - 1);
+        value_slot[sizeof(req->query_values[0]) - 1] = '\0';
+        req->query_count++;
+
+        pair = strtok_r(NULL, "&", &saveptr);
+    }
+}
+
+const char *req_get_query(const Request *req, const char *name) {
+    for (int i = 0; i < req->query_count; i++) {
+        if (strcmp(req->query_names[i], name) == 0) {
+            return req->query_values[i];
+        }
+    }
+    return NULL;
 }
 
 const char *status_text(int status) {

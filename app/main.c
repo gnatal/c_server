@@ -29,6 +29,15 @@ int main(void) {
 
   app_get(&app, "/", handler_home);
   app_get(&app, "/users/:id", handler_get_user);
+  /* Query-string demo: GET /search?q=cats resolves via req_get_query(req, "q")
+   * (lib/http_parser.c) - the query string is parsed into req->query_* once,
+   * up front in parse_http_request, not re-scanned per lookup. */
+  app_get(&app, "/search", handler_search);
+  /* Wildcard demo: a trailing "*" segment matches that segment and everything
+   * after it (lib/router.c: match_path), so this one route answers
+   * GET /files/report.pdf as well as GET /files/2024/q1/report.pdf - it does
+   * not serve actual files, just echoes req->path to show the match. */
+  app_get(&app, "/files/*", handler_files);
   app_post(&app, "/echo", handler_echo);
   /* Only this route requires auth - mw_authenticate is per-route middleware,
    * not app-wide, so it doesn't gate "/" or the other routes above. */

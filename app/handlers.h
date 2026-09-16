@@ -11,5 +11,7 @@ void handler_api_status(const Request *req, Response *res);
 void handler_update_user(const Request *req, Response *res);
 void handler_patch_user(const Request *req, Response *res);
 void handler_delete_user(const Request *req, Response *res);
+void handler_search(const Request *req, Response *res);
+void handler_files(const Request *req, Response *res);
 
 #endif /* HANDLERS_H */

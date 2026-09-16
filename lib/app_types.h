@@ -7,6 +7,7 @@
 #define MAX_MIDDLEWARES 16
 #define MAX_ROUTE_MIDDLEWARES 8
 #define MAX_PARAMS 8
+#define MAX_QUERY_PARAMS 16
 #define MAX_CONNECTIONS 16384
 #define MAX_EVENTS 64
 #define BUF_SIZE 8192
@@ -23,6 +24,16 @@ typedef struct {
     char param_names[MAX_PARAMS][64];
     char param_values[MAX_PARAMS][64];
     int param_count;
+
+    /* Parsed out of `query` (below) by parse_query_string (http_parser.c) at
+     * request-parse time, the same fixed-array-plus-count shape as
+     * param_names/param_values above - bounded by MAX_QUERY_PARAMS rather
+     * than growing, extra pairs past the cap are dropped. A key with no '='
+     * gets an empty-string value. Values are NOT URL-decoded (%XX and '+'
+     * pass through literally) - see req_get_query, http_parser.c. */
+    char query_names[MAX_QUERY_PARAMS][64];
+    char query_values[MAX_QUERY_PARAMS][64];
+    int query_count;
 
     char headers[BUF_SIZE];
     int content_length;

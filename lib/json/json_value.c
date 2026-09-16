@@ -69,3 +69,74 @@ double json_as_number(const JsonValue *value, double default_value) {
 const char *json_as_string(const JsonValue *value, const char *default_value) {
     return (value != NULL && value->type == JSON_STRING) ? value->as.string : default_value;
 }
+
+/* Bounded copy helper for the builders below - malloc+memcpy instead of
+ * strdup (a POSIX extension, not a guaranteed-portable libc function) or
+ * strcpy (banned project-wide). len is strlen(text); the +1 also copies
+ * text's own NUL terminator in the same pass. */
+static char *copy_string(const char *text, size_t len) {
+    char *copy = malloc(len + 1);
+    if (copy == NULL) {
+        return NULL;
+    }
+    memcpy(copy, text, len + 1);
+    return copy;
+}
+
+JsonValue *json_new_string(const char *value) {
+    if (value == NULL) {
+        return NULL;
+    }
+    JsonValue *v = calloc(1, sizeof(JsonValue));
+    if (v == NULL) {
+        return NULL;
+    }
+    v->type = JSON_STRING;
+    v->as.string = copy_string(value, strlen(value));
+    if (v->as.string == NULL) {
+        free(v);
+        return NULL;
+    }
+    return v;
+}
+
+JsonValue *json_new_object(void) {
+    JsonValue *v = calloc(1, sizeof(JsonValue));
+    if (v == NULL) {
+        return NULL;
+    }
+    v->type = JSON_OBJECT;
+    return v;
+}
+
+int json_object_set(JsonValue *object, const char *key, JsonValue *value) {
+    if (object == NULL || object->type != JSON_OBJECT || key == NULL) {
+        json_free(value);
+        return 0;
+    }
+    if (value == NULL) {
+        return 0;
+    }
+
+    char *key_copy = copy_string(key, strlen(key));
+    if (key_copy == NULL) {
+        json_free(value);
+        return 0;
+    }
+
+    /* One member per call rather than parse_object's doubling growth
+     * (json_parser.c) - builder objects are small (a handful of fields at
+     * most), so the simpler realloc-per-call isn't worth the extra state. */
+    JsonMember *grown = realloc(object->as.object.members,
+                                 (object->as.object.count + 1) * sizeof(JsonMember));
+    if (grown == NULL) {
+        free(key_copy);
+        json_free(value);
+        return 0;
+    }
+    object->as.object.members = grown;
+    object->as.object.members[object->as.object.count].key = key_copy;
+    object->as.object.members[object->as.object.count].value = value;
+    object->as.object.count++;
+    return 1;
+}

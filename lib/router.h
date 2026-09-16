@@ -74,6 +74,12 @@ void app_delete_mw(App *app, const char *path, Handler handler,
  * Compares a route pattern (e.g. "/users/:id") against an actual request
  * path segment by segment. Literal segments must match exactly; segments
  * starting with ':' capture the corresponding path segment into req->params.
+ * A "*" segment is a wildcard: mid-pattern (e.g. "/users/" followed by a "*"
+ * segment then "/edit") it matches exactly one path segment without
+ * capturing it; as the pattern's last segment (e.g. "/files/" followed by a
+ * trailing "*") it matches that segment and everything after it, so that
+ * pattern matches "/files/a" and "/files/a/b/c" but not "/files" itself
+ * (no trailing segment to match against).
  */
 int match_path(const char *pattern, const char *path, Request *req);
 
