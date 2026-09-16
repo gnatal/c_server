@@ -1,6 +1,6 @@
 CC = gcc-16
 AR = ar
-CFLAGS = -Wall -Wextra -std=c11 -Ilib
+CFLAGS = -Wall -Wextra -std=c11 -O2 -Ilib
 
 # --- Build output directories (strictly out-of-source) ---
 BUILD_DIR = build

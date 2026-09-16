@@ -258,6 +258,27 @@ lowercase `authorization:` header the way the new case-insensitive lookup does.
 See `tests/test_http_parser.c` (`test_parse_headers`) and `app/CLAUDE.md`
 ("Content-Type-gated body validation").
 
+**Zero-header requests are a real edge case, not a hypothetical one.**
+`parse_http_request` locates the header block via `header_start` (the first
+`"\r\n"` in `raw`, i.e. right after the request line, `+2`) and `header_end`
+(the first `"\r\n\r\n"`, i.e. the blank-line terminator). When at least one
+header line is present these never cross — `header_start` lands before
+`header_end` naturally. But a request with *no* header lines at all (request
+line's own `\r\n` immediately followed by the blank line's `\r\n`, e.g.
+`"GET / HTTP/1.1\r\n\r\n"`) makes the *first* `"\r\n"` in `raw` coincide with
+the start of that `"\r\n\r\n"` itself, so `header_start` (`+2`) lands two
+bytes *past* `header_end`. Previously this pointer subtraction wrapped to a
+huge `size_t`, which the existing `>= sizeof(req->headers)` clamp then capped
+to `8191` — turning an ordinary, spec-legal header-less request into an
+out-of-bounds heap read of up to 8191 bytes via the `memcpy` into
+`req->headers` (found via ASan; reproduces on the live server with e.g.
+`curl -H "Host:" ...` to suppress curl's default `Host` header). `parse_http_request`
+now clamps `header_start` down to `header_end` whenever the former would
+exceed the latter, which is a no-op for every request with real headers and
+makes the zero-header case resolve to an empty header block (`header_len ==
+0`) instead of reading garbage. See `tests/test_http_parser.c`
+(the zero-header case in `test_parse_http_request`).
+
 ## Request size limits
 Headers and body are now bounded independently, at very different sizes - see
 "Body buffering" below for the body side. Headers alone are still hard-capped at
@@ -276,12 +297,38 @@ see below):
   gap noted in `../pending.txt`). This is unaffected by body growth: growth only
   ever triggers once headers are already complete.
 
-There is still no idle/read *timeout* for a slow client trickling bytes in below
-these limits — only the hard buffer-size cutoffs above are enforced. This matters
-more now than it used to: a slow client can hold open up to `MAX_BODY_SIZE` (1 MiB)
-of server-side buffer per connection instead of `BUF_SIZE` (8KB), since a
-Content-Length within that range is never rejected purely for being large - see
-`../pending.txt`.
+The buffer-size cutoffs above only reject a request once it's known to be too big;
+they do nothing about one that's simply too slow to arrive. That gap is closed by
+the idle/read timeout below.
+
+## Idle/read timeout
+`Connection.last_activity` (`app_types.h`) is a `time_t` set at `connection_create`
+(so a connection that never sends a single byte is still bounded) and advanced by
+`handle_readable` on every successful `recv()`. A dedicated `EVFILT_TIMER`
+registered once in `app_listen` (ident `1` — timer idents live in their own
+kqueue namespace, so this never collides with a real connection fd) fires every
+`IDLE_SWEEP_INTERVAL_MS` (1s) and, on each fire, `app_listen`'s event loop calls
+`close_idle_connections(app)` (`connection.c`) instead of routing the event through
+the normal read/write dispatch. `close_idle_connections` walks `app->connections`
+(same direct fd-indexed array `accept_connections`/`connection_close` use) and, for
+every connection whose `now - last_activity >= IDLE_TIMEOUT_SECONDS` (60s):
+- **A write still in flight is left alone even if stale** (`conn->out_buf != NULL`
+  is skipped outright) — that's a slow reader on the *response*, a different
+  problem than this timeout targets (a slow *sender* of the request), and tearing
+  it down here would kill a healthy connection mid-flush. `flush_connection`'s own
+  `EVFILT_WRITE` retry loop is what eventually resolves that connection either way.
+- **A partial request already buffered** (`conn->in_len > 0` — headers or body
+  mid-arrival when the client went quiet) gets a `408 Request Timeout` response
+  before closing, built and sent the same way the 431/500 rejections in
+  `handle_readable` are (`res_send`/`flush_connection`, not a raw `close()`).
+- **An idle keep-alive connection with nothing buffered** (`conn->in_len == 0` —
+  waiting on a next request that never came) is torn down via `connection_close`
+  directly, with no response to send.
+`IDLE_TIMEOUT_SECONDS`/`IDLE_SWEEP_INTERVAL_MS` are compile-time constants in
+`app_types.h`, not `ServerConfig` fields — consistent with every other hard limit
+in this engine (`BUF_SIZE`, `MAX_BODY_SIZE`, ...). See `tests/test_connection.c`
+(`test_close_idle_connections_*`), which drives this deterministically by writing
+a synthetic past `last_activity` rather than sleeping in real time.
 
 ## Body buffering
 A request body can be far larger than `BUF_SIZE` without being rejected, as long as

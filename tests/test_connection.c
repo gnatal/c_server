@@ -328,6 +328,44 @@ static void test_handle_readable_body_too_large_413(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+static void test_handle_readable_path_too_long_414(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    int client_fd = fds[0];
+
+    /* A request-line path longer than req->path (256 bytes) can hold is
+     * rejected with 414 rather than silently truncated (see
+     * lib/CLAUDE.md, "Request size limits"). 300 chars is comfortably under
+     * BUF_SIZE (8192), so this isn't the 431 header-overflow path. */
+    const size_t path_len = 300;
+    char *path = malloc(path_len + 1);
+    path[0] = '/';
+    memset(path + 1, 'a', path_len - 1);
+    path[path_len] = '\0';
+
+    char *req_line = malloc(4 + path_len + 13 + 1);
+    snprintf(req_line, 4 + path_len + 13 + 1, "GET %s HTTP/1.1\r\n\r\n", path);
+    assert(write(fds[1], req_line, strlen(req_line)) == (ssize_t)strlen(req_line));
+    free(path);
+    free(req_line);
+
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 414 URI Too Long") != NULL);
+
+    /* Connection should have been closed */
+    assert(app.connections[client_fd] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_connection_close(void) {
     App app;
     int fds[2];
@@ -355,6 +393,95 @@ static void test_handle_readable_connection_close(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+static void test_close_idle_connections_closes_stale_keep_alive(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    int client_fd = fds[0];
+    /* Idle keep-alive connection (in_len == 0) that's been quiet well past
+     * IDLE_TIMEOUT_SECONDS. */
+    conn->last_activity = time(NULL) - IDLE_TIMEOUT_SECONDS - 1;
+
+    close_idle_connections(&app);
+
+    /* Nothing to respond to - just reclaimed. */
+    assert(app.connections[client_fd] == NULL);
+    char buf[16];
+    ssize_t n = read(fds[1], buf, sizeof(buf));
+    assert(n == 0); /* EOF - fds[0] was closed with nothing written back */
+
+    close(fds[1]);
+    close(app.kq);
+}
+
+static void test_close_idle_connections_408s_stalled_partial_request(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    int client_fd = fds[0];
+
+    /* A request that started but stalled mid-header. */
+    const char *partial = "GET /pi";
+    assert(write(fds[1], partial, strlen(partial)) == (ssize_t)strlen(partial));
+    handle_readable(&app, conn);
+    assert(conn->in_len > 0);
+
+    conn->last_activity = time(NULL) - IDLE_TIMEOUT_SECONDS - 1;
+    close_idle_connections(&app);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 408 Request Timeout") != NULL);
+    assert(app.connections[client_fd] == NULL);
+
+    close(fds[1]);
+    close(app.kq);
+}
+
+static void test_close_idle_connections_leaves_recent_activity_alone(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    conn->last_activity = time(NULL);
+
+    close_idle_connections(&app);
+
+    assert(app.connections[fds[0]] == conn);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+static void test_close_idle_connections_skips_pending_write(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    /* Simulate a write still in flight (e.g. a slow reader on the response
+     * side) - this is a different axis than the read-side idle timeout and
+     * must not be torn down by close_idle_connections. */
+    conn->out_buf = malloc(4);
+    assert(conn->out_buf != NULL);
+    memcpy(conn->out_buf, "ping", 4);
+    conn->out_len = 4;
+    conn->out_sent = 0;
+    conn->last_activity = time(NULL) - IDLE_TIMEOUT_SECONDS - 1;
+
+    close_idle_connections(&app);
+
+    assert(app.connections[fds[0]] == conn);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 int main(void) {
     test_set_nonblocking_and_create();
     test_handle_readable_round_trip_success();
@@ -365,7 +492,12 @@ int main(void) {
     test_handle_readable_header_overflow_431();
     test_handle_readable_large_body_grows_buffer();
     test_handle_readable_body_too_large_413();
+    test_handle_readable_path_too_long_414();
     test_handle_readable_connection_close();
+    test_close_idle_connections_closes_stale_keep_alive();
+    test_close_idle_connections_408s_stalled_partial_request();
+    test_close_idle_connections_leaves_recent_activity_alone();
+    test_close_idle_connections_skips_pending_write();
 
     printf("all connection tests passed\n");
     return 0;

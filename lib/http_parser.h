@@ -41,13 +41,20 @@ int request_wants_close(const Request *req);
  * req->query_names/query_values arrays parse_query_string fills from it are
  * decoded (see parse_query_string).
  *
+ * Returns 0 on success, -1 for most parse failures (malformed request line,
+ * missing headers, invalid Content-Length -> connection.c sends 400, except
+ * where it re-checks extract_content_length itself for -> 413), and -2
+ * specifically for a request-line path longer than req->path (256 bytes)
+ * can hold -> connection.c sends 414 URI Too Long rather than silently
+ * truncating the path into a shorter one the client never asked for.
+ *
  * req->body is malloc'd here, sized to exactly content_length + 1 bytes
  * (never more, even if raw holds trailing bytes past the declared body -
  * e.g. a pipelined next request) - the caller owns it and must free() it
- * once done with the Request, on every return path (a failed parse, return
- * -1, still guarantees req->body is NULL - safe to free unconditionally).
- * raw itself is never modified (this stays a pure function only reading raw
- * bytes and writing out fields on req).
+ * once done with the Request, on every return path (a failed parse still
+ * guarantees req->body is NULL - safe to free unconditionally). raw itself
+ * is never modified (this stays a pure function only reading raw bytes and
+ * writing out fields on req).
  */
 int parse_http_request(const char *raw, Request *req);
 

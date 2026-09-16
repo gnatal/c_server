@@ -81,6 +81,15 @@ int parse_http_request(const char *raw, Request *req) {
         *qmark = '\0';
         strncpy(req->query, qmark + 1, sizeof(req->query) - 1);
     }
+
+    /* full_path (sized 512 above, to comfortably hold a request-line token
+     * before this check) can be longer than req->path (256) can hold -
+     * reject outright (-> 414 URI Too Long, connection.c) rather than
+     * silently truncating into a shorter path that isn't the one the client
+     * asked for. */
+    if (strlen(full_path) >= sizeof(req->path)) {
+        return -2;
+    }
     strncpy(req->path, full_path, sizeof(req->path) - 1);
     url_decode(req->path, req->path, sizeof(req->path), 0);
     parse_query_string(req->query, req);
@@ -91,6 +100,20 @@ int parse_http_request(const char *raw, Request *req) {
         return -1;
     }
     header_start += 2;
+
+    /* A request line with zero header lines after it (request-line CRLF
+     * immediately followed by the blank-line CRLF, e.g. "GET / HTTP/1.1\r\n\r\n")
+     * makes the *first* "\r\n" in raw coincide with the start of that
+     * "\r\n\r\n" terminator itself - header_start (+2) then lands 2 bytes
+     * past header_end instead of at it. Without this clamp, the pointer
+     * subtraction below wraps to a huge size_t (clamped to sizeof(headers)-1
+     * next), turning an ordinary header-less request into an out-of-bounds
+     * heap read via memcpy. Every request with at least one real header line
+     * already has header_start <= header_end naturally, so this is a no-op
+     * there. */
+    if (header_start > header_end) {
+        header_start = header_end;
+    }
 
     size_t header_len = (size_t)(header_end - header_start);
     if (header_len >= sizeof(req->headers)) {
@@ -220,7 +243,9 @@ const char *status_text(int status) {
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
+        case 414: return "URI Too Long";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         default:  return "Unknown";

@@ -2,6 +2,7 @@
 #define APP_TYPES_H
 
 #include <stddef.h>
+#include <time.h>
 
 #define MAX_ROUTES 32
 #define MAX_MIDDLEWARES 16
@@ -26,6 +27,27 @@
  * middleware (see app/middlewares.c: mw_body_size_guard).
  */
 #define MAX_BODY_SIZE (1024 * 1024)
+
+/*
+ * Idle/read timeout: a connection - mid-request (headers or body trickling
+ * in below the size limits in MAX_BODY_SIZE/BUF_SIZE above) or between
+ * keep-alive requests - that goes this long without the server receiving any
+ * bytes from it is closed by the periodic sweep in connection.c
+ * (close_idle_connections). This is what actually bounds a Slowloris-shaped
+ * client: the buffer-size limits above only reject a request once it's
+ * known to be too big, they don't do anything about one that's simply too
+ * slow. Deliberately not part of ServerConfig - every other hard limit in
+ * this engine (BUF_SIZE, MAX_BODY_SIZE, MAX_ROUTES, ...) is a compile-time
+ * constant too, not a runtime knob.
+ */
+#define IDLE_TIMEOUT_SECONDS 60
+
+/* How often the event loop wakes up (via an EVFILT_TIMER registered in
+ * app_listen) to sweep app->connections for timed-out connections - see
+ * close_idle_connections, connection.c. Independent of IDLE_TIMEOUT_SECONDS:
+ * this only bounds how late a timeout is noticed (up to one interval late),
+ * not the timeout duration itself. */
+#define IDLE_SWEEP_INTERVAL_MS 1000
 
 typedef struct {
     char method[8];
@@ -78,6 +100,13 @@ typedef struct {
 typedef struct Connection {
     int fd;
     int keep_alive;
+
+    /* Wall-clock time of the last successful recv() on this fd (set at
+     * connection_create too, so a connection that never sends a single byte
+     * is still bounded). Only ever advanced by reads, never by writes - see
+     * close_idle_connections (connection.c) for why the write side is
+     * deliberately excluded from this timeout. */
+    time_t last_activity;
 
     /* Heap-allocated (connection_create), starting at BUF_SIZE and grown via
      * realloc up to header_len + MAX_BODY_SIZE + 1 when a request's declared

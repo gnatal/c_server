@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/event.h>
 #include <netinet/in.h>
@@ -73,6 +74,7 @@ Connection *connection_create(int fd) {
     }
     conn->in_cap = BUF_SIZE;
     conn->fd = fd;
+    conn->last_activity = time(NULL);
     return conn;
 }
 
@@ -189,6 +191,7 @@ void handle_readable(App *app, Connection *conn) {
 
         conn->in_len += (size_t)n;
         conn->in_buf[conn->in_len] = '\0';
+        conn->last_activity = time(NULL);
 
         if (request_is_complete(conn->in_buf, conn->in_len)) {
             Request req;
@@ -197,15 +200,21 @@ void handle_readable(App *app, Connection *conn) {
             res.status = 200;
             res.header_count = 0;
 
-            if (parse_http_request(conn->in_buf, &req) != 0) {
+            const int parse_status = parse_http_request(conn->in_buf, &req);
+            if (parse_status != 0) {
                 conn->keep_alive = 0;
-                /* parse_http_request folds every parse failure into one -1,
-                 * but a Content-Length that's merely too large (rather than
-                 * malformed/negative) deserves 413, not 400 - re-check the
-                 * same pure function connection.c already relies on
-                 * elsewhere for status-code decisions (cheap: a strcasestr +
-                 * atol scan over headers already sitting in conn->in_buf). */
-                if (extract_content_length(conn->in_buf) == -2) {
+                /* parse_http_request distinguishes -2 (request-line path too
+                 * long -> 414) from every other failure (-1). A -1 still
+                 * folds together a Content-Length that's merely too large
+                 * (rather than malformed/negative), which deserves 413, not
+                 * 400 - re-check the same pure function connection.c already
+                 * relies on elsewhere for status-code decisions (cheap: a
+                 * strcasestr + atol scan over headers already sitting in
+                 * conn->in_buf). */
+                if (parse_status == -2) {
+                    res_status(&res, 414);
+                    res_send(&res, "URI Too Long");
+                } else if (extract_content_length(conn->in_buf) == -2) {
                     res_status(&res, 413);
                     res_send(&res, "Payload Too Large");
                 } else {
@@ -278,6 +287,45 @@ void handle_readable(App *app, Connection *conn) {
     }
 }
 
+void close_idle_connections(App *app) {
+    const time_t now = time(NULL);
+
+    for (int fd = 0; fd < MAX_CONNECTIONS; fd++) {
+        Connection *conn = app->connections[fd];
+        if (conn == NULL) {
+            continue;
+        }
+
+        /* A write still in flight is a slow-reader-on-the-response problem,
+         * not the slow-sender-of-a-request problem this timeout targets -
+         * leave it for flush_connection()/EVFILT_WRITE to keep draining. */
+        if (conn->out_buf != NULL) {
+            continue;
+        }
+
+        if (now - conn->last_activity < IDLE_TIMEOUT_SECONDS) {
+            continue;
+        }
+
+        if (conn->in_len > 0) {
+            /* A request was in progress when the client went quiet - let it
+             * know why before closing, same shape as the 431/500 rejections
+             * in handle_readable(). */
+            Response res;
+            res.conn = conn;
+            res.header_count = 0;
+            conn->keep_alive = 0;
+            res_status(&res, 408);
+            res_send(&res, "Request Timeout");
+            flush_connection(app, conn);
+        } else {
+            /* Idle keep-alive connection that never sent a next request -
+             * nothing to respond to. */
+            connection_close(app, conn);
+        }
+    }
+}
+
 void app_listen(App *app, int port) {
     app->server_fd = create_server_socket(port);
     app->kq = kqueue();
@@ -286,6 +334,16 @@ void app_listen(App *app, int port) {
         exit(EXIT_FAILURE);
     }
     kq_watch(app->kq, app->server_fd, EVFILT_READ, NULL);
+
+    /*
+     * Periodic timer that drives close_idle_connections() - ident 1 is
+     * arbitrary and never collides with a real connection fd: EVFILT_TIMER
+     * idents live in their own namespace, separate from the fd-based idents
+     * EVFILT_READ/EVFILT_WRITE use below.
+     */
+    struct kevent timer_change;
+    EV_SET(&timer_change, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE, 0, IDLE_SWEEP_INTERVAL_MS, NULL);
+    kevent(app->kq, &timer_change, 1, NULL, 0, NULL);
 
     printf("Listening on port %d\n", port);
 
@@ -302,6 +360,11 @@ void app_listen(App *app, int port) {
 
         for (int i = 0; i < n; i++) {
             struct kevent *ev = &events[i];
+
+            if (ev->filter == EVFILT_TIMER) {
+                close_idle_connections(app);
+                continue;
+            }
 
             if ((int)ev->ident == app->server_fd) {
                 accept_connections(app);

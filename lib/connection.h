@@ -48,6 +48,23 @@ void flush_connection(App *app, Connection *conn);
 void handle_readable(App *app, Connection *conn);
 
 /*
+ * Sweeps app->connections for connections that have gone IDLE_TIMEOUT_SECONDS
+ * without the server receiving any bytes (Connection.last_activity) - the
+ * Slowloris-shaped gap where a client trickles a request in too slowly, or
+ * never sends a next request on a keep-alive connection, without ever
+ * tripping the hard buffer-size limits in handle_readable(). A connection
+ * with a write still in flight (conn->out_buf != NULL) is left alone even if
+ * its read side is stale - that's a slow-reading client on the response,
+ * a different problem this function doesn't try to solve. A timed-out
+ * connection with a partial request already buffered (conn->in_len > 0)
+ * gets a 408 response before closing; one that's simply idle between
+ * requests is closed with no response, same as any other idle keep-alive
+ * teardown. Called once per IDLE_SWEEP_INTERVAL_MS from app_listen's event
+ * loop, off a dedicated EVFILT_TIMER registration.
+ */
+void close_idle_connections(App *app);
+
+/*
  * Starts listening and runs a single-threaded event loop: kevent() blocks
  * until a socket is ready, then each event is dispatched to the right
  * handler - no blocking syscalls anywhere in this loop, and no threads.

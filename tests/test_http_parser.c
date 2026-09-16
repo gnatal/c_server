@@ -117,6 +117,21 @@ static void test_parse_http_request(void) {
     assert(strstr(req.headers, "Host: example.com") != NULL);
     free(req.body);
 
+    /* Request line with zero header lines before the blank-line terminator
+     * (request-line CRLF immediately followed by the blank-line CRLF).
+     * Regression test: this used to make the request-line's own "\r\n"
+     * coincide with the start of "\r\n\r\n", producing a negative
+     * header_start-to-header_end distance that wrapped to a huge size_t and
+     * caused an out-of-bounds heap read in the memcpy into req->headers
+     * (found via ASan) - a header-less request is unusual but perfectly
+     * legal to receive and must not crash/over-read. */
+    const char *raw_no_headers = "GET /ping HTTP/1.1\r\n\r\n";
+    assert(parse_http_request(raw_no_headers, &req) == 0);
+    assert(strcmp(req.path, "/ping") == 0);
+    assert(strcmp(req.headers, "") == 0);
+    assert(req.header_count == 0);
+    free(req.body);
+
     /* GET with query string */
     const char *raw_query = "GET /search?q=test&page=2 HTTP/1.1\r\nHost: example.com\r\n\r\n";
     assert(parse_http_request(raw_query, &req) == 0);
@@ -194,6 +209,37 @@ static void test_parse_http_request(void) {
     char over_head[64];
     snprintf(over_head, sizeof(over_head), "POST / HTTP/1.1\r\nContent-Length: %d\r\n\r\nbody", MAX_BODY_SIZE + 1);
     assert(parse_http_request(over_head, &req) == -1);
+
+    /* A request-line path longer than req->path (256 bytes) can hold is
+     * rejected with the distinct -2 sentinel (-> 414 URI Too Long,
+     * connection.c) rather than being silently truncated into a shorter
+     * path the client never asked for. 300 chars is comfortably under the
+     * 511-char sscanf token cap in parse_http_request, but well past 255. */
+    const size_t long_path_len = 300;
+    char *long_path = malloc(long_path_len + 1);
+    long_path[0] = '/';
+    memset(long_path + 1, 'a', long_path_len - 1);
+    long_path[long_path_len] = '\0';
+    char *long_raw = malloc(4 + long_path_len + 13 + 1);
+    snprintf(long_raw, 4 + long_path_len + 13 + 1, "GET %s HTTP/1.1\r\n\r\n", long_path);
+    assert(parse_http_request(long_raw, &req) == -2);
+    free(long_path);
+    free(long_raw);
+
+    /* A path that just fits (255 chars, one under the 256-byte cap) still
+     * parses normally. */
+    const size_t fit_path_len = 255;
+    char *fit_path = malloc(fit_path_len + 1);
+    fit_path[0] = '/';
+    memset(fit_path + 1, 'a', fit_path_len - 1);
+    fit_path[fit_path_len] = '\0';
+    char *fit_raw = malloc(4 + fit_path_len + 13 + 1);
+    snprintf(fit_raw, 4 + fit_path_len + 13 + 1, "GET %s HTTP/1.1\r\n\r\n", fit_path);
+    assert(parse_http_request(fit_raw, &req) == 0);
+    assert(strlen(req.path) == fit_path_len);
+    free(req.body);
+    free(fit_path);
+    free(fit_raw);
 }
 
 static void test_status_text(void) {
@@ -205,7 +251,9 @@ static void test_status_text(void) {
     assert(strcmp(status_text(403), "Forbidden") == 0);
     assert(strcmp(status_text(404), "Not Found") == 0);
     assert(strcmp(status_text(405), "Method Not Allowed") == 0);
+    assert(strcmp(status_text(408), "Request Timeout") == 0);
     assert(strcmp(status_text(413), "Payload Too Large") == 0);
+    assert(strcmp(status_text(414), "URI Too Long") == 0);
     assert(strcmp(status_text(431), "Request Header Fields Too Large") == 0);
     assert(strcmp(status_text(500), "Internal Server Error") == 0);
     assert(strcmp(status_text(418), "Unknown") == 0);
