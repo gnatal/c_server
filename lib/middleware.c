@@ -21,6 +21,14 @@ void chain_next(MiddlewareChain *chain) {
         return;
     }
 
+    const int route_index = chain->index - chain->count;
+    if (route_index < chain->route_middleware_count) {
+        const Middleware mw = chain->route_middlewares[route_index];
+        chain->index++;
+        mw(chain->req, chain->res, chain);
+        return;
+    }
+
     if (chain->final_handler != NULL) {
         chain->final_handler(chain->req, chain->res);
     } else {
@@ -42,6 +50,8 @@ void dispatch(App *app, const Route *route, const Request *req, Response *res) {
     MiddlewareChain chain = {
         .middlewares = app->middlewares,
         .count = app->middleware_count,
+        .route_middlewares = route != NULL ? route->middlewares : NULL,
+        .route_middleware_count = route != NULL ? route->middleware_count : 0,
         .index = 0,
         .final_handler = route != NULL ? route->handler : NULL,
         .error_handler = app->error_handler,

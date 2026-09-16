@@ -25,22 +25,38 @@ layer stays pure and unit-testable independent of sockets:
 
 ## Middleware pipeline
 `dispatch(app, route, req, res)` (`middleware.c`) builds one `MiddlewareChain` per
-request — the app's `middlewares[]` array (registered via `app_use`, run in
-registration order) plus the already-matched `route->handler` (or `NULL`) as the
-chain's `final_handler` — and calls `chain_next` once to start it:
-- Every `Middleware` receives the live `MiddlewareChain *` and must either call
-  `chain_next(chain)` to continue (advances `chain->index`, then either invokes the
-  next middleware or, once exhausted, `final_handler`/a default 404), write a
-  response directly and *not* call `chain_next` (terminates the pipeline there), or
-  call `chain_error(chain, status, message)`.
+request and calls `chain_next` once to start it. The chain walks two arrays back to
+back, then falls through to the handler:
+1. the app's `middlewares[]` (registered via `app_use`, run in registration order,
+   app-wide — every request passes through these, including ones that end up
+   404ing), then
+2. the matched route's own `middlewares[]` (registered via `app_get_mw`/
+   `app_post_mw`/`app_add_route_mw`, stored directly on the `Route` — only requests
+   that match that specific route run these), then
+3. `route->handler` (`final_handler`) — or a default 404 if `route` is `NULL`.
+
+`chain->index` counts continuously across both arrays: `chain_next` first drains
+`middlewares[0..count)`, then `route_middlewares[0..route_middleware_count)`
+(`chain->index - chain->count` gives the position within the route array), then
+invokes `final_handler`. This is why route middleware always runs *after* every
+app-wide middleware and *before* the handler, regardless of registration order.
+- Every `Middleware` (app-wide or per-route) receives the live `MiddlewareChain *`
+  and must either call `chain_next(chain)` to continue, write a response directly
+  and *not* call `chain_next` (terminates the pipeline there), or call
+  `chain_error(chain, status, message)`.
 - `chain_error` is the C analogue of Express's `(err, req, res, next)`: it hands off
   to the app's single registered `ErrorHandler` (`app_use_error`), or — if none is
   registered — falls back to `res_status`+`res_send` with the given status/message
   directly. There is only one error handler per app (last `app_use_error` call wins),
   not a chain of them.
-- Middleware is app-wide only — there is no path-scoping yet (`app_use` middleware
-  runs on every request, including ones that end up 404ing). Path-scoped/mounted
-  middleware is future work (`../pending.txt`, section 2 — sub-routers).
+- Per-route middleware is scoped to that one route (a `Route`'s
+  `Middleware[MAX_ROUTE_MIDDLEWARES]` + `middleware_count`, set at registration time
+  by `app_add_route_mw` in `router.c`) — unlike `app_use`, it does not run for other
+  routes or for 404s. There is still no *prefix*-scoped/mounted middleware (e.g. all
+  of `/api/*`) — that's future work (`../pending.txt`, section 2 — sub-routers).
+  Registering more than `MAX_ROUTE_MIDDLEWARES` for one route truncates the list
+  (stderr warning) rather than overflowing the fixed array, same as
+  `MAX_ROUTES`/`MAX_MIDDLEWARES` elsewhere.
 - Because `chain_next` is a plain synchronous call (no deferred/async dispatch
   anywhere in this engine), a middleware that calls `chain_next(chain)` and then does
   more work afterward (e.g. logging) runs that code *after* the entire rest of the
@@ -48,7 +64,7 @@ chain's `final_handler` — and calls `chain_next` once to start it:
   `res->status` is final by then. See `app/middlewares.c: mw_logger`.
 - Route `Handler`s themselves are not given a `MiddlewareChain *` and so cannot call
   `chain_next`/`chain_error` — they remain the terminal node of the pipeline exactly
-  as before; only middleware registered via `app_use` participates in chaining.
+  as before; only middleware (app-wide or per-route) participates in chaining.
 
 ## Deny-by-default routing
 `match_route` returns `NULL` on no match; `handle_readable` turns that into a 404.

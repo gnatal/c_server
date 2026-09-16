@@ -13,6 +13,11 @@ void app_init(App *app) {
 }
 
 void app_add_route(App *app, const char *method, const char *path, Handler handler) {
+    app_add_route_mw(app, method, path, handler, NULL, 0);
+}
+
+void app_add_route_mw(App *app, const char *method, const char *path, Handler handler,
+                       const Middleware *middlewares, int middleware_count) {
     if (app->route_count >= MAX_ROUTES) {
         fprintf(stderr, "app_add_route: MAX_ROUTES exceeded\n");
         return;
@@ -23,6 +28,15 @@ void app_add_route(App *app, const char *method, const char *path, Handler handl
     strncpy(route->path, path, sizeof(route->path) - 1);
     route->path[sizeof(route->path) - 1] = '\0';
     route->handler = handler;
+
+    if (middleware_count > MAX_ROUTE_MIDDLEWARES) {
+        fprintf(stderr, "app_add_route_mw: MAX_ROUTE_MIDDLEWARES exceeded, truncating\n");
+        middleware_count = MAX_ROUTE_MIDDLEWARES;
+    }
+    for (int i = 0; i < middleware_count; i++) {
+        route->middlewares[i] = middlewares[i];
+    }
+    route->middleware_count = middleware_count;
 }
 
 void app_get(App *app, const char *path, Handler handler) {
@@ -31,6 +45,16 @@ void app_get(App *app, const char *path, Handler handler) {
 
 void app_post(App *app, const char *path, Handler handler) {
     app_add_route(app, "POST", path, handler);
+}
+
+void app_get_mw(App *app, const char *path, Handler handler,
+                 const Middleware *middlewares, int middleware_count) {
+    app_add_route_mw(app, "GET", path, handler, middlewares, middleware_count);
+}
+
+void app_post_mw(App *app, const char *path, Handler handler,
+                  const Middleware *middlewares, int middleware_count) {
+    app_add_route_mw(app, "POST", path, handler, middlewares, middleware_count);
 }
 
 int match_path(const char *pattern, const char *path, Request *req) {

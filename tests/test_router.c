@@ -14,6 +14,18 @@ static void dummy_handler_b(const Request *req, Response *res) {
     (void)res;
 }
 
+static void dummy_mw_a(const Request *req, Response *res, MiddlewareChain *chain) {
+    (void)req;
+    (void)res;
+    (void)chain;
+}
+
+static void dummy_mw_b(const Request *req, Response *res, MiddlewareChain *chain) {
+    (void)req;
+    (void)res;
+    (void)chain;
+}
+
 static void test_match_path_exact_literals(void) {
     Request req;
     memset(&req, 0, sizeof(req));
@@ -139,12 +151,60 @@ static void test_app_add_route_overflow(void) {
     assert(app.route_count == MAX_ROUTES);
 }
 
+static void test_app_get_mw_stores_route_middleware(void) {
+    App app;
+    app_init(&app);
+
+    Middleware mws[] = { dummy_mw_a, dummy_mw_b };
+    app_get_mw(&app, "/protected", dummy_handler_a, mws, 2);
+
+    assert(app.route_count == 1);
+    const Route *route = &app.routes[0];
+    assert(route->middleware_count == 2);
+    assert(route->middlewares[0] == dummy_mw_a);
+    assert(route->middlewares[1] == dummy_mw_b);
+
+    /* app_get (no middleware) still yields a route with zero middleware. */
+    app_get(&app, "/open", dummy_handler_a);
+    assert(app.routes[1].middleware_count == 0);
+}
+
+static void test_app_post_mw_stores_route_middleware(void) {
+    App app;
+    app_init(&app);
+
+    Middleware mws[] = { dummy_mw_a };
+    app_post_mw(&app, "/protected", dummy_handler_b, mws, 1);
+
+    assert(app.route_count == 1);
+    assert(app.routes[0].middleware_count == 1);
+    assert(app.routes[0].middlewares[0] == dummy_mw_a);
+}
+
+static void test_app_add_route_mw_truncates_overflow(void) {
+    App app;
+    app_init(&app);
+
+    Middleware mws[MAX_ROUTE_MIDDLEWARES + 2];
+    for (int i = 0; i < MAX_ROUTE_MIDDLEWARES + 2; i++) {
+        mws[i] = dummy_mw_a;
+    }
+
+    app_add_route_mw(&app, "GET", "/many", dummy_handler_a, mws, MAX_ROUTE_MIDDLEWARES + 2);
+
+    assert(app.route_count == 1);
+    assert(app.routes[0].middleware_count == MAX_ROUTE_MIDDLEWARES);
+}
+
 int main(void) {
     test_match_path_exact_literals();
     test_match_path_params();
     test_match_path_max_params();
     test_match_route();
     test_app_add_route_overflow();
+    test_app_get_mw_stores_route_middleware();
+    test_app_post_mw_stores_route_middleware();
+    test_app_add_route_mw_truncates_overflow();
 
     printf("all router tests passed\n");
     return 0;

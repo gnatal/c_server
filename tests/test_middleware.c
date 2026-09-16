@@ -57,7 +57,7 @@ static void test_middlewares_run_in_order_then_handler(void) {
     app_use(&app, mw_a);
     app_use(&app, mw_b);
 
-    Route route = { "GET", "/", handler_ok };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
@@ -88,7 +88,7 @@ static void test_middleware_can_short_circuit(void) {
     app_init(&app);
     app_use(&app, mw_short_circuit);
 
-    Route route = { "GET", "/", handler_ok };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
@@ -154,7 +154,7 @@ static void test_chain_error_invokes_registered_error_handler(void) {
     app_use(&app, mw_fails);
     app_use_error(&app, error_handler_capture);
 
-    Route route = { "GET", "/", handler_ok };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
@@ -174,7 +174,7 @@ static void test_chain_error_default_fallback_without_handler(void) {
     app_init(&app);
     app_use(&app, mw_fails);
 
-    Route route = { "GET", "/", handler_ok };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
@@ -188,12 +188,108 @@ static void test_chain_error_default_fallback_without_handler(void) {
     free_conn(conn);
 }
 
+static void mw_c(const Request *req, Response *res, MiddlewareChain *chain) {
+    (void)req;
+    (void)res;
+    record(4);
+    chain_next(chain);
+}
+
+static void test_route_middleware_runs_after_app_wide_before_handler(void) {
+    g_order_len = 0;
+    g_handler_called = 0;
+
+    App app;
+    app_init(&app);
+    app_use(&app, mw_a);
+
+    Middleware route_mw[] = { mw_b, mw_c };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    route.middlewares[0] = route_mw[0];
+    route.middlewares[1] = route_mw[1];
+    route.middleware_count = 2;
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    dispatch(&app, &route, &req, &res);
+
+    assert(g_handler_called == 1);
+    assert(g_order_len == 4);
+    assert(g_order[0] == 1 && g_order[1] == 2 && g_order[2] == 4 && g_order[3] == 3);
+    assert(res.status == 200);
+
+    free_conn(conn);
+}
+
+static void test_route_without_middleware_only_runs_app_wide(void) {
+    g_order_len = 0;
+    g_handler_called = 0;
+
+    App app;
+    app_init(&app);
+    app_use(&app, mw_a);
+
+    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    Request req;
+    memset(&req, 0, sizeof(req));
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    dispatch(&app, &route, &req, &res);
+
+    assert(g_handler_called == 1);
+    assert(g_order_len == 2);
+    assert(g_order[0] == 1 && g_order[1] == 3);
+
+    free_conn(conn);
+}
+
+static void mw_route_short_circuit(const Request *req, Response *res, MiddlewareChain *chain) {
+    (void)req;
+    (void)chain;
+    res_status(res, 401);
+    res_send(res, "route unauthorized");
+}
+
+static void test_route_middleware_can_short_circuit_before_handler(void) {
+    g_order_len = 0;
+    g_handler_called = 0;
+
+    App app;
+    app_init(&app);
+    app_use(&app, mw_a);
+
+    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    route.middlewares[0] = mw_route_short_circuit;
+    route.middleware_count = 1;
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    dispatch(&app, &route, &req, &res);
+
+    assert(g_handler_called == 0);
+    assert(g_order_len == 1 && g_order[0] == 1);
+    assert(res.status == 401);
+    assert(strstr(conn->out_buf, "route unauthorized") != NULL);
+
+    free_conn(conn);
+}
+
 int main(void) {
     test_middlewares_run_in_order_then_handler();
     test_middleware_can_short_circuit();
     test_dispatch_falls_through_to_404_without_route();
     test_chain_error_invokes_registered_error_handler();
     test_chain_error_default_fallback_without_handler();
+    test_route_middleware_runs_after_app_wide_before_handler();
+    test_route_without_middleware_only_runs_app_wide();
+    test_route_middleware_can_short_circuit_before_handler();
 
     printf("All middleware tests passed.\n");
     return 0;

@@ -25,13 +25,14 @@ int main(void) {
 
   app_use(&app, mw_logger);
   app_use(&app, mw_body_size_guard);
-  // app_use(&app, mw_authenticate);
   app_use_error(&app, error_handler_json);
 
   app_get(&app, "/", handler_home);
   app_get(&app, "/users/:id", handler_get_user);
   app_post(&app, "/echo", handler_echo);
-  app_post(&app, "/echo/json", handler_echo_json);
+  /* Only this route requires auth - mw_authenticate is per-route middleware,
+   * not app-wide, so it doesn't gate "/" or the other routes above. */
+  app_post_mw(&app, "/echo/json", handler_echo_json, (Middleware[]){mw_authenticate}, 1);
 
   app_listen(&app, app.config.port);
 

@@ -11,9 +11,14 @@ route bodies; each one is a terminal function — the engine's `Middleware` pipe
 participate in chaining (no `next` access), so they still just call
 `res_send`/`res_json`/`res_status` directly as before.
 
-`middlewares.c` holds this app's concrete middleware/error-handler instances,
-registered in `main.c` in this order — `mw_logger`, `mw_body_size_guard`, `mw_authenticate`,
-then `error_handler_json` as the error handler:
+`middlewares.c` holds this app's concrete middleware/error-handler instances.
+`main.c` registers `mw_logger` and `mw_body_size_guard` app-wide via `app_use` (they
+run ahead of every request), registers `error_handler_json` as the error handler,
+and attaches `mw_authenticate` as *per-route* middleware on just
+`POST /echo/json` via `app_post_mw(&app, "/echo/json", handler_echo_json,
+(Middleware[]){mw_authenticate}, 1)` — every other route (`/`, `/users/:id`,
+`/echo`) is reachable without a token, since `app_get`/`app_post` register a route
+with zero route-level middleware:
 - `mw_logger` calls `chain_next` first and logs `METHOD PATH -> STATUS` after it
   returns, once the rest of the pipeline has produced a final `res->status`.
 - `mw_body_size_guard` rejects any request whose `req->content_length` exceeds this
@@ -24,7 +29,8 @@ then `error_handler_json` as the error handler:
   Tokens are verified against the configured key using constant-time comparison
   (`keys_match`) to avoid timing side-channels. The expected key is resolved hierarchically:
   explicit setter (`mw_authenticate_set_key`) → `API_KEY` environment variable → default
-  fallback key.
+  fallback key. Being route-scoped rather than app-wide (`lib/CLAUDE.md`), it only
+  runs on the route(s) it's attached to.
 - `error_handler_json` is the app's single `ErrorHandler`: anything routed to
   `chain_error` (such as body-size or authentication violations) comes back as
   `{"error": "..."}` instead of the engine's default plain-text fallback.

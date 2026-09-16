@@ -5,6 +5,7 @@
 
 #define MAX_ROUTES 32
 #define MAX_MIDDLEWARES 16
+#define MAX_ROUTE_MIDDLEWARES 8
 #define MAX_PARAMS 8
 #define MAX_CONNECTIONS 16384
 #define MAX_EVENTS 64
@@ -62,33 +63,48 @@ typedef struct {
 /* req is never mutated by a handler once routing has filled in its params. */
 typedef void (*Handler)(const Request *req, Response *res);
 
+/* Forward-declared: Middleware/ErrorHandler take a MiddlewareChain *, and
+ * MiddlewareChain in turn holds a Middleware array, so the chain's tag name
+ * has to exist before either function-pointer typedef below. Declared here
+ * (ahead of Route) so Route can carry its own fixed Middleware array. */
+typedef struct MiddlewareChain MiddlewareChain;
+
+/* Request middleware (app-wide via app_use, or per-route via app_get_mw/
+ * app_post_mw). Must either continue the pipeline via chain_next(chain),
+ * terminate it by writing a response directly (res_send/res_json), or
+ * terminate it via chain_error(chain, ...). */
+typedef void (*Middleware)(const Request *req, Response *res, MiddlewareChain *chain);
+
 typedef struct {
     char method[8];
     char path[256];
     Handler handler;
-} Route;
 
-/* Forward-declared: Middleware/ErrorHandler take a MiddlewareChain *, and
- * MiddlewareChain in turn holds a Middleware array, so the chain's tag name
- * has to exist before either function-pointer typedef below. */
-typedef struct MiddlewareChain MiddlewareChain;
+    /* Per-route middleware, registered via app_get_mw/app_post_mw. Runs in
+     * dispatch() after the app-wide middlewares and before this handler.
+     * Fixed-size + count (like route_count/middleware_count/param_count
+     * elsewhere) rather than a NULL-terminated variadic, so a forgotten
+     * sentinel can't silently under-run the array. */
+    Middleware middlewares[MAX_ROUTE_MIDDLEWARES];
+    int middleware_count;
+} Route;
 
 /* C analogue of Express's (err, req, res, next): the app's single
  * centralized error handler, invoked via chain_error() instead of a thrown
  * exception. */
 typedef void (*ErrorHandler)(int status, const char *message, const Request *req, Response *res);
 
-/* App-wide request middleware. Must either continue the pipeline via
- * chain_next(chain), terminate it by writing a response directly
- * (res_send/res_json), or terminate it via chain_error(chain, ...). */
-typedef void (*Middleware)(const Request *req, Response *res, MiddlewareChain *chain);
-
-/* One request's walk through the app-wide middleware list, ending at the
- * matched route's Handler (or a 404 if route is NULL). Built fresh per
- * request by dispatch(); middleware advances it via chain_next(). */
+/* One request's walk through the app-wide middlewares, then the matched
+ * route's own middlewares, ending at its Handler (or a 404 if route is
+ * NULL). Built fresh per request by dispatch(); middleware advances it via
+ * chain_next(). chain->index counts continuously across both arrays - it
+ * first exhausts middlewares[0..count), then route_middlewares[0..
+ * route_middleware_count), then falls through to final_handler. */
 struct MiddlewareChain {
     const Middleware *middlewares;
     int count;
+    const Middleware *route_middlewares;
+    int route_middleware_count;
     int index;
     Handler final_handler;
     ErrorHandler error_handler;

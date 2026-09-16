@@ -19,15 +19,17 @@ Gaps vs. an Express-like C framework
   See lib/middleware_test.c for pipeline/error-handler tests, and
   app/middlewares.c (mw_logger, mw_body_size_guard, error_handler_json) for a real
   usage example wired up in app/main.c.
-- No per-route middleware: app_use() only registers app-wide middleware, so there's
-  no way to require e.g. mw_authenticate on just /echo/json without also gating /.
-  Planned shape: attach an explicit array + count to a Route at registration time -
-  app_get_mw(&app, path, handler, (Middleware[]){mw1, mw2}, 2) - stored in a fixed
-  Middleware[MAX_ROUTE_MIDDLEWARES] on Route, run in dispatch() after the app-wide
-  ones and before the handler. Preferred over a NULL-terminated variadic
-  (app_get_mw(..., mw1, mw2, NULL)) since a forgotten sentinel there is a silent
-  footgun, and this codebase already favors explicit bounded arrays+counts
-  (route_count, param_count, middleware_count) over that pattern.
+- [DONE] Per-route middleware: app_get_mw()/app_post_mw()/app_add_route_mw() attach
+  an explicit Middleware[MAX_ROUTE_MIDDLEWARES] + middleware_count to a Route at
+  registration time (app_types.h, router.c/h). dispatch() (middleware.c) walks
+  app-wide middleware first, then the matched route's own middleware, then the
+  handler - chain->index counts continuously across both arrays. A route registered
+  via plain app_get/app_post still gets middleware_count 0 (no behavior change).
+  Registering more than MAX_ROUTE_MIDDLEWARES truncates with a stderr warning
+  rather than overflowing the fixed array, same as MAX_ROUTES/MAX_MIDDLEWARES.
+  See tests/test_middleware.c and tests/test_router.c for pipeline-ordering/
+  short-circuit/overflow tests, and app/main.c (mw_authenticate now scoped to
+  just POST /echo/json instead of gating every route) for a real usage example.
 - Prefix-scoped middleware (app_use(&app, "/api", mw), only runs when req->path
   starts with that prefix) is the more Express-idiomatic alternative/complement -
   effectively the same work as sub-router mounting below, so tackle them together.
