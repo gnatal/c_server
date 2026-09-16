@@ -7,6 +7,10 @@ Standalone unit and integration test suites compiled independently into `build/b
 - `test_router.c`: Route registration limits (`MAX_ROUTES`), literal pattern matching, parameter tokenization (`:id`), and route param lookup (`req_get_param`).
 - `test_http_parser.c`: Pure buffer parsing of HTTP/1.1 request lines, header scanning, Content-Length bounds enforcement, and keep-alive header determination.
 - `test_connection.c`: Non-blocking socket I/O, `handle_readable` buffer progression, keep-alive connection reuse, partial buffer reads, and buffer overflow cutoff (431 Request Header Fields Too Large / 400 Bad Request) via POSIX `socketpair(2)` connected to an isolated `kqueue()` instance without binding to physical network ports.
+- `test_response.c`: `res_set_header` behavior - custom headers appear in the built
+  response, same-name overwrite (case-insensitive), `Content-Length`/`Connection`
+  rejected as reserved, a custom `Content-Type` overriding the default, and the
+  `MAX_RESPONSE_HEADERS` cap being enforced rather than overflowed.
 
 ## Socket Mocking Strategy (`test_connection.c`)
 - Sockets are created in pairs via `socketpair(AF_UNIX, SOCK_STREAM, 0, fds)`.

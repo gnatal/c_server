@@ -71,6 +71,31 @@ malformed or hostile client stall a connection slot forever:
 There is still no idle/read *timeout* for a slow client trickling bytes in below
 these limits — only the hard buffer-size cutoff above is enforced.
 
+## Response headers
+`Response` (`app_types.h`) carries a fixed `headers[MAX_RESPONSE_HEADERS]` array +
+`header_count`, set via `res_set_header(res, name, value)` (`response.c`) ahead of
+`res_send`/`res_json`. Rules enforced at set-time, not send-time:
+- A second `res_set_header` call with the same name (case-insensitive) overwrites
+  the stored value in place rather than appending a duplicate header line.
+- `Content-Length` and `Connection` are rejected outright (logged to stderr, not
+  stored) - both are computed by `send_with_content_type` itself (from `strlen(body)`
+  and `conn->keep_alive`), so letting a handler override them would let the header
+  and the actual bytes/socket state disagree.
+- `Content-Type` *can* be set this way, and if present takes priority over the
+  hardcoded default `res_send`/`res_json` pass to `send_with_content_type` - the
+  custom value is used once and the default is suppressed, rather than emitting
+  both.
+- Once `header_count` reaches `MAX_RESPONSE_HEADERS`, further `res_set_header` calls
+  are dropped (logged to stderr) rather than overflowing the fixed array - same
+  bounded-array-over-sentinel reasoning as `route_count`/`middleware_count`/
+  `param_count` elsewhere in this engine.
+`send_with_content_type` builds the status line, the three built-in headers, and
+every stored custom header into one fixed `RESPONSE_HEADER_BUF_SIZE` (8192-byte)
+stack buffer via a running offset, checking each `snprintf` for truncation before
+advancing it; on overflow (headers too large to fit) the connection is dropped
+(`out_len = 0`, `keep_alive = 0`) the same way an `out_buf` allocation failure is
+handled, rather than sending a truncated/malformed response.
+
 ## Memory lifecycle
 - `Connection` (`connection_create`/`connection_close`): one `calloc` per accepted
   fd, freed exactly once in `connection_close`, which also deregisters the fd from

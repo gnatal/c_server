@@ -11,6 +11,7 @@
 #define BUF_SIZE 8192
 #define DEFAULT_PORT 8080
 #define BACKLOG 128
+#define MAX_RESPONSE_HEADERS 16
 
 typedef struct {
     char method[8];
@@ -41,8 +42,21 @@ typedef struct Connection {
 } Connection;
 
 typedef struct {
+    char name[64];
+    char value[256];
+} ResponseHeader;
+
+typedef struct {
     Connection *conn;
     int status;
+
+    /* Extra headers set via res_set_header(), sent in addition to the
+     * Content-Type/Content-Length/Connection headers that res_send/res_json
+     * always emit. "Content-Length" and "Connection" are reserved - the
+     * response layer computes those itself, so res_set_header() rejects
+     * attempts to override them. */
+    ResponseHeader headers[MAX_RESPONSE_HEADERS];
+    int header_count;
 } Response;
 
 /* req is never mutated by a handler once routing has filled in its params. */

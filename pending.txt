@@ -52,8 +52,14 @@ Gaps vs. an Express-like C framework
   within the buffer limit (distinct from the now-fixed buffer-overflow hang above)
 
 4. Response
-- Only res_send/res_json; no generic res_set_header, no streaming/chunked response,
-  no static file serving, no res_redirect, no cookie helper
+- [DONE] res_set_header(res, name, value): generic response header API (lib/response.c/h).
+  Repeated calls with the same name (case-insensitive) overwrite in place; Content-Length
+  and Connection are rejected (reserved, computed by send_with_content_type itself);
+  Content-Type may be overridden and takes priority over res_send/res_json's default.
+  Backed by a fixed Response.headers[MAX_RESPONSE_HEADERS] array - extra calls past the
+  cap are dropped rather than overflowing. See tests/test_response.c.
+- Still no streaming/chunked response, no static file serving, no res_redirect, no
+  cookie helper
 - status_text() only covers 7 codes (200/201/204/400/404/431/500)
 - [DONE] malloc in response.c (conn->out_buf) is now null-checked; on OOM the
   connection is dropped instead of writing through a NULL pointer

@@ -7,6 +7,17 @@
 void res_status(Response *res, int status);
 
 /*
+ * Sets a response header to be sent alongside res_send()/res_json()'s own
+ * headers. A second call with the same name (case-insensitive) overwrites
+ * the first, matching Express's res.set(). "Content-Length" and
+ * "Connection" are reserved - the response layer computes those itself, so
+ * attempts to set them are rejected (logged, not applied). "Content-Type"
+ * may be overridden this way, which takes priority over res_send/res_json's
+ * default content type.
+ */
+void res_set_header(Response *res, const char *name, const char *value);
+
+/*
  * Builds a full HTTP response (status line + headers + body) into the
  * connection's out_buf. This does no socket I/O itself - in an event-loop
  * server the socket might not be writable yet, so the event loop

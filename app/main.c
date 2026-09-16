@@ -25,7 +25,7 @@ int main(void) {
 
   app_use(&app, mw_logger);
   app_use(&app, mw_body_size_guard);
-  app_use(&app, mw_authenticate);
+  // app_use(&app, mw_authenticate);
   app_use_error(&app, error_handler_json);
 
   app_get(&app, "/", handler_home);

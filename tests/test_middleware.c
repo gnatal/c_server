@@ -61,7 +61,7 @@ static void test_middlewares_run_in_order_then_handler(void) {
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
-    Response res = { conn, 0 };
+    Response res = { .conn = conn, .status = 0 };
 
     dispatch(&app, &route, &req, &res);
 
@@ -92,7 +92,7 @@ static void test_middleware_can_short_circuit(void) {
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
-    Response res = { conn, 0 };
+    Response res = { .conn = conn, .status = 0 };
 
     dispatch(&app, &route, &req, &res);
 
@@ -117,7 +117,7 @@ static void test_dispatch_falls_through_to_404_without_route(void) {
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
-    Response res = { conn, 0 };
+    Response res = { .conn = conn, .status = 0 };
 
     dispatch(&app, NULL, &req, &res);
 
@@ -158,7 +158,7 @@ static void test_chain_error_invokes_registered_error_handler(void) {
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
-    Response res = { conn, 0 };
+    Response res = { .conn = conn, .status = 0 };
 
     dispatch(&app, &route, &req, &res);
 
@@ -178,7 +178,7 @@ static void test_chain_error_default_fallback_without_handler(void) {
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
-    Response res = { conn, 0 };
+    Response res = { .conn = conn, .status = 0 };
 
     dispatch(&app, &route, &req, &res);
 

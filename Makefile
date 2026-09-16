@@ -25,8 +25,9 @@ MIDDLEWARE_TEST_BIN  = $(BIN_DIR)/test_middleware
 ROUTER_TEST_BIN      = $(BIN_DIR)/test_router
 HTTP_PARSER_TEST_BIN = $(BIN_DIR)/test_http_parser
 CONNECTION_TEST_BIN  = $(BIN_DIR)/test_connection
+RESPONSE_TEST_BIN    = $(BIN_DIR)/test_response
 
-TEST_BINS = $(JSON_TEST_BIN) $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) $(CONNECTION_TEST_BIN)
+TEST_BINS = $(JSON_TEST_BIN) $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN)
 
 .PHONY: all run test clean
 
@@ -71,12 +72,17 @@ $(CONNECTION_TEST_BIN): $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/lib/http_parser.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(RESPONSE_TEST_BIN): $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/tests/test_response.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^
+
 test: $(TEST_BINS)
 	./$(JSON_TEST_BIN)
 	./$(MIDDLEWARE_TEST_BIN)
 	./$(ROUTER_TEST_BIN)
 	./$(HTTP_PARSER_TEST_BIN)
 	./$(CONNECTION_TEST_BIN)
+	./$(RESPONSE_TEST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer
