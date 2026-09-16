@@ -5,6 +5,7 @@
 #include "router.h"
 #include "response.h"
 #include "middleware.h"
+#include "http_parser.h"
 
 static const char *default_api_key = "my-secret-api-key";
 static const char *configured_api_key = NULL;
@@ -63,30 +64,22 @@ static int keys_match(const char *a, size_t a_len, const char *b, size_t b_len) 
 
 void mw_authenticate(const Request *req, Response *res, MiddlewareChain *chain) {
     (void)res;
-    const char *auth_header = strstr(req->headers, "Authorization:");
+    const char *auth_header = req_get_header(req, "Authorization");
     if (auth_header == NULL) {
         chain_error(chain, 401, "Unauthorized: Missing Authorization header");
         return;
     }
 
-    const char *value = auth_header + strlen("Authorization:");
-    while (*value == ' ') {
-        value++;
-    }
-
     static const char prefix[] = "Bearer ";
     static const size_t prefix_len = sizeof(prefix) - 1;
-    if (strncmp(value, prefix, prefix_len) != 0) {
+    if (strncmp(auth_header, prefix, prefix_len) != 0) {
         chain_error(chain, 401, "Unauthorized: Authorization header must be a Bearer token");
         return;
     }
-    value += prefix_len;
-
-    const char *token_end = strstr(value, "\r\n");
-    const size_t token_len = token_end != NULL ? (size_t)(token_end - value) : strlen(value);
+    const char *token = auth_header + prefix_len;
 
     const char *expected_key = mw_authenticate_get_key();
-    if (!keys_match(value, token_len, expected_key, strlen(expected_key))) {
+    if (!keys_match(token, strlen(token), expected_key, strlen(expected_key))) {
         chain_error(chain, 401, "Unauthorized: Invalid API key");
         return;
     }

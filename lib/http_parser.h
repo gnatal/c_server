@@ -68,6 +68,26 @@ void url_decode(const char *src, char *dst, size_t dst_size, int decode_plus);
  * for "?q=cats"), or NULL if that key wasn't present. */
 const char *req_get_query(const Request *req, const char *name);
 
+/*
+ * Pure: splits a raw header block ("Name: value\r\nName2: value2") on
+ * "\r\n" then the first ':' into req->header_names/header_values, bounded
+ * by MAX_HEADERS (extra headers are dropped rather than overflowing the
+ * fixed arrays, same as MAX_QUERY_PARAMS/MAX_PARAMS elsewhere). Leading
+ * spaces after the ':' are trimmed; a line with no ':' is skipped rather
+ * than stored. Not URL-decoded - header values pass through as-is. Called
+ * by parse_http_request; exposed separately so it can be unit-tested
+ * against a header block directly.
+ */
+void parse_headers(const char *header_block, Request *req);
+
+/*
+ * Looks up a parsed header value by name (e.g. req_get_header(req,
+ * "Content-Type")), case-insensitively per RFC 7230 (header field names are
+ * case-insensitive), or NULL if that header wasn't present. Returns the
+ * first matching value if a header appears more than once.
+ */
+const char *req_get_header(const Request *req, const char *name);
+
 const char *status_text(int status);
 
 #endif /* HTTP_PARSER_H */

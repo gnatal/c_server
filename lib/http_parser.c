@@ -95,6 +95,7 @@ int parse_http_request(const char *raw, Request *req) {
     }
     memcpy(req->headers, header_start, header_len);
     req->headers[header_len] = '\0';
+    parse_headers(req->headers, req);
 
     req->content_length = extract_content_length(req->headers);
     if (req->content_length < 0) {
@@ -154,6 +155,48 @@ const char *req_get_query(const Request *req, const char *name) {
     for (int i = 0; i < req->query_count; i++) {
         if (strcmp(req->query_names[i], name) == 0) {
             return req->query_values[i];
+        }
+    }
+    return NULL;
+}
+
+void parse_headers(const char *header_block, Request *req) {
+    req->header_count = 0;
+    if (header_block[0] == '\0') {
+        return;
+    }
+
+    char buf[sizeof(req->headers)];
+    strncpy(buf, header_block, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *saveptr;
+    char *line = strtok_r(buf, "\r\n", &saveptr);
+    while (line != NULL && req->header_count < MAX_HEADERS) {
+        char *colon = strchr(line, ':');
+        if (colon != NULL) {
+            *colon = '\0';
+            char *value = colon + 1;
+            while (*value == ' ') {
+                value++;
+            }
+
+            char *name_slot = req->header_names[req->header_count];
+            char *value_slot = req->header_values[req->header_count];
+            strncpy(name_slot, line, sizeof(req->header_names[0]) - 1);
+            name_slot[sizeof(req->header_names[0]) - 1] = '\0';
+            strncpy(value_slot, value, sizeof(req->header_values[0]) - 1);
+            value_slot[sizeof(req->header_values[0]) - 1] = '\0';
+            req->header_count++;
+        }
+        line = strtok_r(NULL, "\r\n", &saveptr);
+    }
+}
+
+const char *req_get_header(const Request *req, const char *name) {
+    for (int i = 0; i < req->header_count; i++) {
+        if (strcasecmp(req->header_names[i], name) == 0) {
+            return req->header_values[i];
         }
     }
     return NULL;

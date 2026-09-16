@@ -44,6 +44,19 @@ scoping mechanisms in `lib/`:
   `handler_delete_user` responds `204 No Content` with an empty body, the
   one handler in this app that doesn't call `res_json`/plain `res_send` with
   a non-empty body.
+- **Content-Type-gated body validation:** `handler_update_user` and
+  `handler_patch_user` (`app/handlers.c`) both call a shared
+  `has_json_content_type(req)` helper — `req_get_header(req, "Content-Type")`
+  (`lib/http_parser.c`) prefix-matched (case-insensitively) against
+  `"application/json"`, so a `; charset=...` suffix doesn't break the match —
+  before attempting `json_parse` on `req->body`. A declared-JSON body that
+  fails to parse gets a `400` with the same `{"error": "..."}` shape
+  `handler_echo_json` already used for `POST /echo/json`; a body with no
+  Content-Type or a different one skips validation entirely and the handler
+  behaves exactly as before (id-only response, body ignored) — this is
+  deliberate: without the gate, a client sending plain text or form data to
+  `PUT/PATCH /api/users/:id` would get an incorrect `400` for not being JSON
+  it never claimed to be.
 - `GET /search` (`handler_search`) echoes every query-string param back as a JSON
   object (e.g. `?name=natal&age=32` -> `{"name":"natal","age":"32"}`), built via
   the JSON builder API (`json_new_object`/`json_new_string`/`json_object_set`,
@@ -51,8 +64,8 @@ scoping mechanisms in `lib/`:
   (`req->query_count` entries, populated by `parse_query_string`,
   `lib/http_parser.c`) rather than `req_get_query` - that accessor is for
   looking up one known key, not iterating all of them. Every value comes back
-  as a JSON string with no type coercion, and unescaped/undecoded exactly as
-  the client sent it (`lib/CLAUDE.md`, "Query-string parsing"). `json_object_set`
+  as a JSON string with no type coercion, but already URL-decoded (`lib/CLAUDE.md`,
+  "URL decoding"/"Query-string parsing"). `json_object_set`
   takes ownership of the `JsonValue *` it's given either way (attached on
   success, freed on failure), so the loop doesn't need to check
   `json_new_string`'s return before passing it in.
@@ -66,7 +79,11 @@ scoping mechanisms in `lib/`:
   app's own `MAX_APP_BODY_SIZE` (4096, independent of and tighter than the engine's
   hard per-connection `BUF_SIZE` cap) via `chain_error(chain, 400, ...)` instead of
   calling `chain_next`.
-- `mw_authenticate` enforces Bearer token authentication via `Authorization: Bearer <token>`.
+- `mw_authenticate` enforces Bearer token authentication via `Authorization: Bearer <token>`,
+  read via `req_get_header(req, "Authorization")` (`lib/http_parser.c`) rather than an
+  ad-hoc `strstr` scan over `req->headers` - `req_get_header`'s lookup is
+  case-insensitive per RFC 7230 and already trims/isolates the value, so
+  `mw_authenticate` only needs to strip the literal `"Bearer "` prefix itself.
   Tokens are verified against the configured key using constant-time comparison
   (`keys_match`) to avoid timing side-channels. The expected key is resolved hierarchically:
   explicit setter (`mw_authenticate_set_key`) → `API_KEY` environment variable → default

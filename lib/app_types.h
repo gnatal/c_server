@@ -8,6 +8,7 @@
 #define MAX_ROUTE_MIDDLEWARES 8
 #define MAX_PARAMS 8
 #define MAX_QUERY_PARAMS 16
+#define MAX_HEADERS 32
 #define MAX_CONNECTIONS 16384
 #define MAX_EVENTS 64
 #define BUF_SIZE 8192
@@ -36,6 +37,18 @@ typedef struct {
     int query_count;
 
     char headers[BUF_SIZE];
+
+    /* Parsed out of `headers` (above) by parse_headers (http_parser.c) at
+     * request-parse time, the same fixed-array-plus-count shape as
+     * param_names/param_values and query_names/query_values above - bounded
+     * by MAX_HEADERS rather than growing, extra headers past the cap are
+     * dropped. A malformed line (no ':') is skipped rather than stored.
+     * Values are NOT URL-decoded (headers aren't a URL component) - see
+     * req_get_header, http_parser.c. */
+    char header_names[MAX_HEADERS][64];
+    char header_values[MAX_HEADERS][256];
+    int header_count;
+
     int content_length;
     char body[BUF_SIZE];
 } Request;

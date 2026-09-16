@@ -131,6 +131,10 @@ static void test_parse_http_request(void) {
     assert(strcmp(req.path, "/echo") == 0);
     assert(req.content_length == 13);
     assert(strcmp(req.body, "Hello, World!") == 0);
+    /* parse_http_request also populates the parsed header map. */
+    assert(strcmp(req_get_header(&req, "Host"), "localhost") == 0);
+    assert(strcmp(req_get_header(&req, "content-length"), "13") == 0);
+    assert(req_get_header(&req, "X-Missing") == NULL);
 
     /* Malformed request line */
     const char *malformed_line = "INVALID\r\n\r\n";
@@ -202,6 +206,50 @@ static void test_url_decode(void) {
     assert(strcmp(small, "abc") == 0);
 }
 
+static void test_parse_headers(void) {
+    Request req;
+    memset(&req, 0, sizeof(req));
+
+    /* Empty header block yields zero headers */
+    parse_headers("", &req);
+    assert(req.header_count == 0);
+    assert(req_get_header(&req, "Host") == NULL);
+
+    /* Basic Name: value pairs, leading space after ':' trimmed */
+    parse_headers("Host: example.com\r\nContent-Type: application/json", &req);
+    assert(req.header_count == 2);
+    assert(strcmp(req_get_header(&req, "Host"), "example.com") == 0);
+    assert(strcmp(req_get_header(&req, "Content-Type"), "application/json") == 0);
+
+    /* Lookup is case-insensitive on the header name (RFC 7230) */
+    assert(strcmp(req_get_header(&req, "host"), "example.com") == 0);
+    assert(strcmp(req_get_header(&req, "CONTENT-TYPE"), "application/json") == 0);
+
+    /* A line with no ':' is skipped rather than stored */
+    parse_headers("Host: example.com\r\nMalformedLine\r\nAccept: */*", &req);
+    assert(req.header_count == 2);
+    assert(strcmp(req_get_header(&req, "Accept"), "*/*") == 0);
+
+    /* Duplicate header: lookup returns the first occurrence */
+    parse_headers("X-Token: first\r\nX-Token: second", &req);
+    assert(req.header_count == 2);
+    assert(strcmp(req_get_header(&req, "X-Token"), "first") == 0);
+
+    /* A value with no leading space after ':' is still captured as-is */
+    parse_headers("X-Flag:on", &req);
+    assert(strcmp(req_get_header(&req, "X-Flag"), "on") == 0);
+
+    /* Overflow: headers past MAX_HEADERS are dropped, not overflowed. */
+    char many[1024] = "";
+    for (int i = 0; i < MAX_HEADERS + 5; i++) {
+        char line[32];
+        snprintf(line, sizeof(line), "H%d: %d\r\n", i, i);
+        strncat(many, line, sizeof(many) - strlen(many) - 1);
+    }
+    parse_headers(many, &req);
+    assert(req.header_count == MAX_HEADERS);
+}
+
 static void test_parse_query_string(void) {
     Request req;
     memset(&req, 0, sizeof(req));
@@ -270,6 +318,7 @@ int main(void) {
     test_parse_http_request();
     test_status_text();
     test_url_decode();
+    test_parse_headers();
     test_parse_query_string();
 
     printf("all http parser tests passed\n");

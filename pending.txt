@@ -121,19 +121,30 @@ Gaps vs. an Express-like C framework
   as two segments into one before match_path ever sees it.
 
 3. Request parsing
-- Headers are one opaque blob scanned with strcasestr - no req_get_header(name) map
-- Once req_get_header(name) exists: no Content-Type/body validation on mutating
-  requests. Currently the PUT/PATCH demo handlers (app/handlers.c:
-  handler_update_user, handler_patch_user) never look at req->body at all, so a
-  malformed/garbage body (e.g. broken JSON) is silently accepted (200) instead
-  of rejected - a client can't tell the server ignored their payload from the
-  response alone. Fixing this properly means gating body parsing/validation on
-  the request actually declaring Content-Type: application/json (via
-  req_get_header, not another ad-hoc strcasestr scan) before attempting
-  json_parse + 400 on failure, the same pattern handler_echo_json already uses
-  for POST /echo/json - don't add JSON validation to a handler without first
-  checking Content-Type, or a client sending a non-JSON body (plain text, form
-  data) would get an incorrect 400.
+- [DONE] req_get_header(name) map: the new pure parse_headers(header_block, req)
+  (lib/http_parser.c/h) splits req->headers (still stored as the raw blob, unchanged)
+  on "\r\n" then the first ':' into req->header_names/header_values
+  (MAX_HEADERS-capped fixed arrays, same shape as query/param parsing - a line
+  with no ':' is skipped, extra headers past the cap are dropped rather than
+  overflowing). req_get_header(req, name) (http_parser.c) looks the array up
+  case-insensitively (strcasecmp - header field names are case-insensitive per
+  RFC 7230) and returns the first match. Called from parse_http_request right
+  after req->headers is filled. app/middlewares.c: mw_authenticate now reads
+  Authorization via req_get_header instead of an ad-hoc strstr(req->headers, ...)
+  scan - which also fixes a latent bug (strstr was case-sensitive on the header
+  name; req_get_header isn't). See tests/test_http_parser.c (test_parse_headers,
+  and the req_get_header assertions in test_parse_http_request) and
+  lib/CLAUDE.md ("Header parsing").
+- [DONE] Content-Type-gated body validation on PUT/PATCH: handler_update_user and
+  handler_patch_user (app/handlers.c) now call a shared has_json_content_type(req)
+  helper (req_get_header(req, "Content-Type"), prefix-matched against
+  "application/json" so a ";charset=..." suffix doesn't break the match) before
+  attempting json_parse on req->body - a malformed JSON body now gets a 400
+  (same {"error": "..."} shape as handler_echo_json's existing json_parse+400
+  pattern) instead of being silently accepted, but a non-JSON body (missing or
+  different Content-Type) skips validation entirely and behaves exactly as
+  before, so a client sending plain text or form data doesn't get an incorrect
+  400. See app/CLAUDE.md.
 - Whole request (headers+body) lives in one fixed BUF_SIZE=8192 buffer - no streaming
 - [DONE] Negative/oversized Content-Length is now rejected with 400 instead of silently
   truncated or trusted (extract_content_length bounds it to [0, BUF_SIZE-1])

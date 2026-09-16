@@ -234,6 +234,30 @@ output is never longer than the input, so every call site decodes in place
 See `tests/test_http_parser.c` (`test_url_decode`, the encoded-path case in
 `test_parse_http_request`).
 
+## Header parsing
+`req->headers` (`app_types.h`) stays the raw, unparsed header block it always
+was (everything between the request line and the blank line terminator), but
+`parse_http_request` now also calls the new `parse_headers(req->headers, req)`
+(`http_parser.c`) — a pure function, per this project's parsing-function
+convention — right after `req->headers` is filled, before `extract_content_length`
+runs (which still scans the raw blob itself, unchanged). `parse_headers` splits
+the block on `"\r\n"` then each line's first `':'` into
+`req->header_names`/`req->header_values` (fixed `MAX_HEADERS`-sized arrays +
+`header_count`, the same bounded-array-plus-count shape as
+`param_names`/`query_names` elsewhere — extra headers past the cap are dropped
+rather than overflowing). Leading spaces after the `':'` are trimmed; a line
+with no `':'` is skipped rather than stored. `req_get_header(req, name)`
+(`http_parser.c`) looks the array up with `strcasecmp` — header field names are
+case-insensitive per RFC 7230, unlike `req_get_query`/`req_get_param`'s
+case-sensitive `strcmp` — and returns the first matching value. Header values
+are **not** URL-decoded (headers aren't a URL component, unlike the path/query
+handled above). `app/middlewares.c: mw_authenticate` reads `Authorization` via
+`req_get_header` rather than its own ad-hoc `strstr(req->headers, ...)` scan —
+this also fixed a latent case-sensitivity bug, since `strstr` never matched a
+lowercase `authorization:` header the way the new case-insensitive lookup does.
+See `tests/test_http_parser.c` (`test_parse_headers`) and `app/CLAUDE.md`
+("Content-Type-gated body validation").
+
 ## Request size limits
 The whole request (headers + body) shares one `BUF_SIZE` (8192-byte) buffer,
 `conn->in_buf`. Two independent guards enforce this hard limit instead of letting a
