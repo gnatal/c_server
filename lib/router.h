@@ -53,4 +53,63 @@ const Route *match_route(const App *app, Request *req);
 /* Looks up a captured path param by name (e.g. req_get_param(req, "id")). */
 const char *req_get_param(const Request *req, const char *name);
 
+/* Resets a Router to have zero registered routes and zero router-level
+ * middleware. A Router is a standalone route table (Express's Router()) -
+ * it does nothing until mounted into an App via app_mount(). */
+void router_init(Router *router);
+
+/* Registers a handler on a router for a given HTTP method + path pattern -
+ * the Router analogue of app_add_route. Paths are relative to wherever the
+ * router ends up mounted (e.g. "/users" becomes "/api/users" once mounted
+ * at "/api"). */
+void router_add_route(Router *router, const char *method, const char *path, Handler handler);
+
+/* Router analogue of app_add_route_mw: registers a handler with its own
+ * per-route middleware on the router. */
+void router_add_route_mw(Router *router, const char *method, const char *path, Handler handler,
+                          const Middleware *middlewares, int middleware_count);
+
+/* Express-style convenience wrapper: router_get(router, "/users", handler). */
+void router_get(Router *router, const char *path, Handler handler);
+
+/* Express-style convenience wrapper: router_post(router, "/users", handler). */
+void router_post(Router *router, const char *path, Handler handler);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * router_get_mw(router, "/users", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void router_get_mw(Router *router, const char *path, Handler handler,
+                    const Middleware *middlewares, int middleware_count);
+
+/*
+ * Express-style convenience wrapper with per-route middleware:
+ * router_post_mw(router, "/users", handler, (Middleware[]){mw1, mw2}, 2).
+ */
+void router_post_mw(Router *router, const char *path, Handler handler,
+                     const Middleware *middlewares, int middleware_count);
+
+/*
+ * Registers router-level middleware (the Router analogue of app_use): once
+ * the router is mounted via app_mount(app, prefix, router), this runs ahead
+ * of any of the router's own routes for requests under that mount's prefix -
+ * it has no effect before the router is mounted.
+ */
+void router_use(Router *router, Middleware mw);
+
+/*
+ * Mounts a router's routes and router-level middleware onto app at a path
+ * prefix - the C analogue of Express's app.use('/api', router). Flattens
+ * (copies) the router's routes into app->routes with prefix prepended to
+ * each path (a route registered at "/" mounts at the prefix itself), and
+ * registers the router's middleware app-wide via app_use_prefix scoped to
+ * that same prefix, so it only runs for requests under the mount point,
+ * ahead of route dispatch. prefix "" or "/" mounts unscoped (matches every
+ * request), same as app_use_prefix. Both the router's routes and its
+ * middleware are subject to the same MAX_ROUTES/MAX_MIDDLEWARES caps as any
+ * other app_add_route_mw/app_use_prefix call, truncating with a stderr
+ * warning rather than overflowing.
+ */
+void app_mount(App *app, const char *prefix, const Router *router);
+
 #endif /* ROUTER_H */

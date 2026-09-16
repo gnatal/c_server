@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "router.h"
+#include "middleware.h"
 
 void app_init(App *app) {
     app->config.port = DEFAULT_PORT;
@@ -10,6 +11,27 @@ void app_init(App *app) {
     app->server_fd = -1;
     app->kq = -1;
     memset(app->connections, 0, sizeof(app->connections));
+}
+
+/* Shared fill logic for one route slot, used by both app_add_route_mw and
+ * router_add_route_mw - an App and a Router register routes identically,
+ * they just land in different fixed Route[MAX_ROUTES] arrays. */
+static void fill_route(Route *route, const char *method, const char *path, Handler handler,
+                        const Middleware *middlewares, int middleware_count) {
+    strncpy(route->method, method, sizeof(route->method) - 1);
+    route->method[sizeof(route->method) - 1] = '\0';
+    strncpy(route->path, path, sizeof(route->path) - 1);
+    route->path[sizeof(route->path) - 1] = '\0';
+    route->handler = handler;
+
+    if (middleware_count > MAX_ROUTE_MIDDLEWARES) {
+        fprintf(stderr, "route registration: MAX_ROUTE_MIDDLEWARES exceeded, truncating\n");
+        middleware_count = MAX_ROUTE_MIDDLEWARES;
+    }
+    for (int i = 0; i < middleware_count; i++) {
+        route->middlewares[i] = middlewares[i];
+    }
+    route->middleware_count = middleware_count;
 }
 
 void app_add_route(App *app, const char *method, const char *path, Handler handler) {
@@ -22,21 +44,7 @@ void app_add_route_mw(App *app, const char *method, const char *path, Handler ha
         fprintf(stderr, "app_add_route: MAX_ROUTES exceeded\n");
         return;
     }
-    Route *route = &app->routes[app->route_count++];
-    strncpy(route->method, method, sizeof(route->method) - 1);
-    route->method[sizeof(route->method) - 1] = '\0';
-    strncpy(route->path, path, sizeof(route->path) - 1);
-    route->path[sizeof(route->path) - 1] = '\0';
-    route->handler = handler;
-
-    if (middleware_count > MAX_ROUTE_MIDDLEWARES) {
-        fprintf(stderr, "app_add_route_mw: MAX_ROUTE_MIDDLEWARES exceeded, truncating\n");
-        middleware_count = MAX_ROUTE_MIDDLEWARES;
-    }
-    for (int i = 0; i < middleware_count; i++) {
-        route->middlewares[i] = middlewares[i];
-    }
-    route->middleware_count = middleware_count;
+    fill_route(&app->routes[app->route_count++], method, path, handler, middlewares, middleware_count);
 }
 
 void app_get(App *app, const char *path, Handler handler) {
@@ -55,6 +63,97 @@ void app_get_mw(App *app, const char *path, Handler handler,
 void app_post_mw(App *app, const char *path, Handler handler,
                   const Middleware *middlewares, int middleware_count) {
     app_add_route_mw(app, "POST", path, handler, middlewares, middleware_count);
+}
+
+void router_init(Router *router) {
+    router->route_count = 0;
+    router->middleware_count = 0;
+}
+
+void router_add_route(Router *router, const char *method, const char *path, Handler handler) {
+    router_add_route_mw(router, method, path, handler, NULL, 0);
+}
+
+void router_add_route_mw(Router *router, const char *method, const char *path, Handler handler,
+                          const Middleware *middlewares, int middleware_count) {
+    if (router->route_count >= MAX_ROUTES) {
+        fprintf(stderr, "router_add_route: MAX_ROUTES exceeded\n");
+        return;
+    }
+    fill_route(&router->routes[router->route_count++], method, path, handler, middlewares, middleware_count);
+}
+
+void router_get(Router *router, const char *path, Handler handler) {
+    router_add_route(router, "GET", path, handler);
+}
+
+void router_post(Router *router, const char *path, Handler handler) {
+    router_add_route(router, "POST", path, handler);
+}
+
+void router_get_mw(Router *router, const char *path, Handler handler,
+                    const Middleware *middlewares, int middleware_count) {
+    router_add_route_mw(router, "GET", path, handler, middlewares, middleware_count);
+}
+
+void router_post_mw(Router *router, const char *path, Handler handler,
+                     const Middleware *middlewares, int middleware_count) {
+    router_add_route_mw(router, "POST", path, handler, middlewares, middleware_count);
+}
+
+void router_use(Router *router, Middleware mw) {
+    if (router->middleware_count >= MAX_MIDDLEWARES) {
+        fprintf(stderr, "router_use: MAX_MIDDLEWARES exceeded\n");
+        return;
+    }
+    router->middlewares[router->middleware_count++] = mw;
+}
+
+/* Builds the mounted path for one router route: prefix + route->path, except
+ * a router route registered at "/" (the router's own root) mounts at the
+ * prefix itself rather than "prefix/" - so router_get(router, "/", h) mounted
+ * at "/api" matches "/api", not "/api/". prefix has already been normalized
+ * by app_mount (no trailing slash, "" for an unscoped/root mount). */
+static void build_mounted_path(char *out, size_t out_size, const char *prefix, const char *route_path) {
+    if (strcmp(route_path, "/") == 0) {
+        snprintf(out, out_size, "%s", prefix[0] != '\0' ? prefix : "/");
+    } else {
+        snprintf(out, out_size, "%s%s", prefix, route_path);
+    }
+}
+
+void app_mount(App *app, const char *prefix, const Router *router) {
+    if (prefix == NULL) {
+        prefix = "";
+    }
+
+    /* Normalize: "/" alone means an unscoped/root mount, same as "" - both
+     * app_use_prefix and build_mounted_path treat "" as "no prefix to add/
+     * match on". A trailing slash (e.g. "/api/") is stripped so concatenation
+     * with a route's own leading-slash path doesn't double up ("/api//users"). */
+    char normalized_prefix[128];
+    if (prefix[0] == '\0' || strcmp(prefix, "/") == 0) {
+        normalized_prefix[0] = '\0';
+    } else {
+        strncpy(normalized_prefix, prefix, sizeof(normalized_prefix) - 1);
+        normalized_prefix[sizeof(normalized_prefix) - 1] = '\0';
+        const size_t len = strlen(normalized_prefix);
+        if (len > 0 && normalized_prefix[len - 1] == '/') {
+            normalized_prefix[len - 1] = '\0';
+        }
+    }
+
+    for (int i = 0; i < router->middleware_count; i++) {
+        app_use_prefix(app, normalized_prefix, router->middlewares[i]);
+    }
+
+    for (int i = 0; i < router->route_count; i++) {
+        const Route *route = &router->routes[i];
+        char mounted_path[256];
+        build_mounted_path(mounted_path, sizeof(mounted_path), normalized_prefix, route->path);
+        app_add_route_mw(app, route->method, mounted_path, route->handler,
+                          route->middlewares, route->middleware_count);
+    }
 }
 
 int match_path(const char *pattern, const char *path, Request *req) {

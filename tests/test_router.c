@@ -196,6 +196,120 @@ static void test_app_add_route_mw_truncates_overflow(void) {
     assert(app.routes[0].middleware_count == MAX_ROUTE_MIDDLEWARES);
 }
 
+static void test_app_mount_prefixes_router_routes(void) {
+    App app;
+    app_init(&app);
+
+    Router router;
+    router_init(&router);
+    router_get(&router, "/users", dummy_handler_a);
+    router_get(&router, "/", dummy_handler_b);
+
+    app_mount(&app, "/api", &router);
+
+    assert(app.route_count == 2);
+    assert(strcmp(app.routes[0].path, "/api/users") == 0);
+    assert(app.routes[0].handler == dummy_handler_a);
+    /* A router route registered at "/" mounts at the prefix itself, not
+     * "/api/" - so it matches GET /api, not GET /api/. */
+    assert(strcmp(app.routes[1].path, "/api") == 0);
+    assert(app.routes[1].handler == dummy_handler_b);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/api/users", sizeof(req.path) - 1);
+    const Route *matched = match_route(&app, &req);
+    assert(matched != NULL && matched->handler == dummy_handler_a);
+
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/users", sizeof(req.path) - 1);
+    assert(match_route(&app, &req) == NULL);
+}
+
+static void test_app_mount_carries_route_middleware(void) {
+    App app;
+    app_init(&app);
+
+    Router router;
+    router_init(&router);
+    Middleware mws[] = { dummy_mw_a };
+    router_get_mw(&router, "/protected", dummy_handler_a, mws, 1);
+
+    app_mount(&app, "/api", &router);
+
+    assert(app.route_count == 1);
+    assert(strcmp(app.routes[0].path, "/api/protected") == 0);
+    assert(app.routes[0].middleware_count == 1);
+    assert(app.routes[0].middlewares[0] == dummy_mw_a);
+}
+
+static void test_app_mount_scopes_router_middleware_to_prefix(void) {
+    App app;
+    app_init(&app);
+
+    Router router;
+    router_init(&router);
+    router_use(&router, dummy_mw_a);
+
+    app_mount(&app, "/api", &router);
+
+    assert(app.middleware_count == 1);
+    assert(app.middlewares[0].fn == dummy_mw_a);
+    assert(strcmp(app.middlewares[0].prefix, "/api") == 0);
+}
+
+static void test_app_mount_strips_trailing_slash_from_prefix(void) {
+    App app;
+    app_init(&app);
+
+    Router router;
+    router_init(&router);
+    router_get(&router, "/users", dummy_handler_a);
+
+    app_mount(&app, "/api/", &router);
+
+    assert(app.route_count == 1);
+    assert(strcmp(app.routes[0].path, "/api/users") == 0);
+}
+
+static void test_app_mount_root_prefix_is_unscoped(void) {
+    App app;
+    app_init(&app);
+
+    Router router;
+    router_init(&router);
+    router_get(&router, "/users", dummy_handler_a);
+    router_use(&router, dummy_mw_a);
+
+    app_mount(&app, "/", &router);
+
+    assert(app.route_count == 1);
+    assert(strcmp(app.routes[0].path, "/users") == 0);
+    assert(app.middleware_count == 1);
+    assert(app.middlewares[0].prefix[0] == '\0');
+}
+
+static void test_app_mount_respects_max_routes(void) {
+    App app;
+    app_init(&app);
+
+    for (int i = 0; i < MAX_ROUTES; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/route%d", i);
+        app_get(&app, path, dummy_handler_a);
+    }
+    assert(app.route_count == MAX_ROUTES);
+
+    Router router;
+    router_init(&router);
+    router_get(&router, "/overflow", dummy_handler_b);
+
+    app_mount(&app, "/api", &router);
+    assert(app.route_count == MAX_ROUTES);
+}
+
 int main(void) {
     test_match_path_exact_literals();
     test_match_path_params();
@@ -205,6 +319,12 @@ int main(void) {
     test_app_get_mw_stores_route_middleware();
     test_app_post_mw_stores_route_middleware();
     test_app_add_route_mw_truncates_overflow();
+    test_app_mount_prefixes_router_routes();
+    test_app_mount_carries_route_middleware();
+    test_app_mount_scopes_router_middleware_to_prefix();
+    test_app_mount_strips_trailing_slash_from_prefix();
+    test_app_mount_root_prefix_is_unscoped();
+    test_app_mount_respects_max_routes();
 
     printf("all router tests passed\n");
     return 0;

@@ -1,13 +1,40 @@
 #include <stdio.h>
+#include <string.h>
 #include "middleware.h"
 #include "response.h"
 
+/* prefix "" or "/" is treated as unscoped (matches every path), same as an
+ * app_use() call before prefix-scoping existed. Otherwise path must start
+ * with prefix and either end there or be followed by '/', so "/api" matches
+ * "/api"/"/api/foo" but not "/apiary". */
+static int middleware_prefix_matches(const char *prefix, const char *path) {
+    if (prefix[0] == '\0' || (prefix[0] == '/' && prefix[1] == '\0')) {
+        return 1;
+    }
+    const size_t prefix_len = strlen(prefix);
+    if (strncmp(path, prefix, prefix_len) != 0) {
+        return 0;
+    }
+    const char next = path[prefix_len];
+    return next == '\0' || next == '/';
+}
+
 void app_use(App *app, Middleware mw) {
+    app_use_prefix(app, "", mw);
+}
+
+void app_use_prefix(App *app, const char *prefix, Middleware mw) {
     if (app->middleware_count >= MAX_MIDDLEWARES) {
         fprintf(stderr, "app_use: MAX_MIDDLEWARES exceeded\n");
         return;
     }
-    app->middlewares[app->middleware_count++] = mw;
+    if (prefix == NULL) {
+        prefix = "";
+    }
+    MiddlewareEntry *entry = &app->middlewares[app->middleware_count++];
+    entry->fn = mw;
+    strncpy(entry->prefix, prefix, sizeof(entry->prefix) - 1);
+    entry->prefix[sizeof(entry->prefix) - 1] = '\0';
 }
 
 void app_use_error(App *app, ErrorHandler handler) {
@@ -15,9 +42,12 @@ void app_use_error(App *app, ErrorHandler handler) {
 }
 
 void chain_next(MiddlewareChain *chain) {
-    if (chain->index < chain->count) {
-        const Middleware mw = chain->middlewares[chain->index++];
-        mw(chain->req, chain->res, chain);
+    while (chain->index < chain->count) {
+        const MiddlewareEntry *entry = &chain->middlewares[chain->index++];
+        if (!middleware_prefix_matches(entry->prefix, chain->req->path)) {
+            continue;
+        }
+        entry->fn(chain->req, chain->res, chain);
         return;
     }
 

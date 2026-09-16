@@ -34,6 +34,22 @@ int main(void) {
    * not app-wide, so it doesn't gate "/" or the other routes above. */
   app_post_mw(&app, "/echo/json", handler_echo_json, (Middleware[]){mw_authenticate}, 1);
 
+  /* Router demo: a standalone route table mounted under "/api" via
+   * app_mount, the C analogue of Express's Router() + app.use('/api', router).
+   * router_use(mw_authenticate) makes every route on this router require a
+   * bearer token - unlike the single per-route app_post_mw above, this scopes
+   * the whole "/api" prefix at once, including routes added to api_router
+   * later. Paths are relative to the router: "/status" ends up as
+   * "GET /api/status", "/users/:id" as "GET /api/users/:id" (path params
+   * still resolve normally through the mount, req_get_param(req, "id") works
+   * the same as it does for the top-level "/users/:id" route above). */
+  Router api_router;
+  router_init(&api_router);
+  router_use(&api_router, mw_authenticate);
+  router_get(&api_router, "/status", handler_api_status);
+  router_get(&api_router, "/users/:id", handler_get_user);
+  app_mount(&app, "/api", &api_router);
+
   app_listen(&app, app.config.port);
 
   return 0;

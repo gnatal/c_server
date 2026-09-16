@@ -30,12 +30,29 @@ Gaps vs. an Express-like C framework
   See tests/test_middleware.c and tests/test_router.c for pipeline-ordering/
   short-circuit/overflow tests, and app/main.c (mw_authenticate now scoped to
   just POST /echo/json instead of gating every route) for a real usage example.
-- Prefix-scoped middleware (app_use(&app, "/api", mw), only runs when req->path
-  starts with that prefix) is the more Express-idiomatic alternative/complement -
-  effectively the same work as sub-router mounting below, so tackle them together.
+- [DONE] Prefix-scoped middleware: app_use_prefix(&app, "/api", mw) (lib/middleware.h)
+  registers app-wide middleware that only runs when req->path starts with that
+  prefix at a segment boundary ("/api" matches "/api" and "/api/users", not
+  "/apiary"). app_use(app, mw) is unchanged and equivalent to
+  app_use_prefix(app, "", mw) (unscoped, runs on every request as before).
+  App.middlewares now stores MiddlewareEntry{fn, prefix} pairs (app_types.h);
+  chain_next (middleware.c) skips non-matching entries without invoking them.
+  See tests/test_middleware.c (test_prefixed_middleware_*) and lib/CLAUDE.md.
+  Still no full sub-router mounting (nested route tables) - that's section 2.
 
 2. Routing
-- No sub-routers / route mounting at a prefix (Router() + app.use('/api', router))
+- [DONE] Sub-routers / route mounting at a prefix: Router (app_types.h) is a
+  standalone route table built via router_get/router_post/router_get_mw/
+  router_post_mw/router_use (router.c), mirroring app_get/app_post/app_get_mw/
+  app_post_mw/app_use. app_mount(&app, "/api", &router) is the C analogue of
+  Express's app.use('/api', router) - it flattens the router's routes into
+  app->routes with the prefix prepended (a route registered at the router's own
+  "/" mounts at the prefix itself, not "prefix/"), and registers the router's
+  own middleware app-wide via app_use_prefix scoped to that same prefix, reusing
+  the prefix-matching machinery from the bullet above. Routes/middleware are
+  copied at mount time (flattened, not nested) - match_route/dispatch are
+  unchanged, no nested-router support yet. See tests/test_router.c
+  (test_app_mount_*) and lib/CLAUDE.md ("Sub-router mounting").
 - Only app_get/app_post wrappers exist; no app_put/app_delete/app_patch, no HEAD/OPTIONS
 - Path matches but method doesn't -> still 404, not 405
 - No wildcards, no query-string parser (req->query is a raw string, no req_get_query(name))

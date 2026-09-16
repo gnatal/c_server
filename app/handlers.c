@@ -21,6 +21,11 @@ void handler_echo(const Request *req, Response *res) {
     res_send(res, req->body);
 }
 
+void handler_api_status(const Request *req, Response *res) {
+    (void)req;
+    res_json(res, "{\"status\":\"ok\"}");
+}
+
 void handler_echo_json(const Request *req, Response *res) {
     char err[128];
     JsonValue *body = json_parse(req->body, err, sizeof(err));

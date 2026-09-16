@@ -75,6 +75,16 @@ typedef struct MiddlewareChain MiddlewareChain;
  * terminate it via chain_error(chain, ...). */
 typedef void (*Middleware)(const Request *req, Response *res, MiddlewareChain *chain);
 
+/* An app-wide middleware slot (app->middlewares) pairs the function with the
+ * path prefix it's mounted at. prefix == "" or "/" means unscoped - it runs
+ * on every request, same as before prefix-scoping existed. A non-empty
+ * prefix (e.g. "/api") only runs when req->path starts with it at a segment
+ * boundary (see middleware_prefix_matches in middleware.c). */
+typedef struct {
+    Middleware fn;
+    char prefix[128];
+} MiddlewareEntry;
+
 typedef struct {
     char method[8];
     char path[256];
@@ -89,6 +99,21 @@ typedef struct {
     int middleware_count;
 } Route;
 
+/* A standalone, unmounted route table - the C analogue of Express's
+ * Router(). Built up via router_get/router_post/router_use exactly like an
+ * App is via app_get/app_post/app_use, but registers nothing against any
+ * App until app_mount(app, prefix, router) flattens it in: each Route's path
+ * is copied into app->routes with prefix prepended, and each router-level
+ * Middleware is copied into app->middlewares scoped to that same prefix
+ * (see app_mount, router.c). A Router has no existence at request-dispatch
+ * time - only the App it was mounted into does. */
+typedef struct {
+    Route routes[MAX_ROUTES];
+    int route_count;
+    Middleware middlewares[MAX_MIDDLEWARES];
+    int middleware_count;
+} Router;
+
 /* C analogue of Express's (err, req, res, next): the app's single
  * centralized error handler, invoked via chain_error() instead of a thrown
  * exception. */
@@ -101,7 +126,7 @@ typedef void (*ErrorHandler)(int status, const char *message, const Request *req
  * first exhausts middlewares[0..count), then route_middlewares[0..
  * route_middleware_count), then falls through to final_handler. */
 struct MiddlewareChain {
-    const Middleware *middlewares;
+    const MiddlewareEntry *middlewares;
     int count;
     const Middleware *route_middlewares;
     int route_middleware_count;
@@ -120,7 +145,7 @@ typedef struct {
     ServerConfig config;
     Route routes[MAX_ROUTES];
     int route_count;
-    Middleware middlewares[MAX_MIDDLEWARES];
+    MiddlewareEntry middlewares[MAX_MIDDLEWARES];
     int middleware_count;
     ErrorHandler error_handler;
     int server_fd;

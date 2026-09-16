@@ -14,11 +14,26 @@ participate in chaining (no `next` access), so they still just call
 `middlewares.c` holds this app's concrete middleware/error-handler instances.
 `main.c` registers `mw_logger` and `mw_body_size_guard` app-wide via `app_use` (they
 run ahead of every request), registers `error_handler_json` as the error handler,
-and attaches `mw_authenticate` as *per-route* middleware on just
-`POST /echo/json` via `app_post_mw(&app, "/echo/json", handler_echo_json,
-(Middleware[]){mw_authenticate}, 1)` — every other route (`/`, `/users/:id`,
-`/echo`) is reachable without a token, since `app_get`/`app_post` register a route
-with zero route-level middleware:
+and attaches `mw_authenticate` two different ways to demonstrate both middleware
+scoping mechanisms in `lib/`:
+- *Per-route*, on just `POST /echo/json`, via `app_post_mw(&app, "/echo/json",
+  handler_echo_json, (Middleware[]){mw_authenticate}, 1)` — every other
+  top-level route (`/`, `/users/:id`, `/echo`) is reachable without a token,
+  since `app_get`/`app_post` register a route with zero route-level middleware.
+- *Router-scoped*, on an `api_router` (`Router`, built with `router_init`/
+  `router_get`/`router_use`) mounted at `/api` via `app_mount(&app, "/api",
+  &api_router)` — `router_use(&api_router, mw_authenticate)` makes every route
+  on that router require a token as a group, rather than repeating
+  `app_post_mw`'s middleware list on each one. `router_get(&api_router,
+  "/status", handler_api_status)` and `router_get(&api_router, "/users/:id",
+  handler_get_user)` become `GET /api/status` and `GET /api/users/:id` once
+  mounted — the latter reuses `handler_get_user` from the top-level
+  `/users/:id` route to show the same `Handler` works whether reached directly
+  or through a mount, path params included. Because `app_mount` implements
+  router-level middleware via `app_use_prefix(app, "/api", mw_authenticate)`
+  (`lib/CLAUDE.md`, "Sub-router mounting"), auth is enforced for *any* request
+  under `/api` — including `GET /api/nope`, which 401s rather than 404ing,
+  since the prefix-scoped middleware runs ahead of route dispatch.
 - `mw_logger` calls `chain_next` first and logs `METHOD PATH -> STATUS` after it
   returns, once the rest of the pipeline has produced a final `res->status`.
 - `mw_body_size_guard` rejects any request whose `req->content_length` exceeds this

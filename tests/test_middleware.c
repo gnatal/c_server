@@ -281,6 +281,89 @@ static void test_route_middleware_can_short_circuit_before_handler(void) {
     free_conn(conn);
 }
 
+static void mw_prefixed(const Request *req, Response *res, MiddlewareChain *chain) {
+    (void)req;
+    (void)res;
+    record(5);
+    chain_next(chain);
+}
+
+static void test_prefixed_middleware_runs_when_path_matches(void) {
+    g_order_len = 0;
+    g_handler_called = 0;
+
+    App app;
+    app_init(&app);
+    app_use_prefix(&app, "/api", mw_prefixed);
+    app_use(&app, mw_a);
+
+    Route route = { "GET", "/api/users", handler_ok, { 0 }, 0 };
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.path, "/api/users", sizeof(req.path) - 1);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    dispatch(&app, &route, &req, &res);
+
+    assert(g_handler_called == 1);
+    assert(g_order_len == 3);
+    assert(g_order[0] == 5 && g_order[1] == 1 && g_order[2] == 3);
+    assert(res.status == 200);
+
+    free_conn(conn);
+}
+
+static void test_prefixed_middleware_skipped_when_path_does_not_match(void) {
+    g_order_len = 0;
+    g_handler_called = 0;
+
+    App app;
+    app_init(&app);
+    app_use_prefix(&app, "/api", mw_prefixed);
+    app_use(&app, mw_a);
+
+    Route route = { "GET", "/other", handler_ok, { 0 }, 0 };
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.path, "/other", sizeof(req.path) - 1);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    dispatch(&app, &route, &req, &res);
+
+    assert(g_handler_called == 1);
+    assert(g_order_len == 2);
+    assert(g_order[0] == 1 && g_order[1] == 3);
+    assert(res.status == 200);
+
+    free_conn(conn);
+}
+
+static void test_prefixed_middleware_does_not_match_similar_sibling_path(void) {
+    g_order_len = 0;
+    g_handler_called = 0;
+
+    App app;
+    app_init(&app);
+    app_use_prefix(&app, "/api", mw_prefixed);
+
+    Route route = { "GET", "/apiary", handler_ok, { 0 }, 0 };
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.path, "/apiary", sizeof(req.path) - 1);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    dispatch(&app, &route, &req, &res);
+
+    assert(g_handler_called == 1);
+    assert(g_order_len == 1);
+    assert(g_order[0] == 3);
+
+    free_conn(conn);
+}
+
 int main(void) {
     test_middlewares_run_in_order_then_handler();
     test_middleware_can_short_circuit();
@@ -290,6 +373,9 @@ int main(void) {
     test_route_middleware_runs_after_app_wide_before_handler();
     test_route_without_middleware_only_runs_app_wide();
     test_route_middleware_can_short_circuit_before_handler();
+    test_prefixed_middleware_runs_when_path_matches();
+    test_prefixed_middleware_skipped_when_path_does_not_match();
+    test_prefixed_middleware_does_not_match_similar_sibling_path();
 
     printf("All middleware tests passed.\n");
     return 0;

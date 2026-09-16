@@ -52,11 +52,27 @@ app-wide middleware and *before* the handler, regardless of registration order.
 - Per-route middleware is scoped to that one route (a `Route`'s
   `Middleware[MAX_ROUTE_MIDDLEWARES]` + `middleware_count`, set at registration time
   by `app_add_route_mw` in `router.c`) — unlike `app_use`, it does not run for other
-  routes or for 404s. There is still no *prefix*-scoped/mounted middleware (e.g. all
-  of `/api/*`) — that's future work (`../pending.txt`, section 2 — sub-routers).
-  Registering more than `MAX_ROUTE_MIDDLEWARES` for one route truncates the list
-  (stderr warning) rather than overflowing the fixed array, same as
-  `MAX_ROUTES`/`MAX_MIDDLEWARES` elsewhere.
+  routes or for 404s. Registering more than `MAX_ROUTE_MIDDLEWARES` for one route
+  truncates the list (stderr warning) rather than overflowing the fixed array, same
+  as `MAX_ROUTES`/`MAX_MIDDLEWARES` elsewhere.
+- App-wide middleware can also be *prefix*-scoped: `app_use_prefix(app, "/api", mw)`
+  stores the prefix alongside the function pointer in `App.middlewares`
+  (`MiddlewareEntry { fn, prefix }`, `app_types.h`) instead of a bare `Middleware`
+  array. `app_use(app, mw)` is just `app_use_prefix(app, "", mw)`. `chain_next`
+  (`middleware.c`) checks `middleware_prefix_matches(entry->prefix, req->path)`
+  for each app-wide slot as it walks `chain->index` forward: a prefix of `""` or
+  `"/"` matches every path (unscoped, the pre-existing behavior); otherwise `path`
+  must start with `prefix` *and* either end there or be followed by `/`, so `/api`
+  matches `/api` and `/api/users` but not `/apiary`. A non-matching entry is
+  skipped without being invoked (and therefore never calls `chain_next` itself) —
+  `chain_next` loops internally past skipped entries rather than relying on each
+  middleware to re-trigger the chain. `chain->index` still counts every app-wide
+  slot (matched or skipped), so `route_index = chain->index - chain->count` for
+  locating route-middleware position is unaffected. Skipped middleware also means
+  the ordering guarantee is now "registration order, filtered to prefix-matching
+  entries" rather than strictly every registered middleware running on every
+  request — this applies to 404s too (an unmatched route still runs prefix-scoped
+  middleware whose prefix matches `req->path`).
 - Because `chain_next` is a plain synchronous call (no deferred/async dispatch
   anywhere in this engine), a middleware that calls `chain_next(chain)` and then does
   more work afterward (e.g. logging) runs that code *after* the entire rest of the
@@ -65,6 +81,50 @@ app-wide middleware and *before* the handler, regardless of registration order.
 - Route `Handler`s themselves are not given a `MiddlewareChain *` and so cannot call
   `chain_next`/`chain_error` — they remain the terminal node of the pipeline exactly
   as before; only middleware (app-wide or per-route) participates in chaining.
+
+## Sub-router mounting
+`Router` (`app_types.h`) is a standalone route table — its own
+`Route routes[MAX_ROUTES]` + `route_count` and its own router-level
+`Middleware middlewares[MAX_MIDDLEWARES]` + `middleware_count` — built up via
+`router_get`/`router_post`/`router_get_mw`/`router_post_mw`/`router_use`
+(`router.c`), the exact `Router` analogues of `app_get`/`app_post`/`app_get_mw`/
+`app_post_mw`/`app_use`. A `Router` has no effect on dispatch by itself; it only
+takes effect once mounted into an `App` via `app_mount(app, prefix, router)`
+(the C analogue of Express's `app.use('/api', router)`):
+- **Routes are flattened, not nested.** `app_mount` copies each of the router's
+  `Route`s into `app->routes` (via `app_add_route_mw`, same `MAX_ROUTES` cap and
+  truncation-with-warning as any other route registration) with `prefix`
+  prepended to the route's own path (`build_mounted_path`, `router.c`). A route
+  registered at the router's own root (`router_get(router, "/", h)`) mounts at
+  `prefix` itself rather than `prefix + "/"` — so it matches `GET /api`, not
+  `GET /api/`. There is no `Route` back-reference to the `Router` it came from,
+  no runtime indirection through the `Router` struct at all — after `app_mount`
+  returns, the `Router` can go out of scope (e.g. a stack-local in `main`)
+  without dangling anything live in `app`.
+- **Router-level middleware becomes prefix-scoped app-wide middleware**, not a
+  separate pipeline stage: `app_mount` calls `app_use_prefix(app, prefix, mw)`
+  for each of the router's `router_use`-registered middleware. This reuses the
+  prefix-matching machinery above verbatim — a router's middleware runs ahead of
+  route dispatch for *any* request under `prefix`, including one that 404s
+  within the router's own route set, exactly like directly-registered
+  prefix-scoped middleware would.
+- **`prefix` normalization** (`app_mount`, `router.c`): `""` or `"/"` mounts
+  unscoped — router routes keep their own path unmodified and router middleware
+  runs on every request, same as `app_use_prefix(app, "", mw)`. A trailing slash
+  (`"/api/"`) is stripped before concatenation so a router route doesn't end up
+  double-slashed (`"/api//users"`).
+- **Registration order still governs middleware order.** Because mounting just
+  calls `app_use_prefix` at the point `app_mount` runs, a router's middleware is
+  interleaved into `app->middlewares` wherever that call happens relative to
+  other `app_use`/`app_use_prefix`/`app_mount` calls — mount your routers in the
+  order you want their middleware to run relative to each other and to any
+  directly-registered app-wide middleware.
+- This flattening approach means there's still no *nested* mounting (a `Router`
+  containing another `Router`) and no runtime concept of "which router a route
+  came from" — `match_route`/`dispatch` are completely unchanged, they just see
+  a bigger flat `app->routes` table. See `tests/test_router.c`
+  (`test_app_mount_*`) for prefixing, root-route, middleware-scoping, and
+  `MAX_ROUTES` truncation coverage.
 
 ## Deny-by-default routing
 `match_route` returns `NULL` on no match; `handle_readable` turns that into a 404.

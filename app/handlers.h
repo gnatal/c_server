@@ -7,5 +7,6 @@ void handler_home(const Request *req, Response *res);
 void handler_get_user(const Request *req, Response *res);
 void handler_echo(const Request *req, Response *res);
 void handler_echo_json(const Request *req, Response *res);
+void handler_api_status(const Request *req, Response *res);
 
 #endif /* HANDLERS_H */

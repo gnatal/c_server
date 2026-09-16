@@ -6,9 +6,21 @@
 /*
  * Registers app-wide middleware, run in registration order before every
  * request is dispatched - including requests that end up falling through
- * to a 404 (no path-scoping yet; every Middleware sees every request).
+ * to a 404. Unscoped: equivalent to app_use_prefix(app, "", mw).
  */
 void app_use(App *app, Middleware mw);
+
+/*
+ * Registers app-wide middleware scoped to a path prefix (the C analogue of
+ * Express's app.use('/api', mw)): it only runs for requests whose req->path
+ * starts with prefix at a segment boundary (prefix "/api" matches "/api" and
+ * "/api/foo", not "/apiary"). prefix "" or "/" behaves like app_use (runs on
+ * every request). Still runs ahead of route dispatch and in registration
+ * order relative to other app-wide middleware; a request that doesn't match
+ * the prefix skips this middleware entirely (its chain_next is never
+ * called for it).
+ */
+void app_use_prefix(App *app, const char *prefix, Middleware mw);
 
 /*
  * Registers the app's single centralized error handler. Middleware signals
