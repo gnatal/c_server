@@ -79,4 +79,37 @@ void res_set_cookie(Response *res, const char *name, const char *value, const Co
  */
 void res_clear_cookie(Response *res, const char *name, const char *path);
 
+/*
+ * Emits a chunk of data to the client using HTTP/1.1 Transfer-Encoding: chunked.
+ * On the first call to res_write (or res_end), the HTTP response headers
+ * (including Transfer-Encoding: chunked, custom headers, and any staged Trailer
+ * declarations) are serialized into conn->out_buf. Subsequent calls append
+ * "<hex_len>\r\n<data>\r\n" chunks to conn->out_buf, growing it dynamically
+ * up to MAX_BODY_SIZE. For HEAD requests, chunk data is suppressed.
+ */
+void res_write(Response *res, const char *data, size_t len);
+
+/*
+ * Sets a trailing response header to be emitted after the final chunk (0\r\n)
+ * per RFC 7230 §4.1.2. Repeated calls with the same name (case-insensitive)
+ * overwrite in place. Bounded by MAX_RESPONSE_TRAILERS.
+ */
+void res_set_trailer(Response *res, const char *name, const char *value);
+
+/*
+ * Terminates a chunked streaming response: emits headers if not yet sent,
+ * writes the terminal 0\r\n chunk, serializes all staged trailers (followed by
+ * the terminating blank line \r\n), and marks the stream as ended.
+ */
+void res_end(Response *res);
+
+/*
+ * Streams a static file directly from disk to the client in bounded STREAM_CHUNK_SIZE
+ * (16KB) chunks through the event loop, without buffering the entire file into
+ * RAM. Opens filepath, stats it, sends Content-Length and Content-Type headers,
+ * and attaches the file descriptor to the Connection. Returns 0 on success,
+ * or -1 if the file could not be opened or is not a regular file.
+ */
+int res_send_file(Response *res, const char *content_type, const char *filepath);
+
 #endif /* RESPONSE_H */

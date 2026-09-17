@@ -290,3 +290,21 @@ void handler_echo_json(const Request *req, Response *res) {
     free(out);
     json_free(body);
 }
+
+void handler_stream(const Request *req, Response *res) {
+    (void)req;
+    res_set_header(res, "Content-Type", "text/plain");
+    res_set_trailer(res, "Server-Timing", "demo;dur=12.5");
+    res_write(res, "chunk 1: hello\n", 15);
+    res_write(res, "chunk 2: streaming world\n", 25);
+    res_write(res, "chunk 3: done\n", 14);
+    res_end(res);
+}
+
+void handler_download(const Request *req, Response *res) {
+    (void)req;
+    if (res_send_file(res, "text/markdown", "README.md") != 0) {
+        res_status(res, 404);
+        res_send(res, "File Not Found");
+    }
+}

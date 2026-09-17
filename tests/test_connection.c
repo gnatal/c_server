@@ -863,6 +863,45 @@ static void test_app_stop_drains_and_flushes_pending_write(void) {
     app_destroy(&app);
 }
 
+static void test_res_send_file_streams_to_socket(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    char tmp_path[] = "/tmp/cexpress_stream_test_XXXXXX";
+    int tmp_fd = mkstemp(tmp_path);
+    assert(tmp_fd >= 0);
+    const char *payload = "hello streamed file content\n";
+    assert(write(tmp_fd, payload, strlen(payload)) == (ssize_t)strlen(payload));
+    close(tmp_fd);
+
+    Response res;
+    memset(&res, 0, sizeof(res));
+    res.conn = conn;
+    conn->keep_alive = 0;
+
+    int rc = res_send_file(&res, "text/plain", tmp_path);
+    assert(rc == 0);
+    assert(conn->file_fd >= 0);
+
+    flush_connection(&app, conn);
+
+    char buf[1024];
+    memset(buf, 0, sizeof(buf));
+    ssize_t n = read(fds[1], buf, sizeof(buf) - 1);
+    assert(n > 0);
+    assert(strstr(buf, "HTTP/1.1 200 OK\r\n") != NULL);
+    assert(strstr(buf, "Content-Type: text/plain\r\n") != NULL);
+    assert(strstr(buf, "hello streamed file content\n") != NULL);
+
+    assert(app.connections[fds[0]] == NULL);
+
+    unlink(tmp_path);
+    close(fds[1]);
+    app_destroy(&app);
+}
+
 int main(void) {
     test_set_nonblocking_and_create();
     test_handle_readable_round_trip_success();
@@ -890,6 +929,7 @@ int main(void) {
     test_app_stop_idempotency_and_closing_idle();
     test_handle_readable_during_shutdown_forces_connection_close();
     test_app_stop_drains_and_flushes_pending_write();
+    test_res_send_file_streams_to_socket();
 
     printf("all connection tests passed\n");
     return 0;

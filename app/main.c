@@ -56,6 +56,12 @@ int main(void) {
    * parsed field back as JSON, the same shape GET /search builds from the
    * query string. */
   app_post(&app, "/form", handler_form);
+  /* Streaming & Chunked Transfer-Encoding demo (lib/response.h):
+   * GET /stream emits chunked response with trailers via res_write/res_end. */
+  app_get(&app, "/stream", handler_stream);
+  /* Bounded file streaming demo (lib/response.h):
+   * GET /download streams a file in 16KB chunks without buffering into RAM. */
+  app_get(&app, "/download", handler_download);
   /* Only this route requires auth - mw_authenticate is per-route middleware,
    * not app-wide, so it doesn't gate "/" or the other routes above. */
   app_post_mw(&app, "/echo/json", handler_echo_json, (Middleware[]){mw_authenticate}, 1);

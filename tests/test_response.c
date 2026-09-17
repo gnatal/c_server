@@ -2,12 +2,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "app_types.h"
 #include "response.h"
 
 static Connection *make_conn(void) {
     Connection *conn = calloc(1, sizeof(Connection));
     conn->keep_alive = 1;
+    conn->file_fd = -1;
     return conn;
 }
 
@@ -243,6 +245,94 @@ static void test_redirect_explicit_status(void) {
     free_conn(conn);
 }
 
+static void test_chunked_streaming_basic(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    res_write(&res, "hello ", 6);
+    res_write(&res, "world", 5);
+    res_end(&res);
+
+    assert(conn->out_buf != NULL);
+    assert(strstr(conn->out_buf, "Transfer-Encoding: chunked\r\n") != NULL);
+    assert(strstr(conn->out_buf, "Content-Length:") == NULL);
+    assert(strstr(conn->out_buf, "\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n") != NULL);
+
+    free_conn(conn);
+}
+
+static void test_chunked_streaming_trailers(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    res_set_trailer(&res, "Server-Timing", "app;dur=15.2");
+    res_write(&res, "payload", 7);
+    res_end(&res);
+
+    assert(conn->out_buf != NULL);
+    assert(strstr(conn->out_buf, "Trailer: Server-Timing\r\n") != NULL);
+    assert(strstr(conn->out_buf, "7\r\npayload\r\n0\r\nServer-Timing: app;dur=15.2\r\n\r\n") != NULL);
+
+    free_conn(conn);
+}
+
+static void test_chunked_streaming_forbidden_trailers(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    res_set_trailer(&res, "Transfer-Encoding", "chunked");
+    res_set_trailer(&res, "Content-Length", "100");
+    res_set_trailer(&res, "Trailer", "foo");
+
+    assert(res.trailer_count == 0);
+
+    free_conn(conn);
+}
+
+static void test_chunked_head_request_omits_body(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0, .is_head_request = 1 };
+
+    res_write(&res, "suppressed", 10);
+    res_end(&res);
+
+    assert(conn->out_buf != NULL);
+    assert(strstr(conn->out_buf, "Transfer-Encoding: chunked\r\n") != NULL);
+    /* HEAD response terminates after headers double-CRLF; no chunk framing */
+    assert(strstr(conn->out_buf, "suppressed") == NULL);
+    assert(strstr(conn->out_buf, "0\r\n") == NULL);
+
+    free_conn(conn);
+}
+
+static void test_send_file_non_existent(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    int rc = res_send_file(&res, "text/plain", "does_not_exist_xyz123.txt");
+    assert(rc == -1);
+    assert(conn->file_fd == -1);
+
+    free_conn(conn);
+}
+
+static void test_send_file_headers_and_fd(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    int rc = res_send_file(&res, "text/plain", "README.md");
+    assert(rc == 0);
+    assert(conn->file_fd >= 0);
+    assert(conn->file_remaining > 0);
+    assert(conn->out_buf != NULL);
+    assert(strstr(conn->out_buf, "Content-Type: text/plain\r\n") != NULL);
+    assert(strstr(conn->out_buf, "Content-Length:") != NULL);
+
+    close(conn->file_fd);
+    conn->file_fd = -1;
+    free_conn(conn);
+}
+
 int main(void) {
     test_custom_header_is_sent();
     test_repeated_set_header_overwrites_case_insensitively();
@@ -257,6 +347,12 @@ int main(void) {
     test_max_response_cookies_enforced();
     test_redirect_default_status();
     test_redirect_explicit_status();
+    test_chunked_streaming_basic();
+    test_chunked_streaming_trailers();
+    test_chunked_streaming_forbidden_trailers();
+    test_chunked_head_request_omits_body();
+    test_send_file_non_existent();
+    test_send_file_headers_and_fd();
 
     printf("all response tests passed\n");
     return 0;

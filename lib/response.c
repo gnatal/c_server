@@ -1,6 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include "response.h"
 #include "http_parser.h"
 
@@ -121,8 +125,9 @@ static void send_with_content_type(Response *res, const char *content_type, cons
     const size_t header_len = offset;
     /* Content-Length above is always computed from the full body - a HEAD
      * response must report the same length a GET would have (RFC 7231
-     * 4.3.2), it just never actually sends those bytes. */
-    const size_t sent_body_len = res->is_head_request ? 0 : body_len;
+     * 4.3.2), it just never actually sends those bytes. When body is NULL,
+     * this is a file stream (headers only). */
+    const size_t sent_body_len = (body != NULL && !res->is_head_request) ? body_len : 0;
 
     /*
      * Ownership: this buffer is handed to the event loop. On the keep-alive
@@ -146,6 +151,7 @@ static void send_with_content_type(Response *res, const char *content_type, cons
     }
     conn->out_len = header_len + sent_body_len;
     conn->out_sent = 0;
+    conn->out_cap = header_len + sent_body_len;
 }
 
 void res_send(Response *res, const char *body) {
@@ -243,4 +249,253 @@ void res_clear_cookie(Response *res, const char *name, const char *path) {
     const CookieOptions options = { .max_age = 0, .path = path, .domain = NULL,
                                      .http_only = 0, .secure = 0, .same_site = COOKIE_SAMESITE_UNSET };
     res_set_cookie(res, name, "", &options);
+}
+
+static int append_to_out_buf(Connection *conn, const void *data, size_t len) {
+    if (conn == NULL || data == NULL || len == 0) {
+        return 0;
+    }
+    if (conn->out_len + len > (size_t)MAX_BODY_SIZE + RESPONSE_HEADER_BUF_SIZE) {
+        fprintf(stderr, "append_to_out_buf: response exceeds MAX_BODY_SIZE cap\n");
+        return -1;
+    }
+    if (conn->out_len + len > conn->out_cap) {
+        size_t new_cap = (conn->out_cap == 0) ? 1024 : conn->out_cap * 2;
+        while (new_cap < conn->out_len + len) {
+            new_cap *= 2;
+        }
+        char *grown = realloc(conn->out_buf, new_cap);
+        if (grown == NULL) {
+            return -1;
+        }
+        conn->out_buf = grown;
+        conn->out_cap = new_cap;
+    }
+    memcpy(conn->out_buf + conn->out_len, data, len);
+    conn->out_len += len;
+    return 0;
+}
+
+static int commit_chunked_headers(Response *res) {
+    char header[RESPONSE_HEADER_BUF_SIZE];
+    Connection *conn = res->conn;
+    if (conn == NULL) {
+        return -1;
+    }
+
+    if (res->status == 0) {
+        res->status = 200;
+    }
+
+    const char *content_type = "text/plain";
+    const char *custom_content_type = find_header(res, "Content-Type");
+    if (custom_content_type != NULL) {
+        content_type = custom_content_type;
+    }
+
+    int n = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: %s\r\n",
+        res->status, status_text(res->status), content_type,
+        conn->keep_alive ? "keep-alive" : "close");
+
+    int overflow = (n < 0 || (size_t)n >= sizeof(header));
+    size_t offset = overflow ? sizeof(header) : (size_t)n;
+
+    for (int i = 0; i < res->header_count && !overflow; i++) {
+        if (strcasecmp(res->headers[i].name, "Content-Type") == 0 ||
+            strcasecmp(res->headers[i].name, "Transfer-Encoding") == 0 ||
+            strcasecmp(res->headers[i].name, "Content-Length") == 0 ||
+            strcasecmp(res->headers[i].name, "Connection") == 0) {
+            continue;
+        }
+        n = snprintf(header + offset, sizeof(header) - offset,
+            "%s: %s\r\n", res->headers[i].name, res->headers[i].value);
+        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
+            overflow = 1;
+        } else {
+            offset += (size_t)n;
+        }
+    }
+
+    for (int i = 0; i < res->set_cookie_count && !overflow; i++) {
+        n = snprintf(header + offset, sizeof(header) - offset,
+            "Set-Cookie: %s\r\n", res->set_cookies[i]);
+        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
+            overflow = 1;
+        } else {
+            offset += (size_t)n;
+        }
+    }
+
+    if (res->trailer_count > 0 && !overflow) {
+        n = snprintf(header + offset, sizeof(header) - offset, "Trailer: ");
+        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
+            overflow = 1;
+        } else {
+            offset += (size_t)n;
+            for (int i = 0; i < res->trailer_count && !overflow; i++) {
+                n = snprintf(header + offset, sizeof(header) - offset,
+                    "%s%s", res->trailers[i].name,
+                    (i + 1 < res->trailer_count) ? ", " : "\r\n");
+                if (n < 0 || (size_t)n >= sizeof(header) - offset) {
+                    overflow = 1;
+                } else {
+                    offset += (size_t)n;
+                }
+            }
+        }
+    }
+
+    if (!overflow) {
+        n = snprintf(header + offset, sizeof(header) - offset, "\r\n");
+        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
+            overflow = 1;
+        } else {
+            offset += (size_t)n;
+        }
+    }
+
+    if (overflow) {
+        conn->out_len = 0;
+        conn->out_sent = 0;
+        conn->keep_alive = 0;
+        return -1;
+    }
+
+    if (append_to_out_buf(conn, header, offset) != 0) {
+        return -1;
+    }
+    res->headers_sent = 1;
+    res->is_chunked = 1;
+    return 0;
+}
+
+void res_write(Response *res, const char *data, size_t len) {
+    if (res == NULL || res->conn == NULL || res->stream_ended) {
+        return;
+    }
+    if (!res->headers_sent) {
+        if (commit_chunked_headers(res) != 0) {
+            return;
+        }
+    }
+    if (res->is_head_request) {
+        return;
+    }
+    if (len == 0 && data == NULL) {
+        return;
+    }
+
+    char chunk_hdr[32];
+    int n = snprintf(chunk_hdr, sizeof(chunk_hdr), "%zx\r\n", len);
+    if (n <= 0) {
+        return;
+    }
+    if (append_to_out_buf(res->conn, chunk_hdr, (size_t)n) != 0) {
+        return;
+    }
+    if (len > 0 && data != NULL) {
+        if (append_to_out_buf(res->conn, data, len) != 0) {
+            return;
+        }
+    }
+    append_to_out_buf(res->conn, "\r\n", 2);
+}
+
+void res_set_trailer(Response *res, const char *name, const char *value) {
+    if (res == NULL || name == NULL || value == NULL) {
+        return;
+    }
+    if (strcasecmp(name, "Transfer-Encoding") == 0 ||
+        strcasecmp(name, "Content-Length") == 0 ||
+        strcasecmp(name, "Trailer") == 0) {
+        fprintf(stderr, "res_set_trailer: \"%s\" is not permitted in chunked trailer\n", name);
+        return;
+    }
+
+    for (int i = 0; i < res->trailer_count; i++) {
+        if (strcasecmp(res->trailers[i].name, name) == 0) {
+            strncpy(res->trailers[i].value, value, sizeof(res->trailers[i].value) - 1);
+            res->trailers[i].value[sizeof(res->trailers[i].value) - 1] = '\0';
+            return;
+        }
+    }
+
+    if (res->trailer_count >= MAX_RESPONSE_TRAILERS) {
+        fprintf(stderr, "res_set_trailer: MAX_RESPONSE_TRAILERS exceeded\n");
+        return;
+    }
+
+    ResponseHeader *tr = &res->trailers[res->trailer_count++];
+    strncpy(tr->name, name, sizeof(tr->name) - 1);
+    tr->name[sizeof(tr->name) - 1] = '\0';
+    strncpy(tr->value, value, sizeof(tr->value) - 1);
+    tr->value[sizeof(tr->value) - 1] = '\0';
+}
+
+void res_end(Response *res) {
+    if (res == NULL || res->conn == NULL || res->stream_ended) {
+        return;
+    }
+    if (!res->headers_sent) {
+        if (commit_chunked_headers(res) != 0) {
+            return;
+        }
+    }
+    res->stream_ended = 1;
+    if (res->is_head_request) {
+        return;
+    }
+    if (append_to_out_buf(res->conn, "0\r\n", 3) != 0) {
+        return;
+    }
+    for (int i = 0; i < res->trailer_count; i++) {
+        char tr_line[384];
+        int n = snprintf(tr_line, sizeof(tr_line), "%s: %s\r\n",
+                         res->trailers[i].name, res->trailers[i].value);
+        if (n > 0) {
+            append_to_out_buf(res->conn, tr_line, (size_t)n);
+        }
+    }
+    append_to_out_buf(res->conn, "\r\n", 2);
+}
+
+int res_send_file(Response *res, const char *content_type, const char *filepath) {
+    if (res == NULL || res->conn == NULL || filepath == NULL || res->headers_sent) {
+        return -1;
+    }
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+    if (res->status == 0) {
+        res->status = 200;
+    }
+
+    send_with_content_type(res, content_type, NULL, (size_t)st.st_size);
+    if (res->conn->out_buf == NULL) {
+        close(fd);
+        res->conn->file_fd = -1;
+        res->conn->file_remaining = 0;
+        return -1;
+    }
+    res->headers_sent = 1;
+
+    if (res->is_head_request || st.st_size == 0) {
+        close(fd);
+        res->conn->file_fd = -1;
+        res->conn->file_remaining = 0;
+    } else {
+        res->conn->file_fd = fd;
+        res->conn->file_remaining = (size_t)st.st_size;
+    }
+    return 0;
 }

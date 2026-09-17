@@ -895,6 +895,33 @@ socket draining, and memory teardown without blocking the single event thread:
   breaks its loop, restores default signal dispositions, and returns. `main.c` then
   calls `app_destroy(&app)`, releasing all remaining memory and sockets.
 
+## Streaming & Chunked Responses
+CExpress supports incremental chunked responses and event-loop-driven bounded file streaming:
+- **Procedural chunked streaming** (`res_write`, `res_end` in `lib/response.c`):
+  - Handlers call `res_write(res, data, len)` to emit chunks and `res_end(res)` to terminate.
+  - The first call commits response headers with `Transfer-Encoding: chunked` and any custom
+    headers/cookies set on `res`.
+  - `conn->out_buf` grows dynamically via `append_to_out_buf` (realloc) up to `MAX_BODY_SIZE`
+    (10MB), preserving the architectural invariant that handlers do not perform blocking socket
+    I/O during dispatch, keeping response generation 100% unit-testable.
+  - For `HEAD` requests, chunk framing and data are suppressed per RFC 7230 3.3.3: only the
+    response headers terminating with `\r\n\r\n` are sent.
+- **Chunked trailers** (`res_set_trailer` in `lib/response.c`):
+  - Handlers stage up to `MAX_RESPONSE_TRAILERS` (8) trailers (e.g. `Server-Timing`).
+  - Trailers set before headers are sent declare `Trailer: <names>` in the header block.
+  - Forbidden trailer field names (`Transfer-Encoding`, `Content-Length`, `Trailer`) are rejected.
+  - Emitted after the terminal `0\r\n` chunk and followed by the final `\r\n`.
+- **Bounded file streaming** (`res_send_file` in `lib/response.c`, `flush_connection` in `lib/connection.c`):
+  - `res_send_file` stats the target file, validates it is a regular file, commits headers with
+    exact `Content-Length`, sets `conn->file_fd`, and records `conn->file_remaining`.
+  - `flush_connection` drains headers, then reads up to `STREAM_CHUNK_SIZE` (16KB) at a time into
+    `conn->out_buf` and writes to the socket.
+  - Bounded memory footprint: large files are never buffered into RAM.
+  - Cooperative yielding: flushes up to 64KB (`4 * STREAM_CHUNK_SIZE`) per event-loop turn,
+    registering `EVFILT_WRITE` to allow other connections to make progress.
+  - Idle timeout (`close_idle_connections`) and shutdown (`app_stop`) check `conn->file_fd >= 0`
+    as an in-flight condition so streaming transfers are not severed prematurely.
+
 ## Const correctness
 `Handler` (`app_types.h`) takes `const Request *`: routing (`match_path`/`match_route`)
 is the only code that mutates a `Request` (filling in path params before dispatch);

@@ -23,7 +23,11 @@
 #define MAX_MULTIPART_PARTS 16
 #define MAX_COOKIES 16
 #define MAX_RESPONSE_COOKIES 16
+#define MAX_RESPONSE_TRAILERS 8
 #define MAX_FORM_FIELDS 32
+
+/* Bounded chunk size for streaming files off disk in flush_connection (connection.c) */
+#define STREAM_CHUNK_SIZE (16 * 1024)
 
 /* Bounds one fully-formatted "Set-Cookie" header *value* (name=value plus
  * every attribute - Path, Domain, Max-Age, HttpOnly, Secure, SameSite),
@@ -240,6 +244,13 @@ typedef struct Connection {
     char *out_buf;
     size_t out_len;
     size_t out_sent;
+    size_t out_cap;
+
+    /* File streaming: when file_fd >= 0, flush_connection streams file_remaining
+     * bytes off disk in STREAM_CHUNK_SIZE chunks directly through the event loop
+     * without buffering the whole file in RAM. */
+    int file_fd;
+    size_t file_remaining;
 } Connection;
 
 typedef struct {
@@ -312,6 +323,16 @@ typedef struct {
      * connection.c), which is safe - those responses have no real body to
      * suppress either way. */
     int is_head_request;
+
+    /* Chunked response trailers (res_set_trailer, response.c), emitted after
+     * the terminating 0\r\n chunk per RFC 7230 §4.1.2. */
+    ResponseHeader trailers[MAX_RESPONSE_TRAILERS];
+    int trailer_count;
+
+    /* Chunked streaming response state (res_write / res_end): */
+    int is_chunked;
+    int headers_sent;
+    int stream_ended;
 } Response;
 
 /* req is never mutated by a handler once routing has filled in its params. */

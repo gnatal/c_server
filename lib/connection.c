@@ -75,6 +75,7 @@ Connection *connection_create(int fd) {
     }
     conn->in_cap = BUF_SIZE;
     conn->fd = fd;
+    conn->file_fd = -1;
     conn->last_activity = time(NULL);
     return conn;
 }
@@ -84,6 +85,11 @@ void connection_close(App *app, Connection *conn) {
     EV_SET(&changes[0], conn->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
     EV_SET(&changes[1], conn->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
     kevent(app->kq, changes, 2, NULL, 0, NULL);
+
+    if (conn->file_fd >= 0) {
+        close(conn->file_fd);
+        conn->file_fd = -1;
+    }
 
     close(conn->fd);
     app->connections[conn->fd] = NULL;
@@ -149,7 +155,7 @@ void app_stop(App *app) {
             if (conn == NULL) {
                 continue;
             }
-            if (conn->in_len == 0 && conn->out_buf == NULL) {
+            if (conn->in_len == 0 && conn->out_buf == NULL && conn->file_fd < 0) {
                 connection_close(app, conn);
             } else {
                 conn->keep_alive = 0;
@@ -241,17 +247,60 @@ void accept_connections(App *app) {
 }
 
 void flush_connection(App *app, Connection *conn) {
-    while (conn->out_sent < conn->out_len) {
-        ssize_t n = write(conn->fd, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                kq_watch(app->kq, conn->fd, EVFILT_WRITE, conn);
+    size_t bytes_written_this_flush = 0;
+    const size_t max_flush_bytes = 4 * STREAM_CHUNK_SIZE;
+
+    while (1) {
+        while (conn->out_sent < conn->out_len) {
+            ssize_t n = write(conn->fd, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    kq_watch(app->kq, conn->fd, EVFILT_WRITE, conn);
+                    return;
+                }
+                connection_close(app, conn);
                 return;
             }
-            connection_close(app, conn);
-            return;
+            conn->out_sent += (size_t)n;
+            conn->last_activity = time(NULL);
+            bytes_written_this_flush += (size_t)n;
         }
-        conn->out_sent += (size_t)n;
+
+        /* The current out_buf has been fully drained to the socket */
+        if (conn->file_fd >= 0) {
+            if (conn->file_remaining > 0) {
+                if (bytes_written_this_flush >= max_flush_bytes) {
+                    /* Yield to event loop to share bandwidth fairly */
+                    kq_watch(app->kq, conn->fd, EVFILT_WRITE, conn);
+                    return;
+                }
+
+                size_t to_read = conn->file_remaining < STREAM_CHUNK_SIZE
+                                     ? conn->file_remaining
+                                     : STREAM_CHUNK_SIZE;
+                free(conn->out_buf);
+                conn->out_buf = malloc(to_read);
+                if (conn->out_buf == NULL) {
+                    connection_close(app, conn);
+                    return;
+                }
+                ssize_t r = read(conn->file_fd, conn->out_buf, to_read);
+                if (r <= 0) {
+                    connection_close(app, conn);
+                    return;
+                }
+                conn->out_len = (size_t)r;
+                conn->out_sent = 0;
+                conn->out_cap = to_read;
+                conn->file_remaining -= (size_t)r;
+                continue;
+            } else {
+                close(conn->file_fd);
+                conn->file_fd = -1;
+            }
+        }
+
+        break;
     }
 
     if (conn->keep_alive) {
@@ -263,6 +312,7 @@ void flush_connection(App *app, Connection *conn) {
         conn->out_buf = NULL;
         conn->out_len = 0;
         conn->out_sent = 0;
+        conn->out_cap = 0;
         conn->in_len = 0;
 
         /* If handle_readable grew in_buf to fit a large body (in_cap >
@@ -305,11 +355,9 @@ void handle_readable(App *app, Connection *conn) {
         if (request_is_complete(conn->in_buf, conn->in_len)) {
             Request req;
             Response res;
+            memset(&res, 0, sizeof(res));
             res.conn = conn;
             res.status = 200;
-            res.header_count = 0;
-            res.set_cookie_count = 0;
-            res.is_head_request = 0;
 
             const int parse_status = parse_http_request(conn->in_buf, conn->in_len, &req);
             if (parse_status != 0) {
@@ -424,10 +472,8 @@ void handle_readable(App *app, Connection *conn) {
                 }
 
                 Response res;
+                memset(&res, 0, sizeof(res));
                 res.conn = conn;
-                res.header_count = 0;
-                res.set_cookie_count = 0;
-                res.is_head_request = 0;
                 conn->keep_alive = 0;
                 res_status(&res, 413);
                 res_send(&res, "Payload Too Large");
@@ -448,10 +494,8 @@ void handle_readable(App *app, Connection *conn) {
         }
 
         Response res;
+        memset(&res, 0, sizeof(res));
         res.conn = conn;
-        res.header_count = 0;
-        res.set_cookie_count = 0;
-        res.is_head_request = 0;
         conn->keep_alive = 0;
         if (header_end == NULL) {
             res_status(&res, 431);
@@ -476,7 +520,7 @@ void close_idle_connections(App *app) {
         /* A write still in flight is a slow-reader-on-the-response problem,
          * not the slow-sender-of-a-request problem this timeout targets -
          * leave it for flush_connection()/EVFILT_WRITE to keep draining. */
-        if (conn->out_buf != NULL) {
+        if (conn->out_buf != NULL || conn->file_fd >= 0) {
             continue;
         }
 
@@ -489,10 +533,8 @@ void close_idle_connections(App *app) {
              * know why before closing, same shape as the 431/500 rejections
              * in handle_readable(). */
             Response res;
+            memset(&res, 0, sizeof(res));
             res.conn = conn;
-            res.header_count = 0;
-            res.set_cookie_count = 0;
-            res.is_head_request = 0;
             conn->keep_alive = 0;
             res_status(&res, 408);
             res_send(&res, "Request Timeout");

@@ -318,9 +318,15 @@ Gaps vs. an Express-like C framework
   and Connection are rejected (reserved, computed by send_with_content_type itself);
   Content-Type may be overridden and takes priority over res_send/res_json's default.
   Backed by a fixed Response.headers[MAX_RESPONSE_HEADERS] array - extra calls past the
-  cap are dropped rather than overflowing. See tests/test_response.c.
-- Still no streaming/chunked response
-- [DONE] Static file serving: app_serve_static(app, prefix, root_dir) (lib/router.h)
+- [DONE] Streaming & chunked response: procedural chunked response API (res_write, res_end
+  in lib/response.h/c) with dynamic buffer growth up to MAX_BODY_SIZE (10MB), preserving
+  pure handler dispatch and unit testability without raw socket interaction. Supports
+  chunked trailers via res_set_trailer (RFC 7230, validates forbidden field names, emits
+  Trailer header and trailers after terminal 0\r\n chunk). Suppresses chunk framing for HEAD
+  requests. Event-loop-driven bounded 16KB file streaming (res_send_file) in flush_connection
+  via conn->file_fd and EVFILT_WRITE with 64KB cooperative yielding per turn, without
+  buffering whole files in RAM. Tested in tests/test_response.c and tests/test_connection.c;
+  demo routes GET /stream and GET /download in app/main.c.
   registers a static-file mount as a Route (trailing-wildcard pattern, reusing the
   wildcard machinery above) rather than a Handler - root_dir is canonicalized via
   realpath() at registration time (refuses to register against a directory that

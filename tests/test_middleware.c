@@ -10,6 +10,7 @@
 static Connection *make_conn(void) {
     Connection *conn = calloc(1, sizeof(Connection));
     conn->keep_alive = 1;
+    conn->file_fd = -1;
     return conn;
 }
 

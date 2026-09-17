@@ -19,5 +19,7 @@ void handler_search(const Request *req, Response *res);
 void handler_files(const Request *req, Response *res);
 void handler_upload(const Request *req, Response *res);
 void handler_form(const Request *req, Response *res);
+void handler_stream(const Request *req, Response *res);
+void handler_download(const Request *req, Response *res);
 
 #endif /* HANDLERS_H */
