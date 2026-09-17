@@ -239,7 +239,23 @@ Gaps vs. an Express-like C framework
   tests/test_http_parser.c: test_parse_http_request, lib/CLAUDE.md
   ("multipart/form-data parsing" and "Body buffering"), and app/handlers.c
   (handler_upload, POST /upload) for a real usage example.
-- No x-www-form-urlencoded
+- [DONE] application/x-www-form-urlencoded: the new pure parse_urlencoded_body(body,
+  body_len, form) (lib/urlencoded.c/h) splits a Request.body into a UrlEncodedForm
+  (app_types.h): a bounded MAX_FORM_FIELDS array of field_names/field_values,
+  looked up via urlencoded_get_field(form, name) mirroring req_get_query/
+  multipart_get_part's first-match convention. Same "&" then "=" splitting rule
+  and decode_plus=1 URL-decoding as parse_query_string (a bare key with no "="
+  gets an empty-string value, consecutive "&"s don't produce empty entries) -
+  the two share the same key=value&key2=value2 grammar, just carried in the body
+  instead of the URL - but body is read directly via memchr/memcpy rather than
+  strtok_r'd through a local copy, since a form body (unlike the 256-byte-capped
+  query string) can be as large as MAX_BODY_SIZE and parse_urlencoded_body never
+  mutates its input. Handler-gated on Content-Type the same way has_json_content_type
+  gates JSON validation, not run automatically by parse_http_request (unlike
+  headers/query, which every request has) - see app/handlers.c:
+  has_urlencoded_content_type/handler_form (POST /form) for a real usage example
+  and tests/test_urlencoded.c, lib/CLAUDE.md ("application/x-www-form-urlencoded
+  parsing").
 - [DONE] Cookies: request-side, the new pure parse_cookies(cookie_header, req)
   (lib/http_parser.c/h) - called from parse_http_request as
   parse_cookies(req_get_header(req, "Cookie"), req) - splits the "Cookie"

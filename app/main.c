@@ -49,6 +49,11 @@ int main(void) {
    * handler_upload (lib/multipart.h) echoes each part back as JSON, file
    * parts as {filename, content_type, size} rather than raw bytes. */
   app_post(&app, "/upload", handler_upload);
+  /* application/x-www-form-urlencoded demo: POST /form with a body like
+   * "name=natal&age=32" - handler_form (lib/urlencoded.h) echoes every
+   * parsed field back as JSON, the same shape GET /search builds from the
+   * query string. */
+  app_post(&app, "/form", handler_form);
   /* Only this route requires auth - mw_authenticate is per-route middleware,
    * not app-wide, so it doesn't gate "/" or the other routes above. */
   app_post_mw(&app, "/echo/json", handler_echo_json, (Middleware[]){mw_authenticate}, 1);

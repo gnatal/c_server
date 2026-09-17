@@ -25,6 +25,9 @@ layer stays pure and unit-testable independent of sockets:
   trailing parameters, non-multipart rejection), part splitting (fields, file parts,
   a binary payload with an embedded NUL byte), malformed/nameless parts being
   skipped, and the `MAX_MULTIPART_PARTS` truncation cap.
+- `tests/test_urlencoded.c` tests `application/x-www-form-urlencoded` body
+  splitting/decoding, bare-key/empty-pair handling, `NULL`/empty bodies, and the
+  `MAX_FORM_FIELDS` truncation cap.
 
 `App` carries `ServerConfig config` (`app_types.h`), storing runtime parameters such as `config.port` (defaulting to `DEFAULT_PORT` in `app_init`).
 
@@ -558,6 +561,57 @@ checking for, the same way `app/handlers.c: has_json_content_type` gates
   the embedded-NUL binary-payload case, nameless-part skipping, and the
   `MAX_MULTIPART_PARTS` truncation cap) and `app/handlers.c: handler_upload`
   (`POST /upload`, `app/CLAUDE.md`) for a real usage example.
+
+## application/x-www-form-urlencoded parsing
+`parse_urlencoded_body(body, body_len, form)`/`urlencoded_get_field(form, name)`
+(`lib/urlencoded.c/h`) parse an `application/x-www-form-urlencoded`
+`Request.body` the same way `multipart_parse_boundary`/`parse_multipart_body`
+parse a multipart body — a pure function over a `const char *` buffer, called
+explicitly by a handler that has already gated on `Content-Type` (one specific
+media type a handler opts into checking for, not run automatically by
+`parse_http_request` the way header/query parsing is).
+- **Same grammar as the query string, different buffer.**
+  `application/x-www-form-urlencoded` is byte-for-byte the same
+  `key=value&key2=value2` grammar `parse_query_string` already splits out of
+  `req->query` — `&` separates pairs, the first `=` in a pair separates key
+  from value, a pair with no `=` gets an empty-string value, and both key and
+  value are run through `url_decode` (`decode_plus = 1`, `http_parser.c`) —
+  but `parse_urlencoded_body` does **not** reuse `parse_query_string` itself,
+  because `req->query` (and the `strtok_r`-based local copy
+  `parse_query_string` makes of it) is capped at `sizeof(req->query)` (256
+  bytes), while a form body is a `Request.body`, bounded only by
+  `MAX_BODY_SIZE` (10 MiB) same as any other body. `parse_urlencoded_body`
+  instead walks `body`/`body_len` directly with `memchr` to find each `&`/`=`
+  boundary and `memcpy`s each segment into a bounded, NUL-terminated
+  `UrlEncodedForm` (`app_types.h`) slot before `url_decode`-ing it in place —
+  `body` itself is never mutated, mirroring `parse_multipart_body`'s
+  `memmem`-based, non-mutating walk over the same kind of buffer.
+- **`UrlEncodedForm.field_names`/`field_values`** (`app_types.h`) are a fixed
+  `MAX_FORM_FIELDS`-sized array + `field_count`, the same bounded-array-plus-
+  count shape as `query_names`/`query_values` — extra pairs past the cap are
+  dropped rather than overflowing, same convention as `MAX_QUERY_PARAMS`/
+  `MAX_HEADERS` elsewhere. A field value longer than its slot (256 bytes,
+  matching `header_values`/`cookie_values`) is truncated rather than growing —
+  this is a form *field*, not a file upload (that's what `multipart/form-data`
+  above is for).
+- **`body` may be `NULL`** (a request with `Content-Length: 0`), treated the
+  same as an empty body — `form->field_count` is just left at `0`, not a parse
+  error, same convention as `parse_cookies` accepting a `NULL` `Cookie` header.
+- **Content-Type gating is the handler's job**, not `parse_urlencoded_body`'s —
+  unlike `multipart_parse_boundary` (which has to inspect `Content-Type`
+  anyway, to extract the `boundary=` parameter), there's nothing left to
+  extract from an `application/x-www-form-urlencoded` `Content-Type` once its
+  presence is confirmed, so the check is a small prefix-match helper at the
+  app layer (`app/handlers.c: has_urlencoded_content_type`), exactly mirroring
+  `has_json_content_type`'s existing convention rather than adding a new one
+  to the engine.
+- **`urlencoded_get_field(form, name)`** looks the array up by exact name
+  (`strcmp`), mirroring `req_get_query`/`multipart_get_part`'s first-match
+  lookup convention.
+- See `tests/test_urlencoded.c` (splitting/decoding, bare-key/empty-pair
+  handling, `NULL`/empty bodies, `MAX_FORM_FIELDS` truncation) and
+  `app/handlers.c: handler_form` (`POST /form`, `app/CLAUDE.md`) for a real
+  usage example.
 
 ## Response headers
 `Response` (`app_types.h`) carries a fixed `headers[MAX_RESPONSE_HEADERS]` array +

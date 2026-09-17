@@ -88,6 +88,15 @@ scoping mechanisms in `lib/`:
   reaches the filesystem; a successful write adds `"saved_as": "temp.txt"` to
   that part's JSON entry, a failed one (`fopen`/`fwrite` error) is silently
   omitted rather than failing the whole request.
+- `POST /form` (`handler_form`) demonstrates `application/x-www-form-urlencoded`
+  parsing (`lib/CLAUDE.md`, "application/x-www-form-urlencoded parsing"): the
+  static `has_urlencoded_content_type(req)` helper gates on `Content-Type`
+  (prefix match, case-insensitive, same convention as `has_json_content_type`),
+  responding `400` when it's missing or a different media type, then
+  `parse_urlencoded_body` (`lib/urlencoded.h`) fills a `UrlEncodedForm` the
+  handler walks to build a JSON echo — the same shape `GET /search` builds
+  from `req->query_names`/`query_values`, since both share the same
+  `key=value&key2=value2` grammar, just carried in the body instead of the URL.
 - `GET /files/*` (`handler_files`) demonstrates a trailing route wildcard
   (`lib/CLAUDE.md`, "Route wildcards"): one registration answers any path under
   `/files/`, echoing `req->path` back rather than actually serving a file — there's

@@ -19,6 +19,7 @@
 #define MAX_MULTIPART_PARTS 16
 #define MAX_COOKIES 16
 #define MAX_RESPONSE_COOKIES 16
+#define MAX_FORM_FIELDS 32
 
 /* Bounds one fully-formatted "Set-Cookie" header *value* (name=value plus
  * every attribute - Path, Domain, Max-Age, HttpOnly, Secure, SameSite),
@@ -152,6 +153,19 @@ typedef struct {
     MultipartPart parts[MAX_MULTIPART_PARTS];
     int part_count;
 } MultipartForm;
+
+/* A parsed application/x-www-form-urlencoded body - filled by
+ * parse_urlencoded_body (lib/urlencoded.h), the same fixed-array-plus-count
+ * shape as Request.query_names/query_values (the grammar is identical, just
+ * carried in the body instead of the URL) - extra pairs past
+ * MAX_FORM_FIELDS are dropped rather than overflowing, same convention as
+ * MAX_QUERY_PARAMS/MAX_HEADERS elsewhere. Both name and value are
+ * URL-decoded (%XX and '+' -> space). */
+typedef struct {
+    char field_names[MAX_FORM_FIELDS][64];
+    char field_values[MAX_FORM_FIELDS][256];
+    int field_count;
+} UrlEncodedForm;
 
 /* Per-connection state that persists across event-loop turns. */
 typedef struct Connection {

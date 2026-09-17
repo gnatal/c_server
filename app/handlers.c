@@ -6,6 +6,7 @@
 #include "response.h"
 #include "http_parser.h"
 #include "multipart.h"
+#include "urlencoded.h"
 #include "json/json.h"
 
 void handler_home(const Request *req, Response *res) {
@@ -209,6 +210,49 @@ void handler_upload(const Request *req, Response *res) {
             entry = json_new_string(value);
         }
         json_object_set(body, part->name, entry);
+    }
+
+    char *out = json_stringify(body);
+    res_json(res, out != NULL ? out : "null");
+
+    free(out);
+    json_free(body);
+}
+
+/* True when Content-Type declares an application/x-www-form-urlencoded
+ * body, same prefix-match convention as has_json_content_type above (a
+ * trailing ";charset=..." doesn't break the match). Gates form parsing
+ * below so a non-form body isn't misinterpreted as one. */
+static int has_urlencoded_content_type(const Request *req) {
+    const char *content_type = req_get_header(req, "Content-Type");
+    if (content_type == NULL) {
+        return 0;
+    }
+    return strncasecmp(content_type, "application/x-www-form-urlencoded",
+                        strlen("application/x-www-form-urlencoded")) == 0;
+}
+
+/*
+ * Demonstrates application/x-www-form-urlencoded parsing
+ * (lib/urlencoded.h): echoes every parsed field back as a JSON object, e.g.
+ * a body of "name=natal&age=32" -> {"name":"natal","age":"32"} - the same
+ * shape handler_search (above) builds from req->query_names/query_values,
+ * since the two share the same key=value&key2=value2 grammar and decoding
+ * rules, just carried in the body instead of the URL.
+ */
+void handler_form(const Request *req, Response *res) {
+    if (!has_urlencoded_content_type(req)) {
+        res_status(res, 400);
+        res_json(res, "{\"error\":\"expected application/x-www-form-urlencoded\"}");
+        return;
+    }
+
+    UrlEncodedForm form;
+    parse_urlencoded_body(req->body, (size_t)req->content_length, &form);
+
+    JsonValue *body = json_new_object();
+    for (int i = 0; i < form.field_count && body != NULL; i++) {
+        json_object_set(body, form.field_names[i], json_new_string(form.field_values[i]));
     }
 
     char *out = json_stringify(body);

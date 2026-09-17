@@ -11,6 +11,13 @@ Standalone unit and integration test suites compiled independently into `build/b
   response, same-name overwrite (case-insensitive), `Content-Length`/`Connection`
   rejected as reserved, a custom `Content-Type` overriding the default, and the
   `MAX_RESPONSE_HEADERS` cap being enforced rather than overflowed.
+- `test_multipart.c`: `multipart/form-data` boundary extraction (quoted/unquoted,
+  trailing parameters, non-multipart rejection), part splitting (fields, file
+  parts, a binary payload with an embedded NUL byte), malformed/nameless parts
+  being skipped, and the `MAX_MULTIPART_PARTS` truncation cap.
+- `test_urlencoded.c`: `application/x-www-form-urlencoded` body splitting on
+  `&`/`=`, `%XX`/`+` decoding, bare-key-gets-empty-value and skipped-empty-pair
+  edge cases, `NULL`/empty bodies, and the `MAX_FORM_FIELDS` truncation cap.
 
 ## Socket Mocking Strategy (`test_connection.c`)
 - Sockets are created in pairs via `socketpair(AF_UNIX, SOCK_STREAM, 0, fds)`.
