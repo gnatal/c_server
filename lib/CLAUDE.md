@@ -3,8 +3,17 @@
 ## Architecture
 Single-threaded, non-blocking event loop on kqueue (`connection.c: app_listen`). One
 `App` owns the listening socket, the kqueue fd, a fixed route table (`MAX_ROUTES`), and
-a `Connection *` slot per possible fd (`app->connections[MAX_CONNECTIONS]`, indexed
-directly by fd value — this bounds the server to fds below `MAX_CONNECTIONS`).
+a `Connection *` slot per possible fd. Unlike the route table, this connections table
+is *not* a fixed-size array: `App.connections` (`app_types.h`) is a heap-allocated
+`Connection **`, indexed directly by fd value, starting at `INITIAL_CONNECTION_TABLE_CAP`
+(1024 slots, allocated by `app_init`, `router.c`) and grown — `realloc`, doubling, newly
+added slots zeroed — by the new `ensure_connection_capacity` (`connection.c`, `static`)
+whenever `accept_connections` sees an fd that doesn't fit yet (`App.connections_cap`
+tracks the current allocation). There is no fixed ceiling: the real bound is the
+process's own `RLIMIT_NOFILE`, since `accept()` itself starts failing with `EMFILE`
+once that's hit — a fixed-size table would only ever be too small (an artificial cap
+below what the OS already allows) or wastefully large. `app_destroy` (`connection.h`)
+is the documented match for `app_init`'s allocation — see "Memory lifecycle" below.
 
 Data flow per request: `handle_readable` (I/O) accumulates bytes into
 `conn->in_buf` → `request_is_complete` (pure, `http_parser.c`) checks the buffer
@@ -848,6 +857,18 @@ added here as this project actually needs them, not preemptively.
   `free(NULL)` there is always safe).
 - Every other `Request` field is fixed-size (`app_types.h`), never heap-allocated -
   `req->body` is the one exception, and the *why* is covered in "Body buffering".
+- `app->connections` (`router.c: app_init`/`connection.c: ensure_connection_capacity`/
+  `app_destroy`): one `calloc` at `app_init` (`INITIAL_CONNECTION_TABLE_CAP` slots,
+  see "Architecture" above), `realloc`'d larger as needed - never smaller, unlike
+  `conn->in_buf`, since a fd this table has already grown to accommodate can be
+  reused by a future `accept()` at any time. Freed exactly once, by the new
+  `app_destroy` (`connection.h`), which also walks every still-populated slot and
+  calls `connection_close` on it first (so no individual `Connection`/`conn->in_buf`/
+  `conn->out_buf` is ever leaked by tearing the table down), then closes `kq`/
+  `server_fd` if still open. Not called from `main.c` today (`app_listen`'s event
+  loop never returns), but used by test teardown (`tests/test_connection.c:
+  teardown_test_connection`) and left available for a future graceful-shutdown path
+  (`pending.txt`) to call before exiting.
 
 ## Const correctness
 `Handler` (`app_types.h`) takes `const Request *`: routing (`match_path`/`match_route`)

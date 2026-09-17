@@ -16,6 +16,18 @@ Connection *connection_create(int fd);
 /* Deregisters a connection from kqueue, closes its socket and frees its state. */
 void connection_close(App *app, Connection *conn);
 
+/*
+ * Tears down everything app_init allocated/opened: closes every still-open
+ * connection (via connection_close), closes kq/server_fd if valid, and frees
+ * app->connections - the documented match for app_init's calloc (app_types.h:
+ * App.connections), per this engine's memory-lifecycle convention. Not called
+ * from app_listen's event loop (it never returns there today); intended for
+ * test teardown and for a future graceful-shutdown path (pending.txt) to
+ * build on. Safe to call on an App that's already been through app_init but
+ * never app_listen (server_fd/kq still -1, connections_cap slots all NULL).
+ */
+void app_destroy(App *app);
+
 /* Thin wrapper around EV_SET + kevent() for registering interest in one filter on one fd. */
 void kq_watch(int kq, int fd, int16_t filter, void *udata);
 

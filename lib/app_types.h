@@ -15,7 +15,6 @@
 #define MAX_PARAMS 8
 #define MAX_QUERY_PARAMS 16
 #define MAX_HEADERS 32
-#define MAX_CONNECTIONS 16384
 #define MAX_EVENTS 64
 #define BUF_SIZE 8192
 #define DEFAULT_PORT 8080
@@ -91,6 +90,20 @@
  * this only bounds how late a timeout is noticed (up to one interval late),
  * not the timeout duration itself. */
 #define IDLE_SWEEP_INTERVAL_MS 1000
+
+/*
+ * Starting size (in slots) of App.connections (below) - a growable table
+ * indexed directly by fd, realloc'd larger by ensure_connection_capacity
+ * (connection.c) whenever accept_connections sees an fd that doesn't fit
+ * yet. Unlike the fixed-size arrays elsewhere in this engine (MAX_ROUTES,
+ * MAX_HEADERS, ...), there is no hard ceiling here - the real bound is the
+ * process's own RLIMIT_NOFILE (accept() itself starts failing with EMFILE
+ * once that's hit), so a fixed MAX_CONNECTIONS would only ever be either
+ * too small (artificially capping the server below what the OS already
+ * allows) or wastefully large. This is just the initial allocation, sized
+ * for the common case so most servers never need to grow it at all.
+ */
+#define INITIAL_CONNECTION_TABLE_CAP 1024
 
 typedef struct {
     char method[8];
@@ -419,7 +432,16 @@ typedef struct {
     ErrorHandler error_handler;
     int server_fd;
     int kq;
-    Connection *connections[MAX_CONNECTIONS];
+
+    /* Heap-allocated (app_init), indexed directly by fd - a Connection* for
+     * an open connection, NULL otherwise. Starts at
+     * INITIAL_CONNECTION_TABLE_CAP slots and is grown (realloc, doubling) by
+     * ensure_connection_capacity (connection.c) whenever accept_connections
+     * sees an fd that doesn't fit yet - connections_cap tracks the current
+     * allocated slot count. Freed by app_destroy (connection.h), which
+     * matches this malloc per this engine's memory-lifecycle convention. */
+    Connection **connections;
+    int connections_cap;
 } App;
 
 #endif /* APP_TYPES_H */

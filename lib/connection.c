@@ -91,6 +91,25 @@ void connection_close(App *app, Connection *conn) {
     free(conn);
 }
 
+void app_destroy(App *app) {
+    for (int fd = 0; fd < app->connections_cap; fd++) {
+        if (app->connections[fd] != NULL) {
+            connection_close(app, app->connections[fd]);
+        }
+    }
+    if (app->kq >= 0) {
+        close(app->kq);
+        app->kq = -1;
+    }
+    if (app->server_fd >= 0) {
+        close(app->server_fd);
+        app->server_fd = -1;
+    }
+    free(app->connections);
+    app->connections = NULL;
+    app->connections_cap = 0;
+}
+
 void kq_watch(int kq, int fd, int16_t filter, void *udata) {
     struct kevent change;
     EV_SET(&change, fd, filter, EV_ADD | EV_ENABLE, 0, 0, udata);
@@ -103,6 +122,34 @@ void kq_unwatch(int kq, int fd, int16_t filter) {
     kevent(kq, &change, 1, NULL, 0, NULL);
 }
 
+/*
+ * Grows app->connections (realloc, doubling) until index fd fits, zeroing
+ * the newly added slots (realloc doesn't zero new memory) so an unused fd
+ * always reads as NULL - same invariant the initial calloc in app_init
+ * establishes. Called from accept_connections before indexing a freshly
+ * accepted fd's slot; a failed realloc leaves the original block (and
+ * app->connections/connections_cap) untouched at its prior, still-usable
+ * size, so this only ever costs the one connection being accepted, not any
+ * already-open ones. Returns 0 on success, -1 on failure.
+ */
+static int ensure_connection_capacity(App *app, int fd) {
+    if (fd < app->connections_cap) {
+        return 0;
+    }
+    int new_cap = app->connections_cap;
+    while (fd >= new_cap) {
+        new_cap *= 2;
+    }
+    Connection **grown = realloc(app->connections, (size_t)new_cap * sizeof(Connection *));
+    if (grown == NULL) {
+        return -1;
+    }
+    memset(grown + app->connections_cap, 0, (size_t)(new_cap - app->connections_cap) * sizeof(Connection *));
+    app->connections = grown;
+    app->connections_cap = new_cap;
+    return 0;
+}
+
 void accept_connections(App *app) {
     while (1) {
         struct sockaddr_in client_addr;
@@ -112,7 +159,12 @@ void accept_connections(App *app) {
             break;
         }
 
-        if (client_fd >= MAX_CONNECTIONS) {
+        /* fd is bounded only by the process's own RLIMIT_NOFILE (accept()
+         * itself starts failing with EMFILE once that's hit) - no fixed
+         * ceiling here, just grow the table to fit. A failed grow (genuine
+         * OOM) rejects just this one connection, without affecting any
+         * already-open ones. */
+        if (ensure_connection_capacity(app, client_fd) != 0) {
             close(client_fd);
             continue;
         }
@@ -358,7 +410,7 @@ void handle_readable(App *app, Connection *conn) {
 void close_idle_connections(App *app) {
     const time_t now = time(NULL);
 
-    for (int fd = 0; fd < MAX_CONNECTIONS; fd++) {
+    for (int fd = 0; fd < app->connections_cap; fd++) {
         Connection *conn = app->connections[fd];
         if (conn == NULL) {
             continue;

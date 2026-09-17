@@ -16,13 +16,14 @@ correctness, banned unsafe functions, tests required, nested CLAUDE.md updates,
 | 6 | Expand `status_text()` beyond 11 codes | 4 | Low | 15–20 min | ~5k–10k | Mechanical: add more status-code → reason-phrase mappings. |
 | 7 | epoll/IOCP backend (portability beyond kqueue) | 5 | Very High | 1–2+ days | ~200k–400k | Requires abstracting the event-loop interface behind kqueue today, then a parallel epoll (Linux) implementation; IOCP (Windows) is a materially different async model and would likely be its own follow-up. Touches `connection.c` and the accept/read/write/timer paths broadly. |
 | 8 | Multi-threaded / multi-process worker model | 5 | Very High | 1–3 days | ~250k–500k | Fundamental concurrency change (e.g. `SO_REUSEPORT` + one event loop per worker, or a thread pool with shared state/locking). High risk of subtle races; needs careful design before implementation. |
-| 9 | Replace fd-indexed `connections[MAX_CONNECTIONS]` array | 5 | Medium | 1–2 hr | ~40k–70k | Swap fixed array (assumes `fd < 16384`) for a dynamic structure (hash map or growable table) keyed by fd; moderate blast radius since every lookup site needs updating. |
+| 9 | ~~Replace fd-indexed `connections[MAX_CONNECTIONS]` array~~ | 5 | Medium | 1–2 hr | ~40k–70k | **Done.** `App.connections` is now a heap-allocated, growable `Connection **` (`app_types.h`) starting at `INITIAL_CONNECTION_TABLE_CAP` (1024) and grown by the new `ensure_connection_capacity` (`connection.c`) as needed — no more fixed ceiling, bounded only by the process's own `RLIMIT_NOFILE`. New `app_destroy` (`connection.c/h`) is the documented match for `app_init`'s allocation. |
 | 10 | Graceful shutdown (SIGTERM draining) | 5 | Medium | 1–2 hr | ~40k–60k | Signal handler + event-loop cooperation: stop accepting, let in-flight requests finish (with a timeout), then close cleanly. |
 | 11 | TLS/HTTPS support | 6 | Very High | 2–4+ days | ~300k–600k | Integrate OpenSSL/LibreSSL non-blocking handshake into the kqueue event loop, cert/key config, error handling for partial TLS reads/writes. Largest and riskiest single item. |
 
 ## Rough totals
-- **Quick wins** (#4, #5, #6): under an hour combined, mostly mechanical.
-- **Medium items** (#1, #3, #9, #10): a solid day of focused work in total.
+- **Quick wins** (#4, #5, #6): under an hour combined, mostly mechanical. Done.
+- **Medium items** (#1, #3, #9, #10): a solid day of focused work in total. #1, #3,
+  and #9 are done; #10 (graceful shutdown) remains.
 - **Large architectural items** (#2, #7, #8, #11): each is multi-day and would
   benefit from its own design discussion before implementation — these are
   the ones most likely to need splitting into sub-tasks and separate PRs to
@@ -32,7 +33,7 @@ correctness, banned unsafe functions, tests required, nested CLAUDE.md updates,
 1. ~~Cleanup: fix the stale "no cookie helper" line in `pending.txt` (#5).~~ Done.
 2. ~~Quick wins: `res_redirect`, expanded `status_text()` (#4, #6).~~ Done.
 3. ~~Chunked request support (#1) — needed before real interop with many HTTP clients.~~ Done.
-4. ~~Static file serving (#3)~~ Done. Connection-table refactor (#9) is independent and still open, deferred for now.
+4. ~~Static file serving (#3) and connection-table refactor (#9) — independent, medium-sized.~~ Done.
 5. Graceful shutdown (#10) — moderate, improves operability before tackling concurrency.
 6. Design spikes for the big three: streaming responses (#2), TLS (#11), and
    the concurrency/portability model (#7, #8) — these interact (e.g. TLS and

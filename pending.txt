@@ -362,7 +362,24 @@ Gaps vs. an Express-like C framework
 5. Concurrency & portability
 - kqueue ties the engine to macOS/BSD; no epoll/IOCP backend
 - Single-threaded, single-process - no worker/multi-core model
-- app->connections[MAX_CONNECTIONS] indexes by raw fd number - wasteful, assumes fd < 16384
+- [DONE] Connections table no longer a fixed app->connections[MAX_CONNECTIONS]
+  array (16384 slots, hard-capping the server to fds below that number). App
+  now carries a heap-allocated Connection **connections (app_types.h) plus
+  connections_cap, starting at INITIAL_CONNECTION_TABLE_CAP (1024 slots) and
+  grown (realloc, doubling, new slots zeroed) by the new static
+  ensure_connection_capacity (connection.c) whenever accept_connections sees
+  an fd that doesn't fit yet - a failed grow (genuine OOM) rejects just that
+  one connection rather than affecting any already open. There's no fixed
+  ceiling anymore; the real bound is the process's own RLIMIT_NOFILE, since
+  accept() itself starts failing with EMFILE once that's hit. close_idle_connections
+  now sweeps app->connections_cap slots instead of a compile-time constant.
+  The new app_destroy(app) (connection.c/h) is the documented match for
+  app_init's calloc of this table (closes any still-open connections, closes
+  kq/server_fd, frees the table) - not called from main.c (the event loop
+  never returns there today), but used by test teardown and available for a
+  future graceful-shutdown path (see the item below) to build on. See
+  lib/CLAUDE.md ("Architecture" and "Memory lifecycle") and tests/test_connection.c
+  (teardown_test_connection now calls app_destroy instead of an ad hoc close).
 - No graceful shutdown (SIGTERM draining in-flight connections)
 
 6. Security

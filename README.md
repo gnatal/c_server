@@ -167,7 +167,9 @@ PORT=3000 API_KEY=super-secret-token ./cexpress
   - `MAX_ROUTES`: Maximum registered routes (default: `32`).
   - `MAX_MIDDLEWARES`: Maximum app-wide middlewares (default: `16`).
   - `MAX_PARAMS`: Maximum path parameters captured per route (default: `8`).
-  - `MAX_CONNECTIONS`: Maximum concurrent connection descriptors (default: `16384`).
+  - `INITIAL_CONNECTION_TABLE_CAP`: Starting size of the connections table (default:
+    `1024`); it grows automatically as needed, bounded only by the OS's own
+    per-process file-descriptor limit (`ulimit -n`), not a fixed ceiling.
 
 ---
 

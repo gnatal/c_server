@@ -11,7 +11,18 @@ void app_init(App *app) {
     app->error_handler = NULL;
     app->server_fd = -1;
     app->kq = -1;
-    memset(app->connections, 0, sizeof(app->connections));
+
+    /* Starting allocation for the fd-indexed connections table (app_types.h)
+     * - grown later by ensure_connection_capacity (connection.c) as needed.
+     * The server can't run at all without this, so a failed calloc aborts
+     * immediately rather than leaving app in a half-initialized state -
+     * same failure convention as create_server_socket (connection.c). */
+    app->connections = calloc(INITIAL_CONNECTION_TABLE_CAP, sizeof(Connection *));
+    if (app->connections == NULL) {
+        perror("app_init: calloc");
+        exit(EXIT_FAILURE);
+    }
+    app->connections_cap = INITIAL_CONNECTION_TABLE_CAP;
 }
 
 /* Shared fill logic for one route slot, used by both app_add_route_mw and

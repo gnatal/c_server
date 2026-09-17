@@ -40,14 +40,13 @@ static void setup_test_connection(App *app, int fds[2], Connection **conn) {
 }
 
 static void teardown_test_connection(App *app, int fds[2], Connection *conn) {
-    if (app->connections[fds[0]] != NULL) {
-        connection_close(app, conn);
-    }
+    /* app_destroy (connection.h) closes/frees whatever's still tracked in
+     * app->connections (including conn, if a test hasn't already closed it
+     * itself) plus app->kq - conn is unused directly here now, kept as a
+     * parameter so every call site below doesn't need to change. */
+    (void)conn;
     close(fds[1]);
-    if (app->kq >= 0) {
-        close(app->kq);
-        app->kq = -1;
-    }
+    app_destroy(app);
 }
 
 static void test_set_nonblocking_and_create(void) {
