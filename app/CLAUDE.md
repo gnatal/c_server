@@ -97,6 +97,11 @@ scoping mechanisms in `lib/`:
   handler walks to build a JSON echo — the same shape `GET /search` builds
   from `req->query_names`/`query_values`, since both share the same
   `key=value&key2=value2` grammar, just carried in the body instead of the URL.
+- `GET /old-home` (`handler_old_home`) demonstrates `res_redirect`
+  (`lib/response.h`, `lib/CLAUDE.md` "Response headers"): an explicit `301`
+  redirect to `/`. `res_redirect`'s own implicit-`302`-default path
+  (`res_redirect(res, 0, location)`) isn't exercised by any handler here yet -
+  this demo specifically wants a permanent redirect, not the default.
 - `GET /files/*` (`handler_files`) demonstrates a trailing route wildcard
   (`lib/CLAUDE.md`, "Route wildcards"): one registration answers any path under
   `/files/`, echoing `req->path` back rather than actually serving a file — there's

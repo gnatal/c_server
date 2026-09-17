@@ -14,6 +14,17 @@ void handler_home(const Request *req, Response *res) {
     res_send(res, "Welcome to the home page!\n");
 }
 
+/*
+ * Redirect demo (lib/response.h: res_redirect): GET /old-home permanently
+ * redirects to "/" via an explicit 301 - see lib/response.c: res_redirect
+ * for the implicit-302-default behavior (res_redirect(res, 0, ...)) this
+ * demo doesn't need since it wants a permanent redirect specifically.
+ */
+void handler_old_home(const Request *req, Response *res) {
+    (void)req;
+    res_redirect(res, 301, "/");
+}
+
 void handler_get_user(const Request *req, Response *res) {
     const char *id = req_get_param(req, "id");
     char body[128];

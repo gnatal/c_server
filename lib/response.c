@@ -157,6 +157,15 @@ void res_json(Response *res, const char *body) {
     send_with_content_type(res, "application/json", body);
 }
 
+void res_redirect(Response *res, int status, const char *location) {
+    char body[300];
+
+    res_status(res, status != 0 ? status : 302);
+    res_set_header(res, "Location", location);
+    snprintf(body, sizeof(body), "Redirecting to %s", location);
+    res_send(res, body);
+}
+
 static const char *same_site_name(CookieSameSite same_site) {
     switch (same_site) {
         case COOKIE_SAMESITE_STRICT: return "Strict";

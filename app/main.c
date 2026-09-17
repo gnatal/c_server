@@ -28,6 +28,8 @@ int main(void) {
   app_use_error(&app, error_handler_json);
 
   app_get(&app, "/", handler_home);
+  /* Redirect demo (lib/response.h: res_redirect): GET /old-home 301s to "/". */
+  app_get(&app, "/old-home", handler_old_home);
   app_get(&app, "/users/:id", handler_get_user);
   /* Query-string demo: GET /search?q=cats resolves via req_get_query(req, "q")
    * (lib/http_parser.c) - the query string is parsed into req->query_* once,

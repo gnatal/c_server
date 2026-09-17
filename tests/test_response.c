@@ -216,6 +216,33 @@ static void test_max_response_cookies_enforced(void) {
     free_conn(conn);
 }
 
+static void test_redirect_default_status(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    res_redirect(&res, 0, "/login");
+
+    assert(conn->out_buf != NULL);
+    assert(strstr(conn->out_buf, "HTTP/1.1 302 Found\r\n") != NULL);
+    assert(strstr(conn->out_buf, "Location: /login\r\n") != NULL);
+    assert(strstr(conn->out_buf, "Redirecting to /login") != NULL);
+
+    free_conn(conn);
+}
+
+static void test_redirect_explicit_status(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    res_redirect(&res, 301, "/new-path");
+
+    assert(conn->out_buf != NULL);
+    assert(strstr(conn->out_buf, "HTTP/1.1 301 Moved Permanently\r\n") != NULL);
+    assert(strstr(conn->out_buf, "Location: /new-path\r\n") != NULL);
+
+    free_conn(conn);
+}
+
 int main(void) {
     test_custom_header_is_sent();
     test_repeated_set_header_overwrites_case_insensitively();
@@ -228,6 +255,8 @@ int main(void) {
     test_multiple_cookies_each_get_own_line();
     test_clear_cookie_expires_immediately();
     test_max_response_cookies_enforced();
+    test_redirect_default_status();
+    test_redirect_explicit_status();
 
     printf("all response tests passed\n");
     return 0;

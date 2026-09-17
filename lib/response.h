@@ -33,6 +33,14 @@ void res_send(Response *res, const char *body);
 void res_json(Response *res, const char *body);
 
 /*
+ * Sets the "Location" header to location and sends a short text/plain body
+ * naming the redirect target, mirroring Express's res.redirect([status,]
+ * path). status must be a 3xx code; 0 defaults to 302 Found (Express's own
+ * default) since C has no optional arguments to omit it with.
+ */
+void res_redirect(Response *res, int status, const char *location);
+
+/*
  * Appends a "Set-Cookie" response header for name=value, formatted per RFC
  * 6265 with whatever attributes options requests (CookieOptions,
  * app_types.h) - options may be NULL, meaning every attribute defaults (a

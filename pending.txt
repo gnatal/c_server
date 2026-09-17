@@ -299,9 +299,22 @@ Gaps vs. an Express-like C framework
   Content-Type may be overridden and takes priority over res_send/res_json's default.
   Backed by a fixed Response.headers[MAX_RESPONSE_HEADERS] array - extra calls past the
   cap are dropped rather than overflowing. See tests/test_response.c.
-- Still no streaming/chunked response, no static file serving, no res_redirect, no
-  cookie helper
-- status_text() only covers 11 codes (200/201/204/400/401/403/404/405/413/431/500)
+- Still no streaming/chunked response, no static file serving
+- [DONE] Cookie helper: res_set_cookie/res_clear_cookie (lib/response.c/h) and
+  req_get_cookie (lib/http_parser.c/h) - see section 3's Cookies entry above.
+  (This line previously said "no cookie helper" - stale, left over from before
+  that work landed.)
+- [DONE] res_redirect(res, status, location): sets the "Location" header and
+  sends a short text/plain body naming the redirect target, mirroring
+  Express's res.redirect([status,] path). status must be a 3xx code; 0
+  defaults to 302 Found since C has no optional arguments to omit it with.
+  See lib/response.c/h and tests/test_response.c
+  (test_redirect_default_status, test_redirect_explicit_status).
+- [DONE] status_text() now covers 27 codes, including the 3xx redirect codes
+  res_redirect needs (301/302/303/304/307/308) plus a handful of common 4xx/5xx
+  (206/409/410/415/422/429/501/502/503) - still not exhaustive, just the ones
+  this project actually returns or is likely to. See lib/http_parser.c and
+  tests/test_http_parser.c: test_status_text.
 - [DONE] malloc in response.c (conn->out_buf) is now null-checked; on OOM the
   connection is dropped instead of writing through a NULL pointer
 

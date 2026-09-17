@@ -638,6 +638,24 @@ advancing it; on overflow (headers too large to fit) the connection is dropped
 (`out_len = 0`, `keep_alive = 0`) the same way an `out_buf` allocation failure is
 handled, rather than sending a truncated/malformed response.
 
+`res_redirect(res, status, location)` (`response.c`) is a thin composition of
+existing primitives, not a new response path: it calls `res_status` (`status`,
+or `302` when `status` is `0` - C has no way to omit an argument to signal
+"use the default" the way Express's `res.redirect(path)` does), then
+`res_set_header(res, "Location", location)`, then `res_send` with a short
+`"Redirecting to <location>"` body - so it inherits `res_set_header`'s
+truncation-at-256-bytes behavior for an unusually long `location`, same as any
+other header value. Callers are responsible for passing a real 3xx code;
+`res_redirect` does not validate `status` itself.
+
+`status_text` (`http_parser.c`) covers 27 status codes as of this writing -
+notably the 3xx codes `res_redirect` needs (`301`/`302`/`303`/`304`/`307`/`308`)
+plus a handful of common 4xx/5xx codes an app or middleware might reasonably
+return (`409`/`410`/`415`/`422`/`429`/`501`/`502`/`503`). It's still not
+exhaustive (e.g. `418` deliberately falls through to `"Unknown"`, and is
+asserted as such in `tests/test_http_parser.c: test_status_text`) - codes are
+added here as this project actually needs them, not preemptively.
+
 ## Memory lifecycle
 - `Connection` (`connection_create`/`connection_close`): one `calloc` per accepted
   fd, freed exactly once in `connection_close`, which also deregisters the fd from
