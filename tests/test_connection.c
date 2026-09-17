@@ -5,8 +5,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
-#include <sys/event.h>
 #include "app_types.h"
+#include "event_loop.h"
 #include "connection.h"
 #include "router.h"
 #include "response.h"
@@ -27,8 +27,7 @@ static void echo_len_handler(const Request *req, Response *res) {
 
 static void setup_test_connection(App *app, int fds[2], Connection **conn) {
     app_init(app);
-    app->kq = kqueue();
-    assert(app->kq >= 0);
+    assert(event_loop_init(app) == 0);
 
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
     assert(set_nonblocking(fds[0]) == 0);
@@ -37,6 +36,7 @@ static void setup_test_connection(App *app, int fds[2], Connection **conn) {
     *conn = connection_create(fds[0]);
     assert(*conn != NULL);
     app->connections[fds[0]] = *conn;
+    assert(event_loop_watch_read(app, fds[0], *conn) == 0);
 }
 
 static void teardown_test_connection(App *app, int fds[2], Connection *conn) {
@@ -585,7 +585,7 @@ static void test_close_idle_connections_closes_stale_keep_alive(void) {
     assert(n == 0); /* EOF - fds[0] was closed with nothing written back */
 
     close(fds[1]);
-    close(app.kq);
+    app_destroy(&app);
 }
 
 static void test_close_idle_connections_408s_stalled_partial_request(void) {
@@ -613,7 +613,7 @@ static void test_close_idle_connections_408s_stalled_partial_request(void) {
     assert(app.connections[client_fd] == NULL);
 
     close(fds[1]);
-    close(app.kq);
+    app_destroy(&app);
 }
 
 static void test_close_idle_connections_leaves_recent_activity_alone(void) {
@@ -714,8 +714,7 @@ static void test_handle_readable_auto_options_response(void) {
 static void test_app_count_connections(void) {
     App app;
     app_init(&app);
-    app.kq = kqueue();
-    assert(app.kq >= 0);
+    assert(event_loop_init(&app) == 0);
     assert(app_count_connections(&app) == 0);
 
     int fds1[2], fds2[2];
@@ -745,14 +744,13 @@ static void test_app_count_connections(void) {
 static void test_app_stop_idempotency_and_closing_idle(void) {
     App app;
     app_init(&app);
-    app.kq = kqueue();
-    assert(app.kq >= 0);
+    assert(event_loop_init(&app) == 0);
 
     /* Dummy server socket using socketpair */
     int srv[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, srv) == 0);
     app.server_fd = srv[0];
-    kq_watch(app.kq, app.server_fd, EVFILT_READ, NULL);
+    event_loop_watch_read(&app, app.server_fd, NULL);
 
     int fds_idle[2], fds_busy[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds_idle) == 0);

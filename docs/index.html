@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CExpress — High-Performance C11 Web Framework</title>
-  <meta name="description" content="A lightweight, high-performance, single-threaded HTTP/1.1 web framework and server written in C11, inspired by Express.js and powered by kqueue.">
+  <meta name="description" content="A lightweight, high-performance, single-threaded HTTP/1.1 web framework and server written in C11, inspired by Express.js and powered by native kqueue and epoll.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -681,7 +681,7 @@
         <div class="hero-tagline">Native C11 Web Framework</div>
         <h1>The Simplicity of Express.js.<br>The Speed of Native C.</h1>
         <p>
-          CExpress is a lightweight, single-threaded HTTP/1.1 web framework and server designed with Express.js ergonomics, running directly on the native BSD/macOS <code>kqueue</code> event loop.
+          CExpress is a lightweight, single-threaded HTTP/1.1 web framework and server designed with Express.js ergonomics, running directly on native BSD/macOS <code>kqueue</code> and Linux <code>epoll</code> event loops.
         </p>
 
         <div class="stats-grid">
@@ -1139,7 +1139,7 @@ free(out);
       <section id="graceful-shutdown">
         <h2>🛑 Graceful Shutdown</h2>
         <p>
-          CExpress intercepts <code>SIGINT</code> and <code>SIGTERM</code> directly in the kqueue loop:
+          CExpress intercepts <code>SIGINT</code> and <code>SIGTERM</code> synchronously in the native event loop (<code>EVFILT_SIGNAL</code> on kqueue, <code>signalfd</code> on Linux):
         </p>
         <div class="alert alert-tip">
           1. Stops accepting incoming TCP connections.<br>
@@ -1180,7 +1180,7 @@ free(out);
               <tr data-cat="routing">
                 <td><code>app_listen(App *app, int port)</code></td>
                 <td><code>connection.h</code></td>
-                <td>Starts non-blocking kqueue event loop.</td>
+                <td>Starts non-blocking event loop (kqueue or epoll).</td>
               </tr>
               <tr data-cat="routing">
                 <td><code>app_destroy(App *app)</code></td>

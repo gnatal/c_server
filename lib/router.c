@@ -10,7 +10,10 @@ void app_init(App *app) {
     app->middleware_count = 0;
     app->error_handler = NULL;
     app->server_fd = -1;
-    app->kq = -1;
+    app->loop_fd = -1;
+    app->timer_idle_fd = -1;
+    app->timer_shutdown_fd = -1;
+    app->signal_fd = -1;
     app->is_shutting_down = 0;
 
     /* Starting allocation for the fd-indexed connections table (app_types.h)

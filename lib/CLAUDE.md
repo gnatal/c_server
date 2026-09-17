@@ -1,19 +1,16 @@
 # lib/ — engine internals
 
 ## Architecture
-Single-threaded, non-blocking event loop on kqueue (`connection.c: app_listen`). One
-`App` owns the listening socket, the kqueue fd, a fixed route table (`MAX_ROUTES`), and
-a `Connection *` slot per possible fd. Unlike the route table, this connections table
-is *not* a fixed-size array: `App.connections` (`app_types.h`) is a heap-allocated
-`Connection **`, indexed directly by fd value, starting at `INITIAL_CONNECTION_TABLE_CAP`
-(1024 slots, allocated by `app_init`, `router.c`) and grown — `realloc`, doubling, newly
-added slots zeroed — by the new `ensure_connection_capacity` (`connection.c`, `static`)
-whenever `accept_connections` sees an fd that doesn't fit yet (`App.connections_cap`
-tracks the current allocation). There is no fixed ceiling: the real bound is the
-process's own `RLIMIT_NOFILE`, since `accept()` itself starts failing with `EMFILE`
-once that's hit — a fixed-size table would only ever be too small (an artificial cap
-below what the OS already allows) or wastefully large. `app_destroy` (`connection.h`)
-is the documented match for `app_init`'s allocation — see "Memory lifecycle" below.
+Single-threaded, non-blocking event loop abstracted via `event_loop.h` (`connection.c: app_listen`). One
+`App` owns the listening socket, the event-loop descriptor (`loop_fd`, aliasing `kq` on BSD/macOS
+and `epoll_fd` on Linux), a fixed route table (`MAX_ROUTES`), and a `Connection *` slot per possible fd.
+Unlike the route table, this connections table is *not* a fixed-size array: `App.connections` (`app_types.h`)
+is a heap-allocated `Connection **`, indexed directly by fd value, starting at `INITIAL_CONNECTION_TABLE_CAP`
+(1024 slots, allocated by `app_init`, `router.c`) and grown — `realloc`, doubling, newly added slots zeroed —
+by `ensure_connection_capacity` (`connection.c`, `static`) whenever `accept_connections` sees an fd that
+doesn't fit yet (`App.connections_cap` tracks the current allocation). There is no fixed ceiling: the real bound
+is the process's own `RLIMIT_NOFILE`, since `accept()` itself starts failing with `EMFILE` once that's hit.
+`app_destroy` (`connection.h`) is the documented match for `app_init`'s allocation — see "Memory lifecycle" below.
 
 Data flow per request: `handle_readable` (I/O) accumulates bytes into
 `conn->in_buf` → `request_is_complete` (pure, `http_parser.c`) checks the buffer
@@ -29,7 +26,7 @@ layer stays pure and unit-testable independent of sockets:
 - `tests/test_middleware.c` tests pipeline ordering, short-circuiting, 404 fallthrough, and error handlers.
 - `tests/test_router.c` tests segment-by-segment tokenization, `:param` extraction, bounded param limits, `*` wildcard matching, and route table resolution.
 - `tests/test_http_parser.c` tests pure request line, query-string splitting/lookup, header, Content-Length boundary extraction, and keep-alive parsing.
-- `tests/test_connection.c` tests non-blocking socket I/O, `handle_readable` state progression, keep-alive persistence, partial buffer reads, 400 Bad Request on malformed inputs, 431 on header overflow, `in_buf` growth/shrink for a body beyond `BUF_SIZE`, and 413 on a `Content-Length` beyond `MAX_BODY_SIZE`, via POSIX `socketpair(2)` with a dedicated `kqueue()` instance without opening live TCP ports.
+- `tests/test_connection.c` tests non-blocking socket I/O, `handle_readable` state progression, keep-alive persistence, partial buffer reads, 400 Bad Request on malformed inputs, 431 on header overflow, `in_buf` growth/shrink for a body beyond `BUF_SIZE`, and 413 on a `Content-Length` beyond `MAX_BODY_SIZE`, via POSIX `socketpair(2)` with an isolated event loop without opening live TCP ports.
 - `tests/test_multipart.c` tests `Content-Type` boundary extraction (quoted/unquoted,
   trailing parameters, non-multipart rejection), part splitting (fields, file parts,
   a binary payload with an embedded NUL byte), malformed/nameless parts being
@@ -37,11 +34,10 @@ layer stays pure and unit-testable independent of sockets:
 - `tests/test_urlencoded.c` tests `application/x-www-form-urlencoded` body
   splitting/decoding, bare-key/empty-pair handling, `NULL`/empty bodies, and the
   `MAX_FORM_FIELDS` truncation cap.
-- `tests/test_static.c` tests the pure `static_resolve_relative_path`/
-  `static_mime_type` (traversal rejection, prefix stripping, MIME lookup), and
-  `static_serve_file` end-to-end against a real `mkdtemp`-created directory tree
-  (a served file, a missing file, a `..` attempt, a symlink escaping the mount
-  root, and the directory→`index.html` fallback).
+- `tests/test_static.c` tests pure relative path resolution, MIME lookup, and
+  directory traversal prevention (`..` rejection, symlink escape checks).
+- `tests/test_event_loop.c` tests cross-platform event loop lifecycle (`event_loop_init`/
+  `close`), read/write readiness polling across `socketpair`, and idle/shutdown timers.
 
 `App` carries `ServerConfig config` (`app_types.h`), storing runtime parameters such as `config.port` (defaulting to `DEFAULT_PORT` in `app_init`).
 
@@ -498,10 +494,9 @@ the idle/read timeout below.
 ## Idle/read timeout
 `Connection.last_activity` (`app_types.h`) is a `time_t` set at `connection_create`
 (so a connection that never sends a single byte is still bounded) and advanced by
-`handle_readable` on every successful `recv()`. A dedicated `EVFILT_TIMER`
-registered once in `app_listen` (ident `1` — timer idents live in their own
-kqueue namespace, so this never collides with a real connection fd) fires every
-`IDLE_SWEEP_INTERVAL_MS` (1s) and, on each fire, `app_listen`'s event loop calls
+`handle_readable` on every successful `recv()`. A dedicated periodic timer
+(`EVFILT_TIMER` on kqueue, `timerfd` on epoll) registered during `event_loop_init`
+fires every `IDLE_SWEEP_INTERVAL_MS` (1s) and, on each fire, `app_listen`'s event loop calls
 `close_idle_connections(app)` (`connection.c`) instead of routing the event through
 the normal read/write dispatch. `close_idle_connections` walks `app->connections`
 (same direct fd-indexed array `accept_connections`/`connection_close` use) and, for
@@ -864,27 +859,39 @@ added here as this project actually needs them, not preemptively.
   reused by a future `accept()` at any time. Freed exactly once, by the new
   `app_destroy` (`connection.h`), which also walks every still-populated slot and
   calls `connection_close` on it first (so no individual `Connection`/`conn->in_buf`/
-  `conn->out_buf` is ever leaked by tearing the table down), then closes `kq`/
-  `server_fd` if still open. Called from `app/main.c` right after `app_listen`
+  `conn->out_buf` is ever leaked by tearing the table down), then calls `event_loop_close(app)`
+  and closes `server_fd` if still open. Called from `app/main.c` right after `app_listen`
   returns (clean process teardown on graceful shutdown) and by test teardown
   (`tests/test_connection.c: teardown_test_connection`).
+
+## Event Loop Abstraction (`event_loop.h`)
+The event loop is abstracted across operating systems via `lib/event_loop.h`, implemented by
+`lib/event_loop_kqueue.c` on macOS/BSD and `lib/event_loop_epoll.c` on Linux:
+- **Unified API**: `event_loop_init`, `event_loop_close`, `event_loop_watch_read`,
+  `event_loop_unwatch_read`, `event_loop_watch_write`, `event_loop_unwatch_write`,
+  `event_loop_unwatch_all`, `event_loop_arm_shutdown_timer`, and `event_loop_poll`.
+- **Event Tracking**: Epoll monitors combined bitmasks (`EPOLLIN | EPOLLOUT`), unlike kqueue's separate
+  filters. `Connection.events_watched` (`EVENT_READ | EVENT_WRITE`) maintains the active mask per
+  fd so `epoll_ctl` correctly transitions via `EPOLL_CTL_ADD`, `EPOLL_CTL_MOD`, or `EPOLL_CTL_DEL`.
+- **Timers**: Idle sweeps run every 1s (`EVFILT_TIMER` on kqueue; Linux `timerfd_create` with
+  monotonic clock on epoll). The 5s graceful shutdown deadline uses a dedicated oneshot timer.
+- **Signals**: Polled synchronously without async signal handlers (`EVFILT_SIGNAL` on kqueue;
+  `signalfd` with `sigprocmask(SIG_BLOCK)` on Linux). A second signal forces immediate exit.
 
 ## Graceful shutdown
 Graceful shutdown (`connection.c: app_listen`, `app_stop`) coordinates signal handling,
 socket draining, and memory teardown without blocking the single event thread:
-- **Signal interception**: `app_listen` sets `signal(SIGINT, SIG_IGN)` and
-  `signal(SIGTERM, SIG_IGN)` so default termination dispositions are suppressed, and
-  registers both signals with kqueue using `EVFILT_SIGNAL`. Signals are delivered
-  synchronously as events within `kevent()` — completely async-signal-safe, with no
-  signal handlers, pipes, or volatile flags required. A second signal received while
-  already draining forces immediate exit.
-- **Draining state machine** (`app_stop`): sets `App.is_shutting_down = 1`, drops
-  interest in `server_fd` from kqueue and closes it (`server_fd = -1`) so no new
+- **Signal interception**: `event_loop_init` sets up synchronous signal delivery (`EVFILT_SIGNAL`
+  on kqueue; `signalfd` on Linux with default actions blocked via `sigprocmask`). Signals are
+  polled as normal event loop events (`LOOP_EVENT_SIGNAL`) without asynchronous signal handlers
+  or volatile flags. A second signal received while already draining forces immediate exit.
+- **Draining state machine** (`app_stop`): sets `App.is_shutting_down = 1`, removes
+  interest in `server_fd` via `event_loop_unwatch_read` and closes it (`server_fd = -1`) so no new
   connections are accepted. It sweeps `app->connections`:
   - Idle keep-alive connections (`in_len == 0 && out_buf == NULL`) are closed immediately.
   - In-flight connections (`in_len > 0 || out_buf != NULL`) have `conn->keep_alive = 0`
     set so they terminate as soon as the current request finishes.
-  - Arms a oneshot `EVFILT_TIMER` (ident 2, `SHUTDOWN_TIMEOUT_SECONDS = 5s`) on kqueue
+  - Arms a oneshot shutdown timer via `event_loop_arm_shutdown_timer(app, 5)`
     so slow or stalled clients cannot hold the process indefinitely.
 - **Response semantics during drain**: `handle_readable` enforces
   `conn->keep_alive = !request_wants_close(req) && !app->is_shutting_down`. Any response

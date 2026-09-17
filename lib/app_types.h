@@ -251,7 +251,35 @@ typedef struct Connection {
      * without buffering the whole file in RAM. */
     int file_fd;
     size_t file_remaining;
+
+    /* Events actively registered with the event loop backend (EVENT_READ | EVENT_WRITE) */
+    int events_watched;
 } Connection;
+
+typedef enum {
+    EVENT_NONE  = 0,
+    EVENT_READ  = 1 << 0,
+    EVENT_WRITE = 1 << 1
+} EventFlags;
+
+typedef enum {
+    LOOP_EVENT_NONE = 0,
+    LOOP_EVENT_READ,
+    LOOP_EVENT_WRITE,
+    LOOP_EVENT_ACCEPT,
+    LOOP_EVENT_SIGNAL,
+    LOOP_EVENT_TIMER_IDLE,
+    LOOP_EVENT_TIMER_SHUTDOWN,
+    LOOP_EVENT_ERROR
+} LoopEventType;
+
+typedef struct {
+    LoopEventType type;
+    int fd;
+    Connection *conn;
+    int signo;
+} LoopEvent;
+
 
 typedef struct {
     char name[64];
@@ -460,7 +488,14 @@ typedef struct {
     int middleware_count;
     ErrorHandler error_handler;
     int server_fd;
-    int kq;
+    union {
+        int kq;
+        int epoll_fd;
+        int loop_fd;
+    };
+    int timer_idle_fd;
+    int timer_shutdown_fd;
+    int signal_fd;
 
     /* Heap-allocated (app_init), indexed directly by fd - a Connection* for
      * an open connection, NULL otherwise. Starts at

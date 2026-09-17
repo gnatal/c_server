@@ -366,7 +366,15 @@ Gaps vs. an Express-like C framework
   connection is dropped instead of writing through a NULL pointer
 
 5. Concurrency & portability
-- kqueue ties the engine to macOS/BSD; no epoll/IOCP backend
+- [DONE] Cross-platform event backend: abstracted event loop interface (lib/event_loop.h)
+  with dual native backends: kqueue for macOS/BSD (lib/event_loop_kqueue.c) and epoll
+  for Linux (lib/event_loop_epoll.c). The Linux backend uses epoll_create1, epoll_ctl,
+  timerfd_create/timerfd_settime (for IDLE_SWEEP_INTERVAL_MS and SHUTDOWN_TIMEOUT_SECONDS),
+  and signalfd for synchronous SIGINT/SIGTERM delivery without signal races. Connection.events_watched
+  tracks active interest (EVENT_READ/EVENT_WRITE) for clean EPOLL_CTL_MOD transitions.
+  connection.c is now completely OS-independent, polling normalized LoopEvent events.
+  Tested on macOS via isolated kqueue and via epoll-shim (make test_epoll), in a native
+  Alpine Linux Docker container, and benchmarked with wrk (>61k req/sec inside Docker).
 - Single-threaded, single-process - no worker/multi-core model
 - [DONE] Connections table no longer a fixed app->connections[MAX_CONNECTIONS]
   array (16384 slots, hard-capping the server to fds below that number). App

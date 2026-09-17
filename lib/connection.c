@@ -7,10 +7,10 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/socket.h>
-#include <sys/event.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include "connection.h"
+#include "event_loop.h"
 #include "http_parser.h"
 #include "router.h"
 #include "response.h"
@@ -81,10 +81,7 @@ Connection *connection_create(int fd) {
 }
 
 void connection_close(App *app, Connection *conn) {
-    struct kevent changes[2];
-    EV_SET(&changes[0], conn->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-    EV_SET(&changes[1], conn->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-    kevent(app->kq, changes, 2, NULL, 0, NULL);
+    event_loop_unwatch_all(app, conn->fd);
 
     if (conn->file_fd >= 0) {
         close(conn->file_fd);
@@ -104,10 +101,7 @@ void app_destroy(App *app) {
             connection_close(app, app->connections[fd]);
         }
     }
-    if (app->kq >= 0) {
-        close(app->kq);
-        app->kq = -1;
-    }
+    event_loop_close(app);
     if (app->server_fd >= 0) {
         close(app->server_fd);
         app->server_fd = -1;
@@ -136,10 +130,10 @@ void app_stop(App *app) {
     }
     app->is_shutting_down = 1;
 
-    /* Stop accepting new connections: deregister from kqueue and close server socket */
+    /* Stop accepting new connections: deregister from event loop and close server socket */
     if (app->server_fd >= 0) {
-        if (app->kq >= 0) {
-            kq_unwatch(app->kq, app->server_fd, EVFILT_READ);
+        if (app->loop_fd >= 0) {
+            event_loop_unwatch_read(app, app->server_fd);
         }
         close(app->server_fd);
         app->server_fd = -1;
@@ -163,26 +157,11 @@ void app_stop(App *app) {
         }
     }
 
-    /* Arm a oneshot shutdown deadline timer on kqueue so slow/stalled clients
+    /* Arm a oneshot shutdown deadline timer on the event loop so slow/stalled clients
      * cannot prevent the server process from exiting indefinitely. */
-    if (app->kq >= 0) {
-        struct kevent shutdown_timer;
-        EV_SET(&shutdown_timer, 2, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, 0,
-               SHUTDOWN_TIMEOUT_SECONDS * 1000, NULL);
-        kevent(app->kq, &shutdown_timer, 1, NULL, 0, NULL);
+    if (app->loop_fd >= 0) {
+        event_loop_arm_shutdown_timer(app);
     }
-}
-
-void kq_watch(int kq, int fd, int16_t filter, void *udata) {
-    struct kevent change;
-    EV_SET(&change, fd, filter, EV_ADD | EV_ENABLE, 0, 0, udata);
-    kevent(kq, &change, 1, NULL, 0, NULL);
-}
-
-void kq_unwatch(int kq, int fd, int16_t filter) {
-    struct kevent change;
-    EV_SET(&change, fd, filter, EV_DELETE, 0, 0, NULL);
-    kevent(kq, &change, 1, NULL, 0, NULL);
 }
 
 /*
@@ -242,7 +221,7 @@ void accept_connections(App *app) {
             continue;
         }
         app->connections[client_fd] = conn;
-        kq_watch(app->kq, client_fd, EVFILT_READ, conn);
+        event_loop_watch_read(app, client_fd, conn);
     }
 }
 
@@ -255,7 +234,7 @@ void flush_connection(App *app, Connection *conn) {
             ssize_t n = write(conn->fd, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    kq_watch(app->kq, conn->fd, EVFILT_WRITE, conn);
+                    event_loop_watch_write(app, conn->fd, conn);
                     return;
                 }
                 connection_close(app, conn);
@@ -271,7 +250,7 @@ void flush_connection(App *app, Connection *conn) {
             if (conn->file_remaining > 0) {
                 if (bytes_written_this_flush >= max_flush_bytes) {
                     /* Yield to event loop to share bandwidth fairly */
-                    kq_watch(app->kq, conn->fd, EVFILT_WRITE, conn);
+                    event_loop_watch_write(app, conn->fd, conn);
                     return;
                 }
 
@@ -304,10 +283,8 @@ void flush_connection(App *app, Connection *conn) {
     }
 
     if (conn->keep_alive) {
-        /* Drop any EVFILT_WRITE registration from a partial write above -
-         * left registered with nothing queued, kqueue would report this fd
-         * write-ready on every single loop iteration forever. */
-        kq_unwatch(app->kq, conn->fd, EVFILT_WRITE);
+        /* Drop write registration from a partial write above */
+        event_loop_unwatch_write(app, conn->fd, conn);
         free(conn->out_buf);
         conn->out_buf = NULL;
         conn->out_len = 0;
@@ -549,41 +526,17 @@ void close_idle_connections(App *app) {
 
 void app_listen(App *app, int port) {
     app->server_fd = create_server_socket(port);
-    app->kq = kqueue();
-    if (app->kq < 0) {
-        perror("kqueue");
+    if (event_loop_init(app) != 0) {
+        perror("event_loop_init");
         exit(EXIT_FAILURE);
     }
-    kq_watch(app->kq, app->server_fd, EVFILT_READ, NULL);
-
-    /*
-     * Intercept SIGINT and SIGTERM for graceful shutdown. Ignore their default
-     * actions (which would terminate the process asynchronously) and monitor
-     * them synchronously via kqueue's EVFILT_SIGNAL.
-     */
-    signal(SIGINT, SIG_IGN);
-    signal(SIGTERM, SIG_IGN);
-
-    struct kevent sig_changes[2];
-    EV_SET(&sig_changes[0], SIGINT, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, NULL);
-    EV_SET(&sig_changes[1], SIGTERM, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, NULL);
-    kevent(app->kq, sig_changes, 2, NULL, 0, NULL);
-
-    /*
-     * Periodic timer that drives close_idle_connections() - ident 1 is
-     * arbitrary and never collides with a real connection fd: EVFILT_TIMER
-     * idents live in their own namespace, separate from the fd-based idents
-     * EVFILT_READ/EVFILT_WRITE use below.
-     */
-    struct kevent timer_change;
-    EV_SET(&timer_change, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE, 0, IDLE_SWEEP_INTERVAL_MS, NULL);
-    kevent(app->kq, &timer_change, 1, NULL, 0, NULL);
+    event_loop_watch_read(app, app->server_fd, NULL);
 
     printf("Listening on port %d\n", port);
 
-    struct kevent events[MAX_EVENTS];
+    LoopEvent events[MAX_EVENTS];
     while (1) {
-        int n = kevent(app->kq, NULL, 0, events, MAX_EVENTS, NULL);
+        int n = event_loop_poll(app, events, MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -591,68 +544,61 @@ void app_listen(App *app, int port) {
             if (errno == EBADF && app->is_shutting_down) {
                 break;
             }
-            perror("kevent");
+            perror("event_loop_poll");
             break;
         }
 
         for (int i = 0; i < n; i++) {
-            struct kevent *ev = &events[i];
+            LoopEvent *ev = &events[i];
 
-            if (ev->filter == EVFILT_SIGNAL) {
+            if (ev->type == LOOP_EVENT_SIGNAL) {
                 if (!app->is_shutting_down) {
-                    printf("\nReceived signal %ld, draining connections...\n", (long)ev->ident);
+                    printf("\nReceived signal %d, draining connections...\n", ev->signo);
                     app_stop(app);
                     if (app_count_connections(app) == 0) {
                         goto shutdown_complete;
                     }
                 } else {
-                    fprintf(stderr, "\nReceived second signal %ld, forcing shutdown\n", (long)ev->ident);
+                    fprintf(stderr, "\nReceived second signal %d, forcing shutdown\n", ev->signo);
                     goto shutdown_complete;
                 }
                 continue;
             }
 
-            if (ev->filter == EVFILT_TIMER) {
-                if (ev->ident == 1) {
-                    close_idle_connections(app);
-                } else if (ev->ident == 2) {
-                    fprintf(stderr, "Shutdown timeout reached (%ds), force-closing remaining connections\n",
-                            SHUTDOWN_TIMEOUT_SECONDS);
-                    goto shutdown_complete;
-                }
+            if (ev->type == LOOP_EVENT_TIMER_IDLE) {
+                close_idle_connections(app);
                 continue;
             }
 
-            if (app->server_fd >= 0 && (int)ev->ident == app->server_fd) {
+            if (ev->type == LOOP_EVENT_TIMER_SHUTDOWN) {
+                fprintf(stderr, "Shutdown timeout reached (%ds), force-closing remaining connections\n",
+                        SHUTDOWN_TIMEOUT_SECONDS);
+                goto shutdown_complete;
+            }
+
+            if (ev->type == LOOP_EVENT_ACCEPT) {
                 accept_connections(app);
                 continue;
             }
 
-            int fd = (int)ev->ident;
+            int fd = ev->fd;
             if (fd < 0 || fd >= app->connections_cap || app->connections[fd] == NULL ||
-                app->connections[fd] != (Connection *)ev->udata) {
+                app->connections[fd] != ev->conn) {
                 /* Connection was closed earlier in this event batch (e.g. by app_stop
                  * or close_idle_connections) - skip to avoid use-after-free. */
                 continue;
             }
 
-            Connection *conn = (Connection *)ev->udata;
+            Connection *conn = ev->conn;
 
-            if (ev->flags & EV_ERROR) {
+            if (ev->type == LOOP_EVENT_ERROR) {
                 connection_close(app, conn);
                 continue;
             }
 
-            /*
-             * Note: EV_EOF can be set on a readable event even while there is
-             * still unread data (the peer half-closed after sending). Don't
-             * close here - let handle_readable()/flush_connection() drain
-             * what's available and close naturally once recv()/write() see
-             * the actual end of stream or an error.
-             */
-            if (ev->filter == EVFILT_READ) {
+            if (ev->type == LOOP_EVENT_READ) {
                 handle_readable(app, conn);
-            } else if (ev->filter == EVFILT_WRITE) {
+            } else if (ev->type == LOOP_EVENT_WRITE) {
                 flush_connection(app, conn);
             }
         }
@@ -664,7 +610,5 @@ void app_listen(App *app, int port) {
     }
 
 shutdown_complete:
-    /* Restore default signal dispositions */
-    signal(SIGINT, SIG_DFL);
-    signal(SIGTERM, SIG_DFL);
+    event_loop_close(app);
 }

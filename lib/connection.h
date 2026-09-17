@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "app_types.h"
+#include "event_loop.h"
 
 /* Puts a socket into non-blocking mode so recv()/send()/accept() never stall the single thread. */
 int set_nonblocking(int fd);
@@ -13,8 +14,9 @@ int create_server_socket(int port);
 /* Allocates and zero-initializes per-connection state for a freshly accepted fd. */
 Connection *connection_create(int fd);
 
-/* Deregisters a connection from kqueue, closes its socket and frees its state. */
+/* Deregisters a connection from the event loop, closes its socket and frees its state. */
 void connection_close(App *app, Connection *conn);
+
 
 /*
  * Tears down everything app_init allocated/opened: closes every still-open

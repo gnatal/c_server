@@ -1,6 +1,6 @@
 # CExpress API & Developer Documentation
 
-Welcome to the **CExpress** documentation. CExpress brings the developer ergonomics and modular architecture of [Express.js](https://expressjs.com/) to native C (C11), powered by non-blocking `kqueue` event-driven I/O.
+Welcome to the **CExpress** documentation. CExpress brings the developer ergonomics and modular architecture of [Express.js](https://expressjs.com/) to native C (C11), powered by non-blocking `kqueue` (macOS/BSD) and `epoll` (Linux) event-driven I/O.
 
 ---
 
@@ -78,7 +78,7 @@ int main(void) {
     printf("Server listening on http://localhost:8080\n");
     app_listen(&app, 8080);
 
-    /* Cleans up remaining connections and kqueue upon shutdown */
+    /* Cleans up remaining connections and event loop resources upon shutdown */
     app_destroy(&app);
     return 0;
 }
@@ -396,7 +396,7 @@ json_free(obj);
 ```
 
 ### Graceful Shutdown
-CExpress intercepts `SIGINT` (`Ctrl+C`) and `SIGTERM` directly in the `kqueue` event loop:
+CExpress intercepts `SIGINT` (`Ctrl+C`) and `SIGTERM` directly in the native event loop (`EVFILT_SIGNAL` on kqueue, `signalfd` on Linux):
 1. Stops accepting incoming TCP connections immediately.
 2. Closes idle keep-alive connections.
 3. Drains in-flight requests and file streams.
@@ -410,9 +410,9 @@ CExpress intercepts `SIGINT` (`Ctrl+C`) and `SIGTERM` directly in the `kqueue` e
 | Function | File | Description |
 |---|---|---|
 | `app_init(App *app)` | `router.h` | Initializes an application instance and connection table. |
-| `app_listen(App *app, int port)` | `connection.h` | Starts the kqueue non-blocking event loop. |
+| `app_listen(App *app, int port)` | `connection.h` | Starts the non-blocking event loop (`kqueue` or `epoll`). |
 | `app_stop(App *app)` | `connection.h` | Initiates graceful shutdown and connection draining. |
-| `app_destroy(App *app)` | `connection.h` | Releases connections table, kqueue fd, and resources. |
+| `app_destroy(App *app)` | `connection.h` | Releases connections table, event loop descriptors, and resources. |
 | `app_get(...)` / `app_post(...)` | `router.h` | Registers verb routes. |
 | `app_put(...)` / `app_patch(...)` / `app_delete(...)` | `router.h` | Registers PUT, PATCH, and DELETE routes. |
 | `app_mount(App *app, prefix, Router *sub)` | `router.h` | Mounts a sub-router under a path prefix. |

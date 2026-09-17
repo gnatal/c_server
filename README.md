@@ -28,7 +28,7 @@ A lightweight, high-performance, single-threaded HTTP/1.1 server and web framewo
 Modern backend applications often rely on high-level runtimes like Node.js or Go. This project brings the ergonomic, developer-friendly routing and middleware design of **Express.js** directly to **C**, providing:
 - **Maximum Performance & Low Latency**: Native execution with minimal CPU overhead, sub-millisecond response times, and over 160,000 requests/sec on a single thread.
 - **Minimal Footprint**: Lightweight static binary with zero external dependencies beyond standard C and POSIX APIs.
-- **Event-Driven Non-Blocking I/O**: Single-threaded concurrency powered by `kqueue` (macOS / BSD), following the same architectural pattern as Node.js's underlying `libuv`.
+- **Event-Driven Non-Blocking I/O**: Single-threaded concurrency powered by native `kqueue` (macOS / BSD) and `epoll` (Linux), following the same architectural pattern as Node.js's underlying `libuv`.
 - **Memory Safety & Control**: Explicit bounded buffers, aggressive `const` correctness, bounded I/O guards, and strict dynamic memory allocation tracking.
 
 ---
@@ -67,7 +67,10 @@ The codebase is split into two distinct tiers:
                             │ links against
 ┌───────────────────────────▼────────────────────────────┐
 │              lib/ (Core Engine - libcexpress.a)        │
-│   - connection.c : kqueue event loop & socket I/O      │
+│   - connection.c : Portable socket I/O & lifecycle     │
+│   - event_loop.h : Cross-platform event-loop interface │
+│   - event_loop_kqueue.c: Native macOS/BSD kqueue loop  │
+│   - event_loop_epoll.c : Native Linux epoll loop       │
 │   - http_parser.c: HTTP/1.1 parser, query & dechunking │
 │   - router.c     : Pattern matcher, sub-routers, mount │
 │   - middleware.c : Dispatch & middleware pipeline      │
@@ -99,7 +102,7 @@ The codebase is split into two distinct tiers:
 - **Built-in Demo Middlewares**: `mw_logger`, `mw_body_size_guard`, `mw_authenticate` (constant-time token verification), and `error_handler_json`.
 
 ### 3. Non-Blocking Event-Driven Networking
-- **Kqueue Event Loop**: Single-threaded, level-triggered event loop on BSD/macOS.
+- **Cross-Platform Event Loop**: Native `kqueue` on macOS/BSD and native `epoll` (`epoll_create1`, `timerfd`, `signalfd`) on Linux with zero external dependencies.
 - **Dynamic Connection Table**: Bounded only by `RLIMIT_NOFILE`, growing dynamically via `ensure_connection_capacity`.
 - **HTTP/1.1 Keep-Alive**: Persistent connections with idle connection timeout sweeps.
 - **Graceful Shutdown**: Synchronous signal trapping (`SIGINT`/`SIGTERM`), stops accepting new connections, drains in-flight responses, and enforces a 5-second deadline timer before clean exit.
@@ -138,12 +141,13 @@ The codebase is split into two distinct tiers:
 
 ## Prerequisites
 
-- **Operating System**: macOS or BSD (requires `kqueue`).
-- **Compiler**: C11 compliant compiler (`gcc-16` or `clang`).
+- **Operating System**: macOS / BSD (native `kqueue`), Linux (native `epoll`), or Docker on any host.
+- **Compiler**: C11 compliant compiler (`gcc-16` or `clang` on macOS; `gcc` on Linux).
 - **Build Tool**: GNU `make`.
+- **Optional**: Docker (for containerized deployment and automated multi-platform verification).
 
 > [!TIP]
-> On macOS, `gcc-16` is installed via Homebrew (`brew install gcc`). The default `Makefile` is configured with `CC = gcc-16`.
+> On macOS, `gcc-16` is installed via Homebrew (`brew install gcc`). The default `Makefile` automatically detects macOS (`Darwin`) or Linux (`Linux`), selecting `gcc-16` on Darwin and `gcc` on Linux.
 
 ---
 
@@ -165,11 +169,18 @@ make run
 ```
 By default, the server listens on port `8080`.
 
+### 3. Running via Docker
+CExpress includes an Alpine-based multi-stage `Dockerfile`:
+```bash
+docker build -t cexpress .
+docker run --rm -p 8080:8080 cexpress
+```
+
 ---
 
 ## Running Tests
 
-The project includes **9 isolated test suites** testing all components:
+The project includes **10 isolated test suites** testing all components:
 
 ```bash
 make test
@@ -180,11 +191,12 @@ This compiles and executes:
 2. `build/bin/test_middleware`: Pipeline ordering, short-circuiting, 404 fallthrough, and error handlers.
 3. `build/bin/test_router`: Literal paths, parameter extraction, and route table bounds.
 4. `build/bin/test_http_parser`: Header parsing, bounds validation, dechunking, and keep-alive.
-5. `build/bin/test_connection`: Non-blocking socket I/O, partial reads, socket file streaming, and lifecycle using POSIX `socketpair(2)` and isolated `kqueue`.
+5. `build/bin/test_connection`: Non-blocking socket I/O, partial reads, socket file streaming, and lifecycle using POSIX `socketpair(2)`.
 6. `build/bin/test_response`: Headers, cookies, redirects, chunked streaming, trailers, and HEAD suppression.
 7. `build/bin/test_multipart`: RFC 7578 multipart body splitting, file parts, and boundary handling.
 8. `build/bin/test_urlencoded`: URL-encoded key-value parsing and percent-decoding.
 9. `build/bin/test_static`: Path traversal prevention, symlink escape checks, MIME types, and directory index fallback.
+10. `build/bin/test_event_loop`: Event-loop lifecycle, read/write polling across `socketpair`, and idle/shutdown timer verification.
 
 ---
 
@@ -299,7 +311,9 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 
 ```
 .
-├── Makefile              # Build rules for lib, demo app, and all test suites
+├── Makefile              # OS-detecting build rules for macOS (kqueue) & Linux (epoll)
+├── Dockerfile            # Multi-stage container build and test harness
+├── .dockerignore         # Build context exclusions
 ├── README.md             # Project documentation
 ├── CLAUDE.md             # Project standards, coding guidelines, and workflow rules
 ├── AGENTS.md             # Agent context and workflow guidelines
@@ -307,8 +321,11 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 ├── plan.md               # Architectural roadmap and task estimates
 ├── lib/                  # Reusable CExpress engine (builds to build/lib/libcexpress.a)
 │   ├── CLAUDE.md         # Engine architecture, data flow, and memory lifecycle
-│   ├── app_types.h       # Struct definitions, function pointer signatures, and limits
-│   ├── connection.h/c    # kqueue event loop, non-blocking socket I/O & graceful shutdown
+│   ├── app_types.h       # Struct definitions, event loop types, function pointer signatures
+│   ├── event_loop.h      # Cross-platform event-loop abstraction
+│   ├── event_loop_kqueue.c # Native BSD/macOS kqueue backend
+│   ├── event_loop_epoll.c  # Native Linux epoll backend (timerfd + signalfd)
+│   ├── connection.h/c    # Portable non-blocking socket I/O & graceful shutdown
 │   ├── http_parser.h/c   # HTTP/1.1 parser, query string, chunked decoding
 │   ├── router.h/c        # Path pattern matching, route table, sub-routers
 │   ├── response.h/c      # Response builder, streaming chunks & trailers, file streaming
@@ -332,6 +349,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 ├── tests/                # Isolated test suites (built into build/bin/test_*)
 │   ├── CLAUDE.md         # Test harness architecture and socket mocking strategy
 │   ├── test_connection.c # Socket I/O and lifecycle tests via socketpair(2)
+│   ├── test_event_loop.c # Event-loop abstraction tests (lifecycle, I/O, timers)
 │   ├── test_http_parser.c# Unit tests for HTTP parser and request dechunking
 │   ├── test_middleware.c # Middleware chain dispatching and error handling
 │   ├── test_router.c     # Unit tests for router pattern matching and sub-routers
@@ -362,6 +380,7 @@ Check [pending.txt](pending.txt) and [plan.md](plan.md) for the complete archite
 - [x] Cookie helpers (`res_set_cookie`, `res_clear_cookie`, `req_get_cookie`)
 - [x] Graceful shutdown on `SIGINT`/`SIGTERM` with in-flight request draining
 - [x] Streaming & chunked responses (`res_write`, `res_end`, `res_set_trailer`, `res_send_file`)
-- [ ] Cross-platform event backend (`epoll` for Linux, `IOCP` for Windows)
+- [x] Cross-platform event backend (`epoll` for Linux, `kqueue` for macOS/BSD)
 - [ ] Multi-threaded / multi-process worker model (`SO_REUSEPORT`)
 - [ ] TLS / HTTPS support (OpenSSL/LibreSSL non-blocking handshake integration)
+

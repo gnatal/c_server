@@ -1,0 +1,68 @@
+#ifndef EVENT_LOOP_H
+#define EVENT_LOOP_H
+
+#include "app_types.h"
+
+/*
+ * Initializes the event loop subsystem (kqueue on BSD/macOS, epoll on Linux).
+ * Sets up signal interception for SIGINT and SIGTERM, and registers the
+ * periodic idle-connection sweep timer (IDLE_SWEEP_INTERVAL_MS).
+ * Returns 0 on success, -1 on failure.
+ */
+int event_loop_init(App *app);
+
+/*
+ * Closes the event loop descriptor and any auxiliary descriptors (timerfds,
+ * signalfds on Linux), and restores default dispositions and masks for
+ * SIGINT and SIGTERM. Safe and idempotent.
+ */
+void event_loop_close(App *app);
+
+/*
+ * Registers interest in read readiness on the given descriptor (EVFILT_READ on
+ * kqueue, EPOLLIN on epoll). udata is passed through to event notifications.
+ * Returns 0 on success, -1 on failure.
+ */
+int event_loop_watch_read(App *app, int fd, void *udata);
+
+/*
+ * Drops interest in read readiness on the given descriptor.
+ * Returns 0 on success, -1 on failure.
+ */
+int event_loop_unwatch_read(App *app, int fd);
+
+/*
+ * Registers interest in write readiness on the given descriptor (EVFILT_WRITE on
+ * kqueue, EPOLLOUT on epoll). Preserves any existing read interest.
+ * Returns 0 on success, -1 on failure.
+ */
+int event_loop_watch_write(App *app, int fd, void *udata);
+
+/*
+ * Drops interest in write readiness on the given descriptor, preserving read
+ * interest.
+ * Returns 0 on success, -1 on failure.
+ */
+int event_loop_unwatch_write(App *app, int fd, void *udata);
+
+/*
+ * Deregisters all event interest on the given descriptor (both read and write).
+ * Returns 0 on success, -1 on failure.
+ */
+int event_loop_unwatch_all(App *app, int fd);
+
+/*
+ * Arms a oneshot shutdown deadline timer (SHUTDOWN_TIMEOUT_SECONDS) on the event
+ * loop to bound maximum connection drain time during graceful shutdown.
+ * Returns 0 on success, -1 on failure.
+ */
+int event_loop_arm_shutdown_timer(App *app);
+
+/*
+ * Blocks waiting for events up to timeout_ms (-1 for indefinite wait).
+ * Populates out_events with normalized LoopEvent structures, up to max_events.
+ * Returns the number of events ready, 0 on timeout, or -1 on error.
+ */
+int event_loop_poll(App *app, LoopEvent *out_events, int max_events, int timeout_ms);
+
+#endif /* EVENT_LOOP_H */
