@@ -1,0 +1,1409 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CExpress — High-Performance C11 Web Framework</title>
+  <meta name="description" content="A lightweight, high-performance, single-threaded HTTP/1.1 web framework and server written in C11, inspired by Express.js and powered by kqueue.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-main: #0a0d14;
+      --bg-surface: #111622;
+      --bg-surface-elevated: #182030;
+      --bg-card: rgba(24, 32, 48, 0.65);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-accent: rgba(56, 189, 248, 0.3);
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-faint: #64748b;
+      --primary: #38bdf8;
+      --primary-glow: rgba(56, 189, 248, 0.25);
+      --primary-dark: #0284c7;
+      --accent-emerald: #10b981;
+      --accent-purple: #a855f7;
+      --accent-amber: #f59e0b;
+      --accent-rose: #f43f5e;
+      --code-bg: #07090e;
+      --sidebar-width: 280px;
+      --toc-width: 240px;
+      --header-height: 64px;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 16px;
+      --transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    html.light {
+      --bg-main: #f8fafc;
+      --bg-surface: #ffffff;
+      --bg-surface-elevated: #f1f5f9;
+      --bg-card: rgba(255, 255, 255, 0.85);
+      --border-subtle: rgba(0, 0, 0, 0.08);
+      --border-accent: rgba(2, 132, 199, 0.3);
+      --text-main: #0f172a;
+      --text-muted: #475569;
+      --text-faint: #94a3b8;
+      --primary: #0284c7;
+      --primary-glow: rgba(2, 132, 199, 0.15);
+      --primary-dark: #0369a1;
+      --code-bg: #0f172a;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      line-height: 1.65;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Top Navbar */
+    header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: var(--header-height);
+      background: rgba(10, 13, 20, 0.82);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--border-subtle);
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 1.5rem;
+    }
+
+    html.light header {
+      background: rgba(255, 255, 255, 0.85);
+    }
+
+    .nav-left {
+      display: flex;
+      align-items: center;
+      gap: 1.25rem;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-size: 1.25rem;
+      font-weight: 800;
+      color: var(--text-main);
+      text-decoration: none;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-badge {
+      background: linear-gradient(135deg, #38bdf8, #6366f1);
+      color: white;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 0.15rem 0.5rem;
+      border-radius: 9999px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .search-box {
+      position: relative;
+      width: 280px;
+    }
+
+    .search-input {
+      width: 100%;
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-main);
+      padding: 0.45rem 2.2rem 0.45rem 0.85rem;
+      border-radius: var(--radius-sm);
+      font-size: 0.85rem;
+      outline: none;
+      transition: var(--transition);
+    }
+
+    .search-input:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px var(--primary-glow);
+    }
+
+    .search-shortcut {
+      position: absolute;
+      right: 0.6rem;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 0.68rem;
+      color: var(--text-faint);
+      background: var(--bg-surface);
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      pointer-events: none;
+    }
+
+    .nav-right {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .stat-pill {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.78rem;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      color: #34d399;
+      padding: 0.25rem 0.65rem;
+      border-radius: 9999px;
+      font-weight: 600;
+    }
+
+    .stat-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background-color: #34d399;
+      box-shadow: 0 0 8px #34d399;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.85); }
+    }
+
+    .btn-icon {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 0.45rem;
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: var(--transition);
+    }
+
+    .btn-icon:hover {
+      color: var(--text-main);
+      border-color: var(--border-accent);
+    }
+
+    /* Layout */
+    .docs-container {
+      display: flex;
+      padding-top: var(--header-height);
+      min-height: 100vh;
+    }
+
+    /* Left Sidebar */
+    .sidebar {
+      position: fixed;
+      top: var(--header-height);
+      left: 0;
+      bottom: 0;
+      width: var(--sidebar-width);
+      background: var(--bg-surface);
+      border-right: 1px solid var(--border-subtle);
+      overflow-y: auto;
+      padding: 1.5rem 1rem 3rem 1.25rem;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border-subtle) transparent;
+      z-index: 50;
+    }
+
+    .sidebar-group {
+      margin-bottom: 1.5rem;
+    }
+
+    .sidebar-title {
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: var(--text-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.6rem;
+      padding-left: 0.5rem;
+    }
+
+    .sidebar-link {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.88rem;
+      color: var(--text-muted);
+      text-decoration: none;
+      padding: 0.4rem 0.6rem;
+      border-radius: var(--radius-sm);
+      transition: var(--transition);
+    }
+
+    .sidebar-link:hover {
+      color: var(--text-main);
+      background: var(--bg-surface-elevated);
+    }
+
+    .sidebar-link.active {
+      color: var(--primary);
+      background: var(--primary-glow);
+      font-weight: 600;
+    }
+
+    /* Main Content */
+    .main-content {
+      margin-left: var(--sidebar-width);
+      margin-right: var(--toc-width);
+      flex: 1;
+      padding: 2.5rem 3rem 5rem 3rem;
+      max-width: 960px;
+    }
+
+    @media (max-width: 1200px) {
+      .main-content { margin-right: 0; }
+      .toc { display: none; }
+    }
+
+    @media (max-width: 800px) {
+      .sidebar { transform: translateX(-100%); transition: transform 0.3s ease; }
+      .sidebar.open { transform: translateX(0); }
+      .main-content { margin-left: 0; padding: 1.5rem; }
+    }
+
+    /* Right TOC */
+    .toc {
+      position: fixed;
+      top: var(--header-height);
+      right: 0;
+      bottom: 0;
+      width: var(--toc-width);
+      padding: 2rem 1.25rem;
+      overflow-y: auto;
+      border-left: 1px solid var(--border-subtle);
+    }
+
+    .toc-title {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-faint);
+      margin-bottom: 0.75rem;
+    }
+
+    .toc-link {
+      display: block;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      text-decoration: none;
+      padding: 0.25rem 0;
+      transition: var(--transition);
+      line-height: 1.4;
+    }
+
+    .toc-link:hover { color: var(--primary); }
+
+    /* Hero Banner */
+    .hero {
+      padding: 2.5rem 2rem;
+      background: radial-gradient(circle at top right, rgba(56, 189, 248, 0.12), transparent 60%),
+                  radial-gradient(circle at bottom left, rgba(99, 102, 241, 0.1), transparent 50%),
+                  var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      margin-bottom: 3rem;
+      box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+    }
+
+    .hero-tagline {
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: var(--primary);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.5rem;
+    }
+
+    .hero h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      margin-bottom: 1rem;
+      background: linear-gradient(135deg, #ffffff 40%, #94a3b8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    html.light .hero h1 {
+      background: linear-gradient(135deg, #0f172a 40%, #475569);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero p {
+      font-size: 1.1rem;
+      color: var(--text-muted);
+      max-width: 680px;
+      margin-bottom: 1.5rem;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+
+    .stat-card {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1rem 1.25rem;
+      transition: var(--transition);
+    }
+
+    .stat-card:hover {
+      border-color: var(--border-accent);
+      transform: translateY(-2px);
+    }
+
+    .stat-val {
+      font-size: 1.6rem;
+      font-weight: 800;
+      color: var(--text-main);
+      font-feature-settings: "tnum";
+    }
+
+    .stat-label {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      margin-top: 0.2rem;
+    }
+
+    /* Content Typography & Structure */
+    section {
+      margin-bottom: 3.5rem;
+      scroll-margin-top: 5rem;
+    }
+
+    h2 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin: 1.75rem 0 0.75rem 0;
+      color: var(--text-main);
+    }
+
+    p {
+      margin-bottom: 1rem;
+      color: var(--text-muted);
+    }
+
+    strong { color: var(--text-main); }
+
+    /* Code Snippets */
+    .code-block {
+      position: relative;
+      background: var(--code-bg);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      margin: 1rem 0 1.5rem 0;
+      overflow: hidden;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+    }
+
+    .code-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.5rem 1rem;
+      background: rgba(255, 255, 255, 0.03);
+      border-bottom: 1px solid var(--border-subtle);
+      font-size: 0.75rem;
+      color: var(--text-faint);
+    }
+
+    .code-lang {
+      font-family: 'Fira Code', monospace;
+      font-weight: 600;
+      text-transform: uppercase;
+      color: var(--primary);
+    }
+
+    .btn-copy {
+      background: transparent;
+      border: 1px solid var(--border-subtle);
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      transition: var(--transition);
+    }
+
+    .btn-copy:hover {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-main);
+    }
+
+    pre {
+      padding: 1rem 1.25rem;
+      overflow-x: auto;
+      font-family: 'Fira Code', monospace;
+      font-size: 0.88rem;
+      line-height: 1.6;
+      color: #e2e8f0;
+    }
+
+    code {
+      font-family: 'Fira Code', monospace;
+      font-size: 0.85em;
+    }
+
+    p code, li code {
+      background: var(--bg-surface-elevated);
+      color: var(--primary);
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+    }
+
+    /* Syntax Highlighting primitives */
+    .kw { color: #f472b6; }        /* keyword (void, int, const, return) */
+    .type { color: #38bdf8; }      /* types (Request, Response, App) */
+    .fn { color: #a78bfa; }        /* functions (app_get, res_send) */
+    .str { color: #34d399; }       /* string literals ("Hello") */
+    .num { color: #fb923c; }       /* numbers (8080, 200) */
+    .com { color: #64748b; font-style: italic; } /* comments */
+
+    /* Alerts */
+    .alert {
+      padding: 1rem 1.25rem;
+      border-radius: var(--radius-md);
+      margin: 1.25rem 0;
+      border-left: 4px solid;
+      background: var(--bg-surface);
+      font-size: 0.92rem;
+    }
+
+    .alert-tip {
+      border-color: var(--accent-emerald);
+      background: rgba(16, 185, 129, 0.08);
+    }
+
+    .alert-note {
+      border-color: var(--primary);
+      background: rgba(56, 189, 248, 0.08);
+    }
+
+    .alert-warn {
+      border-color: var(--accent-amber);
+      background: rgba(245, 158, 11, 0.08);
+    }
+
+    /* Tables */
+    .table-container {
+      overflow-x: auto;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      margin: 1.25rem 0;
+      background: var(--bg-surface);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.88rem;
+    }
+
+    th {
+      background: var(--bg-surface-elevated);
+      padding: 0.75rem 1rem;
+      font-weight: 600;
+      border-bottom: 1px solid var(--border-subtle);
+      color: var(--text-main);
+    }
+
+    td {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border-subtle);
+      color: var(--text-muted);
+    }
+
+    tr:last-child td { border-bottom: none; }
+
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+      color: var(--text-main);
+    }
+
+    /* Filter buttons for API table */
+    .filter-bar {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+    }
+
+    .filter-btn {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-muted);
+      padding: 0.35rem 0.8rem;
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: var(--transition);
+    }
+
+    .filter-btn:hover, .filter-btn.active {
+      background: var(--primary);
+      color: white;
+      border-color: var(--primary);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Header Navigation -->
+  <header>
+    <div class="nav-left">
+      <a href="#overview" class="brand" id="brand-link">
+        <span>⚡ CExpress</span>
+        <span class="brand-badge">v1.0</span>
+      </a>
+      <div class="search-box">
+        <input type="text" id="api-search" class="search-input" placeholder="Search functions, routes..." aria-label="Search docs">
+        <span class="search-shortcut">⌘K</span>
+      </div>
+    </div>
+
+    <div class="nav-right">
+      <div class="stat-pill" title="Tested on macOS with wrk">
+        <span class="stat-dot"></span>
+        <span>167k req/sec</span>
+      </div>
+      <button id="theme-toggle" class="btn-icon" title="Toggle Theme" aria-label="Toggle dark/light theme">
+        🌙
+      </button>
+      <a href="https://github.com/guilhermenatal/c_server" target="_blank" class="btn-icon" title="View Source" aria-label="GitHub Repository">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>
+      </a>
+    </div>
+  </header>
+
+  <div class="docs-container">
+    <!-- Left Navigation Sidebar -->
+    <nav class="sidebar" id="sidebar">
+      <div class="sidebar-group">
+        <div class="sidebar-title">Getting Started</div>
+        <a href="#overview" class="sidebar-link active">Overview</a>
+        <a href="#benchmarks" class="sidebar-link">Benchmarks</a>
+        <a href="#installation" class="sidebar-link">Installation & Linking</a>
+        <a href="#hello-world" class="sidebar-link">Hello World</a>
+      </div>
+
+      <div class="sidebar-group">
+        <div class="sidebar-title">Routing Guide</div>
+        <a href="#routing-basics" class="sidebar-link">HTTP Verbs & Handlers</a>
+        <a href="#route-params" class="sidebar-link">Path Parameters (:id)</a>
+        <a href="#wildcards" class="sidebar-link">Wildcards (*)</a>
+        <a href="#sub-routers" class="sidebar-link">Sub-Routers (app_mount)</a>
+      </div>
+
+      <div class="sidebar-group">
+        <div class="sidebar-title">Middleware</div>
+        <a href="#middleware-pipeline" class="sidebar-link">Execution Flow</a>
+        <a href="#prefix-middleware" class="sidebar-link">Prefix Scoping</a>
+        <a href="#route-middleware" class="sidebar-link">Per-Route Guards</a>
+        <a href="#error-handling" class="sidebar-link">Centralized Errors</a>
+      </div>
+
+      <div class="sidebar-group">
+        <div class="sidebar-title">Request & Response</div>
+        <a href="#request-api" class="sidebar-link">Request Object</a>
+        <a href="#response-api" class="sidebar-link">Response API</a>
+        <a href="#cookies" class="sidebar-link">Cookies & Sessions</a>
+        <a href="#redirects" class="sidebar-link">Redirects</a>
+      </div>
+
+      <div class="sidebar-group">
+        <div class="sidebar-title">Advanced Features</div>
+        <a href="#streaming" class="sidebar-link">Chunked Responses & Trailers</a>
+        <a href="#file-streaming" class="sidebar-link">Bounded File Streaming</a>
+        <a href="#static-files" class="sidebar-link">Static File Serving</a>
+        <a href="#form-parsing" class="sidebar-link">Multipart & URL-Encoded</a>
+        <a href="#json-engine" class="sidebar-link">Built-in JSON Parser</a>
+        <a href="#graceful-shutdown" class="sidebar-link">Graceful Shutdown</a>
+      </div>
+
+      <div class="sidebar-group">
+        <div class="sidebar-title">Reference</div>
+        <a href="#api-index" class="sidebar-link">API Cheat Sheet</a>
+      </div>
+    </nav>
+
+    <!-- Main Content Area -->
+    <main class="main-content" id="main-content">
+
+      <!-- Hero Section -->
+      <section id="overview" class="hero">
+        <div class="hero-tagline">Native C11 Web Framework</div>
+        <h1>The Simplicity of Express.js.<br>The Speed of Native C.</h1>
+        <p>
+          CExpress is a lightweight, single-threaded HTTP/1.1 web framework and server designed with Express.js ergonomics, running directly on the native BSD/macOS <code>kqueue</code> event loop.
+        </p>
+
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-val" style="color: #38bdf8;">167,902</div>
+            <div class="stat-label">Requests / Second (1 Core)</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" style="color: #34d399;">573 µs</div>
+            <div class="stat-label">Average Latency (100 conns)</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" style="color: #a855f7;">&lt; 3 MB</div>
+            <div class="stat-label">Idle Memory Footprint</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" style="color: #fb923c;">0</div>
+            <div class="stat-label">External Dependencies</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Benchmarks Section -->
+      <section id="benchmarks">
+        <h2>📊 Performance & Benchmarks</h2>
+        <p>
+          Measured with <code>wrk</code> on macOS (Apple Silicon, keep-alive active, 15-second benchmark runs):
+        </p>
+
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Concurrency</th>
+                <th>Threads</th>
+                <th>Throughput</th>
+                <th>Avg Latency</th>
+                <th>Max Latency</th>
+                <th>Requests Served</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>100 connections</strong></td>
+                <td>8</td>
+                <td><strong style="color: var(--primary);">167,902 req/s</strong></td>
+                <td>573.86 µs</td>
+                <td>4.32 ms</td>
+                <td>2,535,418</td>
+              </tr>
+              <tr>
+                <td><strong>1,000 connections</strong></td>
+                <td>8</td>
+                <td><strong style="color: var(--primary);">159,373 req/s</strong></td>
+                <td>6.25 ms</td>
+                <td>22.67 ms</td>
+                <td>2,391,896</td>
+              </tr>
+              <tr>
+                <td><strong>5,000 connections</strong></td>
+                <td>8</td>
+                <td><strong style="color: var(--primary);">154,621 req/s</strong></td>
+                <td>26.40 ms</td>
+                <td>109.22 ms</td>
+                <td>2,325,396</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Installation & Umbrella Header -->
+      <section id="installation">
+        <h2>📦 Installation & Umbrella Header</h2>
+        <p>
+          CExpress exposes its entire public API via a single <strong>umbrella header</strong>:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="com">/* Includes routing, response builders, middlewares, HTTP parser, static files, and JSON */</span>
+<span class="kw">#include</span> <span class="str">"cexpress.h"</span></code></pre>
+        </div>
+
+        <p>
+          Compile and link directly against the static library <code>libcexpress.a</code>:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">bash</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code>gcc-16 -Wall -Wextra -std=c11 -O2 -Ipath/to/lib -o my_app main.c path/to/libcexpress.a</code></pre>
+        </div>
+      </section>
+
+      <!-- Hello World -->
+      <section id="hello-world">
+        <h2>🚀 Hello World</h2>
+        <p>
+          A minimal server with a single route listening on port <code>8080</code>:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="kw">#include</span> <span class="str">"cexpress.h"</span>
+<span class="kw">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+
+<span class="kw">void</span> <span class="fn">handler_home</span>(<span class="kw">const</span> <span class="type">Request</span> *req, <span class="type">Response</span> *res) {
+    (<span class="kw">void</span>)req;
+    <span class="fn">res_send</span>(res, <span class="str">"Hello from CExpress!"</span>);
+}
+
+<span class="kw">int</span> <span class="fn">main</span>(<span class="kw">void</span>) {
+    <span class="type">App</span> app;
+    <span class="fn">app_init</span>(&app);
+
+    <span class="fn">app_get</span>(&app, <span class="str">"/"</span>, handler_home);
+
+    printf(<span class="str">"Listening on http://localhost:8080\n"</span>);
+    <span class="fn">app_listen</span>(&app, <span class="num">8080</span>);
+
+    <span class="fn">app_destroy</span>(&app);
+    <span class="kw">return</span> <span class="num">0</span>;
+}</code></pre>
+        </div>
+      </section>
+
+      <!-- Routing Section -->
+      <section id="routing-basics">
+        <h2>🧭 Routing & HTTP Verbs</h2>
+        <p>
+          Handlers are defined with the signature <code>void (*Handler)(const Request *req, Response *res)</code>.
+          Register handlers for standard HTTP verbs:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="fn">app_get</span>(&app, <span class="str">"/users"</span>, handler_get_users);
+<span class="fn">app_post</span>(&app, <span class="str">"/users"</span>, handler_create_user);
+<span class="fn">app_put</span>(&app, <span class="str">"/users/:id"</span>, handler_update_user);
+<span class="fn">app_patch</span>(&app, <span class="str">"/users/:id"</span>, handler_patch_user);
+<span class="fn">app_delete</span>(&app, <span class="str">"/users/:id"</span>, handler_delete_user);</code></pre>
+        </div>
+
+        <div class="alert alert-note">
+          <strong>Automatic Protocol Conformance:</strong><br>
+          • <strong>HEAD Requests:</strong> Executes the matching <code>GET</code> handler while automatically suppressing the message body.<br>
+          • <strong>OPTIONS Requests:</strong> Returns <code>204 No Content</code> with the computed <code>Allow</code> header.<br>
+          • <strong>405 Method Not Allowed:</strong> Emitted automatically if the route path exists but the verb is not registered.
+        </div>
+      </section>
+
+      <!-- Route Parameters -->
+      <section id="route-params">
+        <h3>Route Parameters (:id)</h3>
+        <p>
+          Extract URL path variables with <code>req_get_param</code>:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="fn">app_get</span>(&app, <span class="str">"/orgs/:org/repos/:repo"</span>, handler_repo);
+
+<span class="kw">void</span> <span class="fn">handler_repo</span>(<span class="kw">const</span> <span class="type">Request</span> *req, <span class="type">Response</span> *res) {
+    <span class="kw">const char</span> *org  = <span class="fn">req_get_param</span>(req, <span class="str">"org"</span>);
+    <span class="kw">const char</span> *repo = <span class="fn">req_get_param</span>(req, <span class="str">"repo"</span>);
+
+    <span class="kw">char</span> body[<span class="num">128</span>];
+    snprintf(body, <span class="kw">sizeof</span>(body), <span class="str">"Repository: %s/%s"</span>, org, repo);
+    <span class="fn">res_send</span>(res, body);
+}</code></pre>
+        </div>
+      </section>
+
+      <!-- Sub-Routers -->
+      <section id="sub-routers">
+        <h3>Sub-Routers (app_mount)</h3>
+        <p>
+          Modularize routes into isolated <code>Router</code> instances and mount them under path prefixes (like Express's <code>app.use('/api', apiRouter)</code>):
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="type">Router</span> api_router;
+<span class="fn">router_init</span>(&api_router);
+
+<span class="com">/* Scoped to /api */</span>
+<span class="fn">router_get</span>(&api_router, <span class="str">"/health"</span>, handler_health);
+<span class="fn">router_get</span>(&api_router, <span class="str">"/metrics"</span>, handler_metrics);
+
+<span class="com">/* Mounts routes to /api/health and /api/metrics */</span>
+<span class="fn">app_mount</span>(&app, <span class="str">"/api"</span>, &api_router);</code></pre>
+        </div>
+      </section>
+
+      <!-- Middleware Pipeline -->
+      <section id="middleware-pipeline">
+        <h2>🛡️ Middleware Pipeline</h2>
+        <p>
+          Middleware functions match <code>void (*Middleware)(const Request *req, Response *res, MiddlewareChain *chain)</code>.
+          Advance with <code>chain_next(chain)</code> or terminate early:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="kw">void</span> <span class="fn">mw_logger</span>(<span class="kw">const</span> <span class="type">Request</span> *req, <span class="type">Response</span> *res, <span class="type">MiddlewareChain</span> *chain) {
+    <span class="com">/* 1. Pre-handler processing */</span>
+    <span class="fn">chain_next</span>(chain);
+
+    <span class="com">/* 2. Post-handler inspection (res->status is finalized) */</span>
+    printf(<span class="str">"%s %s -> %d\n"</span>, req->method, req->path, res->status);
+}
+
+<span class="com">/* Register app-wide middleware */</span>
+<span class="fn">app_use</span>(&app, mw_logger);
+
+<span class="com">/* Register prefix-scoped middleware (only runs for /admin/*) */</span>
+<span class="fn">app_use_prefix</span>(&app, <span class="str">"/admin"</span>, mw_admin_auth);
+
+<span class="com">/* Register per-route middleware */</span>
+<span class="fn">app_post_mw</span>(&app, <span class="str">"/checkout"</span>, handler_checkout, (<span class="type">Middleware</span>[]){mw_auth}, <span class="num">1</span>);</code></pre>
+        </div>
+      </section>
+
+      <!-- Error Handling -->
+      <section id="error-handling">
+        <h3>Centralized Error Handling</h3>
+        <p>
+          Trigger centralized error handling with <code>chain_error</code>:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="kw">void</span> <span class="fn">mw_guard</span>(<span class="kw">const</span> <span class="type">Request</span> *req, <span class="type">Response</span> *res, <span class="type">MiddlewareChain</span> *chain) {
+    <span class="kw">if</span> (!is_authorized(req)) {
+        <span class="fn">chain_error</span>(chain, <span class="num">401</span>, <span class="str">"Invalid or missing API key"</span>);
+        <span class="kw">return</span>;
+    }
+    <span class="fn">chain_next</span>(chain);
+}
+
+<span class="com">/* Register custom error handler */</span>
+<span class="kw">void</span> <span class="fn">custom_error_handler</span>(<span class="kw">int</span> status, <span class="kw">const char</span> *msg, <span class="kw">const</span> <span class="type">Request</span> *req, <span class="type">Response</span> *res) {
+    (<span class="kw">void</span>)req;
+    <span class="fn">res_status</span>(res, status);
+    <span class="kw">char</span> json[<span class="num">256</span>];
+    snprintf(json, <span class="kw">sizeof</span>(json), <span class="str">"{\"error\":\"%s\",\"status\":%d}"</span>, msg, status);
+    <span class="fn">res_json</span>(res, json);
+}
+
+<span class="fn">app_use_error</span>(&app, custom_error_handler);</code></pre>
+        </div>
+      </section>
+
+      <!-- Request & Response API -->
+      <section id="request-api">
+        <h2>📥 Request & Response API</h2>
+        <p>
+          Inspect headers, cookies, query strings, and body data:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="kw">void</span> <span class="fn">handler_inspect</span>(<span class="kw">const</span> <span class="type">Request</span> *req, <span class="type">Response</span> *res) {
+    <span class="kw">const char</span> *query_sort = <span class="fn">req_get_query</span>(req, <span class="str">"sort"</span>);
+    <span class="kw">const char</span> *auth_hdr   = <span class="fn">req_get_header</span>(req, <span class="str">"Authorization"</span>);
+    <span class="kw">const char</span> *session    = <span class="fn">req_get_cookie</span>(req, <span class="str">"session_id"</span>);
+
+    <span class="com">/* Set status and custom headers */</span>
+    <span class="fn">res_status</span>(res, <span class="num">200</span>);
+    <span class="fn">res_set_header</span>(res, <span class="str">"X-Engine"</span>, <span class="str">"CExpress"</span>);
+
+    <span class="com">/* Send JSON */</span>
+    <span class="fn">res_json</span>(res, <span class="str">"{\"status\":\"ok\"}"</span>);
+}</code></pre>
+        </div>
+      </section>
+
+      <!-- Cookies & Redirects -->
+      <section id="cookies">
+        <h3>Cookies & Redirects</h3>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="com">/* Setting a cookie with SameSite, Max-Age, and HttpOnly */</span>
+<span class="type">CookieOptions</span> opts = {
+    .max_age = <span class="num">86400</span>,
+    .http_only = <span class="num">1</span>,
+    .secure = <span class="num">1</span>,
+    .same_site = <span class="type">COOKIE_SAMESITE_STRICT</span>
+};
+<span class="fn">res_set_cookie</span>(res, <span class="str">"auth_token"</span>, <span class="str">"secure_secret"</span>, &opts);
+
+<span class="com">/* Clearing a cookie */</span>
+<span class="fn">res_clear_cookie</span>(res, <span class="str">"auth_token"</span>, <span class="str">"/"</span>);
+
+<span class="com">/* Performing a 302 Redirect */</span>
+<span class="fn">res_redirect</span>(res, <span class="num">0</span>, <span class="str">"/dashboard"</span>);</code></pre>
+        </div>
+      </section>
+
+      <!-- Streaming & Chunked Responses -->
+      <section id="streaming">
+        <h2>🌊 Streaming & Chunked Responses</h2>
+        <p>
+          Emit HTTP/1.1 chunked responses incrementally using <code>res_write()</code>, attach RFC 7230 chunked trailers with <code>res_set_trailer()</code>, and finalize with <code>res_end()</code>:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="kw">void</span> <span class="fn">handler_stream</span>(<span class="kw">const</span> <span class="type">Request</span> *req, <span class="type">Response</span> *res) {
+    (<span class="kw">void</span>)req;
+    <span class="fn">res_set_header</span>(res, <span class="str">"Content-Type"</span>, <span class="str">"text/plain"</span>);
+
+    <span class="com">/* Stage trailer (declares Trailer: Server-Timing in headers) */</span>
+    <span class="fn">res_set_trailer</span>(res, <span class="str">"Server-Timing"</span>, <span class="str">"app;dur=24.2"</span>);
+
+    <span class="com">/* Write chunks incrementally */</span>
+    <span class="fn">res_write</span>(res, <span class="str">"Chunk 1\n"</span>, <span class="num">8</span>);
+    <span class="fn">res_write</span>(res, <span class="str">"Chunk 2\n"</span>, <span class="num">8</span>);
+
+    <span class="com">/* Emits terminal 0\r\n, trailers, and terminating CRLF */</span>
+    <span class="fn">res_end</span>(res);
+}</code></pre>
+        </div>
+      </section>
+
+      <!-- Bounded File Streaming -->
+      <section id="file-streaming">
+        <h3>Bounded File Streaming (res_send_file)</h3>
+        <p>
+          Stream large files directly from the filesystem in bounded 16KB chunks through the non-blocking event loop. Memory is bounded and whole files are never buffered into RAM:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="kw">void</span> <span class="fn">handler_download</span>(<span class="kw">const</span> <span class="type">Request</span> *req, <span class="type">Response</span> *res) {
+    (<span class="kw">void</span>)req;
+    <span class="kw">if</span> (<span class="fn">res_send_file</span>(res, <span class="str">"application/pdf"</span>, <span class="str">"reports/report.pdf"</span>) != <span class="num">0</span>) {
+        <span class="fn">res_status</span>(res, <span class="num">404</span>);
+        <span class="fn">res_send</span>(res, <span class="str">"Report not found"</span>);
+    }
+}</code></pre>
+        </div>
+      </section>
+
+      <!-- Static File Serving -->
+      <section id="static-files">
+        <h3>Static File Serving (app_serve_static)</h3>
+        <p>
+          Mount a directory of static assets with traversal protection and MIME type detection:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="com">/* GET /static/app.css -> serves public/app.css */</span>
+<span class="fn">app_serve_static</span>(&app, <span class="str">"/static"</span>, <span class="str">"app/public"</span>);</code></pre>
+        </div>
+      </section>
+
+      <!-- Form Parsing -->
+      <section id="form-parsing">
+        <h2>📋 Multipart & Form Parsing</h2>
+        <p>
+          Parse <code>multipart/form-data</code> file uploads and <code>application/x-www-form-urlencoded</code> forms:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="com">/* Multipart File Uploads */</span>
+<span class="kw">const char</span> *content_type = <span class="fn">req_get_header</span>(req, <span class="str">"Content-Type"</span>);
+<span class="type">MultipartForm</span> form;
+<span class="fn">parse_multipart_body</span>(content_type, req->body, req->content_length, &form);
+
+<span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; form.part_count; i++) {
+    <span class="kw">if</span> (form.parts[i].is_file) {
+        printf(<span class="str">"File uploaded: %s (%zu bytes)\n"</span>, form.parts[i].filename, form.parts[i].data_len);
+    }
+}</code></pre>
+        </div>
+      </section>
+
+      <!-- Built-in JSON Engine -->
+      <section id="json-engine">
+        <h2>⚡ Built-in JSON Parser & Serializer</h2>
+        <p>
+          Recursive-descent JSON parser and stringifier without external dependencies:
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="com">/* Parse incoming JSON */</span>
+<span class="kw">char</span> err[<span class="num">128</span>];
+<span class="type">JsonValue</span> *val = <span class="fn">json_parse</span>(req->body, err, <span class="kw">sizeof</span>(err));
+<span class="kw">if</span> (val != NULL) {
+    <span class="kw">const</span> <span class="type">JsonValue</span> *name = <span class="fn">json_object_get</span>(val, <span class="str">"name"</span>);
+    <span class="fn">json_free</span>(val);
+}
+
+<span class="com">/* Construct JSON */</span>
+<span class="type">JsonValue</span> *obj = <span class="fn">json_new_object</span>();
+<span class="fn">json_object_set</span>(obj, <span class="str">"status"</span>, <span class="fn">json_new_string</span>(<span class="str">"active"</span>));
+<span class="kw">char</span> *out = <span class="fn">json_stringify</span>(obj);
+<span class="fn">res_json</span>(res, out);
+free(out);
+<span class="fn">json_free</span>(obj);</code></pre>
+        </div>
+      </section>
+
+      <!-- Graceful Shutdown -->
+      <section id="graceful-shutdown">
+        <h2>🛑 Graceful Shutdown</h2>
+        <p>
+          CExpress intercepts <code>SIGINT</code> and <code>SIGTERM</code> directly in the kqueue loop:
+        </p>
+        <div class="alert alert-tip">
+          1. Stops accepting incoming TCP connections.<br>
+          2. Closes idle keep-alive sockets immediately.<br>
+          3. Sets <code>Connection: close</code> on active responses and streams until flushed.<br>
+          4. Arms a 5-second deadline timer to prevent stalled clients from blocking process exit.<br>
+          5. Returns cleanly to <code>main()</code> so <code>app_destroy()</code> frees all memory.
+        </div>
+      </section>
+
+      <!-- API Cheat Sheet -->
+      <section id="api-index">
+        <h2>📖 API Cheat Sheet</h2>
+
+        <div class="filter-bar">
+          <button class="filter-btn active" onclick="filterApi('all', this)">All</button>
+          <button class="filter-btn" onclick="filterApi('routing', this)">Routing</button>
+          <button class="filter-btn" onclick="filterApi('response', this)">Response</button>
+          <button class="filter-btn" onclick="filterApi('middleware', this)">Middleware</button>
+          <button class="filter-btn" onclick="filterApi('parser', this)">Parser</button>
+        </div>
+
+        <div class="table-container">
+          <table id="api-table">
+            <thead>
+              <tr>
+                <th>Function</th>
+                <th>Header</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr data-cat="routing">
+                <td><code>app_init(App *app)</code></td>
+                <td><code>router.h</code></td>
+                <td>Initializes server app and dynamic connection table.</td>
+              </tr>
+              <tr data-cat="routing">
+                <td><code>app_listen(App *app, int port)</code></td>
+                <td><code>connection.h</code></td>
+                <td>Starts non-blocking kqueue event loop.</td>
+              </tr>
+              <tr data-cat="routing">
+                <td><code>app_destroy(App *app)</code></td>
+                <td><code>connection.h</code></td>
+                <td>Closes sockets and frees connection tables cleanly.</td>
+              </tr>
+              <tr data-cat="routing">
+                <td><code>app_get / app_post / app_put ...</code></td>
+                <td><code>router.h</code></td>
+                <td>Registers route handlers for specific HTTP methods.</td>
+              </tr>
+              <tr data-cat="routing">
+                <td><code>app_mount(App *app, prefix, Router *r)</code></td>
+                <td><code>router.h</code></td>
+                <td>Mounts a sub-router under a URL prefix.</td>
+              </tr>
+              <tr data-cat="routing">
+                <td><code>app_serve_static(App *app, pfx, root)</code></td>
+                <td><code>router.h</code></td>
+                <td>Mounts static file directory with traversal protection.</td>
+              </tr>
+              <tr data-cat="middleware">
+                <td><code>app_use(App *app, Middleware mw)</code></td>
+                <td><code>router.h</code></td>
+                <td>Registers an app-wide middleware.</td>
+              </tr>
+              <tr data-cat="middleware">
+                <td><code>app_use_prefix(App *app, pfx, mw)</code></td>
+                <td><code>router.h</code></td>
+                <td>Registers prefix-scoped middleware (e.g. <code>/api</code>).</td>
+              </tr>
+              <tr data-cat="middleware">
+                <td><code>chain_next(MiddlewareChain *c)</code></td>
+                <td><code>middleware.h</code></td>
+                <td>Advances to next middleware or route handler.</td>
+              </tr>
+              <tr data-cat="middleware">
+                <td><code>chain_error(c, status, message)</code></td>
+                <td><code>middleware.h</code></td>
+                <td>Delegates to centralized error handler.</td>
+              </tr>
+              <tr data-cat="response">
+                <td><code>res_status(Response *res, int status)</code></td>
+                <td><code>response.h</code></td>
+                <td>Sets HTTP status code (200, 201, 404, etc.).</td>
+              </tr>
+              <tr data-cat="response">
+                <td><code>res_set_header(res, name, value)</code></td>
+                <td><code>response.h</code></td>
+                <td>Sets a custom response header.</td>
+              </tr>
+              <tr data-cat="response">
+                <td><code>res_send(Response *res, const char *b)</code></td>
+                <td><code>response.h</code></td>
+                <td>Sends <code>text/plain</code> body.</td>
+              </tr>
+              <tr data-cat="response">
+                <td><code>res_json(Response *res, const char *b)</code></td>
+                <td><code>response.h</code></td>
+                <td>Sends <code>application/json</code> body.</td>
+              </tr>
+              <tr data-cat="response">
+                <td><code>res_write(Response *res, data, len)</code></td>
+                <td><code>response.h</code></td>
+                <td>Emits incremental chunk in chunked response.</td>
+              </tr>
+              <tr data-cat="response">
+                <td><code>res_set_trailer(res, name, value)</code></td>
+                <td><code>response.h</code></td>
+                <td>Stages RFC 7230 trailer for chunked transfer.</td>
+              </tr>
+              <tr data-cat="response">
+                <td><code>res_end(Response *res)</code></td>
+                <td><code>response.h</code></td>
+                <td>Finalizes chunked response and emits trailers.</td>
+              </tr>
+              <tr data-cat="response">
+                <td><code>res_send_file(res, type, filepath)</code></td>
+                <td><code>response.h</code></td>
+                <td>Streams file in bounded 16KB chunks through event loop.</td>
+              </tr>
+              <tr data-cat="parser">
+                <td><code>req_get_param(req, name)</code></td>
+                <td><code>http_parser.h</code></td>
+                <td>Retrieves extracted route path variable.</td>
+              </tr>
+              <tr data-cat="parser">
+                <td><code>req_get_query(req, name)</code></td>
+                <td><code>http_parser.h</code></td>
+                <td>Retrieves parsed query-string parameter.</td>
+              </tr>
+              <tr data-cat="parser">
+                <td><code>req_get_header(req, name)</code></td>
+                <td><code>http_parser.h</code></td>
+                <td>Looks up request header (case-insensitive).</td>
+              </tr>
+              <tr data-cat="parser">
+                <td><code>req_get_cookie(req, name)</code></td>
+                <td><code>http_parser.h</code></td>
+                <td>Extracts cookie value from Cookie header.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Right Quick TOC -->
+    <aside class="toc">
+      <div class="toc-title">On this page</div>
+      <a href="#overview" class="toc-link">Overview</a>
+      <a href="#benchmarks" class="toc-link">Benchmarks</a>
+      <a href="#installation" class="toc-link">Installation</a>
+      <a href="#hello-world" class="toc-link">Hello World</a>
+      <a href="#routing-basics" class="toc-link">Routing & Verbs</a>
+      <a href="#route-params" class="toc-link">Path Parameters</a>
+      <a href="#sub-routers" class="toc-link">Sub-Routers</a>
+      <a href="#middleware-pipeline" class="toc-link">Middleware</a>
+      <a href="#error-handling" class="toc-link">Error Handling</a>
+      <a href="#request-api" class="toc-link">Request & Response</a>
+      <a href="#streaming" class="toc-link">Streaming Chunks</a>
+      <a href="#file-streaming" class="toc-link">File Streaming</a>
+      <a href="#static-files" class="toc-link">Static Files</a>
+      <a href="#form-parsing" class="toc-link">Multipart / Forms</a>
+      <a href="#json-engine" class="toc-link">JSON Engine</a>
+      <a href="#graceful-shutdown" class="toc-link">Graceful Shutdown</a>
+      <a href="#api-index" class="toc-link">API Cheat Sheet</a>
+    </aside>
+  </div>
+
+  <script>
+    // Copy Code functionality
+    function copyCode(btn) {
+      const pre = btn.closest('.code-block').querySelector('pre');
+      navigator.clipboard.writeText(pre.innerText).then(() => {
+        const originalText = btn.innerText;
+        btn.innerText = "✓ Copied";
+        btn.style.borderColor = "var(--accent-emerald)";
+        btn.style.color = "var(--accent-emerald)";
+        setTimeout(() => {
+          btn.innerText = originalText;
+          btn.style.borderColor = "";
+          btn.style.color = "";
+        }, 2000);
+      });
+    }
+
+    // Theme Toggle
+    const themeBtn = document.getElementById('theme-toggle');
+    themeBtn.addEventListener('click', () => {
+      const isLight = document.documentElement.classList.toggle('light');
+      themeBtn.innerText = isLight ? '☀️' : '🌙';
+      localStorage.setItem('cexpress-theme', isLight ? 'light' : 'dark');
+    });
+
+    if (localStorage.getItem('cexpress-theme') === 'light') {
+      document.documentElement.classList.add('light');
+      themeBtn.innerText = '☀️';
+    }
+
+    // API Table Category Filter
+    function filterApi(category, btn) {
+      document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const rows = document.querySelectorAll('#api-table tbody tr');
+      rows.forEach(row => {
+        if (category === 'all' || row.getAttribute('data-cat') === category) {
+          row.style.display = '';
+        } else {
+          row.style.display = 'none';
+        }
+      });
+    }
+
+    // Real-time Search
+    const searchInput = document.getElementById('api-search');
+    searchInput.addEventListener('input', (e) => {
+      const q = e.target.value.toLowerCase().trim();
+      const rows = document.querySelectorAll('#api-table tbody tr');
+      rows.forEach(row => {
+        const text = row.innerText.toLowerCase();
+        row.style.display = text.includes(q) ? '' : 'none';
+      });
+
+      // Also filter headings
+      document.querySelectorAll('section').forEach(sec => {
+        if (!q) {
+          sec.style.display = '';
+          return;
+        }
+        const match = sec.innerText.toLowerCase().includes(q);
+        sec.style.display = match ? '' : 'none';
+      });
+    });
+
+    // Keyboard shortcut Cmd+K / Ctrl+K
+    window.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        searchInput.focus();
+        searchInput.select();
+      }
+      if (e.key === 'Escape' && document.activeElement === searchInput) {
+        searchInput.value = '';
+        searchInput.dispatchEvent(new Event('input'));
+        searchInput.blur();
+      }
+    });
+
+    // Active Sidebar Link on Scroll
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const id = entry.target.id;
+          document.querySelectorAll('.sidebar-link').forEach(link => {
+            link.classList.toggle('active', link.getAttribute('href') === `#${id}`);
+          });
+        }
+      });
+    }, { threshold: 0.25 });
+
+    document.querySelectorAll('section').forEach(sec => observer.observe(sec));
+  </script>
+</body>
+</html>
