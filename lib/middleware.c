@@ -3,6 +3,7 @@
 #include "middleware.h"
 #include "response.h"
 #include "router.h"
+#include "static.h"
 
 /* prefix "" or "/" is treated as unscoped (matches every path), same as an
  * app_use() call before prefix-scoping existed. Otherwise path must start
@@ -78,7 +79,13 @@ void chain_next(MiddlewareChain *chain) {
         return;
     }
 
-    if (chain->final_handler != NULL) {
+    if (chain->route != NULL && chain->route->static_root[0] != '\0') {
+        /* A static-file mount (app_serve_static, router.h) has no Handler -
+         * route->handler is NULL, a plain Handler(req, res) has no way to
+         * receive the mount's root directory anyway - so this is checked
+         * ahead of final_handler below rather than through it. */
+        static_serve_file(chain->route, chain->req, chain->res);
+    } else if (chain->final_handler != NULL) {
         chain->final_handler(chain->req, chain->res);
     } else if (chain->method_not_allowed && strcmp(chain->req->method, "OPTIONS") == 0) {
         /* Auto-OPTIONS: mirrors Express, which answers OPTIONS for any path
@@ -137,6 +144,7 @@ void dispatch(App *app, const Route *route, const Request *req, Response *res) {
         .route_middleware_count = route != NULL ? route->middleware_count : 0,
         .index = 0,
         .final_handler = route != NULL ? route->handler : NULL,
+        .route = route,
         .error_handler = app->error_handler,
         .req = req,
         .res = res,

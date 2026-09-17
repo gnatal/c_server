@@ -28,6 +28,11 @@ layer stays pure and unit-testable independent of sockets:
 - `tests/test_urlencoded.c` tests `application/x-www-form-urlencoded` body
   splitting/decoding, bare-key/empty-pair handling, `NULL`/empty bodies, and the
   `MAX_FORM_FIELDS` truncation cap.
+- `tests/test_static.c` tests the pure `static_resolve_relative_path`/
+  `static_mime_type` (traversal rejection, prefix stripping, MIME lookup), and
+  `static_serve_file` end-to-end against a real `mkdtemp`-created directory tree
+  (a served file, a missing file, a `..` attempt, a symlink escaping the mount
+  root, and the directory→`index.html` fallback).
 
 `App` carries `ServerConfig config` (`app_types.h`), storing runtime parameters such as `config.port` (defaulting to `DEFAULT_PORT` in `app_init`).
 
@@ -244,6 +249,70 @@ any other route — including the 405-vs-404 distinction above, since
 `match_route_allowed_methods` also runs `match_path` under the hood. See
 `tests/test_router.c` (`test_match_path_wildcards`) and `app/main.c`
 (`GET /files/*` → `handler_files`).
+
+## Static file serving
+`app_serve_static(app, prefix, root_dir)` (`router.c`) registers a static-file mount
+as a `Route` rather than a `Handler` call — it builds a trailing-wildcard pattern
+(`"<prefix>/*"`, reusing the machinery above) via the same `fill_route` every other
+registration function uses, then overwrites that `Route`'s `static_root` field
+(`app_types.h`, empty `""` for every ordinary route — `fill_route` explicitly clears
+it, since `Route` slots aren't zero-initialized on their own and stale stack garbage
+could otherwise look like a static mount) with `root_dir` canonicalized via
+`realpath()` **at registration time** — if `root_dir` doesn't exist, this logs a
+warning and registers nothing at all (deny-by-default, same as every other hard
+failure in this engine's registration functions). `route->handler` stays `NULL`: a
+plain `Handler(const Request*, Response*)` has no way to receive the mount's root
+directory, so a static route is never dispatched through one. Instead,
+`MiddlewareChain` now also carries the matched `route` itself (not just the
+`Handler` derived from it), and `chain_next`'s final fallback (`middleware.c`)
+checks `route->static_root[0] != '\0'` *before* the `final_handler != NULL` check
+and calls `static_serve_file` (`static.c/h`) directly instead. App-level only —
+there's no `router_serve_static`/`app_mount` equivalent yet.
+
+`static_serve_file(route, req, res)` is the one impure function in `static.c`;
+everything else is pure and unit-tested without touching a filesystem
+(`tests/test_static.c`):
+- **`static_resolve_relative_path(mount_pattern, req_path, out, out_size)`** strips
+  the mount's literal prefix off `req_path` (already URL-decoded by
+  `parse_http_request` before routing ever runs — see "URL decoding" above) and
+  walks the remainder segment by segment, rejecting (`-1`) any segment that is
+  exactly `".."` — the primary traversal defense, and why this function is pure:
+  it never needs to touch the filesystem to catch a `..`-shaped request. A `req_path`
+  that doesn't start with the mount's prefix, or resolves to nothing after stripping
+  (a request for the mount root itself — which a trailing wildcard route never
+  matches anyway, see "Route wildcards" above), is also rejected.
+- **`static_mime_type(path)`** is a small, demo-sized extension → MIME-type lookup
+  table, defaulting to `application/octet-stream` for anything not in it.
+- **`static_serve_file`** resolves `route->static_root + "/" + subpath` via
+  `realpath()` and — critically — re-checks that the *resolved* path still starts
+  with `route->static_root` at a `/` boundary. This is defense-in-depth on top of
+  the textual `..` check above: a symlink living inside the mount's root can point
+  outside it without any `..` ever appearing in the request path, and `realpath()`
+  is what actually follows that symlink. A directory request retries once against
+  `<resolved>/index.html` through the same containment check (Express's default
+  directory-index behavior) — there is no directory listing, ever. Status mapping:
+  `403` for a rejected/escaping path, `404` for anything that doesn't resolve to a
+  regular file even after the `index.html` retry, `500` if the file exceeds the new
+  `MAX_STATIC_FILE_SIZE` cap (`app_types.h`, 50 MiB — there's no streaming response
+  path yet, see `pending.txt` item #2) or a read fails partway through, `200`
+  otherwise. The whole file is read into one `malloc`'d buffer and sent via the new
+  `res_send_bytes` (below), freed immediately after.
+
+**`res_send_bytes(res, content_type, data, len)`** (`response.c/h`) is a new sibling
+to `res_send`/`res_json` for a byte buffer of known length rather than a
+NUL-terminated C string — a served file (an image, a font, ...) can contain
+embedded NUL bytes, which `strlen`-based `res_send`/`res_json` would silently
+truncate (the same class of bug already fixed for `req->body`, see "Body
+buffering" below). `send_with_content_type` (`response.c`) now takes an explicit
+`body_len` parameter instead of computing `strlen(body)` itself; `res_send`/
+`res_json` are unchanged in behavior, they just pass `strlen(body)` through
+themselves.
+
+See `tests/test_static.c` (pure coverage for `static_resolve_relative_path`/
+`static_mime_type`, plus an I/O suite against a real `mkdtemp`-created directory
+tree — including a symlink escaping the mount root — driven directly against
+`static_serve_file`) and `app/main.c`/`app/CLAUDE.md` (`GET /static/*` →
+`app/public/`) for a real usage example.
 
 ## Query-string parsing
 `parse_http_request` (`http_parser.c`) still stores the raw query string as-is in

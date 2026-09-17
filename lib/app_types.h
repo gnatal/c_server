@@ -3,6 +3,11 @@
 
 #include <stddef.h>
 #include <time.h>
+#include <limits.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define MAX_ROUTES 32
 #define MAX_MIDDLEWARES 16
@@ -54,6 +59,17 @@
  * mw_body_size_guard).
  */
 #define MAX_BODY_SIZE (10 * 1024 * 1024)
+
+/*
+ * Hard ceiling on a file static_serve_file (lib/static.h) will read off disk
+ * and hand to res_send_bytes for one request - an existing file larger than
+ * this gets a 500 rather than being read into memory whole, since there's no
+ * streaming response path yet (see pending.txt item #2, and lib/CLAUDE.md
+ * "Static file serving"). 50 MiB, comfortably larger than MAX_BODY_SIZE
+ * (which bounds an upload, not a served asset) while still bounded - an app
+ * serving larger files needs the streaming response work first.
+ */
+#define MAX_STATIC_FILE_SIZE (50 * 1024 * 1024)
 
 /*
  * Idle/read timeout: a connection - mid-request (headers or body trickling
@@ -305,6 +321,11 @@ typedef struct {
 typedef struct {
     char method[8];
     char path[256];
+
+    /* NULL for a static-file route (see static_root below) - dispatch()
+     * (middleware.c) never calls a NULL handler, it branches to
+     * static_serve_file (lib/static.h) instead once it sees static_root is
+     * non-empty. Every other route always has a real handler here. */
     Handler handler;
 
     /* Per-route middleware, registered via app_get_mw/app_post_mw. Runs in
@@ -314,6 +335,16 @@ typedef struct {
      * sentinel can't silently under-run the array. */
     Middleware middlewares[MAX_ROUTE_MIDDLEWARES];
     int middleware_count;
+
+    /* Empty ("") for an ordinary route - set only by app_serve_static
+     * (lib/router.h) to the canonicalized (realpath'd) absolute directory a
+     * static-file mount serves from. A route with a non-empty static_root
+     * has `path` always ending in a trailing wildcard segment
+     * (app_serve_static's own doing) and a NULL handler -
+     * dispatch()/chain_next() (lib/middleware.c) check this field, not
+     * `handler`, to tell a static mount apart from a route with no handler
+     * by mistake. See lib/CLAUDE.md ("Static file serving"). */
+    char static_root[PATH_MAX];
 } Route;
 
 /* A standalone, unmounted route table - the C analogue of Express's
@@ -350,6 +381,14 @@ struct MiddlewareChain {
     int route_middleware_count;
     int index;
     Handler final_handler;
+
+    /* The matched Route itself (NULL if none matched) - final_handler above
+     * is just route->handler, which is NULL for a static-file route
+     * (Route.static_root, app_types.h). chain_next's final fallback
+     * (middleware.c) checks this field ahead of final_handler so it can
+     * dispatch to static_serve_file (lib/static.h) instead of trying to call
+     * a NULL Handler. */
+    const Route *route;
     ErrorHandler error_handler;
     const Request *req;
     Response *res;

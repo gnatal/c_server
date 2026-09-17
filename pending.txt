@@ -319,7 +319,28 @@ Gaps vs. an Express-like C framework
   Content-Type may be overridden and takes priority over res_send/res_json's default.
   Backed by a fixed Response.headers[MAX_RESPONSE_HEADERS] array - extra calls past the
   cap are dropped rather than overflowing. See tests/test_response.c.
-- Still no streaming/chunked response, no static file serving
+- Still no streaming/chunked response
+- [DONE] Static file serving: app_serve_static(app, prefix, root_dir) (lib/router.h)
+  registers a static-file mount as a Route (trailing-wildcard pattern, reusing the
+  wildcard machinery above) rather than a Handler - root_dir is canonicalized via
+  realpath() at registration time (refuses to register against a directory that
+  doesn't exist, deny-by-default) and stored on Route.static_root (app_types.h).
+  chain_next's final fallback (middleware.c) checks static_root ahead of the
+  ordinary Handler dispatch and calls the new static_serve_file (lib/static.c/h)
+  instead. Path-traversal defense is two layers: static_resolve_relative_path
+  (pure, unit-tested without a filesystem) rejects any ".." segment in the
+  request path, and static_serve_file re-checks via realpath() that the resolved
+  file still lives inside static_root, catching a symlink escape a textual check
+  alone can't see. A directory request falls back to its own index.html once
+  (Express's default), never a directory listing; MAX_STATIC_FILE_SIZE
+  (app_types.h, 50 MiB) bounds what's read into memory, since there's no
+  streaming response path yet (see the item above). The new res_send_bytes
+  (lib/response.c/h) sends a length-prefixed byte buffer rather than a
+  NUL-terminated string, so a served binary file with embedded NUL bytes isn't
+  silently truncated the way res_send/res_json's strlen-based body would. See
+  tests/test_static.c, lib/CLAUDE.md ("Static file serving"), and app/main.c
+  (GET /static/* -> app/public/) for a real usage example. App-level only - no
+  router_serve_static/app_mount equivalent yet.
 - [DONE] Cookie helper: res_set_cookie/res_clear_cookie (lib/response.c/h) and
   req_get_cookie (lib/http_parser.c/h) - see section 3's Cookies entry above.
   (This line previously said "no cookie helper" - stale, left over from before

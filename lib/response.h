@@ -1,6 +1,7 @@
 #ifndef RESPONSE_H
 #define RESPONSE_H
 
+#include <stddef.h>
 #include "app_types.h"
 
 /* Sets the status code that res_send() will report. */
@@ -31,6 +32,15 @@ void res_send(Response *res, const char *body);
 
 /* Same as res_send, but with a "Content-Type: application/json" header. */
 void res_json(Response *res, const char *body);
+
+/*
+ * Same as res_send, but for a raw byte buffer of known length rather than a
+ * NUL-terminated C string - res_send/res_json compute Content-Length via
+ * strlen(body), which would silently truncate a body containing an embedded
+ * NUL byte (e.g. a served binary file, lib/static.h: static_serve_file).
+ * data may be NULL only if len is 0.
+ */
+void res_send_bytes(Response *res, const char *content_type, const unsigned char *data, size_t len);
 
 /*
  * Sets the "Location" header to location and sends a short text/plain body

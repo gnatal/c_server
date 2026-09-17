@@ -10,7 +10,7 @@ correctness, banned unsafe functions, tests required, nested CLAUDE.md updates,
 |---|------|---------|------------|-----------|-------------|-------|
 | 1 | ~~Chunked `Transfer-Encoding` support (request body dechunking)~~ | 3 / 6 (listed twice) | Medium-High | 1–1.5 hr | ~40k–70k | **Done.** New pure parser (chunk-size lines, trailers, terminating `0\r\n\r\n`), wired into `http_parser.c`/`connection.c` buffering, rejects malformed/oversized chunks and the Transfer-Encoding+Content-Length smuggling shape (400), tests + `lib/CLAUDE.md` updated. |
 | 2 | Streaming / chunked **response** support | 4 | High | 2–4 hr | ~80k–150k | Currently `Handler` is fully synchronous and materializes the whole body. True streaming needs an incremental write API and touches `response.c`, `connection.c` event loop, and likely the `Handler` signature — largest scope item outside concurrency work. |
-| 3 | Static file serving | 4 | Medium | 1–2 hr | ~50k–90k | New module: safe path resolution (no traversal outside root), deny-by-default, MIME-type table, file read + send. Should reuse existing 403/404 conventions. |
+| 3 | ~~Static file serving~~ | 4 | Medium | 1–2 hr | ~50k–90k | **Done.** New `lib/static.c/h`: pure path resolution (`static_resolve_relative_path`, rejects `..`) plus a `realpath()`-based containment check against symlink escapes, MIME-type table, `app_serve_static` (`router.h`) registers a mount as a `Route` rather than a `Handler`. 403/404/500 per the existing conventions; new `res_send_bytes` for NUL-safe binary responses. |
 | 4 | `res_redirect()` helper | 4 | Low | 15–30 min | ~8k–15k | Small helper: set `Location` header + 3xx status via existing `res_set_header`/status machinery. Straightforward, low risk. |
 | 5 | Cookie helper (listed as missing) | 4 | N/A — likely stale | ~0 (doc fix only) | ~2k | `res_set_cookie`/`res_clear_cookie`/`req_get_cookie` already exist per section 3's `[DONE]` cookies entry. This line in the Response section appears to predate that work; just needs `pending.txt` cleanup, not code. |
 | 6 | Expand `status_text()` beyond 11 codes | 4 | Low | 15–20 min | ~5k–10k | Mechanical: add more status-code → reason-phrase mappings. |
@@ -32,7 +32,7 @@ correctness, banned unsafe functions, tests required, nested CLAUDE.md updates,
 1. ~~Cleanup: fix the stale "no cookie helper" line in `pending.txt` (#5).~~ Done.
 2. ~~Quick wins: `res_redirect`, expanded `status_text()` (#4, #6).~~ Done.
 3. ~~Chunked request support (#1) — needed before real interop with many HTTP clients.~~ Done.
-4. Static file serving (#3) and connection-table refactor (#9) — independent, medium-sized.
+4. ~~Static file serving (#3)~~ Done. Connection-table refactor (#9) is independent and still open, deferred for now.
 5. Graceful shutdown (#10) — moderate, improves operability before tackling concurrency.
 6. Design spikes for the big three: streaming responses (#2), TLS (#11), and
    the concurrency/portability model (#7, #8) — these interact (e.g. TLS and

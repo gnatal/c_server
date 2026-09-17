@@ -52,7 +52,7 @@ static const char *find_header(const Response *res, const char *name) {
     return NULL;
 }
 
-static void send_with_content_type(Response *res, const char *content_type, const char *body) {
+static void send_with_content_type(Response *res, const char *content_type, const char *body, size_t body_len) {
     char header[RESPONSE_HEADER_BUF_SIZE];
     Connection *conn = res->conn;
 
@@ -68,7 +68,7 @@ static void send_with_content_type(Response *res, const char *content_type, cons
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n",
-        res->status, status_text(res->status), content_type, strlen(body),
+        res->status, status_text(res->status), content_type, body_len,
         conn->keep_alive ? "keep-alive" : "close");
 
     int overflow = (n < 0 || (size_t)n >= sizeof(header));
@@ -119,7 +119,6 @@ static void send_with_content_type(Response *res, const char *content_type, cons
     }
 
     const size_t header_len = offset;
-    const size_t body_len = strlen(body);
     /* Content-Length above is always computed from the full body - a HEAD
      * response must report the same length a GET would have (RFC 7231
      * 4.3.2), it just never actually sends those bytes. */
@@ -150,11 +149,15 @@ static void send_with_content_type(Response *res, const char *content_type, cons
 }
 
 void res_send(Response *res, const char *body) {
-    send_with_content_type(res, "text/plain", body);
+    send_with_content_type(res, "text/plain", body, strlen(body));
 }
 
 void res_json(Response *res, const char *body) {
-    send_with_content_type(res, "application/json", body);
+    send_with_content_type(res, "application/json", body, strlen(body));
+}
+
+void res_send_bytes(Response *res, const char *content_type, const unsigned char *data, size_t len) {
+    send_with_content_type(res, content_type, (const char *)data, len);
 }
 
 void res_redirect(Response *res, int status, const char *location) {

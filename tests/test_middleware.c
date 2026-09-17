@@ -62,7 +62,7 @@ static void test_middlewares_run_in_order_then_handler(void) {
     app_use(&app, mw_a);
     app_use(&app, mw_b);
 
-    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0, { 0 } };
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
@@ -93,7 +93,7 @@ static void test_middleware_can_short_circuit(void) {
     app_init(&app);
     app_use(&app, mw_short_circuit);
 
-    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0, { 0 } };
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
@@ -206,7 +206,7 @@ static void test_chain_error_invokes_registered_error_handler(void) {
     app_use(&app, mw_fails);
     app_use_error(&app, error_handler_capture);
 
-    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0, { 0 } };
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
@@ -226,7 +226,7 @@ static void test_chain_error_default_fallback_without_handler(void) {
     app_init(&app);
     app_use(&app, mw_fails);
 
-    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0, { 0 } };
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
@@ -256,7 +256,7 @@ static void test_route_middleware_runs_after_app_wide_before_handler(void) {
     app_use(&app, mw_a);
 
     Middleware route_mw[] = { mw_b, mw_c };
-    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0, { 0 } };
     route.middlewares[0] = route_mw[0];
     route.middlewares[1] = route_mw[1];
     route.middleware_count = 2;
@@ -284,7 +284,7 @@ static void test_route_without_middleware_only_runs_app_wide(void) {
     app_init(&app);
     app_use(&app, mw_a);
 
-    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0, { 0 } };
     Request req;
     memset(&req, 0, sizeof(req));
     Connection *conn = make_conn();
@@ -314,7 +314,7 @@ static void test_route_middleware_can_short_circuit_before_handler(void) {
     app_init(&app);
     app_use(&app, mw_a);
 
-    Route route = { "GET", "/", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/", handler_ok, { 0 }, 0, { 0 } };
     route.middlewares[0] = mw_route_short_circuit;
     route.middleware_count = 1;
 
@@ -349,7 +349,7 @@ static void test_prefixed_middleware_runs_when_path_matches(void) {
     app_use_prefix(&app, "/api", mw_prefixed);
     app_use(&app, mw_a);
 
-    Route route = { "GET", "/api/users", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/api/users", handler_ok, { 0 }, 0, { 0 } };
     Request req;
     memset(&req, 0, sizeof(req));
     strncpy(req.path, "/api/users", sizeof(req.path) - 1);
@@ -375,7 +375,7 @@ static void test_prefixed_middleware_skipped_when_path_does_not_match(void) {
     app_use_prefix(&app, "/api", mw_prefixed);
     app_use(&app, mw_a);
 
-    Route route = { "GET", "/other", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/other", handler_ok, { 0 }, 0, { 0 } };
     Request req;
     memset(&req, 0, sizeof(req));
     strncpy(req.path, "/other", sizeof(req.path) - 1);
@@ -400,7 +400,7 @@ static void test_prefixed_middleware_does_not_match_similar_sibling_path(void) {
     app_init(&app);
     app_use_prefix(&app, "/api", mw_prefixed);
 
-    Route route = { "GET", "/apiary", handler_ok, { 0 }, 0 };
+    Route route = { "GET", "/apiary", handler_ok, { 0 }, 0, { 0 } };
     Request req;
     memset(&req, 0, sizeof(req));
     strncpy(req.path, "/apiary", sizeof(req.path) - 1);
@@ -494,7 +494,7 @@ static void test_dispatch_explicit_options_route_wins_over_auto(void) {
     app_init(&app);
     app_get(&app, "/users", dummy_handler_unused);
 
-    Route route = { "OPTIONS", "/users", handler_ok, { 0 }, 0 };
+    Route route = { "OPTIONS", "/users", handler_ok, { 0 }, 0, { 0 } };
     Request req;
     memset(&req, 0, sizeof(req));
     strncpy(req.method, "OPTIONS", sizeof(req.method) - 1);

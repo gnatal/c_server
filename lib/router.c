@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "router.h"
 #include "middleware.h"
@@ -23,6 +24,15 @@ static void fill_route(Route *route, const char *method, const char *path, Handl
     strncpy(route->path, path, sizeof(route->path) - 1);
     route->path[sizeof(route->path) - 1] = '\0';
     route->handler = handler;
+
+    /* Every route filled through here is an ordinary (non-static) route -
+     * only app_serve_static fills a Route's static_root directly, bypassing
+     * fill_route entirely. Route slots aren't zero-initialized before this
+     * runs (App/Router are plain structs, not calloc'd), so without this an
+     * ordinary route could inherit whatever stack garbage was previously in
+     * this slot's static_root and be mistaken for a static mount by
+     * dispatch()/chain_next() (middleware.c). */
+    route->static_root[0] = '\0';
 
     if (middleware_count > MAX_ROUTE_MIDDLEWARES) {
         fprintf(stderr, "route registration: MAX_ROUTE_MIDDLEWARES exceeded, truncating\n");
@@ -199,6 +209,25 @@ void router_use(Router *router, Middleware mw) {
     router->middlewares[router->middleware_count++] = mw;
 }
 
+/* Normalizes a mount-point prefix (app_mount, app_serve_static): "" or "/"
+ * alone means an unscoped/root mount - both app_use_prefix and
+ * build_mounted_path below treat "" as "no prefix to add/match on". A
+ * trailing slash (e.g. "/api/") is stripped so concatenating a route's own
+ * leading-slash path doesn't double up ("/api//users"). Shared by both
+ * mounting entry points rather than duplicated, since the rule is identical. */
+static void normalize_mount_prefix(const char *prefix, char *out, size_t out_size) {
+    if (prefix == NULL || prefix[0] == '\0' || strcmp(prefix, "/") == 0) {
+        out[0] = '\0';
+        return;
+    }
+    strncpy(out, prefix, out_size - 1);
+    out[out_size - 1] = '\0';
+    const size_t len = strlen(out);
+    if (len > 0 && out[len - 1] == '/') {
+        out[len - 1] = '\0';
+    }
+}
+
 /* Builds the mounted path for one router route: prefix + route->path, except
  * a router route registered at "/" (the router's own root) mounts at the
  * prefix itself rather than "prefix/" - so router_get(router, "/", h) mounted
@@ -213,25 +242,8 @@ static void build_mounted_path(char *out, size_t out_size, const char *prefix, c
 }
 
 void app_mount(App *app, const char *prefix, const Router *router) {
-    if (prefix == NULL) {
-        prefix = "";
-    }
-
-    /* Normalize: "/" alone means an unscoped/root mount, same as "" - both
-     * app_use_prefix and build_mounted_path treat "" as "no prefix to add/
-     * match on". A trailing slash (e.g. "/api/") is stripped so concatenation
-     * with a route's own leading-slash path doesn't double up ("/api//users"). */
     char normalized_prefix[128];
-    if (prefix[0] == '\0' || strcmp(prefix, "/") == 0) {
-        normalized_prefix[0] = '\0';
-    } else {
-        strncpy(normalized_prefix, prefix, sizeof(normalized_prefix) - 1);
-        normalized_prefix[sizeof(normalized_prefix) - 1] = '\0';
-        const size_t len = strlen(normalized_prefix);
-        if (len > 0 && normalized_prefix[len - 1] == '/') {
-            normalized_prefix[len - 1] = '\0';
-        }
-    }
+    normalize_mount_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
 
     for (int i = 0; i < router->middleware_count; i++) {
         app_use_prefix(app, normalized_prefix, router->middlewares[i]);
@@ -244,6 +256,45 @@ void app_mount(App *app, const char *prefix, const Router *router) {
         app_add_route_mw(app, route->method, mounted_path, route->handler,
                           route->middlewares, route->middleware_count);
     }
+}
+
+void app_serve_static(App *app, const char *prefix, const char *root_dir) {
+    if (app->route_count >= MAX_ROUTES) {
+        fprintf(stderr, "app_serve_static: MAX_ROUTES exceeded\n");
+        return;
+    }
+
+    /* Canonicalize root_dir once, at registration time, rather than per
+     * request - static_serve_file (lib/static.c) compares every resolved
+     * request path against this canonical root to catch a symlink inside
+     * root_dir escaping it (realpath also requires the path to already
+     * exist, which doubles as a deny-by-default check: refuse to register a
+     * mount pointing at a directory that isn't there). */
+    char canonical_root[PATH_MAX];
+    if (realpath(root_dir, canonical_root) == NULL) {
+        fprintf(stderr, "app_serve_static: root directory \"%s\" does not exist, not registered\n", root_dir);
+        return;
+    }
+
+    char normalized_prefix[128];
+    normalize_mount_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
+
+    /* Always a trailing-wildcard pattern (see match_path, "Route wildcards",
+     * lib/CLAUDE.md) so this mount answers everything under the prefix - a
+     * request for the prefix itself, with nothing after it, simply doesn't
+     * match (same as any other trailing "*" route) and falls through to the
+     * app's ordinary 404/405 handling. */
+    Route *route = &app->routes[app->route_count++];
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "%s/*", normalized_prefix);
+    fill_route(route, "GET", pattern, NULL, NULL, 0);
+
+    size_t root_len = strlen(canonical_root);
+    if (root_len >= sizeof(route->static_root)) {
+        root_len = sizeof(route->static_root) - 1;
+    }
+    memcpy(route->static_root, canonical_root, root_len);
+    route->static_root[root_len] = '\0';
 }
 
 int match_path(const char *pattern, const char *path, Request *req) {

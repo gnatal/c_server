@@ -249,4 +249,19 @@ void router_use(Router *router, Middleware mw);
  */
 void app_mount(App *app, const char *prefix, const Router *router);
 
+/*
+ * Registers a static-file mount at a path prefix - the C analogue of
+ * Express's app.use('/static', express.static('root_dir')). Any GET request
+ * under prefix (e.g. "/static/js/app.js") is answered by reading the
+ * corresponding file out of root_dir (lib/static.h: static_serve_file),
+ * instead of calling a Handler - there is no Handler to register here.
+ * root_dir is resolved to an absolute, canonical path via realpath() at
+ * registration time; if it doesn't exist, this logs a warning and does not
+ * register anything (deny-by-default, same as every other hard failure in
+ * this engine's registration functions). Subject to the same MAX_ROUTES cap
+ * as any other route. App-level only - there is no router_serve_static/
+ * app_mount equivalent yet. See lib/CLAUDE.md ("Static file serving").
+ */
+void app_serve_static(App *app, const char *prefix, const char *root_dir);
+
 #endif /* ROUTER_H */

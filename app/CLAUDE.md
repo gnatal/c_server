@@ -104,8 +104,15 @@ scoping mechanisms in `lib/`:
   this demo specifically wants a permanent redirect, not the default.
 - `GET /files/*` (`handler_files`) demonstrates a trailing route wildcard
   (`lib/CLAUDE.md`, "Route wildcards"): one registration answers any path under
-  `/files/`, echoing `req->path` back rather than actually serving a file — there's
-  still no static file server (`pending.txt`).
+  `/files/`, echoing `req->path` back rather than actually serving a file.
+- `GET /static/*` demonstrates real static file serving
+  (`lib/CLAUDE.md`, "Static file serving"): `app_serve_static(&app, "/static",
+  "app/public")` (`lib/router.h`) reads matching files out of `app/public/`
+  (relative to the server's working directory) instead of going through a
+  `Handler` at all. `app/public/style.css` is served directly
+  (`GET /static/style.css`); `app/public/docs/index.html` demonstrates the
+  directory-index fallback (`GET /static/docs`, since a trailing-wildcard route
+  never matches a bare mount path with nothing after it — see "Route wildcards").
 - `GET /login` / `GET /whoami` / `GET /logout` demonstrate cookies
   (`lib/CLAUDE.md`, "Cookies"): `handler_login` calls `res_set_cookie(res,
   "session", "demo-session-token", &options)` (`lib/response.h`) with

@@ -85,6 +85,14 @@ int main(void) {
   router_delete(&api_router, "/users/:id", handler_delete_user);
   app_mount(&app, "/api", &api_router);
 
+  /* Static file demo (lib/router.h: app_serve_static, lib/static.h): any GET
+   * under "/static" is answered by reading the matching file out of
+   * "app/public" (relative to the server's working directory) instead of a
+   * Handler - GET /static/style.css serves that file directly, GET
+   * /static/docs resolves the directory and falls back to
+   * app/public/docs/index.html (lib/CLAUDE.md, "Static file serving"). */
+  app_serve_static(&app, "/static", "app/public");
+
   app_listen(&app, app.config.port);
 
   return 0;
