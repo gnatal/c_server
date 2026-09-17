@@ -711,6 +711,158 @@ static void test_handle_readable_auto_options_response(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+static void test_app_count_connections(void) {
+    App app;
+    app_init(&app);
+    app.kq = kqueue();
+    assert(app.kq >= 0);
+    assert(app_count_connections(&app) == 0);
+
+    int fds1[2], fds2[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds1) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds2) == 0);
+
+    Connection *c1 = connection_create(fds1[0]);
+    Connection *c2 = connection_create(fds2[0]);
+    assert(c1 != NULL && c2 != NULL);
+
+    app.connections[fds1[0]] = c1;
+    assert(app_count_connections(&app) == 1);
+
+    app.connections[fds2[0]] = c2;
+    assert(app_count_connections(&app) == 2);
+
+    connection_close(&app, c1);
+    assert(app_count_connections(&app) == 1);
+    assert(app.connections[fds1[0]] == NULL);
+
+    close(fds1[1]);
+    close(fds2[1]);
+    app_destroy(&app);
+    assert(app_count_connections(&app) == 0);
+}
+
+static void test_app_stop_idempotency_and_closing_idle(void) {
+    App app;
+    app_init(&app);
+    app.kq = kqueue();
+    assert(app.kq >= 0);
+
+    /* Dummy server socket using socketpair */
+    int srv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, srv) == 0);
+    app.server_fd = srv[0];
+    kq_watch(app.kq, app.server_fd, EVFILT_READ, NULL);
+
+    int fds_idle[2], fds_busy[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds_idle) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds_busy) == 0);
+
+    Connection *c_idle = connection_create(fds_idle[0]);
+    Connection *c_busy = connection_create(fds_busy[0]);
+    assert(c_idle != NULL && c_busy != NULL);
+
+    app.connections[fds_idle[0]] = c_idle;
+    app.connections[fds_busy[0]] = c_busy;
+
+    /* Simulate c_busy having partial request bytes in flight */
+    c_busy->in_len = 10;
+    c_busy->keep_alive = 1;
+
+    /* Initiate graceful shutdown */
+    app_stop(&app);
+    assert(app.is_shutting_down == 1);
+    assert(app.server_fd == -1);
+
+    /* Idle connection must be closed immediately */
+    assert(app.connections[fds_idle[0]] == NULL);
+
+    /* Busy connection must remain open but with keep_alive cleared */
+    assert(app.connections[fds_busy[0]] != NULL);
+    assert(c_busy->keep_alive == 0);
+
+    /* Second call must be a no-op (idempotent) */
+    app_stop(&app);
+    assert(app.is_shutting_down == 1);
+
+    close(srv[1]);
+    close(fds_idle[1]);
+    close(fds_busy[1]);
+    app_destroy(&app);
+}
+
+static void test_handle_readable_during_shutdown_forces_connection_close(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+    app_get(&app, "/ping", ping_handler);
+
+    /* Enter graceful shutdown */
+    app.is_shutting_down = 1;
+
+    /* Client sends request with explicit Connection: keep-alive */
+    const char *req = "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+    assert(write(fds[1], req, strlen(req)) == (ssize_t)strlen(req));
+
+    handle_readable(&app, conn);
+
+    char resp[1024];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    /* During shutdown, Connection header MUST be "close", not "keep-alive" */
+    assert(strstr(resp, "Connection: close\r\n") != NULL);
+    assert(strstr(resp, "Connection: keep-alive\r\n") == NULL);
+
+    /* Connection should be closed after response finishes, not kept open */
+    assert(app.connections[fds[0]] == NULL);
+    assert(app_count_connections(&app) == 0);
+
+    close(fds[1]);
+    app_destroy(&app);
+}
+
+static void test_app_stop_drains_and_flushes_pending_write(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    /* Set up an in-flight response buffered in conn->out_buf */
+    const char *data = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong";
+    size_t len = strlen(data);
+    conn->out_buf = malloc(len);
+    assert(conn->out_buf != NULL);
+    memcpy(conn->out_buf, data, len);
+    conn->out_len = len;
+    conn->out_sent = 0;
+    conn->keep_alive = 1;
+
+    /* Graceful shutdown should leave conn open because out_buf != NULL,
+     * but force keep_alive to 0 */
+    app_stop(&app);
+    assert(app.connections[fds[0]] != NULL);
+    assert(conn->keep_alive == 0);
+
+    /* Flush out the write */
+    flush_connection(&app, conn);
+
+    char resp[128];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n == (ssize_t)len);
+    assert(strcmp(resp, data) == 0);
+
+    /* Once flushed, the connection is closed */
+    assert(app.connections[fds[0]] == NULL);
+    assert(app_count_connections(&app) == 0);
+
+    close(fds[1]);
+    app_destroy(&app);
+}
+
 int main(void) {
     test_set_nonblocking_and_create();
     test_handle_readable_round_trip_success();
@@ -734,6 +886,10 @@ int main(void) {
     test_close_idle_connections_skips_pending_write();
     test_handle_readable_head_request_omits_body();
     test_handle_readable_auto_options_response();
+    test_app_count_connections();
+    test_app_stop_idempotency_and_closing_idle();
+    test_handle_readable_during_shutdown_forces_connection_close();
+    test_app_stop_drains_and_flushes_pending_write();
 
     printf("all connection tests passed\n");
     return 0;

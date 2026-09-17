@@ -865,10 +865,35 @@ added here as this project actually needs them, not preemptively.
   `app_destroy` (`connection.h`), which also walks every still-populated slot and
   calls `connection_close` on it first (so no individual `Connection`/`conn->in_buf`/
   `conn->out_buf` is ever leaked by tearing the table down), then closes `kq`/
-  `server_fd` if still open. Not called from `main.c` today (`app_listen`'s event
-  loop never returns), but used by test teardown (`tests/test_connection.c:
-  teardown_test_connection`) and left available for a future graceful-shutdown path
-  (`pending.txt`) to call before exiting.
+  `server_fd` if still open. Called from `app/main.c` right after `app_listen`
+  returns (clean process teardown on graceful shutdown) and by test teardown
+  (`tests/test_connection.c: teardown_test_connection`).
+
+## Graceful shutdown
+Graceful shutdown (`connection.c: app_listen`, `app_stop`) coordinates signal handling,
+socket draining, and memory teardown without blocking the single event thread:
+- **Signal interception**: `app_listen` sets `signal(SIGINT, SIG_IGN)` and
+  `signal(SIGTERM, SIG_IGN)` so default termination dispositions are suppressed, and
+  registers both signals with kqueue using `EVFILT_SIGNAL`. Signals are delivered
+  synchronously as events within `kevent()` — completely async-signal-safe, with no
+  signal handlers, pipes, or volatile flags required. A second signal received while
+  already draining forces immediate exit.
+- **Draining state machine** (`app_stop`): sets `App.is_shutting_down = 1`, drops
+  interest in `server_fd` from kqueue and closes it (`server_fd = -1`) so no new
+  connections are accepted. It sweeps `app->connections`:
+  - Idle keep-alive connections (`in_len == 0 && out_buf == NULL`) are closed immediately.
+  - In-flight connections (`in_len > 0 || out_buf != NULL`) have `conn->keep_alive = 0`
+    set so they terminate as soon as the current request finishes.
+  - Arms a oneshot `EVFILT_TIMER` (ident 2, `SHUTDOWN_TIMEOUT_SECONDS = 5s`) on kqueue
+    so slow or stalled clients cannot hold the process indefinitely.
+- **Response semantics during drain**: `handle_readable` enforces
+  `conn->keep_alive = !request_wants_close(req) && !app->is_shutting_down`. Any response
+  built during draining emits `Connection: close` (via `send_with_content_type`), and
+  `flush_connection` calls `connection_close` immediately once the bytes are sent.
+- **Loop exit and teardown**: once `app->is_shutting_down` is set and
+  `app_count_connections(app) == 0` (or the 5-second shutdown timer expires), `app_listen`
+  breaks its loop, restores default signal dispositions, and returns. `main.c` then
+  calls `app_destroy(&app)`, releasing all remaining memory and sockets.
 
 ## Const correctness
 `Handler` (`app_types.h`) takes `const Request *`: routing (`match_path`/`match_route`)

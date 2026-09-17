@@ -92,6 +92,14 @@
 #define IDLE_SWEEP_INTERVAL_MS 1000
 
 /*
+ * Maximum time (in seconds) allowed for in-flight requests to complete and
+ * flush during graceful shutdown (app_stop, connection.c) before the server
+ * force-closes remaining connections and exits. Enforced via a dedicated
+ * oneshot EVFILT_TIMER registered upon entering the draining phase.
+ */
+#define SHUTDOWN_TIMEOUT_SECONDS 5
+
+/*
  * Starting size (in slots) of App.connections (below) - a growable table
  * indexed directly by fd, realloc'd larger by ensure_connection_capacity
  * (connection.c) whenever accept_connections sees an fd that doesn't fit
@@ -442,6 +450,13 @@ typedef struct {
      * matches this malloc per this engine's memory-lifecycle convention. */
     Connection **connections;
     int connections_cap;
+
+    /* Graceful shutdown state: set to 1 by app_stop (connection.c) when a
+     * SIGINT/SIGTERM arrives or shutdown is initiated programmatically.
+     * Tells handle_readable/flush_connection to close idle connections,
+     * set Connection: close on responses, and terminate the event loop
+     * once open connections reach 0 or timeout expires. */
+    int is_shutting_down;
 } App;
 
 #endif /* APP_TYPES_H */

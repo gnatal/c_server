@@ -94,6 +94,7 @@ int main(void) {
   app_serve_static(&app, "/static", "app/public");
 
   app_listen(&app, app.config.port);
+  app_destroy(&app);
 
   return 0;
 }

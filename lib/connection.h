@@ -77,10 +77,26 @@ void handle_readable(App *app, Connection *conn);
 void close_idle_connections(App *app);
 
 /*
+ * Returns the number of currently open client connections tracked in
+ * app->connections.
+ */
+int app_count_connections(const App *app);
+
+/*
+ * Initiates graceful shutdown: stops accepting new connections (unwatches and
+ * closes server_fd), closes idle keep-alive connections immediately, sets
+ * is_shutting_down = 1 so in-flight requests finish with Connection: close,
+ * and arms a oneshot shutdown timeout timer (SHUTDOWN_TIMEOUT_SECONDS) on kqueue.
+ * Idempotent: safe to call multiple times.
+ */
+void app_stop(App *app);
+
+/*
  * Starts listening and runs a single-threaded event loop: kevent() blocks
  * until a socket is ready, then each event is dispatched to the right
  * handler - no blocking syscalls anywhere in this loop, and no threads.
- * This is the same shape as libuv's loop underneath Node.js on macOS.
+ * Catches SIGINT/SIGTERM via kqueue EVFILT_SIGNAL for graceful shutdown,
+ * draining in-flight requests before returning.
  */
 void app_listen(App *app, int port);
 

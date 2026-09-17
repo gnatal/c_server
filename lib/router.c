@@ -11,6 +11,7 @@ void app_init(App *app) {
     app->error_handler = NULL;
     app->server_fd = -1;
     app->kq = -1;
+    app->is_shutting_down = 0;
 
     /* Starting allocation for the fd-indexed connections table (app_types.h)
      * - grown later by ensure_connection_capacity (connection.c) as needed.

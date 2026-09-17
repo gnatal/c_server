@@ -375,12 +375,24 @@ Gaps vs. an Express-like C framework
   now sweeps app->connections_cap slots instead of a compile-time constant.
   The new app_destroy(app) (connection.c/h) is the documented match for
   app_init's calloc of this table (closes any still-open connections, closes
-  kq/server_fd, frees the table) - not called from main.c (the event loop
-  never returns there today), but used by test teardown and available for a
-  future graceful-shutdown path (see the item below) to build on. See
+  kq/server_fd, frees the table) - called from main.c upon app_listen exit,
+  used by test teardown, and forming the final step of graceful shutdown. See
   lib/CLAUDE.md ("Architecture" and "Memory lifecycle") and tests/test_connection.c
   (teardown_test_connection now calls app_destroy instead of an ad hoc close).
-- No graceful shutdown (SIGTERM draining in-flight connections)
+- [DONE] Graceful shutdown (SIGINT/SIGTERM draining in-flight connections): app_listen
+  (lib/connection.c) intercepts SIGINT and SIGTERM via kqueue's EVFILT_SIGNAL with
+  default dispositions ignored, ensuring signals are delivered synchronously to the
+  event loop without signal-handler race conditions. The new app_stop(app)
+  (lib/connection.c/h) stops accepting new connections (unwatches and closes server_fd),
+  immediately closes idle keep-alive connections, marks in-flight connections with
+  conn->keep_alive = 0, and arms a 5-second oneshot EVFILT_TIMER deadline. Requests
+  handled during shutdown emit "Connection: close", and once active connections drop
+  to 0 (or timeout expires), app_listen cleanly returns to main.c which calls
+  app_destroy(&app) and exits with code 0. A second signal received during drain forces
+  an immediate exit. See tests/test_connection.c (test_app_count_connections,
+  test_app_stop_idempotency_and_closing_idle,
+  test_handle_readable_during_shutdown_forces_connection_close,
+  test_app_stop_drains_and_flushes_pending_write) and lib/CLAUDE.md ("Graceful shutdown").
 
 6. Security
 - No TLS/HTTPS

@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/event.h>
 #include <netinet/in.h>
@@ -108,6 +109,62 @@ void app_destroy(App *app) {
     free(app->connections);
     app->connections = NULL;
     app->connections_cap = 0;
+}
+
+int app_count_connections(const App *app) {
+    if (app == NULL || app->connections == NULL) {
+        return 0;
+    }
+    int count = 0;
+    for (int fd = 0; fd < app->connections_cap; fd++) {
+        if (app->connections[fd] != NULL) {
+            count++;
+        }
+    }
+    return count;
+}
+
+void app_stop(App *app) {
+    if (app == NULL || app->is_shutting_down) {
+        return;
+    }
+    app->is_shutting_down = 1;
+
+    /* Stop accepting new connections: deregister from kqueue and close server socket */
+    if (app->server_fd >= 0) {
+        if (app->kq >= 0) {
+            kq_unwatch(app->kq, app->server_fd, EVFILT_READ);
+        }
+        close(app->server_fd);
+        app->server_fd = -1;
+    }
+
+    /* Sweep open connections:
+     * - Immediately close idle keep-alive connections (nothing in flight).
+     * - For in-flight connections (reading request or writing response), disable
+     *   keep_alive so they close as soon as their current response is flushed. */
+    if (app->connections != NULL) {
+        for (int fd = 0; fd < app->connections_cap; fd++) {
+            Connection *conn = app->connections[fd];
+            if (conn == NULL) {
+                continue;
+            }
+            if (conn->in_len == 0 && conn->out_buf == NULL) {
+                connection_close(app, conn);
+            } else {
+                conn->keep_alive = 0;
+            }
+        }
+    }
+
+    /* Arm a oneshot shutdown deadline timer on kqueue so slow/stalled clients
+     * cannot prevent the server process from exiting indefinitely. */
+    if (app->kq >= 0) {
+        struct kevent shutdown_timer;
+        EV_SET(&shutdown_timer, 2, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, 0,
+               SHUTDOWN_TIMEOUT_SECONDS * 1000, NULL);
+        kevent(app->kq, &shutdown_timer, 1, NULL, 0, NULL);
+    }
 }
 
 void kq_watch(int kq, int fd, int16_t filter, void *udata) {
@@ -282,7 +339,7 @@ void handle_readable(App *app, Connection *conn) {
                     res_send(&res, "Bad Request");
                 }
             } else {
-                conn->keep_alive = !request_wants_close(&req);
+                conn->keep_alive = !request_wants_close(&req) && !app->is_shutting_down;
                 /* HTTP forbids a body in any response to HEAD, regardless of
                  * status (see response.c: send_with_content_type). Set ahead
                  * of dispatch() so it applies uniformly whether the request
@@ -458,6 +515,19 @@ void app_listen(App *app, int port) {
     kq_watch(app->kq, app->server_fd, EVFILT_READ, NULL);
 
     /*
+     * Intercept SIGINT and SIGTERM for graceful shutdown. Ignore their default
+     * actions (which would terminate the process asynchronously) and monitor
+     * them synchronously via kqueue's EVFILT_SIGNAL.
+     */
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+
+    struct kevent sig_changes[2];
+    EV_SET(&sig_changes[0], SIGINT, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    EV_SET(&sig_changes[1], SIGTERM, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    kevent(app->kq, sig_changes, 2, NULL, 0, NULL);
+
+    /*
      * Periodic timer that drives close_idle_connections() - ident 1 is
      * arbitrary and never collides with a real connection fd: EVFILT_TIMER
      * idents live in their own namespace, separate from the fd-based idents
@@ -476,6 +546,9 @@ void app_listen(App *app, int port) {
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EBADF && app->is_shutting_down) {
+                break;
+            }
             perror("kevent");
             break;
         }
@@ -483,13 +556,41 @@ void app_listen(App *app, int port) {
         for (int i = 0; i < n; i++) {
             struct kevent *ev = &events[i];
 
-            if (ev->filter == EVFILT_TIMER) {
-                close_idle_connections(app);
+            if (ev->filter == EVFILT_SIGNAL) {
+                if (!app->is_shutting_down) {
+                    printf("\nReceived signal %ld, draining connections...\n", (long)ev->ident);
+                    app_stop(app);
+                    if (app_count_connections(app) == 0) {
+                        goto shutdown_complete;
+                    }
+                } else {
+                    fprintf(stderr, "\nReceived second signal %ld, forcing shutdown\n", (long)ev->ident);
+                    goto shutdown_complete;
+                }
                 continue;
             }
 
-            if ((int)ev->ident == app->server_fd) {
+            if (ev->filter == EVFILT_TIMER) {
+                if (ev->ident == 1) {
+                    close_idle_connections(app);
+                } else if (ev->ident == 2) {
+                    fprintf(stderr, "Shutdown timeout reached (%ds), force-closing remaining connections\n",
+                            SHUTDOWN_TIMEOUT_SECONDS);
+                    goto shutdown_complete;
+                }
+                continue;
+            }
+
+            if (app->server_fd >= 0 && (int)ev->ident == app->server_fd) {
                 accept_connections(app);
+                continue;
+            }
+
+            int fd = (int)ev->ident;
+            if (fd < 0 || fd >= app->connections_cap || app->connections[fd] == NULL ||
+                app->connections[fd] != (Connection *)ev->udata) {
+                /* Connection was closed earlier in this event batch (e.g. by app_stop
+                 * or close_idle_connections) - skip to avoid use-after-free. */
                 continue;
             }
 
@@ -513,5 +614,15 @@ void app_listen(App *app, int port) {
                 flush_connection(app, conn);
             }
         }
+
+        if (app->is_shutting_down && app_count_connections(app) == 0) {
+            printf("All connections drained. Server shutting down.\n");
+            break;
+        }
     }
+
+shutdown_complete:
+    /* Restore default signal dispositions */
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
 }
