@@ -117,6 +117,27 @@ void parse_headers(const char *header_block, Request *req);
  */
 const char *req_get_header(const Request *req, const char *name);
 
+/*
+ * Pure: splits a raw "Cookie" header value ("a=1; b=2") on ';' then the
+ * first '=' into req->cookie_names/cookie_values, bounded by MAX_COOKIES
+ * (extra pairs are dropped rather than overflowing the fixed arrays, same
+ * as MAX_QUERY_PARAMS/MAX_HEADERS elsewhere). Leading spaces after ';' are
+ * trimmed; a pair with no '=' is skipped rather than stored. Not
+ * URL-decoded, same as header values. cookie_header may be NULL (no
+ * "Cookie" header present), treated the same as an empty string. Called by
+ * parse_http_request (via req_get_header(req, "Cookie")); exposed
+ * separately so it can be unit-tested against a header value directly.
+ */
+void parse_cookies(const char *cookie_header, Request *req);
+
+/*
+ * Looks up a parsed cookie value by name (e.g. req_get_cookie(req,
+ * "session")), or NULL if that cookie wasn't sent. Case-sensitive per RFC
+ * 6265 (strcmp), unlike req_get_header's case-insensitive header-name
+ * lookup.
+ */
+const char *req_get_cookie(const Request *req, const char *name);
+
 const char *status_text(int status);
 
 #endif /* HTTP_PARSER_H */

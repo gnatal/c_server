@@ -240,7 +240,29 @@ Gaps vs. an Express-like C framework
   ("multipart/form-data parsing" and "Body buffering"), and app/handlers.c
   (handler_upload, POST /upload) for a real usage example.
 - No x-www-form-urlencoded
-- No cookies
+- [DONE] Cookies: request-side, the new pure parse_cookies(cookie_header, req)
+  (lib/http_parser.c/h) - called from parse_http_request as
+  parse_cookies(req_get_header(req, "Cookie"), req) - splits the "Cookie"
+  header on ';' then '=' into req->cookie_names/cookie_values (MAX_COOKIES-
+  capped fixed arrays, same shape as header/query parsing), looked up via
+  req_get_cookie(req, name) (case-sensitive strcmp, unlike req_get_header's
+  case-insensitive lookup - RFC 6265 cookie names are case-sensitive). No
+  Cookie header just leaves cookie_count at 0, not a parse error. Values are
+  not URL-decoded. Response-side, res_set_cookie(res, name, value, options)
+  (lib/response.c/h) formats one RFC 6265 Set-Cookie line (Path/Domain/
+  Max-Age/HttpOnly/Secure/SameSite per the new CookieOptions, app_types.h)
+  into a separate Response.set_cookies array (not res_set_header - a
+  response can carry more than one Set-Cookie line, and res_set_header
+  overwrites same-name entries), each emitted as its own header line by
+  send_with_content_type; res_clear_cookie(res, name, path) expires one via
+  Max-Age=0. See tests/test_http_parser.c (test_parse_cookies, the
+  Cookie-header case in test_parse_http_request), tests/test_response.c
+  (test_set_cookie_defaults, test_set_cookie_with_options,
+  test_multiple_cookies_each_get_own_line,
+  test_clear_cookie_expires_immediately, test_max_response_cookies_enforced),
+  lib/CLAUDE.md ("Cookies"), and app/handlers.c (handler_login/
+  handler_whoami/handler_logout, GET /login, /whoami, /logout) for a real
+  usage example.
 - [DONE] Idle/read timeout for a slow client that trickles a request in a byte at a
   time within the buffer limit (distinct from the buffer-overflow hang, which was
   already fixed above). Connection.last_activity (app_types.h) is set at

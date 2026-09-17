@@ -29,6 +29,33 @@ void handler_api_status(const Request *req, Response *res) {
     res_json(res, "{\"status\":\"ok\"}");
 }
 
+/*
+ * Cookie demo (lib/response.h: res_set_cookie / lib/http_parser.h:
+ * req_get_cookie): GET /login sets a session cookie, GET /whoami reads it
+ * back, GET /logout expires it. HttpOnly + a 1-hour Max-Age here are just
+ * demo choices, not requirements of res_set_cookie itself.
+ */
+void handler_login(const Request *req, Response *res) {
+    (void)req;
+    const CookieOptions options = { .max_age = 3600, .path = "/", .http_only = 1,
+                                     .same_site = COOKIE_SAMESITE_LAX };
+    res_set_cookie(res, "session", "demo-session-token", &options);
+    res_send(res, "Logged in - session cookie set\n");
+}
+
+void handler_whoami(const Request *req, Response *res) {
+    const char *session = req_get_cookie(req, "session");
+    char body[128];
+    snprintf(body, sizeof(body), "session: %s\n", session != NULL ? session : "(none - not logged in)");
+    res_send(res, body);
+}
+
+void handler_logout(const Request *req, Response *res) {
+    (void)req;
+    res_clear_cookie(res, "session", "/");
+    res_send(res, "Logged out - session cookie cleared\n");
+}
+
 /* True when Content-Type declares a JSON body - an optional ";charset=..."
  * (or any other) suffix is ignored, only the media-type prefix matters.
  * Gates JSON validation below so a non-JSON body (plain text, form data)

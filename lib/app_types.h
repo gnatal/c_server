@@ -17,6 +17,13 @@
 #define BACKLOG 128
 #define MAX_RESPONSE_HEADERS 16
 #define MAX_MULTIPART_PARTS 16
+#define MAX_COOKIES 16
+#define MAX_RESPONSE_COOKIES 16
+
+/* Bounds one fully-formatted "Set-Cookie" header *value* (name=value plus
+ * every attribute - Path, Domain, Max-Age, HttpOnly, Secure, SameSite),
+ * built by res_set_cookie (lib/response.h) into Response.set_cookies. */
+#define MAX_SET_COOKIE_LEN 512
 
 /* RFC 2046 caps a boundary delimiter at 70 characters; this is that cap
  * plus room for the NUL terminator, used to size boundary buffers
@@ -90,6 +97,19 @@ typedef struct {
     char header_names[MAX_HEADERS][64];
     char header_values[MAX_HEADERS][256];
     int header_count;
+
+    /* Parsed out of the "Cookie" header (one of header_values above, found
+     * via req_get_header) by parse_cookies (http_parser.c) at
+     * request-parse time - same fixed-array-plus-count shape as
+     * query_names/query_values. A cookie header with no "Cookie" line at
+     * all just leaves cookie_count at 0. Cookie names are case-sensitive
+     * per RFC 6265 - req_get_cookie uses strcmp, unlike req_get_header's
+     * case-insensitive strcasecmp. Values are NOT URL-decoded, same
+     * reasoning as header_values (and because RFC 6265 cookie values are
+     * defined over a restricted byte set that doesn't need it). */
+    char cookie_names[MAX_COOKIES][64];
+    char cookie_values[MAX_COOKIES][256];
+    int cookie_count;
 
     int content_length;
 
@@ -166,6 +186,36 @@ typedef struct {
     char value[256];
 } ResponseHeader;
 
+/* SameSite attribute for res_set_cookie (lib/response.h) - COOKIE_SAMESITE_UNSET
+ * (the zero value, so a zero-initialized CookieOptions defaults to it) omits
+ * the SameSite attribute entirely rather than emitting an empty one. */
+typedef enum {
+    COOKIE_SAMESITE_UNSET = 0,
+    COOKIE_SAMESITE_STRICT,
+    COOKIE_SAMESITE_LAX,
+    COOKIE_SAMESITE_NONE
+} CookieSameSite;
+
+/*
+ * Options for res_set_cookie (lib/response.h), mirroring a subset of
+ * Express's res.cookie(name, value, options). A zero-initialized
+ * CookieOptions (e.g. `(CookieOptions){0}`) means: session cookie (no
+ * Max-Age - max_age must be set to a non-negative value to emit one; 0 is
+ * a valid explicit value, used by res_clear_cookie to expire a cookie
+ * immediately, so "unset" can't just be 0), no Domain, not HttpOnly/Secure,
+ * no SameSite attribute. A NULL path defaults to "/" (res_set_cookie's own
+ * default - not the browser's implicit "current request path" default,
+ * which is rarely what a handler wants).
+ */
+typedef struct {
+    int max_age;
+    const char *path;
+    const char *domain;
+    int http_only;
+    int secure;
+    CookieSameSite same_site;
+} CookieOptions;
+
 typedef struct {
     Connection *conn;
     int status;
@@ -177,6 +227,18 @@ typedef struct {
      * attempts to override them. */
     ResponseHeader headers[MAX_RESPONSE_HEADERS];
     int header_count;
+
+    /* Set via res_set_cookie() (response.c): each entry is one fully
+     * pre-formatted Set-Cookie header value (e.g. "name=value; Path=/;
+     * HttpOnly"), sent as its own "Set-Cookie: ..." line by
+     * send_with_content_type. Unlike headers[] above, these can't share
+     * that same-name-overwrites array - a response can legitimately carry
+     * more than one Set-Cookie line at once (one per cookie), and
+     * res_set_cookie never deduplicates by name. Bounded by
+     * MAX_RESPONSE_COOKIES; extra calls past the cap are dropped (stderr
+     * warning), same convention as headers[]/MAX_RESPONSE_HEADERS. */
+    char set_cookies[MAX_RESPONSE_COOKIES][MAX_SET_COOKIE_LEN];
+    int set_cookie_count;
 
     /* Set by handle_readable (connection.c) from req->method before dispatch
      * runs, whenever a request was successfully parsed. HTTP requires a HEAD

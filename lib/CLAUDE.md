@@ -338,6 +338,60 @@ makes the zero-header case resolve to an empty header block (`header_len ==
 0`) instead of reading garbage. See `tests/test_http_parser.c`
 (the zero-header case in `test_parse_http_request`).
 
+## Cookies
+Request-side and response-side cookie handling are two independent pieces,
+each following an existing convention rather than introducing a new one:
+- **Reading** (`lib/http_parser.c/h`): `parse_cookies(cookie_header, req)` is a
+  pure function, called from `parse_http_request` as
+  `parse_cookies(req_get_header(req, "Cookie"), req)` right after `parse_headers`
+  fills `req->header_*` (so the `Cookie` header, if any, is already available to
+  look up). It splits the header value on `';'` then the first `'='` into
+  `req->cookie_names`/`req->cookie_values` (fixed `MAX_COOKIES`-sized arrays +
+  `cookie_count`, the same bounded-array-plus-count shape as
+  `header_names`/`query_names` elsewhere — extra pairs past the cap are dropped
+  rather than overflowing). Leading spaces after `';'` are trimmed; a pair with
+  no `'='` is skipped rather than stored, same as `parse_headers` skipping a
+  line with no `':'`. `cookie_header` may be `NULL` (no `Cookie` header sent at
+  all), treated the same as an empty string — `req.cookie_count` just stays `0`,
+  this is not a parse error. `req_get_cookie(req, name)` looks the array up with
+  `strcmp` — cookie names are case-*sensitive* per RFC 6265, unlike
+  `req_get_header`'s case-insensitive `strcasecmp` — and returns the first
+  match. Values are **not** URL-decoded, same reasoning as header values (a
+  `Cookie` header isn't a URL component either). Because `req->header_values`
+  entries (and so the raw `Cookie` header value `parse_cookies` splits) are
+  capped at 256 bytes each, a request sending an unusually large number of
+  cookies can already be truncated before `parse_cookies` ever sees the rest —
+  an existing per-header-value limit, not something specific to cookies.
+- **Writing** (`lib/response.c/h`): `res_set_cookie(res, name, value, options)`
+  formats one RFC 6265 `Set-Cookie` header value (`name=value` plus whichever
+  attributes `options` — `CookieOptions`, `app_types.h` — requests: `Path`
+  defaulting to `"/"` when `options->path` is `NULL`, optional `Domain`,
+  optional `Max-Age` when `options->max_age >= 0` (a valid explicit `0` expires
+  a cookie immediately, so "omit this attribute" needs its own sentinel,
+  `-1`), optional `HttpOnly`/`Secure` flags, optional `SameSite`) directly into
+  a slot in `Response.set_cookies` (`app_types.h`) — a **separate** fixed array
+  from `Response.headers`, not a `res_set_header` call, because a response can
+  carry more than one `Set-Cookie` line at once and `res_set_header` overwrites
+  same-name entries. `options` may be `NULL` for an all-default session
+  cookie. Bounded by `MAX_RESPONSE_COOKIES`; extra calls past the cap, or a
+  formatted cookie longer than `MAX_SET_COOKIE_LEN`, are dropped with a stderr
+  warning rather than overflowing/truncating into a malformed line — same
+  convention as `res_set_header`/`MAX_RESPONSE_HEADERS`. `send_with_content_type`
+  emits one `"Set-Cookie: ...\r\n"` line per stored entry, in its own loop
+  alongside (not merged into) the `headers[]` loop. `res_clear_cookie(res, name,
+  path)` is `res_set_cookie` with `Max-Age=0` and an empty value — `path` must
+  match whatever `Path` the cookie was originally set with (`NULL` defaults to
+  `"/"`, same as `res_set_cookie`'s own default) for a browser to actually
+  delete it, mirroring Express's `res.clearCookie(name)`.
+- See `tests/test_http_parser.c` (`test_parse_cookies`, and the `Cookie`-header
+  case in `test_parse_http_request`), `tests/test_response.c`
+  (`test_set_cookie_defaults`, `test_set_cookie_with_options`,
+  `test_multiple_cookies_each_get_own_line`,
+  `test_clear_cookie_expires_immediately`,
+  `test_max_response_cookies_enforced`), and `app/handlers.c`
+  (`handler_login`/`handler_whoami`/`handler_logout`, `app/CLAUDE.md`) for a
+  real usage example.
+
 ## Request size limits
 Headers and body are now bounded independently, at very different sizes - see
 "Body buffering" below for the body side. Headers alone are still hard-capped at

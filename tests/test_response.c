@@ -126,6 +126,96 @@ static void test_head_response_omits_body_but_keeps_content_length(void) {
     free_conn(conn);
 }
 
+static void test_set_cookie_defaults(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    res_status(&res, 200);
+    res_set_cookie(&res, "session", "abc123", NULL);
+    res_send(&res, "body");
+
+    assert(conn->out_buf != NULL);
+    /* No options: session cookie, Path=/, no Domain/Max-Age/HttpOnly/
+     * Secure/SameSite. */
+    assert(strstr(conn->out_buf, "Set-Cookie: session=abc123; Path=/\r\n") != NULL);
+    assert(strstr(conn->out_buf, "Max-Age") == NULL);
+    assert(strstr(conn->out_buf, "HttpOnly") == NULL);
+
+    free_conn(conn);
+}
+
+static void test_set_cookie_with_options(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+    const CookieOptions options = { .max_age = 3600, .path = "/api", .domain = "example.com",
+                                     .http_only = 1, .secure = 1, .same_site = COOKIE_SAMESITE_STRICT };
+
+    res_status(&res, 200);
+    res_set_cookie(&res, "session", "abc123", &options);
+    res_send(&res, "body");
+
+    assert(conn->out_buf != NULL);
+    assert(strstr(conn->out_buf,
+        "Set-Cookie: session=abc123; Path=/api; Domain=example.com; Max-Age=3600; "
+        "HttpOnly; Secure; SameSite=Strict\r\n") != NULL);
+
+    free_conn(conn);
+}
+
+static void test_multiple_cookies_each_get_own_line(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    res_status(&res, 200);
+    res_set_cookie(&res, "a", "1", NULL);
+    res_set_cookie(&res, "b", "2", NULL);
+    /* Same name twice: unlike res_set_header, this does NOT overwrite -
+     * both lines are sent. */
+    res_set_cookie(&res, "a", "3", NULL);
+    res_send(&res, "body");
+
+    assert(conn->out_buf != NULL);
+    assert(strstr(conn->out_buf, "Set-Cookie: a=1; Path=/\r\n") != NULL);
+    assert(strstr(conn->out_buf, "Set-Cookie: b=2; Path=/\r\n") != NULL);
+    assert(strstr(conn->out_buf, "Set-Cookie: a=3; Path=/\r\n") != NULL);
+
+    free_conn(conn);
+}
+
+static void test_clear_cookie_expires_immediately(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    res_status(&res, 200);
+    res_clear_cookie(&res, "session", NULL);
+    res_send(&res, "body");
+
+    assert(conn->out_buf != NULL);
+    assert(strstr(conn->out_buf, "Set-Cookie: session=; Path=/; Max-Age=0\r\n") != NULL);
+
+    free_conn(conn);
+}
+
+static void test_max_response_cookies_enforced(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    res_status(&res, 200);
+    for (int i = 0; i < MAX_RESPONSE_COOKIES + 4; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "c%d", i);
+        res_set_cookie(&res, name, "v", NULL);
+    }
+
+    /* Extras beyond the fixed cap are dropped, not overflowed into. */
+    assert(res.set_cookie_count == MAX_RESPONSE_COOKIES);
+
+    res_send(&res, "body");
+    assert(conn->out_buf != NULL);
+
+    free_conn(conn);
+}
+
 int main(void) {
     test_custom_header_is_sent();
     test_repeated_set_header_overwrites_case_insensitively();
@@ -133,6 +223,11 @@ int main(void) {
     test_custom_content_type_overrides_default();
     test_max_response_headers_enforced();
     test_head_response_omits_body_but_keeps_content_length();
+    test_set_cookie_defaults();
+    test_set_cookie_with_options();
+    test_multiple_cookies_each_get_own_line();
+    test_clear_cookie_expires_immediately();
+    test_max_response_cookies_enforced();
 
     printf("all response tests passed\n");
     return 0;

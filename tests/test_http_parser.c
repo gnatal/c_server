@@ -170,6 +170,26 @@ static void test_parse_http_request(void) {
     assert(req_get_header(&req, "X-Missing") == NULL);
     free(req.body);
 
+    /* parse_http_request also populates the parsed cookie map, off the
+     * "Cookie" header (case-insensitive lookup finds it via req_get_header,
+     * cookie name lookup itself stays case-sensitive per RFC 6265). */
+    const char *raw_with_cookies =
+        "GET /profile HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Cookie: session=abc123; theme=dark\r\n"
+        "\r\n";
+    assert(parse_http_request(raw_with_cookies, strlen(raw_with_cookies), &req) == 0);
+    assert(strcmp(req_get_cookie(&req, "session"), "abc123") == 0);
+    assert(strcmp(req_get_cookie(&req, "theme"), "dark") == 0);
+    assert(req_get_cookie(&req, "missing") == NULL);
+    free(req.body);
+
+    /* No Cookie header at all -> zero parsed cookies, not a parse error. */
+    const char *raw_no_cookies = "GET /profile HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert(parse_http_request(raw_no_cookies, strlen(raw_no_cookies), &req) == 0);
+    assert(req.cookie_count == 0);
+    free(req.body);
+
     /* A body well beyond the old BUF_SIZE (8192) now parses cleanly -
      * req->body is heap-allocated to fit it exactly rather than being
      * copied into a BUF_SIZE-capped fixed array (see lib/CLAUDE.md,
@@ -361,6 +381,48 @@ static void test_parse_headers(void) {
     assert(req.header_count == MAX_HEADERS);
 }
 
+static void test_parse_cookies(void) {
+    Request req;
+    memset(&req, 0, sizeof(req));
+
+    /* NULL (no Cookie header present) and empty string both yield zero cookies. */
+    parse_cookies(NULL, &req);
+    assert(req.cookie_count == 0);
+    assert(req_get_cookie(&req, "session") == NULL);
+
+    parse_cookies("", &req);
+    assert(req.cookie_count == 0);
+
+    /* Basic "a=1; b=2" pairs, leading space after ';' trimmed. */
+    parse_cookies("session=abc123; theme=dark", &req);
+    assert(req.cookie_count == 2);
+    assert(strcmp(req_get_cookie(&req, "session"), "abc123") == 0);
+    assert(strcmp(req_get_cookie(&req, "theme"), "dark") == 0);
+
+    /* Cookie name lookup is case-sensitive (RFC 6265), unlike req_get_header. */
+    assert(req_get_cookie(&req, "Session") == NULL);
+
+    /* Not URL-decoded - unlike query-string values. */
+    parse_cookies("greeting=hello%20world", &req);
+    assert(strcmp(req_get_cookie(&req, "greeting"), "hello%20world") == 0);
+
+    /* A pair with no '=' is malformed - skipped rather than stored. */
+    parse_cookies("a=1; malformed; b=2", &req);
+    assert(req.cookie_count == 2);
+    assert(strcmp(req_get_cookie(&req, "a"), "1") == 0);
+    assert(strcmp(req_get_cookie(&req, "b"), "2") == 0);
+
+    /* Overflow: pairs past MAX_COOKIES are dropped, not overflowed. */
+    char many[512] = "";
+    for (int i = 0; i < MAX_COOKIES + 5; i++) {
+        char pair[16];
+        snprintf(pair, sizeof(pair), "c%d=%d; ", i, i);
+        strncat(many, pair, sizeof(many) - strlen(many) - 1);
+    }
+    parse_cookies(many, &req);
+    assert(req.cookie_count == MAX_COOKIES);
+}
+
 static void test_parse_query_string(void) {
     Request req;
     memset(&req, 0, sizeof(req));
@@ -430,6 +492,7 @@ int main(void) {
     test_status_text();
     test_url_decode();
     test_parse_headers();
+    test_parse_cookies();
     test_parse_query_string();
 
     printf("all http parser tests passed\n");

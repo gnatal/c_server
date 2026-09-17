@@ -32,4 +32,33 @@ void res_send(Response *res, const char *body);
 /* Same as res_send, but with a "Content-Type: application/json" header. */
 void res_json(Response *res, const char *body);
 
+/*
+ * Appends a "Set-Cookie" response header for name=value, formatted per RFC
+ * 6265 with whatever attributes options requests (CookieOptions,
+ * app_types.h) - options may be NULL, meaning every attribute defaults (a
+ * session cookie scoped to Path=/, no Domain/HttpOnly/Secure/SameSite).
+ * Unlike res_set_header, repeated calls (even with the same name) always
+ * append a new Set-Cookie line rather than overwriting one - a response
+ * can legitimately set more than one cookie, and res_set_cookie never
+ * deduplicates by name (the browser tells cookies apart by name + Path +
+ * Domain together, not by whichever Set-Cookie line came last). Bounded by
+ * MAX_RESPONSE_COOKIES; extra calls past the cap are dropped (stderr
+ * warning), same convention as res_set_header/MAX_RESPONSE_HEADERS. A
+ * cookie that doesn't fit MAX_SET_COOKIE_LEN once formatted is dropped the
+ * same way rather than being silently truncated into a malformed
+ * Set-Cookie line.
+ */
+void res_set_cookie(Response *res, const char *name, const char *value, const CookieOptions *options);
+
+/*
+ * Expires an existing cookie immediately: shorthand for res_set_cookie
+ * with Max-Age=0 - the value is irrelevant once a cookie is expired, so
+ * this always sends an empty one. path must match whatever Path the
+ * cookie was originally set with (defaults to "/", res_set_cookie's own
+ * default) - a browser only clears a cookie whose Path (and Domain, not
+ * offered here) matches exactly, it does not clear every cookie of that
+ * name regardless of scope. Mirrors Express's res.clearCookie(name).
+ */
+void res_clear_cookie(Response *res, const char *name, const char *path);
+
 #endif /* RESPONSE_H */

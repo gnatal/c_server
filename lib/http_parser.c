@@ -122,6 +122,7 @@ int parse_http_request(const char *raw, size_t raw_len, Request *req) {
     memcpy(req->headers, header_start, header_len);
     req->headers[header_len] = '\0';
     parse_headers(req->headers, req);
+    parse_cookies(req_get_header(req, "Cookie"), req);
 
     req->content_length = extract_content_length(req->headers);
     if (req->content_length < 0) {
@@ -233,6 +234,52 @@ const char *req_get_header(const Request *req, const char *name) {
     for (int i = 0; i < req->header_count; i++) {
         if (strcasecmp(req->header_names[i], name) == 0) {
             return req->header_values[i];
+        }
+    }
+    return NULL;
+}
+
+void parse_cookies(const char *cookie_header, Request *req) {
+    req->cookie_count = 0;
+    if (cookie_header == NULL || cookie_header[0] == '\0') {
+        return;
+    }
+
+    char buf[sizeof(req->header_values[0])];
+    strncpy(buf, cookie_header, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *saveptr;
+    char *pair = strtok_r(buf, ";", &saveptr);
+    while (pair != NULL && req->cookie_count < MAX_COOKIES) {
+        while (*pair == ' ') {
+            pair++;
+        }
+
+        char *eq = strchr(pair, '=');
+        if (eq != NULL) {
+            *eq = '\0';
+            const char *value = eq + 1;
+
+            char *name_slot = req->cookie_names[req->cookie_count];
+            char *value_slot = req->cookie_values[req->cookie_count];
+            strncpy(name_slot, pair, sizeof(req->cookie_names[0]) - 1);
+            name_slot[sizeof(req->cookie_names[0]) - 1] = '\0';
+            strncpy(value_slot, value, sizeof(req->cookie_values[0]) - 1);
+            value_slot[sizeof(req->cookie_values[0]) - 1] = '\0';
+            req->cookie_count++;
+        }
+        /* A pair with no '=' is malformed - skipped, same as parse_headers
+         * skipping a header line with no ':'. */
+
+        pair = strtok_r(NULL, ";", &saveptr);
+    }
+}
+
+const char *req_get_cookie(const Request *req, const char *name) {
+    for (int i = 0; i < req->cookie_count; i++) {
+        if (strcmp(req->cookie_names[i], name) == 0) {
+            return req->cookie_values[i];
         }
     }
     return NULL;

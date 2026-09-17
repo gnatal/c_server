@@ -87,6 +87,19 @@ static void send_with_content_type(Response *res, const char *content_type, cons
         }
     }
 
+    /* One "Set-Cookie: ..." line per res_set_cookie() call - unlike the
+     * headers[] loop above, this never overwrites/dedupes by name (see
+     * res_set_cookie, app_types.h: Response.set_cookies). */
+    for (int i = 0; i < res->set_cookie_count && !overflow; i++) {
+        n = snprintf(header + offset, sizeof(header) - offset,
+            "Set-Cookie: %s\r\n", res->set_cookies[i]);
+        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
+            overflow = 1;
+        } else {
+            offset += (size_t)n;
+        }
+    }
+
     if (!overflow) {
         n = snprintf(header + offset, sizeof(header) - offset, "\r\n");
         if (n < 0 || (size_t)n >= sizeof(header) - offset) {
@@ -142,4 +155,80 @@ void res_send(Response *res, const char *body) {
 
 void res_json(Response *res, const char *body) {
     send_with_content_type(res, "application/json", body);
+}
+
+static const char *same_site_name(CookieSameSite same_site) {
+    switch (same_site) {
+        case COOKIE_SAMESITE_STRICT: return "Strict";
+        case COOKIE_SAMESITE_LAX:    return "Lax";
+        case COOKIE_SAMESITE_NONE:   return "None";
+        default:                     return NULL;
+    }
+}
+
+void res_set_cookie(Response *res, const char *name, const char *value, const CookieOptions *options) {
+    static const CookieOptions defaults = { .max_age = -1, .path = NULL, .domain = NULL,
+                                             .http_only = 0, .secure = 0, .same_site = COOKIE_SAMESITE_UNSET };
+    if (options == NULL) {
+        options = &defaults;
+    }
+
+    if (res->set_cookie_count >= MAX_RESPONSE_COOKIES) {
+        fprintf(stderr, "res_set_cookie: MAX_RESPONSE_COOKIES exceeded\n");
+        return;
+    }
+
+    char *dest = res->set_cookies[res->set_cookie_count];
+    const size_t cap = sizeof(res->set_cookies[0]);
+    const char *path = options->path != NULL ? options->path : "/";
+
+    int n = snprintf(dest, cap, "%s=%s; Path=%s", name, value, path);
+    int overflow = (n < 0 || (size_t)n >= cap);
+    size_t offset = overflow ? cap : (size_t)n;
+
+    if (!overflow && options->domain != NULL) {
+        n = snprintf(dest + offset, cap - offset, "; Domain=%s", options->domain);
+        overflow = (n < 0 || (size_t)n >= cap - offset);
+        if (!overflow) {
+            offset += (size_t)n;
+        }
+    }
+    if (!overflow && options->max_age >= 0) {
+        n = snprintf(dest + offset, cap - offset, "; Max-Age=%d", options->max_age);
+        overflow = (n < 0 || (size_t)n >= cap - offset);
+        if (!overflow) {
+            offset += (size_t)n;
+        }
+    }
+    if (!overflow && options->http_only) {
+        n = snprintf(dest + offset, cap - offset, "; HttpOnly");
+        overflow = (n < 0 || (size_t)n >= cap - offset);
+        if (!overflow) {
+            offset += (size_t)n;
+        }
+    }
+    if (!overflow && options->secure) {
+        n = snprintf(dest + offset, cap - offset, "; Secure");
+        overflow = (n < 0 || (size_t)n >= cap - offset);
+        if (!overflow) {
+            offset += (size_t)n;
+        }
+    }
+    if (!overflow && options->same_site != COOKIE_SAMESITE_UNSET) {
+        n = snprintf(dest + offset, cap - offset, "; SameSite=%s", same_site_name(options->same_site));
+        overflow = (n < 0 || (size_t)n >= cap - offset);
+    }
+
+    if (overflow) {
+        fprintf(stderr, "res_set_cookie: cookie \"%s\" exceeds MAX_SET_COOKIE_LEN, dropped\n", name);
+        return;
+    }
+
+    res->set_cookie_count++;
+}
+
+void res_clear_cookie(Response *res, const char *name, const char *path) {
+    const CookieOptions options = { .max_age = 0, .path = path, .domain = NULL,
+                                     .http_only = 0, .secure = 0, .same_site = COOKIE_SAMESITE_UNSET };
+    res_set_cookie(res, name, "", &options);
 }

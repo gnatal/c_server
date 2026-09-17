@@ -199,6 +199,7 @@ void handle_readable(App *app, Connection *conn) {
             res.conn = conn;
             res.status = 200;
             res.header_count = 0;
+            res.set_cookie_count = 0;
             res.is_head_request = 0;
 
             const int parse_status = parse_http_request(conn->in_buf, conn->in_len, &req);
@@ -282,6 +283,7 @@ void handle_readable(App *app, Connection *conn) {
         Response res;
         res.conn = conn;
         res.header_count = 0;
+        res.set_cookie_count = 0;
         res.is_head_request = 0;
         conn->keep_alive = 0;
         if (header_end == NULL) {
@@ -322,6 +324,7 @@ void close_idle_connections(App *app) {
             Response res;
             res.conn = conn;
             res.header_count = 0;
+            res.set_cookie_count = 0;
             res.is_head_request = 0;
             conn->keep_alive = 0;
             res_status(&res, 408);

@@ -92,6 +92,16 @@ scoping mechanisms in `lib/`:
   (`lib/CLAUDE.md`, "Route wildcards"): one registration answers any path under
   `/files/`, echoing `req->path` back rather than actually serving a file — there's
   still no static file server (`pending.txt`).
+- `GET /login` / `GET /whoami` / `GET /logout` demonstrate cookies
+  (`lib/CLAUDE.md`, "Cookies"): `handler_login` calls `res_set_cookie(res,
+  "session", "demo-session-token", &options)` (`lib/response.h`) with
+  `HttpOnly` + `SameSite=Lax` + a one-hour `Max-Age` (demo choices, not
+  requirements of the API); `handler_whoami` reads it back via
+  `req_get_cookie(req, "session")` (`lib/http_parser.h`); `handler_logout`
+  calls `res_clear_cookie(res, "session", "/")` to expire it — the `"/"` must
+  match the `Path` the cookie was set with (`options.path` above, also `"/"`)
+  for a browser to actually delete it rather than leaving an orphaned cookie
+  scoped to a `Path` nothing clears anymore.
 - `mw_logger` calls `chain_next` first and logs `METHOD PATH -> STATUS` after it
   returns, once the rest of the pipeline has produced a final `res->status`.
 - `mw_body_size_guard` rejects any request whose `req->content_length` exceeds this

@@ -39,6 +39,12 @@ int main(void) {
    * not serve actual files, just echoes req->path to show the match. */
   app_get(&app, "/files/*", handler_files);
   app_post(&app, "/echo", handler_echo);
+  /* Cookie demo (lib/response.h/lib/http_parser.h): /login sets a session
+   * cookie, /whoami reads it back via req_get_cookie, /logout expires it
+   * via res_clear_cookie. */
+  app_get(&app, "/login", handler_login);
+  app_get(&app, "/whoami", handler_whoami);
+  app_get(&app, "/logout", handler_logout);
   /* multipart/form-data demo: POST /upload with fields and/or file parts -
    * handler_upload (lib/multipart.h) echoes each part back as JSON, file
    * parts as {filename, content_type, size} rather than raw bytes. */
