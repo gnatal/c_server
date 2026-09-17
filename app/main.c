@@ -1,9 +1,6 @@
-#include "app_types.h"
-#include "connection.h"
+#include "cexpress.h"
 #include "handlers.h"
-#include "middleware.h"
 #include "middlewares.h"
-#include "router.h"
 #include <stdlib.h>
 
 int main(void) {
