@@ -509,6 +509,101 @@ require.
   connection's memory footprint. A failed shrink isn't fatal (`realloc` leaves the
   larger block untouched) - the connection just keeps using the bigger buffer.
 
+## Chunked Transfer-Encoding
+A `Transfer-Encoding: chunked` request body is an alternative to a declared
+`Content-Length` (previous section) - the body's size isn't known upfront, it's
+split into `"<hex-size>[;ext]\r\n<data>\r\n"` chunks terminated by a `0`-size
+last-chunk, an optional trailer-part, and a final CRLF (RFC 7230 4.1). Three
+pure functions in `lib/http_parser.c/h` implement this, mirroring the
+Content-Length path's shape at every call site rather than introducing a
+separate code path:
+- **`request_has_chunked_encoding(header_block)`** - true when a
+  `Transfer-Encoding` header's value contains `"chunked"` (case-insensitive),
+  scoped to just that header's own line via a bounded stack copy so a
+  `"chunked"` appearing elsewhere (another header, or body bytes when called
+  on the whole raw connection buffer) can't false-match. Called both on the
+  raw buffer, before headers are even sliced out (`request_is_complete`), and
+  on the already-isolated `req->headers` block (`parse_http_request`) - the
+  same dual-use pattern `extract_content_length` already follows.
+- **`chunked_body_scan(body_start, available, max_decoded_len,
+  decoded_len_out)`** - walks the chunk framing without allocating or copying
+  any data, returning `1` (fully received), `0` (need more bytes), `-1`
+  (malformed framing - non-hex size, a chunk's data not followed by its own
+  CRLF, or a chunk-size line longer than `MAX_CHUNK_SIZE_LINE_LEN` can
+  legitimately be), or `-2` (the running decoded size, tracked in
+  `*decoded_len_out` across chunks, already exceeds `max_decoded_len`). The
+  `-2` check happens against each chunk's *declared* size as soon as its
+  size-line is parsed, before that chunk's data has necessarily arrived -
+  the same early-rejection shape `extract_content_length` gives a
+  Content-Length beyond `MAX_BODY_SIZE`, just applied cumulatively across
+  chunks instead of to one header value. `request_is_complete` calls this
+  with `max_decoded_len = MAX_BODY_SIZE` and stops buffering (returns `1`) on
+  any non-zero result, positive or negative - `parse_http_request` re-derives
+  which one happened, same pattern the plain Content-Length branch already
+  uses its own negative sentinels for.
+- **`chunked_body_decode(body_start, available, out)`** - decodes a body
+  `chunked_body_scan` has already confirmed complete (`1`) for this exact
+  input into `out` (a caller-owned buffer sized to that same call's
+  `decoded_len_out`), returning the number of bytes written. Does not
+  re-validate framing - same trust-the-precondition contract
+  `parse_multipart_body` has toward a prior successful
+  `multipart_parse_boundary` call. Decoded data can contain arbitrary bytes,
+  including embedded NULs (a chunked binary upload) - callers must use the
+  return value, never `strlen(out)`, same convention as multipart/urlencoded
+  body parsing.
+
+`parse_http_request` branches on `request_has_chunked_encoding(req->headers)`
+right after headers are parsed: a `Content-Length` header present
+*alongside* `Transfer-Encoding: chunked` is rejected outright (`-1` -> 400) -
+RFC 7230 3.3.3 calls this combination ambiguous about where the body actually
+ends, a request-smuggling shape rather than a client mistake, so neither
+header is preferred over the other. Otherwise `chunked_body_scan` re-confirms
+completeness (`request_is_complete` already required this before
+`parse_http_request` was ever called) and, on success, `chunked_body_decode`
+fills `req->body` - `req->content_length` is set to the *decoded* size
+(matching what a handler reading it would expect from the Content-Length
+path), not the raw wire size. A `chunked_body_scan` result of `-2` sets
+`req->content_length = -2` before failing - the same sentinel
+`extract_content_length` returns for an oversized declared Content-Length -
+so `connection.c`'s `req.content_length == -2 -> 413` check covers both
+oversized cases without connection.c needing to know which framing was used.
+
+`connection.c: handle_readable`'s buffer-growth branch (reached when `in_buf`
+fills up with headers already complete) also branches on
+`request_has_chunked_encoding`: a chunked body has no single declared size to
+`realloc` straight to the way a Content-Length body does, so it grows
+geometrically (doubling) instead, capped at `header_len + MAX_BODY_SIZE` - the
+same ceiling a Content-Length body gets, but applied here to the *raw* wire
+size rather than the decoded size `chunked_body_scan` already bounds
+independently. This raw-side cap matters on its own: without it, a client
+could inflate server memory well past `MAX_BODY_SIZE` by sending the same
+decoded byte count as a pile of pathologically tiny chunks (each
+`"1\r\nX\r\n"` chunk costs 6 raw bytes per 1 decoded byte) before the
+decoded-size check would otherwise trigger. Reaching this branch at all means
+`chunked_body_scan` already returned exactly `0` on the current buffer (`1`/
+`-1`/`-2` all end the request via the dispatch branch above instead, on an
+earlier `recv()`), so growth here never needs to re-examine *why* - just
+whether there's still room to grow under the cap. Hitting the cap while still
+incomplete rejects with 413 directly, rather than falling through to the
+generic realloc-failure-shaped 500 the Content-Length path's fallback uses.
+
+**Known trade-off:** the raw-wire-size cap above is a blanket ceiling
+independent of chunk granularity, so a legitimately-small decoded body sent
+as pathologically many tiny chunks could be rejected as "too large" purely
+from framing overhead, even though its decoded size is well under
+`MAX_BODY_SIZE`. This is a deliberate simplification favoring predictable
+memory bounds over supporting that edge case - similar in spirit to the
+known `%2F` path-decoding gap in "URL decoding" above.
+
+See `tests/test_http_parser.c` (`test_request_has_chunked_encoding`,
+`test_chunked_body_scan`, `test_chunked_body_decode`,
+`test_request_is_complete_chunked`, `test_parse_http_request_chunked`) and
+`tests/test_connection.c` (`test_handle_readable_chunked_round_trip`,
+`test_handle_readable_chunked_grows_buffer`,
+`test_handle_readable_chunked_too_large_413`,
+`test_handle_readable_chunked_malformed_400`,
+`test_handle_readable_chunked_and_content_length_400`).
+
 ## multipart/form-data parsing
 `multipart_parse_boundary`/`parse_multipart_body`/`multipart_get_part`
 (`lib/multipart.c/h`) parse a `multipart/form-data` `Request.body` the same way

@@ -216,7 +216,13 @@ void handle_readable(App *app, Connection *conn) {
                 if (parse_status == -2) {
                     res_status(&res, 414);
                     res_send(&res, "URI Too Long");
-                } else if (extract_content_length(conn->in_buf) == -2) {
+                } else if (req.content_length == -2) {
+                    /* parse_http_request sets this same sentinel whether the
+                     * rejection came from a Content-Length beyond
+                     * MAX_BODY_SIZE or (see lib/CLAUDE.md, "Chunked
+                     * Transfer-Encoding") a chunked body whose decoded size
+                     * exceeds it - one check covers both, connection.c
+                     * doesn't need to know which framing was used. */
                     res_status(&res, 413);
                     res_send(&res, "Payload Too Large");
                 } else {
@@ -255,21 +261,73 @@ void handle_readable(App *app, Connection *conn) {
          *     MAX_BODY_SIZE can never reach this branch in the first place -
          *     request_is_complete (called on every recv() above, including
          *     the one that completed the header block) already caught that
-         *     and dispatched a 413 the moment headers arrived (see the
-         *     extract_content_length == -2 check above). So content_length
-         *     here is always valid and within MAX_BODY_SIZE - grow in_buf
-         *     via realloc to exactly header+body+NUL and keep waiting for
-         *     more EVFILT_READ events instead of rejecting - this is what
-         *     lets a body exceed BUF_SIZE (see pending.txt, "no streaming",
-         *     and lib/CLAUDE.md, "Body buffering"). Only a failed realloc
-         *     (genuine server-side OOM, not a client-declared size problem)
-         *     falls through to a rejection below, as 500.
+         *     and dispatched a 413 the moment headers arrived (see
+         *     req.content_length == -2 above). So content_length here is
+         *     always valid and within MAX_BODY_SIZE - grow in_buf via
+         *     realloc to exactly header+body+NUL and keep waiting for more
+         *     EVFILT_READ events instead of rejecting - this is what lets a
+         *     body exceed BUF_SIZE (see lib/CLAUDE.md, "Body buffering").
+         *     Only a failed realloc (genuine server-side OOM, not a
+         *     client-declared size problem) falls through to a rejection
+         *     below, as 500. A Transfer-Encoding: chunked body takes a
+         *     separate branch just below instead, since it has no single
+         *     declared size to realloc straight to (see lib/CLAUDE.md,
+         *     "Chunked Transfer-Encoding").
          */
         const char *header_end = strstr(conn->in_buf, "\r\n\r\n");
         if (header_end != NULL) {
+            const size_t header_len = (size_t)(header_end + 4 - conn->in_buf);
+
+            if (request_has_chunked_encoding(conn->in_buf)) {
+                /*
+                 * A chunked body's total size isn't known upfront the way a
+                 * declared Content-Length is (there's no single number to
+                 * realloc straight to) - grow geometrically instead, capped
+                 * at header_len + MAX_BODY_SIZE: the same ceiling a
+                 * Content-Length body gets, applied here to the *raw* wire
+                 * size rather than the decoded size chunked_body_scan/
+                 * request_is_complete already bounds independently. Without
+                 * this raw-side cap too, a client could inflate memory use
+                 * well past MAX_BODY_SIZE by sending the same decoded byte
+                 * count as a pile of pathologically tiny chunks (each
+                 * "1\r\nX\r\n" chunk costs 6 raw bytes per 1 decoded byte)
+                 * before chunked_body_scan's decoded-size check ever
+                 * triggers - see lib/CLAUDE.md, "Chunked Transfer-Encoding".
+                 * By the time this branch runs, request_is_complete already
+                 * requires chunked_body_scan to have returned exactly 0 on
+                 * the current buffer (1/-1/-2 all end the request in the
+                 * dispatch branch above instead) - reaching here always
+                 * means "still incomplete", never "reject this specific
+                 * scan result".
+                 */
+                const size_t raw_cap = header_len + MAX_BODY_SIZE;
+                if (conn->in_cap < raw_cap) {
+                    size_t needed = conn->in_cap * 2;
+                    if (needed > raw_cap) {
+                        needed = raw_cap;
+                    }
+                    char *grown = realloc(conn->in_buf, needed);
+                    if (grown != NULL) {
+                        conn->in_buf = grown;
+                        conn->in_cap = needed;
+                        return; /* wait for more EVFILT_READ events */
+                    }
+                }
+
+                Response res;
+                res.conn = conn;
+                res.header_count = 0;
+                res.set_cookie_count = 0;
+                res.is_head_request = 0;
+                conn->keep_alive = 0;
+                res_status(&res, 413);
+                res_send(&res, "Payload Too Large");
+                flush_connection(app, conn);
+                return;
+            }
+
             const int content_length = extract_content_length(conn->in_buf);
             if (content_length >= 0) {
-                const size_t header_len = (size_t)(header_end + 4 - conn->in_buf);
                 const size_t needed = header_len + (size_t)content_length + 1;
                 char *grown = realloc(conn->in_buf, needed);
                 if (grown != NULL) {

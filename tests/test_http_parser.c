@@ -281,6 +281,189 @@ static void test_parse_http_request(void) {
     free(binary_raw);
 }
 
+static void test_request_has_chunked_encoding(void) {
+    assert(request_has_chunked_encoding("Transfer-Encoding: chunked\r\n") == 1);
+    /* Case-insensitive, same as every other header lookup in this engine. */
+    assert(request_has_chunked_encoding("transfer-encoding: CHUNKED\r\n") == 1);
+    /* Absent header. */
+    assert(request_has_chunked_encoding("Host: localhost\r\n") == 0);
+    /* Present but a different encoding. */
+    assert(request_has_chunked_encoding("Transfer-Encoding: gzip\r\n") == 0);
+    /* "chunked" appearing elsewhere must not cause a false match - only the
+     * Transfer-Encoding header's own line is scanned. */
+    assert(request_has_chunked_encoding(
+        "Transfer-Encoding: gzip\r\nX-Debug: chunked-test\r\n\r\n") == 0);
+    /* A raw connection buffer (headers + whatever body has arrived) is a
+     * valid input too - the same dual-use extract_content_length has. */
+    assert(request_has_chunked_encoding(
+        "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n") == 1);
+}
+
+static void test_chunked_body_scan(void) {
+    size_t decoded_len;
+
+    /* Single chunk, no trailers. */
+    const char *one_chunk = "4\r\nWiki\r\n0\r\n\r\n";
+    assert(chunked_body_scan(one_chunk, strlen(one_chunk), MAX_BODY_SIZE, &decoded_len) == 1);
+    assert(decoded_len == 4);
+
+    /* Multiple chunks. */
+    const char *two_chunks = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    assert(chunked_body_scan(two_chunks, strlen(two_chunks), MAX_BODY_SIZE, &decoded_len) == 1);
+    assert(decoded_len == 9);
+
+    /* Chunk extensions are accepted and ignored. */
+    const char *with_ext = "4;ext=1\r\nWiki\r\n0\r\n\r\n";
+    assert(chunked_body_scan(with_ext, strlen(with_ext), MAX_BODY_SIZE, &decoded_len) == 1);
+    assert(decoded_len == 4);
+
+    /* Trailer headers after the last-chunk are accepted (and, per
+     * chunked_body_decode, discarded rather than surfaced to the caller). */
+    const char *with_trailer = "0\r\nExpires: never\r\n\r\n";
+    assert(chunked_body_scan(with_trailer, strlen(with_trailer), MAX_BODY_SIZE, &decoded_len) == 1);
+    assert(decoded_len == 0);
+
+    /* Incomplete: chunk data hasn't fully arrived yet. */
+    const char *partial_data = "4\r\nWi";
+    assert(chunked_body_scan(partial_data, strlen(partial_data), MAX_BODY_SIZE, &decoded_len) == 0);
+    assert(decoded_len == 0);
+
+    /* Incomplete: a whole chunk arrived, but not the terminating last-chunk. */
+    const char *partial_terminator = "4\r\nWiki\r\n";
+    assert(chunked_body_scan(partial_terminator, strlen(partial_terminator), MAX_BODY_SIZE, &decoded_len) == 0);
+    assert(decoded_len == 4);
+
+    /* Incomplete: chunk-size line itself hasn't fully arrived. */
+    const char *partial_size_line = "4";
+    assert(chunked_body_scan(partial_size_line, strlen(partial_size_line), MAX_BODY_SIZE, &decoded_len) == 0);
+
+    /* Malformed: non-hex chunk-size. */
+    const char *bad_hex = "ZZ\r\nWiki\r\n0\r\n\r\n";
+    assert(chunked_body_scan(bad_hex, strlen(bad_hex), MAX_BODY_SIZE, &decoded_len) == -1);
+
+    /* Malformed: chunk data not followed by its own CRLF (a chunk-size that
+     * doesn't match the actual data would otherwise desync every later
+     * chunk boundary). */
+    const char *bad_terminator = "4\r\nWikiXX0\r\n\r\n";
+    assert(chunked_body_scan(bad_terminator, strlen(bad_terminator), MAX_BODY_SIZE, &decoded_len) == -1);
+
+    /* Malformed: an empty chunk-size line. */
+    const char *empty_size_line = "\r\nWiki\r\n0\r\n\r\n";
+    assert(chunked_body_scan(empty_size_line, strlen(empty_size_line), MAX_BODY_SIZE, &decoded_len) == -1);
+
+    /* Malformed: chunk-size line far longer than any legitimate one, with
+     * no CRLF in sight - rejected outright rather than buffered forever. */
+    char huge_line[256];
+    memset(huge_line, 'a', sizeof(huge_line) - 1);
+    huge_line[sizeof(huge_line) - 1] = '\0';
+    assert(chunked_body_scan(huge_line, strlen(huge_line), MAX_BODY_SIZE, &decoded_len) == -1);
+
+    /* Oversized: the declared chunk size alone already exceeds the cap -
+     * rejected without needing that much data to actually arrive. */
+    const char *too_big = "A\r\n";
+    assert(chunked_body_scan(too_big, strlen(too_big), 5, &decoded_len) == -2);
+
+    /* Oversized: the *cumulative* decoded size across multiple confirmed
+     * chunks exceeds the cap, even though no single chunk alone does. */
+    const char *cumulative_too_big = "4\r\nWiki\r\n4\r\npedi\r\n0\r\n\r\n";
+    assert(chunked_body_scan(cumulative_too_big, strlen(cumulative_too_big), 6, &decoded_len) == -2);
+}
+
+static void test_chunked_body_decode(void) {
+    const char *two_chunks = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    char out[16] = { 0 };
+    size_t written = chunked_body_decode(two_chunks, strlen(two_chunks), out);
+    assert(written == 9);
+    assert(memcmp(out, "Wikipedia", 9) == 0);
+
+    /* Trailer headers are discarded, not appended to the decoded body. */
+    const char *with_trailer = "4\r\nWiki\r\n0\r\nExpires: never\r\n\r\n";
+    written = chunked_body_decode(with_trailer, strlen(with_trailer), out);
+    assert(written == 4);
+    assert(memcmp(out, "Wiki", 4) == 0);
+
+    /* Decoded chunk data can contain arbitrary bytes, including embedded
+     * NULs (e.g. a chunked binary upload) - the return value, not strlen(),
+     * is what callers must rely on. */
+    const char chunked_binary[] = "3\r\na\0b\r\n0\r\n\r\n";
+    written = chunked_body_decode(chunked_binary, sizeof(chunked_binary) - 1, out);
+    assert(written == 3);
+    assert(memcmp(out, "a\0b", 3) == 0);
+}
+
+static void test_request_is_complete_chunked(void) {
+    /* Complete chunked request. */
+    const char *complete = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
+    assert(request_is_complete(complete, strlen(complete)) == 1);
+
+    /* Incomplete: last-chunk terminator hasn't arrived yet. */
+    const char *incomplete = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n";
+    assert(request_is_complete(incomplete, strlen(incomplete)) == 0);
+
+    /* Malformed chunk framing stops buffering (like an invalid
+     * Content-Length does) so parse_http_request can reject it as a 400
+     * rather than waiting on bytes that will never form a valid body. */
+    const char *malformed = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nWiki\r\n0\r\n\r\n";
+    assert(request_is_complete(malformed, strlen(malformed)) == 1);
+
+    /* A non-chunked request with no matching Transfer-Encoding header still
+     * uses ordinary Content-Length-based completeness (regression guard for
+     * the branch added alongside chunked support). */
+    const char *plain = "POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\n12345";
+    assert(request_is_complete(plain, strlen(plain)) == 1);
+}
+
+static void test_parse_http_request_chunked(void) {
+    Request req;
+
+    /* Basic chunked POST, multiple chunks. */
+    const char *raw = "POST /echo HTTP/1.1\r\nHost: example.com\r\n"
+                       "Transfer-Encoding: chunked\r\n\r\n"
+                       "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    assert(parse_http_request(raw, strlen(raw), &req) == 0);
+    assert(strcmp(req.method, "POST") == 0);
+    assert(strcmp(req.path, "/echo") == 0);
+    assert(req.content_length == 9);
+    assert(strcmp(req.body, "Wikipedia") == 0);
+    free(req.body);
+
+    /* Trailer headers are accepted but not surfaced anywhere on Request. */
+    const char *with_trailer = "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                "4\r\nWiki\r\n0\r\nExpires: never\r\n\r\n";
+    assert(parse_http_request(with_trailer, strlen(with_trailer), &req) == 0);
+    assert(strcmp(req.body, "Wiki") == 0);
+    free(req.body);
+
+    /* A chunked body can contain embedded NUL bytes - the caller must rely
+     * on req.content_length, not strlen(req.body), same as the equivalent
+     * Content-Length case (see the binary-body case above). */
+    const char chunked_binary_head[] = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const char chunked_binary_body[] = "3\r\na\0b\r\n0\r\n\r\n";
+    char binary_raw[128];
+    size_t head_len = strlen(chunked_binary_head);
+    size_t body_len = sizeof(chunked_binary_body) - 1;
+    memcpy(binary_raw, chunked_binary_head, head_len);
+    memcpy(binary_raw + head_len, chunked_binary_body, body_len);
+    assert(parse_http_request(binary_raw, head_len + body_len, &req) == 0);
+    assert(req.content_length == 3);
+    assert(memcmp(req.body, "a\0b", 3) == 0);
+    free(req.body);
+
+    /* RFC 7230 3.3.3: Transfer-Encoding and Content-Length together is an
+     * ambiguous/smuggling-shaped message - rejected outright (400), not
+     * resolved by preferring one header over the other. */
+    const char *both_headers = "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+                                "Content-Length: 4\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
+    assert(parse_http_request(both_headers, strlen(both_headers), &req) == -1);
+    assert(req.body == NULL);
+
+    /* Malformed chunk framing fails the parse (-1), same status family a
+     * malformed Content-Length gets. */
+    const char *malformed = "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nWiki\r\n0\r\n\r\n";
+    assert(parse_http_request(malformed, strlen(malformed), &req) == -1);
+    assert(req.body == NULL);
+}
+
 static void test_status_text(void) {
     assert(strcmp(status_text(200), "OK") == 0);
     assert(strcmp(status_text(201), "Created") == 0);
@@ -504,6 +687,11 @@ int main(void) {
     test_request_is_complete();
     test_request_wants_close();
     test_parse_http_request();
+    test_request_has_chunked_encoding();
+    test_chunked_body_scan();
+    test_chunked_body_decode();
+    test_request_is_complete_chunked();
+    test_parse_http_request_chunked();
     test_status_text();
     test_url_decode();
     test_parse_headers();

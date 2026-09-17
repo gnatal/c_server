@@ -53,9 +53,12 @@ different design, not just a bigger buffer:
    register a chunk callback before the body starts arriving.
 2. **`Transfer-Encoding: chunked` support.** Streaming is far more useful when the
    client doesn't have to know the body's length upfront (that's the whole point of
-   chunked encoding) — right now this server has no chunked-decoding logic at all
-   (`pending.txt`, section 3). True streaming without chunked support only helps
-   when `Content-Length` is already known, which is a narrower win.
+   chunked encoding) — this server can now decode a chunked body (`lib/CLAUDE.md`,
+   "Chunked Transfer-Encoding"), but only in the same *buffer-then-call-the-handler*
+   shape `Content-Length` bodies already get: `chunked_body_scan` waits for the
+   whole thing to arrive before `chunked_body_decode` ever runs. True incremental
+   streaming would still mean handing chunks to a handler as each one completes,
+   rather than after the terminating `0\r\n\r\n`.
 3. **Event-loop changes.** `handle_readable` currently treats "a complete request
    arrived" as the one moment it hands control to routing/dispatch. Streaming means
    dispatch has to happen *before* the body finishes arriving, and subsequent
@@ -73,3 +76,59 @@ and only pays for itself once there's an actual use case (large uploads, proxyin
 that the current buffered-body approach can't serve. Worth doing if this project
 ever needs to handle uploads or streaming proxying; not worth doing preemptively for
 JSON API routes, which are what this server is built around today.
+
+## HTTP/1.1 only — no HTTP/2 or HTTP/3
+
+**What this server does today:** CExpress speaks plaintext HTTP/1.1 exclusively.
+`parse_http_request` (`lib/http_parser.c`) expects a textual request line
+(`sscanf("%s %s %s", method, path, version)`), the connection model is one request
+handled at a time per TCP connection (`handle_readable` buffers until a single
+request is complete, dispatches it, then waits for the next one), and there's no
+TLS at all yet (`pending.txt`, section 6). That last point matters more than it
+might seem: in real-world deployments, HTTP/2 is negotiated via ALPN *inside the
+TLS handshake* — browsers essentially never speak HTTP/2 over a cleartext
+connection (the `h2c` cleartext-upgrade path exists in the spec but was dropped by
+every major browser), so this server is missing the prerequisite for HTTP/2 before
+even getting to HTTP/2 itself.
+
+**Why this isn't "a bigger/different parser" the way chunked encoding was:**
+Chunked-encoding support (above) slotted into the existing model because HTTP/1.1
+framing stayed textual and one-request-at-a-time. HTTP/2 changes the framing to a
+binary, length-prefixed frame format (`HEADERS`, `DATA`, `SETTINGS`, ...), compresses
+headers with a stateful codec (HPACK — headers can reference and update a shared
+dynamic table across the connection, so frames can't be parsed independently of
+prior ones), and multiplexes many logical *streams* concurrently over one TCP
+connection with flow control and stream-priority semantics. That last part is a
+superset of the "true streaming" redesign described earlier in this file: instead
+of one in-flight body per connection, `handle_readable`'s state machine would need
+to track many concurrent partial reads/writes per connection, each belonging to a
+different logical request, all sharing one socket buffer.
+
+HTTP/3 is a bigger jump still: it runs over **QUIC, which is UDP-based, not TCP**.
+`connection.c` is built entirely around `socket(AF_INET, SOCK_STREAM, ...)` and a
+kqueue loop watching TCP-oriented `EVFILT_READ`/`EVFILT_WRITE` events per
+connection fd — HTTP/3 support wouldn't extend that loop, it would mean standing up
+an entirely separate UDP/QUIC transport stack alongside it (QUIC's own connection
+IDs, stream multiplexing, loss recovery/congestion control, and TLS 1.3 baked
+directly into the QUIC handshake — QUIC has no cleartext mode at all, unlike
+HTTP/1.1 or even `h2c`).
+
+**What real support would require, roughly:**
+1. **TLS termination first** (`pending.txt`, section 6) — a prerequisite for HTTP/2
+   in practice, not an independent gap to schedule alongside it.
+2. **HTTP/2:** a binary frame reader/writer, an HPACK encoder/decoder (stateful,
+   security-sensitive — HPACK implementation bugs have caused real CVEs elsewhere),
+   and a per-connection multiplexed-stream state machine replacing the current
+   one-request-at-a-time model in `handle_readable`/`dispatch`.
+3. **HTTP/3:** a QUIC implementation (almost certainly a third-party library, not
+   something to hand-roll — QUIC's loss recovery and congestion control alone are
+   substantial) plus a parallel UDP-based accept/read/write loop that the existing
+   kqueue-over-TCP code has no natural extension point for.
+
+**Verdict:** out of scope for now, and bigger in scope than the streaming-body
+redesign above — it touches the transport layer, connection state machine, and
+adds an entire security-sensitive compression codec (HTTP/2), or an entirely
+separate protocol stack (HTTP/3). TLS and true request/response streaming are
+smaller, more self-contained wins that would need to land first regardless; this is
+worth revisiting only if CExpress's ambitions grow well past "Express-like
+developer experience in C" toward being a general-purpose production web server.

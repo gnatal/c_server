@@ -140,4 +140,54 @@ const char *req_get_cookie(const Request *req, const char *name);
 
 const char *status_text(int status);
 
+/*
+ * Pure: true when header_block's "Transfer-Encoding" header value contains
+ * "chunked" (case-insensitive), scoped to just that header's own line (a
+ * bounded stack copy, not scanned past it) so a "chunked" appearing
+ * elsewhere - another header's value, or body bytes, when header_block is
+ * actually the whole raw connection buffer - can't cause a false match.
+ * Called both on the raw connection buffer, before headers are even sliced
+ * out of it (request_is_complete), and on the already-isolated req->headers
+ * block (parse_http_request) - the same dual-use pattern
+ * extract_content_length already follows.
+ */
+int request_has_chunked_encoding(const char *header_block);
+
+/*
+ * Pure scan of a Transfer-Encoding: chunked request body (RFC 7230 4.1)
+ * starting at body_start: walks "<hex-size>[;ext]\r\n<data>\r\n" chunks, up
+ * to available bytes, until a 0-size last-chunk plus its trailer-part and
+ * terminating CRLF is found. Never allocates or copies chunk data itself -
+ * chunked_body_decode does that once this reports the body complete - it
+ * only verifies chunk framing and tracks the running decoded size in
+ * *decoded_len_out, so a caller can reject an oversized body
+ * (max_decoded_len, e.g. MAX_BODY_SIZE) as soon as the chunk-size lines
+ * declare more than that, without needing that much actual data to have
+ * arrived first (mirrors extract_content_length's early rejection of a
+ * too-large declared Content-Length).
+ *
+ * Returns:
+ *   1  - fully received; *decoded_len_out is the total decoded body size.
+ *   0  - not yet complete (need more bytes); *decoded_len_out is the
+ *        decoded size of whole chunks confirmed so far.
+ *  -1  - malformed chunk framing (non-hex chunk-size, a chunk's data not
+ *        followed by its own CRLF, or a chunk-size line longer than
+ *        MAX_CHUNK_SIZE_LINE_LEN can legitimately be).
+ *  -2  - the running decoded size already exceeds max_decoded_len.
+ */
+int chunked_body_scan(const char *body_start, size_t available, size_t max_decoded_len, size_t *decoded_len_out);
+
+/*
+ * Pure: decodes a complete chunked body into out - a caller-owned buffer of
+ * at least the decoded_len_out chunked_body_scan reported for this exact
+ * body_start/available. The caller must have already gotten a 1 back from
+ * chunked_body_scan on this same input; this does not re-validate framing,
+ * same contract as parse_multipart_body trusting a prior successful
+ * multipart_parse_boundary call. Returns the number of bytes written -
+ * decoded chunk data can contain arbitrary bytes, including embedded NULs,
+ * so callers must use this return value, never strlen(out), the same
+ * convention multipart/urlencoded body parsing already follow.
+ */
+size_t chunked_body_decode(const char *body_start, size_t available, char *out);
+
 #endif /* HTTP_PARSER_H */

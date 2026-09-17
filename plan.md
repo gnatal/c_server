@@ -8,7 +8,7 @@ correctness, banned unsafe functions, tests required, nested CLAUDE.md updates,
 
 | # | Task | Section | Complexity | Est. time | Est. tokens | Notes |
 |---|------|---------|------------|-----------|-------------|-------|
-| 1 | Chunked `Transfer-Encoding` support (request body dechunking) | 3 / 6 (listed twice) | Medium-High | 1–1.5 hr | ~40k–70k | New pure parser (chunk-size lines, trailers, terminating `0\r\n\r\n`), wire into `http_parser.c`/`connection.c` buffering, reject malformed chunks safely, tests + `lib/CLAUDE.md` update. |
+| 1 | ~~Chunked `Transfer-Encoding` support (request body dechunking)~~ | 3 / 6 (listed twice) | Medium-High | 1–1.5 hr | ~40k–70k | **Done.** New pure parser (chunk-size lines, trailers, terminating `0\r\n\r\n`), wired into `http_parser.c`/`connection.c` buffering, rejects malformed/oversized chunks and the Transfer-Encoding+Content-Length smuggling shape (400), tests + `lib/CLAUDE.md` updated. |
 | 2 | Streaming / chunked **response** support | 4 | High | 2–4 hr | ~80k–150k | Currently `Handler` is fully synchronous and materializes the whole body. True streaming needs an incremental write API and touches `response.c`, `connection.c` event loop, and likely the `Handler` signature — largest scope item outside concurrency work. |
 | 3 | Static file serving | 4 | Medium | 1–2 hr | ~50k–90k | New module: safe path resolution (no traversal outside root), deny-by-default, MIME-type table, file read + send. Should reuse existing 403/404 conventions. |
 | 4 | `res_redirect()` helper | 4 | Low | 15–30 min | ~8k–15k | Small helper: set `Location` header + 3xx status via existing `res_set_header`/status machinery. Straightforward, low risk. |
@@ -29,9 +29,9 @@ correctness, banned unsafe functions, tests required, nested CLAUDE.md updates,
   respect the 1,000-line file cap and keep changes reviewable.
 
 ## Suggested order (per `pending.txt` + this estimate)
-1. Cleanup: fix the stale "no cookie helper" line in `pending.txt` (#5).
-2. Quick wins: `res_redirect`, expanded `status_text()` (#4, #6).
-3. Chunked request support (#1) — needed before real interop with many HTTP clients.
+1. ~~Cleanup: fix the stale "no cookie helper" line in `pending.txt` (#5).~~ Done.
+2. ~~Quick wins: `res_redirect`, expanded `status_text()` (#4, #6).~~ Done.
+3. ~~Chunked request support (#1) — needed before real interop with many HTTP clients.~~ Done.
 4. Static file serving (#3) and connection-table refactor (#9) — independent, medium-sized.
 5. Graceful shutdown (#10) — moderate, improves operability before tackling concurrency.
 6. Design spikes for the big three: streaming responses (#2), TLS (#11), and

@@ -328,6 +328,179 @@ static void test_handle_readable_body_too_large_413(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+static void test_handle_readable_chunked_round_trip(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_post(&app, "/upload", echo_len_handler);
+
+    const char *head = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    handle_readable(&app, conn);
+    assert(app.connections[fds[0]] == conn);
+
+    /* Two chunks streamed in separately, like a real socket would deliver
+     * them, decoding to "Hello World" (11 bytes). */
+    const char *chunk1 = "5\r\nHello\r\n";
+    const char *chunk2 = "6\r\n World\r\n";
+    const char *last_chunk = "0\r\n\r\n";
+    assert(write(fds[1], chunk1, strlen(chunk1)) == (ssize_t)strlen(chunk1));
+    handle_readable(&app, conn);
+    assert(write(fds[1], chunk2, strlen(chunk2)) == (ssize_t)strlen(chunk2));
+    handle_readable(&app, conn);
+    assert(write(fds[1], last_chunk, strlen(last_chunk)) == (ssize_t)strlen(last_chunk));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(resp, "received 11 bytes") != NULL);
+
+    /* Keep-alive connection stays open, same as any other HTTP/1.1 request. */
+    assert(app.connections[fds[0]] == conn);
+    assert(conn->keep_alive == 1);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+static void test_handle_readable_chunked_grows_buffer(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_post(&app, "/upload", echo_len_handler);
+
+    const char *head = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    handle_readable(&app, conn);
+    assert(conn->in_cap == BUF_SIZE);
+
+    /* Total decoded size well beyond BUF_SIZE (8192) with no Content-Length
+     * to jump straight to an exact target - forces handle_readable to grow
+     * conn->in_buf geometrically instead (see lib/CLAUDE.md, "Chunked
+     * Transfer-Encoding"), unlike the Content-Length path exercised by
+     * test_handle_readable_large_body_grows_buffer above. */
+    const size_t chunk_payload_len = 4000;
+    const int num_chunks = 5;
+    char *payload = malloc(chunk_payload_len);
+    assert(payload != NULL);
+    memset(payload, 'x', chunk_payload_len);
+
+    int saw_growth = 0;
+    for (int i = 0; i < num_chunks; i++) {
+        char chunk_head[32];
+        snprintf(chunk_head, sizeof(chunk_head), "%zx\r\n", chunk_payload_len);
+        assert(write(fds[1], chunk_head, strlen(chunk_head)) == (ssize_t)strlen(chunk_head));
+        handle_readable(&app, conn);
+        assert(write(fds[1], payload, chunk_payload_len) == (ssize_t)chunk_payload_len);
+        handle_readable(&app, conn);
+        assert(write(fds[1], "\r\n", 2) == 2);
+        handle_readable(&app, conn);
+        if (conn->in_cap > BUF_SIZE) {
+            saw_growth = 1;
+        }
+    }
+    assert(write(fds[1], "0\r\n\r\n", 5) == 5);
+    handle_readable(&app, conn);
+    assert(saw_growth);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    char expected[64];
+    snprintf(expected, sizeof(expected), "received %d bytes", (int)(chunk_payload_len * (size_t)num_chunks));
+    assert(strstr(resp, expected) != NULL);
+
+    /* Keep-alive connection stays open, and in_buf was shrunk back down to
+     * BUF_SIZE now that it's idle again (flush_connection). */
+    assert(app.connections[fds[0]] == conn);
+    assert(conn->in_cap == BUF_SIZE);
+
+    free(payload);
+    teardown_test_connection(&app, fds, conn);
+}
+
+static void test_handle_readable_chunked_too_large_413(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    const char *head = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    handle_readable(&app, conn);
+    assert(app.connections[fds[0]] == conn);
+
+    /* The declared chunk size alone already exceeds MAX_BODY_SIZE - rejected
+     * immediately, without needing to actually send that much chunk data
+     * (see lib/CLAUDE.md, "Chunked Transfer-Encoding", and the analogous
+     * Content-Length case in test_handle_readable_body_too_large_413 above). */
+    char chunk_head[32];
+    snprintf(chunk_head, sizeof(chunk_head), "%x\r\n", MAX_BODY_SIZE + 1);
+    assert(write(fds[1], chunk_head, strlen(chunk_head)) == (ssize_t)strlen(chunk_head));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 413 Payload Too Large") != NULL);
+    assert(app.connections[fds[0]] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+static void test_handle_readable_chunked_malformed_400(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    const char *raw = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nWiki\r\n0\r\n\r\n";
+    assert(write(fds[1], raw, strlen(raw)) == (ssize_t)strlen(raw));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 400 Bad Request") != NULL);
+    assert(app.connections[fds[0]] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+static void test_handle_readable_chunked_and_content_length_400(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    /* RFC 7230 3.3.3: Transfer-Encoding + Content-Length together is
+     * ambiguous/smuggling-shaped and rejected outright - see lib/CLAUDE.md,
+     * "Chunked Transfer-Encoding". */
+    const char *raw = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+                       "Content-Length: 4\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
+    assert(write(fds[1], raw, strlen(raw)) == (ssize_t)strlen(raw));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 400 Bad Request") != NULL);
+    assert(app.connections[fds[0]] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_path_too_long_414(void) {
     App app;
     int fds[2];
@@ -549,6 +722,11 @@ int main(void) {
     test_handle_readable_header_overflow_431();
     test_handle_readable_large_body_grows_buffer();
     test_handle_readable_body_too_large_413();
+    test_handle_readable_chunked_round_trip();
+    test_handle_readable_chunked_grows_buffer();
+    test_handle_readable_chunked_too_large_413();
+    test_handle_readable_chunked_malformed_400();
+    test_handle_readable_chunked_and_content_length_400();
     test_handle_readable_path_too_long_414();
     test_handle_readable_connection_close();
     test_close_idle_connections_closes_stale_keep_alive();

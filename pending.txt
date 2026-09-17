@@ -219,7 +219,27 @@ Gaps vs. an Express-like C framework
   (was the slowloris-shaped gap noted below). This guard is specifically about
   headers now (see the buffer-decoupling entry above) - a body that's merely large
   (but within MAX_BODY_SIZE) no longer hits this at all, it grows the buffer instead.
-- No chunked transfer-encoding
+- [DONE] Chunked transfer-encoding: request_has_chunked_encoding,
+  chunked_body_scan, and chunked_body_decode (lib/http_parser.c/h) parse a
+  Transfer-Encoding: chunked request body - request_is_complete stops
+  buffering once chunked_body_scan reports the body fully received (or
+  rejects it as malformed/oversized), and parse_http_request decodes it into
+  req->body (req->content_length set to the *decoded* size) via the same
+  code path a Content-Length body uses downstream. A Content-Length header
+  present alongside Transfer-Encoding: chunked is rejected outright (400,
+  RFC 7230 3.3.3 - an ambiguous/smuggling-shaped combination, not resolved by
+  preferring one header). connection.c's buffer-growth logic grows
+  geometrically (doubling, capped at header_len + MAX_BODY_SIZE) instead of
+  jumping to an exact target, since a chunked body has no single declared
+  size to grow straight to. See lib/CLAUDE.md ("Chunked Transfer-Encoding"),
+  tests/test_http_parser.c (test_request_has_chunked_encoding,
+  test_chunked_body_scan, test_chunked_body_decode,
+  test_request_is_complete_chunked, test_parse_http_request_chunked), and
+  tests/test_connection.c (test_handle_readable_chunked_round_trip,
+  test_handle_readable_chunked_grows_buffer,
+  test_handle_readable_chunked_too_large_413,
+  test_handle_readable_chunked_malformed_400,
+  test_handle_readable_chunked_and_content_length_400).
 - [DONE] multipart/form-data: the new pure multipart_parse_boundary(content_type,
   boundary_out, size) and parse_multipart_body(body, body_len, boundary, form)
   (lib/multipart.c/h) parse a multipart/form-data Request.body into a
@@ -330,7 +350,10 @@ Gaps vs. an Express-like C framework
   malformed (negative) Content-Length returns 400, and a well-formed Content-Length
   beyond the new MAX_BODY_SIZE cap (1 MiB, decoupled from BUF_SIZE) returns 413
   (see section 3)
-- No Transfer-Encoding awareness (chunked bodies aren't supported at all yet)
+- [DONE] Transfer-Encoding awareness: chunked bodies are now supported (see
+  section 3's chunked transfer-encoding entry above), including the security-
+  relevant edge case (Transfer-Encoding + Content-Length together is
+  rejected outright as a smuggling-shaped ambiguity, RFC 7230 3.3.3).
 
 7. Testing & DX
 - [DONE] Comprehensive test binaries across all engine components (run via `make test`):

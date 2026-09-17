@@ -32,6 +32,16 @@
  * rejected by multipart_parse_boundary rather than truncated. */
 #define MAX_BOUNDARY_LEN 71
 
+/* Generous upper bound on one "<hex-size>[;ext]" chunk-size line's length in
+ * a Transfer-Encoding: chunked request body (lib/http_parser.h:
+ * chunked_body_scan/chunked_body_decode) - comfortably fits any legitimate
+ * hex chunk size (MAX_BODY_SIZE itself is nowhere near this many hex
+ * digits) plus a chunk extension, while still being small enough that a
+ * line this long with no CRLF terminator in sight is clearly malformed
+ * rather than just "still arriving" (mirrors BUF_SIZE's role for the main
+ * header block, at a much smaller scale appropriate to one framing line). */
+#define MAX_CHUNK_SIZE_LINE_LEN 64
+
 /*
  * Hard ceiling on a request body's size (Content-Length), independent of and
  * much larger than BUF_SIZE - BUF_SIZE now only bounds the headers (see
