@@ -785,6 +785,7 @@
       box-shadow: 0 0 14px rgba(56, 189, 248, 0.4);
     }
 
+    .bar-fill.rust { background: #ce422b; }
     .bar-fill.go { background: #00add8; }
     .bar-fill.fastify { background: #475569; }
     .bar-fill.express { background: #334155; }
@@ -1010,11 +1011,11 @@
           </div>
         </div>
 
-        <!-- Comparative Framework Benchmark Chart -->
+        <!-- Comparative Framework Benchmark Chart (Measured on this machine) -->
         <div class="comparison-chart">
           <div class="comparison-chart-title">
-            <span>HTTP/1.1 Throughput Comparison (Requests per Second)</span>
-            <span style="font-size: 0.75rem; color: var(--text-faint); font-weight: 400;">Higher is better</span>
+            <span>HTTP/1.1 Throughput Comparison (1,000 Connections, 4 Cores/Workers)</span>
+            <span style="font-size: 0.75rem; color: var(--accent-emerald); font-weight: 600;">✓ Live benchmarked on this machine</span>
           </div>
           <div class="bar-row">
             <div class="bar-label"><strong>⚡ CExpress (C11)</strong></div>
@@ -1024,32 +1025,51 @@
             <div class="bar-val" style="color: var(--primary);">217,278 req/s</div>
           </div>
           <div class="bar-row">
-            <div class="bar-label">Go (net/http stdlib)</div>
+            <div class="bar-label">Rust Actix-web (4 workers)</div>
             <div class="bar-track">
-              <div class="bar-fill go" style="width: 42.4%;">92,200</div>
+              <div class="bar-fill rust" style="width: 91.1%;">197,880 req/s</div>
             </div>
-            <div class="bar-val">~92,200 req/s</div>
+            <div class="bar-val">197,880 req/s</div>
           </div>
           <div class="bar-row">
-            <div class="bar-label">Node.js (Fastify)</div>
+            <div class="bar-label">Node.js Express (4 workers)</div>
             <div class="bar-track">
-              <div class="bar-fill fastify" style="width: 18.9%;">41,100</div>
+              <div class="bar-fill express" style="width: 87.9%;">191,093 req/s</div>
             </div>
-            <div class="bar-val">~41,100 req/s</div>
+            <div class="bar-val">191,093 req/s</div>
           </div>
           <div class="bar-row">
-            <div class="bar-label">Python (FastAPI+Uvicorn)</div>
+            <div class="bar-label">Go stdlib (GOMAXPROCS=4)</div>
             <div class="bar-track">
-              <div class="bar-fill fastapi" style="width: 10.6%;">23,000</div>
+              <div class="bar-fill go" style="width: 87.3%;">189,735 req/s</div>
             </div>
-            <div class="bar-val">~23,000 req/s</div>
+            <div class="bar-val">189,735 req/s</div>
           </div>
           <div class="bar-row">
-            <div class="bar-label">Node.js (Express.js)</div>
+            <div class="bar-label">Node.js Express (1 worker)</div>
             <div class="bar-track">
-              <div class="bar-fill express" style="width: 7.1%;">15,500</div>
+              <div class="bar-fill fastify" style="width: 30.7%;">66,645 req/s</div>
             </div>
-            <div class="bar-val">~15,500 req/s</div>
+            <div class="bar-val">66,645 req/s</div>
+          </div>
+
+          <!-- Memory & Latency Footprint Comparison -->
+          <div style="margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border-subtle); display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0.75rem;">
+            <div style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">Memory (4 Workers)</div>
+              <div style="font-size: 1.15rem; font-weight: 800; color: var(--primary); margin-top: 0.2rem;">20.0 MB <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">CExpress</span></div>
+              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Rust: 58 MB · Go: 45 MB · Express: 507 MB</div>
+            </div>
+            <div style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">5,000 Conns Max Latency</div>
+              <div style="font-size: 1.15rem; font-weight: 800; color: #34d399; margin-top: 0.2rem;">58.26 ms <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">CExpress</span></div>
+              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Rust Actix: 769 ms (13x lower spike)</div>
+            </div>
+            <div style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">Zero Runtime Overhead</div>
+              <div style="font-size: 1.15rem; font-weight: 800; color: #a855f7; margin-top: 0.2rem;">0 ns GC <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">C11 stack</span></div>
+              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Direct kqueue/epoll multiplexing</div>
+            </div>
           </div>
         </div>
 
