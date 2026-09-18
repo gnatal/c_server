@@ -10,7 +10,7 @@
  * policy before the engine's own cap would apply - an app wanting a
  * tighter app-specific limit can still lower this independently of
  * MAX_BODY_SIZE. A body between this and MAX_BODY_SIZE is still fully
- * received by the engine (lib/CLAUDE.md, "Body buffering") before this
+ * received by the engine (lib/CLAUDE.md, "Behavior reference, Buffers") before this
  * middleware ever gets a chance to reject it - to reject earlier, cheaper,
  * this would need to be an engine-level policy rather than app middleware. */
 #define MAX_APP_BODY_SIZE MAX_BODY_SIZE

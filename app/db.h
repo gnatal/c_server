@@ -27,7 +27,7 @@ void db_close(void);
  *
  * Intended to be registered via app_on_worker_start(app, db_worker_init)
  * (lib/connection.h) rather than called directly - see lib/CLAUDE.md
- * ("Worker lifecycle hooks") for why: lib/cluster.c may fork() worker
+ * ("Behavior reference, Workers and fork") for why: lib/cluster.c may fork() worker
  * processes after main() runs, and SQLite connections are not safe to share
  * across a fork (documented locking-corruption risk). db_open validates and
  * migrates the schema once in the original process and closes its

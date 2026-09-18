@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "app_types.h"
 #include "router.h"
@@ -534,7 +535,72 @@ static void test_match_route_explicit_head_wins_over_get_fallback(void) {
     assert(strcmp(matched->method, "HEAD") == 0);
 }
 
+static void test_match_path_without_request_captures_nothing(void) {
+    /* req == NULL means "just tell me if it matches" (used by match_route_allowed_methods). */
+    assert(match_path("/users/:id", "/users/5", NULL) == 1);
+    assert(match_path("/users/:id", "/users", NULL) == 0);
+    assert(match_path("/files/*", "/files/a/b/c", NULL) == 1);
+    assert(match_path("/a/*/c", "/a/b/c", NULL) == 1);
+    assert(match_path("/a/*/c", "/a/b/x", NULL) == 0);
+}
+
+static void test_match_path_segments_and_truncation(void) {
+    Request req;
+    memset(&req, 0xA5, sizeof(req)); /* garbage: match_path must terminate everything it writes */
+
+    /* Empty segments are ignored on both sides, like a tokenizer would. */
+    assert(match_path("//users//:id/", "/users/9//", &req) == 1);
+    assert(req.param_count == 1);
+    assert(strcmp(req.param_names[0], "id") == 0);
+    assert(strcmp(req_get_param(&req, "id"), "9") == 0);
+
+    /* Root pattern matches only the root. */
+    assert(match_path("/", "/", &req) == 1);
+    assert(match_path("/", "", &req) == 1);
+    assert(match_path("/", "/x", &req) == 0);
+    assert(req.param_count == 0);
+
+    /* A path segment longer than a param slot is truncated and NUL-terminated. */
+    char long_path[200] = "/users/";
+    memset(long_path + 7, 'z', 150);
+    long_path[157] = '\0';
+    assert(match_path("/users/:id", long_path, &req) == 1);
+    assert(strlen(req.param_values[0]) == sizeof(req.param_values[0]) - 1);
+
+    /* A literal must match whole segments, not prefixes. */
+    assert(match_path("/api", "/apiary", &req) == 0);
+    assert(match_path("/apiary", "/api", &req) == 0);
+    assert(match_path("/a/b", "/a/bc", &req) == 0);
+
+    /* A failed match after a capture leaves param_count for the next attempt to reset. */
+    assert(match_path("/u/:id/x", "/u/1/y", &req) == 0);
+    assert(match_path("/u/:id/y", "/u/1/y", &req) == 1);
+    assert(req.param_count == 1);
+}
+
+static void test_allowed_methods_does_not_touch_request(void) {
+    App app;
+    app_init(&app);
+    app_get(&app, "/users/:id", dummy_handler_a);
+    app_put(&app, "/users/:id", dummy_handler_b);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "DELETE", sizeof(req.method) - 1);
+    strncpy(req.path, "/users/5", sizeof(req.path) - 1);
+    req.param_count = 0;
+
+    char allowed[64];
+    assert(match_route_allowed_methods(&app, &req, allowed, sizeof(allowed)) == 2);
+    assert(strcmp(allowed, "GET, PUT") == 0);
+    assert(req.param_count == 0); /* no scratch capture leaked into the caller's request */
+    free(app.connections); /* app_init's table; app_destroy lives in connection.c, not linked here */
+}
+
 int main(void) {
+    test_match_path_without_request_captures_nothing();
+    test_match_path_segments_and_truncation();
+    test_allowed_methods_does_not_touch_request();
     test_match_path_exact_literals();
     test_match_path_params();
     test_match_path_max_params();

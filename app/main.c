@@ -2,6 +2,7 @@
 #include "handlers.h"
 #include "middlewares.h"
 #include "db.h"
+#include "ping.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +51,7 @@ int main(void) {
    * schema migration once, in this (pre-fork) process, then closes again -
    * app_on_worker_start registers db_worker_init to open this app's actual,
    * per-process connection later, always after any cluster fork has
-   * happened. See lib/CLAUDE.md ("Worker lifecycle hooks") and
+   * happened. See lib/CLAUDE.md ("Behavior reference, Workers and fork") and
    * app/CLAUDE.md for why this two-step dance is necessary. */
   const char *db_path_env = getenv("TODO_DB_PATH");
   const char *db_path = (db_path_env != NULL && db_path_env[0] != '\0') ? db_path_env : "todos.db";
@@ -71,6 +72,9 @@ int main(void) {
   /* Todo UI: a single self-contained static page, served directly (not
    * through the /static mount below) via res_send_file. */
   app_get(&app, "/", handler_home);
+
+  /* Connection stress-test target: no database, no JSON (see scripts/stress_test.sh). */
+  app_get(&app, "/ping", handler_ping);
 
   /* Generic static-file-serving demo (lib/router.h: app_serve_static),
    * unrelated to the Todo UI above - serves whatever's in app/public/

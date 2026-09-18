@@ -17,6 +17,39 @@
  */
 #define RESPONSE_HEADER_BUF_SIZE 8192
 
+/*
+ * Header/cookie text is written into the response verbatim, and handlers routinely pass request data
+ * (req_get_query decodes %0d%0a into CR LF). Any control character would let a client inject headers or
+ * a second response (HTTP response splitting), so such text is refused here rather than trusted to callers.
+ * Bytes >= 0x80 (UTF-8) pass. HTAB is allowed in values only. `extra_forbidden` adds delimiter characters.
+ */
+static int text_is_safe(const char *text, const int allow_htab, const char *extra_forbidden) {
+    for (const unsigned char *c = (const unsigned char *)text; *c != '\0'; c++) {
+        if ((*c < 0x20 && !(allow_htab && *c == '\t')) || *c == 0x7f) {
+            return 0;
+        }
+        if (extra_forbidden != NULL && strchr(extra_forbidden, *c) != NULL) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void res_init(Response *res, Connection *conn) {
+    /* Only the scalars and *_count fields are initialized: the header/cookie/
+     * trailer arrays are never read past their count, so zeroing the whole
+     * ~16 KB struct per request would be wasted work. */
+    res->conn = conn;
+    res->status = 200;
+    res->header_count = 0;
+    res->set_cookie_count = 0;
+    res->trailer_count = 0;
+    res->is_head_request = 0;
+    res->is_chunked = 0;
+    res->headers_sent = 0;
+    res->stream_ended = 0;
+}
+
 void res_status(Response *res, int status) {
     res->status = status;
 }
@@ -24,6 +57,11 @@ void res_status(Response *res, int status) {
 void res_set_header(Response *res, const char *name, const char *value) {
     if (strcasecmp(name, "Content-Length") == 0 || strcasecmp(name, "Connection") == 0) {
         fprintf(stderr, "res_set_header: \"%s\" is managed by the response layer and cannot be overridden\n", name);
+        return;
+    }
+
+    if (name[0] == '\0' || !text_is_safe(name, 0, ":") || !text_is_safe(value, 1, NULL)) {
+        fprintf(stderr, "res_set_header: header \"%s\" has an empty name or a control character, dropped\n", name);
         return;
     }
 
@@ -56,102 +94,136 @@ static const char *find_header(const Response *res, const char *name) {
     return NULL;
 }
 
-static void send_with_content_type(Response *res, const char *content_type, const char *body, size_t body_len) {
-    char header[RESPONSE_HEADER_BUF_SIZE];
-    Connection *conn = res->conn;
+/* ---- response head assembly: bounded appends into a caller-owned buffer ---- */
 
-    /* A custom Content-Type (set via res_set_header) takes priority over
-     * res_send/res_json's default, and must not be emitted twice below. */
+/* Appends n bytes at *off; -1 (and no write) if they would not fit in cap. */
+static int put_bytes(char *buf, const size_t cap, size_t *off, const char *s, const size_t n) {
+    if (n > cap - *off) {
+        return -1;
+    }
+    memcpy(buf + *off, s, n);
+    *off += n;
+    return 0;
+}
+
+static int put_str(char *buf, const size_t cap, size_t *off, const char *s) {
+    return put_bytes(buf, cap, off, s, strlen(s));
+}
+
+static int put_uint(char *buf, const size_t cap, size_t *off, size_t value) {
+    char digits[24];
+    size_t i = sizeof(digits);
+    do {
+        digits[--i] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    return put_bytes(buf, cap, off, digits + i, sizeof(digits) - i);
+}
+
+/*
+ * Writes "HTTP/1.1 <status> <reason>\r\nContent-Type: ..\r\n" + framing header
+ * (Content-Length, or Transfer-Encoding: chunked when body_len == CHUNKED_BODY)
+ * + "Connection: ..\r\n" + custom headers + Set-Cookie lines + (Trailer: names)
+ * + blank line into buf. Returns the head length, or 0 if it does not fit.
+ * A custom Content-Type (res_set_header) replaces `content_type` and is emitted once.
+ */
+#define CHUNKED_BODY ((size_t)-1)
+
+static size_t build_response_head(const Response *res, const char *content_type, const size_t body_len,
+                                  char *buf, const size_t cap) {
+    size_t off = 0;
     const char *custom_content_type = find_header(res, "Content-Type");
     if (custom_content_type != NULL) {
         content_type = custom_content_type;
     }
 
-    int n = snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: %s\r\n",
-        res->status, status_text(res->status), content_type, body_len,
-        conn->keep_alive ? "keep-alive" : "close");
+    int bad = put_str(buf, cap, &off, "HTTP/1.1 ");
+    bad |= put_uint(buf, cap, &off, (size_t)res->status);
+    bad |= put_str(buf, cap, &off, " ");
+    bad |= put_str(buf, cap, &off, status_text(res->status));
+    bad |= put_str(buf, cap, &off, "\r\nContent-Type: ");
+    bad |= put_str(buf, cap, &off, content_type);
+    if (body_len == CHUNKED_BODY) {
+        bad |= put_str(buf, cap, &off, "\r\nTransfer-Encoding: chunked");
+    } else {
+        bad |= put_str(buf, cap, &off, "\r\nContent-Length: ");
+        bad |= put_uint(buf, cap, &off, body_len);
+    }
+    bad |= put_str(buf, cap, &off, res->conn->keep_alive ? "\r\nConnection: keep-alive\r\n" : "\r\nConnection: close\r\n");
 
-    int overflow = (n < 0 || (size_t)n >= sizeof(header));
-    size_t offset = overflow ? sizeof(header) : (size_t)n;
-
-    for (int i = 0; i < res->header_count && !overflow; i++) {
-        if (strcasecmp(res->headers[i].name, "Content-Type") == 0) {
+    for (int i = 0; i < res->header_count && !bad; i++) {
+        const char *name = res->headers[i].name;
+        if (strcasecmp(name, "Content-Type") == 0 ||
+            (body_len == CHUNKED_BODY && (strcasecmp(name, "Transfer-Encoding") == 0 ||
+                                          strcasecmp(name, "Content-Length") == 0 ||
+                                          strcasecmp(name, "Connection") == 0))) {
             continue;
         }
-        n = snprintf(header + offset, sizeof(header) - offset,
-            "%s: %s\r\n", res->headers[i].name, res->headers[i].value);
-        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
-            overflow = 1;
-        } else {
-            offset += (size_t)n;
+        bad |= put_str(buf, cap, &off, name);
+        bad |= put_str(buf, cap, &off, ": ");
+        bad |= put_str(buf, cap, &off, res->headers[i].value);
+        bad |= put_str(buf, cap, &off, "\r\n");
+    }
+
+    /* One Set-Cookie line per res_set_cookie call: never deduplicated by name. */
+    for (int i = 0; i < res->set_cookie_count && !bad; i++) {
+        bad |= put_str(buf, cap, &off, "Set-Cookie: ");
+        bad |= put_str(buf, cap, &off, res->set_cookies[i]);
+        bad |= put_str(buf, cap, &off, "\r\n");
+    }
+
+    if (body_len == CHUNKED_BODY && res->trailer_count > 0 && !bad) {
+        bad |= put_str(buf, cap, &off, "Trailer: ");
+        for (int i = 0; i < res->trailer_count && !bad; i++) {
+            bad |= put_str(buf, cap, &off, res->trailers[i].name);
+            bad |= put_str(buf, cap, &off, (i + 1 < res->trailer_count) ? ", " : "\r\n");
         }
     }
 
-    /* One "Set-Cookie: ..." line per res_set_cookie() call - unlike the
-     * headers[] loop above, this never overwrites/dedupes by name (see
-     * res_set_cookie, app_types.h: Response.set_cookies). */
-    for (int i = 0; i < res->set_cookie_count && !overflow; i++) {
-        n = snprintf(header + offset, sizeof(header) - offset,
-            "Set-Cookie: %s\r\n", res->set_cookies[i]);
-        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
-            overflow = 1;
-        } else {
-            offset += (size_t)n;
-        }
-    }
+    bad |= put_str(buf, cap, &off, "\r\n");
+    return bad ? 0 : off;
+}
 
-    if (!overflow) {
-        n = snprintf(header + offset, sizeof(header) - offset, "\r\n");
-        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
-            overflow = 1;
-        } else {
-            offset += (size_t)n;
-        }
-    }
+/* Drops the connection: used when a response cannot be built (head too big, out of memory). */
+static void abort_response(Connection *conn) {
+    conn->out_len = 0;
+    conn->out_sent = 0;
+    conn->keep_alive = 0;
+}
 
-    if (overflow) {
-        /* Headers can't fit the fixed buffer - drop the connection rather
-         * than send a truncated/malformed response. */
-        conn->out_len = 0;
-        conn->out_sent = 0;
-        conn->keep_alive = 0;
+static void send_with_content_type(Response *res, const char *content_type, const char *body, const size_t body_len) {
+    char head[RESPONSE_HEADER_BUF_SIZE];
+    Connection *conn = res->conn;
+
+    const size_t head_len = build_response_head(res, content_type, body_len, head, sizeof(head));
+    if (head_len == 0) {
+        abort_response(conn); /* headers do not fit: drop rather than send a malformed response */
         return;
     }
 
-    const size_t header_len = offset;
-    /* Content-Length above is always computed from the full body - a HEAD
-     * response must report the same length a GET would have (RFC 7231
-     * 4.3.2), it just never actually sends those bytes. When body is NULL,
-     * this is a file stream (headers only). */
+    /* Content-Length is always the full body's: a HEAD response reports what GET would
+     * (RFC 7231 4.3.2) but sends no body bytes. body == NULL means a file stream (head only). */
     const size_t sent_body_len = (body != NULL && !res->is_head_request) ? body_len : 0;
 
-    /*
-     * Ownership: this buffer is handed to the event loop. On the keep-alive
-     * path it's freed once fully written in flush_connection(); on any
-     * error/close path it's freed in connection_close(). Exactly one of
-     * those runs for every connection, so exactly one free matches this
-     * malloc.
-     */
-    conn->out_buf = malloc(header_len + sent_body_len);
+    /* A second res_send/res_json in the same request replaces the first response (last wins);
+     * without this the earlier buffer would leak. */
+    free(conn->out_buf);
+
+    /* Ownership: handed to the event loop. Freed exactly once, by flush_connection() when a
+     * keep-alive response finishes or by connection_close() on any error/close path. */
+    conn->out_buf = malloc(head_len + sent_body_len + 1);
     if (conn->out_buf == NULL) {
-        /* Out of memory: nothing safe to send back. Drop the connection
-         * rather than write through a NULL pointer. */
-        conn->out_len = 0;
-        conn->out_sent = 0;
-        conn->keep_alive = 0;
+        abort_response(conn);
         return;
     }
-    memcpy(conn->out_buf, header, header_len);
+    memcpy(conn->out_buf, head, head_len);
     if (sent_body_len > 0) {
-        memcpy(conn->out_buf + header_len, body, sent_body_len);
+        memcpy(conn->out_buf + head_len, body, sent_body_len);
     }
-    conn->out_len = header_len + sent_body_len;
+    conn->out_len = head_len + sent_body_len;
+    conn->out_buf[conn->out_len] = '\0'; /* not sent; lets tests strstr/strcmp the response safely */
     conn->out_sent = 0;
-    conn->out_cap = header_len + sent_body_len;
+    conn->out_cap = head_len + sent_body_len + 1;
 }
 
 void res_send(Response *res, const char *body) {
@@ -169,6 +241,12 @@ void res_send_bytes(Response *res, const char *content_type, const unsigned char
 void res_redirect(Response *res, int status, const char *location) {
     char body[300];
 
+    if (!text_is_safe(location, 1, NULL)) {
+        /* A Location with CR/LF is a response-splitting attempt: refuse instead of sending a broken redirect. */
+        res_status(res, 500);
+        res_send(res, "invalid redirect target");
+        return;
+    }
     res_status(res, status != 0 ? status : 302);
     res_set_header(res, "Location", location);
     snprintf(body, sizeof(body), "Redirecting to %s", location);
@@ -185,7 +263,7 @@ static const char *same_site_name(CookieSameSite same_site) {
 }
 
 void res_set_cookie(Response *res, const char *name, const char *value, const CookieOptions *options) {
-    static const CookieOptions defaults = { .max_age = -1, .path = NULL, .domain = NULL,
+    static const CookieOptions defaults = { .max_age = 0, .path = NULL, .domain = NULL,
                                              .http_only = 0, .secure = 0, .same_site = COOKIE_SAMESITE_UNSET };
     if (options == NULL) {
         options = &defaults;
@@ -193,6 +271,13 @@ void res_set_cookie(Response *res, const char *name, const char *value, const Co
 
     if (res->set_cookie_count >= MAX_RESPONSE_COOKIES) {
         fprintf(stderr, "res_set_cookie: MAX_RESPONSE_COOKIES exceeded\n");
+        return;
+    }
+
+    if (name[0] == '\0' || !text_is_safe(name, 0, ";= ,") || !text_is_safe(value, 0, ";") ||
+        (options->path != NULL && !text_is_safe(options->path, 0, ";")) ||
+        (options->domain != NULL && !text_is_safe(options->domain, 0, ";"))) {
+        fprintf(stderr, "res_set_cookie: cookie \"%s\" has a control character or delimiter in a field, dropped\n", name);
         return;
     }
 
@@ -211,8 +296,9 @@ void res_set_cookie(Response *res, const char *name, const char *value, const Co
             offset += (size_t)n;
         }
     }
-    if (!overflow && options->max_age >= 0) {
-        n = snprintf(dest + offset, cap - offset, "; Max-Age=%d", options->max_age);
+    if (!overflow && options->max_age != 0) {
+        /* > 0: lifetime in seconds; < 0: expire now (sent as Max-Age=0); 0: session cookie, omitted */
+        n = snprintf(dest + offset, cap - offset, "; Max-Age=%d", options->max_age > 0 ? options->max_age : 0);
         overflow = (n < 0 || (size_t)n >= cap - offset);
         if (!overflow) {
             offset += (size_t)n;
@@ -246,7 +332,7 @@ void res_set_cookie(Response *res, const char *name, const char *value, const Co
 }
 
 void res_clear_cookie(Response *res, const char *name, const char *path) {
-    const CookieOptions options = { .max_age = 0, .path = path, .domain = NULL,
+    const CookieOptions options = { .max_age = -1, .path = path, .domain = NULL,
                                      .http_only = 0, .secure = 0, .same_site = COOKIE_SAMESITE_UNSET };
     res_set_cookie(res, name, "", &options);
 }
@@ -259,9 +345,9 @@ static int append_to_out_buf(Connection *conn, const void *data, size_t len) {
         fprintf(stderr, "append_to_out_buf: response exceeds MAX_BODY_SIZE cap\n");
         return -1;
     }
-    if (conn->out_len + len > conn->out_cap) {
+    if (conn->out_len + len + 1 > conn->out_cap) { /* +1: trailing NUL, see send_with_content_type */
         size_t new_cap = (conn->out_cap == 0) ? 1024 : conn->out_cap * 2;
-        while (new_cap < conn->out_len + len) {
+        while (new_cap < conn->out_len + len + 1) {
             new_cap *= 2;
         }
         char *grown = realloc(conn->out_buf, new_cap);
@@ -273,99 +359,26 @@ static int append_to_out_buf(Connection *conn, const void *data, size_t len) {
     }
     memcpy(conn->out_buf + conn->out_len, data, len);
     conn->out_len += len;
+    conn->out_buf[conn->out_len] = '\0';
     return 0;
 }
 
 static int commit_chunked_headers(Response *res) {
-    char header[RESPONSE_HEADER_BUF_SIZE];
     Connection *conn = res->conn;
     if (conn == NULL) {
         return -1;
     }
-
     if (res->status == 0) {
         res->status = 200;
     }
 
-    const char *content_type = "text/plain";
-    const char *custom_content_type = find_header(res, "Content-Type");
-    if (custom_content_type != NULL) {
-        content_type = custom_content_type;
-    }
-
-    int n = snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Transfer-Encoding: chunked\r\n"
-        "Connection: %s\r\n",
-        res->status, status_text(res->status), content_type,
-        conn->keep_alive ? "keep-alive" : "close");
-
-    int overflow = (n < 0 || (size_t)n >= sizeof(header));
-    size_t offset = overflow ? sizeof(header) : (size_t)n;
-
-    for (int i = 0; i < res->header_count && !overflow; i++) {
-        if (strcasecmp(res->headers[i].name, "Content-Type") == 0 ||
-            strcasecmp(res->headers[i].name, "Transfer-Encoding") == 0 ||
-            strcasecmp(res->headers[i].name, "Content-Length") == 0 ||
-            strcasecmp(res->headers[i].name, "Connection") == 0) {
-            continue;
-        }
-        n = snprintf(header + offset, sizeof(header) - offset,
-            "%s: %s\r\n", res->headers[i].name, res->headers[i].value);
-        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
-            overflow = 1;
-        } else {
-            offset += (size_t)n;
-        }
-    }
-
-    for (int i = 0; i < res->set_cookie_count && !overflow; i++) {
-        n = snprintf(header + offset, sizeof(header) - offset,
-            "Set-Cookie: %s\r\n", res->set_cookies[i]);
-        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
-            overflow = 1;
-        } else {
-            offset += (size_t)n;
-        }
-    }
-
-    if (res->trailer_count > 0 && !overflow) {
-        n = snprintf(header + offset, sizeof(header) - offset, "Trailer: ");
-        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
-            overflow = 1;
-        } else {
-            offset += (size_t)n;
-            for (int i = 0; i < res->trailer_count && !overflow; i++) {
-                n = snprintf(header + offset, sizeof(header) - offset,
-                    "%s%s", res->trailers[i].name,
-                    (i + 1 < res->trailer_count) ? ", " : "\r\n");
-                if (n < 0 || (size_t)n >= sizeof(header) - offset) {
-                    overflow = 1;
-                } else {
-                    offset += (size_t)n;
-                }
-            }
-        }
-    }
-
-    if (!overflow) {
-        n = snprintf(header + offset, sizeof(header) - offset, "\r\n");
-        if (n < 0 || (size_t)n >= sizeof(header) - offset) {
-            overflow = 1;
-        } else {
-            offset += (size_t)n;
-        }
-    }
-
-    if (overflow) {
-        conn->out_len = 0;
-        conn->out_sent = 0;
-        conn->keep_alive = 0;
+    char head[RESPONSE_HEADER_BUF_SIZE];
+    const size_t head_len = build_response_head(res, "text/plain", CHUNKED_BODY, head, sizeof(head));
+    if (head_len == 0) {
+        abort_response(conn);
         return -1;
     }
-
-    if (append_to_out_buf(conn, header, offset) != 0) {
+    if (append_to_out_buf(conn, head, head_len) != 0) {
         return -1;
     }
     res->headers_sent = 1;
@@ -413,6 +426,11 @@ void res_set_trailer(Response *res, const char *name, const char *value) {
         strcasecmp(name, "Content-Length") == 0 ||
         strcasecmp(name, "Trailer") == 0) {
         fprintf(stderr, "res_set_trailer: \"%s\" is not permitted in chunked trailer\n", name);
+        return;
+    }
+
+    if (name[0] == '\0' || !text_is_safe(name, 0, ":") || !text_is_safe(value, 1, NULL)) {
+        fprintf(stderr, "res_set_trailer: trailer \"%s\" has an empty name or a control character, dropped\n", name);
         return;
     }
 

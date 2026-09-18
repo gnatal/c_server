@@ -28,6 +28,30 @@ Standalone unit and integration test suites compiled independently into `build/b
   master supervisor process lifecycle, concurrent HTTP serving across workers,
   and synchronized graceful shutdown.
 
+- `test_cookbook.c`: drives every recipe in `lib/examples/cookbook.c` through the real path
+  (`parse_http_request` → `match_route` → `dispatch`) with a fake `Connection` and asserts exact status
+  lines and bodies (JSON in/out, middleware kinds, sub-router, cookies, forms, multipart with an embedded
+  NUL, redirect safety, chunked streaming, HEAD, worker hook registration). Links the static library.
+- `test_ping.c`: the demo app's `GET /ping` handler (`app/ping.c`) through parse → route → dispatch: exact response bytes, `Connection: close` detection, HEAD, 405 + `Allow`, 404. Links only the library plus `ping.o` (no SQLite).
+- `bench_hotpath.c` (`make bench`): not a test. Prints ns/request for the pure request path and the JSON writer
+  versus the tree serializer.
+- `fuzz_parser.c` (`make fuzz [FUZZ_ITERS=n]`): mutation fuzzer over `request_framing`, `request_is_complete`,
+  `parse_http_request`, the accessors, `match_route`, `dispatch` and the response builder, compiled with
+  ASan + UBSan and fed exact-size heap buffers (no NUL, no slack). Exit 0 means no finding.
+
+`test_http_hardening.c` (split from `test_http_parser.c` to stay far below the 1,000-line cap) pins regressions: header names matched by substring (`X-Content-Length`, text in the
+request target or in a body), overlong method token, `Connection:close` without a space, strict / duplicate /
+conflicting `Content-Length`, `Content-Length` with chunked, parsing into a garbage-filled `Request`, percent
+escapes at buffer boundaries. In `test_response.c`: header / cookie / trailer / redirect injection (CR LF),
+zero-valued `CookieOptions`, exact head bytes, `res_init` on a garbage-filled struct, second send replacing the first.
+In `test_router.c`: `match_path` with `req == NULL`, empty segments, truncation and NUL-termination of captures.
+
+## Running
+- `make test` builds and runs every suite. `make SANITIZE=1 BUILD_DIR=build-asan test` runs them all under ASan + UBSan
+  (LeakSanitizer is not available on macOS). The Makefile tracks header dependencies (`-MMD`), so editing a header rebuilds every
+  dependent test; before that fix, tests could silently keep an old struct layout.
+- `Connection.out_buf` built by the response layer is NUL-terminated at `out_len`, so tests may `strstr` / `strcmp` it.
+
 ## Socket Mocking Strategy (`test_connection.c`)
 - Sockets are created in pairs via `socketpair(AF_UNIX, SOCK_STREAM, 0, fds)`.
 - Client simulation writes directly into `fds[1]`, and server engine reads via `handle_readable` on `fds[0]`.

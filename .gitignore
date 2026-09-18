@@ -36,6 +36,7 @@ perf.data*
 
 # --- Build directories ---
 build/
+build-asan/
 out/
 bin/
 cmake-build-*/

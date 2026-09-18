@@ -249,7 +249,7 @@ static void test_handle_readable_large_body_grows_buffer(void) {
     /* Well beyond the original BUF_SIZE (8192), comfortably under
      * MAX_BODY_SIZE - this body cannot possibly fit in in_buf's starting
      * capacity, so completing this request requires handle_readable to grow
-     * conn->in_buf partway through (see lib/CLAUDE.md, "Body buffering"). */
+     * conn->in_buf partway through (see lib/CLAUDE.md, "Behavior reference, Buffers"). */
     const size_t body_len = 20000;
     char *body = malloc(body_len);
     assert(body != NULL);
@@ -308,7 +308,7 @@ static void test_handle_readable_body_too_large_413(void) {
 
     /* A well-formed but too-large Content-Length is rejected the moment
      * headers complete - no need to actually send MAX_BODY_SIZE+ bytes of
-     * body to trigger this (see lib/CLAUDE.md, "Body buffering"). */
+     * body to trigger this (see lib/CLAUDE.md, "Behavior reference, Buffers"). */
     char req_line[128];
     snprintf(req_line, sizeof(req_line),
              "POST /upload HTTP/1.1\r\nContent-Length: %d\r\n\r\n", MAX_BODY_SIZE + 1);
@@ -381,8 +381,7 @@ static void test_handle_readable_chunked_grows_buffer(void) {
 
     /* Total decoded size well beyond BUF_SIZE (8192) with no Content-Length
      * to jump straight to an exact target - forces handle_readable to grow
-     * conn->in_buf geometrically instead (see lib/CLAUDE.md, "Chunked
-     * Transfer-Encoding"), unlike the Content-Length path exercised by
+     * conn->in_buf geometrically instead (see lib/CLAUDE.md, "Behavior reference, Request parsing"), unlike the Content-Length path exercised by
      * test_handle_readable_large_body_grows_buffer above. */
     const size_t chunk_payload_len = 4000;
     const int num_chunks = 5;
@@ -439,7 +438,7 @@ static void test_handle_readable_chunked_too_large_413(void) {
 
     /* The declared chunk size alone already exceeds MAX_BODY_SIZE - rejected
      * immediately, without needing to actually send that much chunk data
-     * (see lib/CLAUDE.md, "Chunked Transfer-Encoding", and the analogous
+     * (see lib/CLAUDE.md, "Behavior reference, Request parsing", and the analogous
      * Content-Length case in test_handle_readable_body_too_large_413 above). */
     char chunk_head[32];
     snprintf(chunk_head, sizeof(chunk_head), "%x\r\n", MAX_BODY_SIZE + 1);
@@ -484,7 +483,7 @@ static void test_handle_readable_chunked_and_content_length_400(void) {
 
     /* RFC 7230 3.3.3: Transfer-Encoding + Content-Length together is
      * ambiguous/smuggling-shaped and rejected outright - see lib/CLAUDE.md,
-     * "Chunked Transfer-Encoding". */
+     * "Behavior reference, Request parsing". */
     const char *raw = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
                        "Content-Length: 4\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
     assert(write(fds[1], raw, strlen(raw)) == (ssize_t)strlen(raw));
@@ -510,7 +509,7 @@ static void test_handle_readable_path_too_long_414(void) {
 
     /* A request-line path longer than req->path (256 bytes) can hold is
      * rejected with 414 rather than silently truncated (see
-     * lib/CLAUDE.md, "Request size limits"). 300 chars is comfortably under
+     * lib/CLAUDE.md, "Limits"). 300 chars is comfortably under
      * BUF_SIZE (8192), so this isn't the 431 header-overflow path. */
     const size_t path_len = 300;
     char *path = malloc(path_len + 1);

@@ -10,7 +10,7 @@
  * route's own pattern (Route.path, always "<prefix>" plus a trailing
  * wildcard segment - see app_serve_static, router.h) and req_path is the
  * request path being served (already URL-decoded by parse_http_request
- * before routing ever sees it - see lib/CLAUDE.md, "URL decoding"). Strips
+ * before routing ever sees it - see lib/CLAUDE.md, "Behavior reference, Request parsing"). Strips
  * the mount's literal prefix off req_path, then walks the remainder segment
  * by segment (split on '/') and rejects (-1) any segment that is exactly
  * ".." - this is the
@@ -21,7 +21,7 @@
  * rejects (-1) a req_path that doesn't actually start with the mount's
  * prefix, a remainder that resolves to nothing (a request for the mount
  * root itself, which a trailing "*" route never matches anyway - see
- * "Route wildcards", lib/CLAUDE.md), or a sanitized result that doesn't fit
+ * "Behavior reference, Routing", lib/CLAUDE.md), or a sanitized result that doesn't fit
  * out_size. On success (0), out holds the relative path (no leading slash)
  * to join onto the mount's root directory.
  */

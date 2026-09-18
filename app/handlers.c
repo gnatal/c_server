@@ -9,11 +9,17 @@
 #include "json/json.h"
 #include "db.h"
 
+/* Sends {"error": message} with `status`. JsonWriter escapes the message. */
 static void send_error(Response *res, int status, const char *message) {
-    char body[256];
-    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
+    JsonWriter w;
+    jw_init(&w);
+    jw_object_begin(&w);
+    jw_key(&w, "error");
+    jw_string(&w, message);
+    jw_object_end(&w);
     res_status(res, status);
-    res_json(res, body);
+    res_json(res, jw_ok(&w) ? jw_data(&w) : "{\"error\":\"internal error\"}");
+    jw_free(&w);
 }
 
 /* True when Content-Type declares a JSON body - an optional ";charset=..."
@@ -43,23 +49,29 @@ static int parse_id_param(const Request *req, long long *out) {
     return 0;
 }
 
-static JsonValue *todo_to_json(const Todo *todo) {
-    JsonValue *obj = json_new_object();
-    json_object_set(obj, "id", json_new_number((double)todo->id));
-    json_object_set(obj, "title", json_new_string(todo->title));
-    json_object_set(obj, "done", json_new_bool(todo->done));
-    json_object_set(obj, "created_at", json_new_string(todo->created_at));
-    json_object_set(obj, "updated_at", json_new_string(todo->updated_at));
-    return obj;
+/* Writes one todo as a JSON object into `w` (no allocation beyond the writer's own buffer). */
+static void write_todo(JsonWriter *w, const Todo *todo) {
+    jw_object_begin(w);
+    jw_key(w, "id");         jw_int(w, todo->id);
+    jw_key(w, "title");      jw_string(w, todo->title);
+    jw_key(w, "done");       jw_bool(w, todo->done);
+    jw_key(w, "created_at"); jw_string(w, todo->created_at);
+    jw_key(w, "updated_at"); jw_string(w, todo->updated_at);
+    jw_object_end(w);
 }
 
 static void send_todo_json(Response *res, int status, const Todo *todo) {
-    JsonValue *obj = todo_to_json(todo);
-    char *out = json_stringify(obj);
+    JsonWriter w;
+    jw_init(&w);
+    write_todo(&w, todo);
+    if (!jw_ok(&w)) {
+        jw_free(&w);
+        send_error(res, 500, "failed to encode todo");
+        return;
+    }
     res_status(res, status);
-    res_json(res, out != NULL ? out : "null");
-    free(out);
-    json_free(obj);
+    res_json(res, jw_data(&w));
+    jw_free(&w);
 }
 
 void handler_home(const Request *req, Response *res) {
@@ -93,16 +105,20 @@ void handler_list_todos(const Request *req, Response *res) {
         return;
     }
 
-    JsonValue *arr = json_new_array();
-    for (int i = 0; i < list.count && arr != NULL; i++) {
-        json_array_append(arr, todo_to_json(&list.items[i]));
+    JsonWriter w;
+    jw_init(&w);
+    jw_array_begin(&w);
+    for (int i = 0; i < list.count; i++) {
+        write_todo(&w, &list.items[i]);
     }
-
-    char *out = json_stringify(arr);
-    res_json(res, out != NULL ? out : "null");
-
-    free(out);
-    json_free(arr);
+    jw_array_end(&w);
+    if (!jw_ok(&w)) {
+        jw_free(&w);
+        send_error(res, 500, "failed to encode todos");
+        return;
+    }
+    res_json(res, jw_data(&w));
+    jw_free(&w);
 }
 
 void handler_get_todo(const Request *req, Response *res) {

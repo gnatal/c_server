@@ -300,7 +300,7 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
     char normalized_prefix[128];
     normalize_mount_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
 
-    /* Always a trailing-wildcard pattern (see match_path, "Route wildcards",
+    /* Always a trailing-wildcard pattern (see match_path, "Behavior reference, Routing",
      * lib/CLAUDE.md) so this mount answers everything under the prefix - a
      * request for the prefix itself, with nothing after it, simply doesn't
      * match (same as any other trailing "*" route) and falls through to the
@@ -318,55 +318,74 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
     route->static_root[root_len] = '\0';
 }
 
+/* Advances *cursor past '/' separators and returns the next path segment
+ * (pointer + length), or NULL at the end. Empty segments are skipped, so
+ * "/a//b/" has the segments "a" and "b". Allocation-free and read-only. */
+static const char *next_segment(const char **cursor, size_t *len_out) {
+    const char *p = *cursor;
+    while (*p == '/') {
+        p++;
+    }
+    if (*p == '\0') {
+        *cursor = p;
+        return NULL;
+    }
+    const char *start = p;
+    while (*p != '\0' && *p != '/') {
+        p++;
+    }
+    *cursor = p;
+    *len_out = (size_t)(p - start);
+    return start;
+}
+
 int match_path(const char *pattern, const char *path, Request *req) {
-    char pattern_copy[256];
-    char path_copy[256];
-    strncpy(pattern_copy, pattern, sizeof(pattern_copy) - 1);
-    pattern_copy[sizeof(pattern_copy) - 1] = '\0';
-    strncpy(path_copy, path, sizeof(path_copy) - 1);
-    path_copy[sizeof(path_copy) - 1] = '\0';
+    const char *pattern_cursor = pattern;
+    const char *path_cursor = path;
+    size_t pattern_len = 0;
+    size_t path_len = 0;
 
-    char *pattern_saveptr, *path_saveptr;
-    char *pattern_tok = strtok_r(pattern_copy, "/", &pattern_saveptr);
-    char *path_tok = strtok_r(path_copy, "/", &path_saveptr);
-
-    req->param_count = 0;
-
-    while (pattern_tok != NULL && path_tok != NULL) {
-        if (strcmp(pattern_tok, "*") == 0) {
-            char *next_pattern_tok = strtok_r(NULL, "/", &pattern_saveptr);
-            if (next_pattern_tok == NULL) {
-                /* Trailing wildcard (a pattern ending in "/files/" plus a
-                 * trailing "*"): matches this segment and every segment
-                 * after it, so the rest of path never needs checking. Not
-                 * captured as a param - unlike ":name", "*" has no name to
-                 * capture under. */
-                return 1;
-            }
-            /* Mid-path wildcard (e.g. "/users/", "*", "/edit"): matches
-             * exactly this one segment, then matching resumes normally
-             * against the rest of the pattern. */
-            pattern_tok = next_pattern_tok;
-            path_tok = strtok_r(NULL, "/", &path_saveptr);
-            continue;
-        }
-        if (pattern_tok[0] == ':') {
-            if (req->param_count < MAX_PARAMS) {
-                strncpy(req->param_names[req->param_count], pattern_tok + 1,
-                        sizeof(req->param_names[0]) - 1);
-                strncpy(req->param_values[req->param_count], path_tok,
-                        sizeof(req->param_values[0]) - 1);
-                req->param_count++;
-            }
-        } else if (strcmp(pattern_tok, path_tok) != 0) {
-            return 0;
-        }
-        pattern_tok = strtok_r(NULL, "/", &pattern_saveptr);
-        path_tok = strtok_r(NULL, "/", &path_saveptr);
+    if (req != NULL) {
+        req->param_count = 0;
     }
 
-    /* Both must be fully consumed, otherwise one path is longer than the other. */
-    return pattern_tok == NULL && path_tok == NULL;
+    const char *pattern_seg = next_segment(&pattern_cursor, &pattern_len);
+    const char *path_seg = next_segment(&path_cursor, &path_len);
+
+    while (pattern_seg != NULL && path_seg != NULL) {
+        if (pattern_len == 1 && pattern_seg[0] == '*') {
+            pattern_seg = next_segment(&pattern_cursor, &pattern_len);
+            if (pattern_seg == NULL) {
+                return 1; /* trailing "*": this segment and everything after it */
+            }
+            /* mid-pattern "*": consumes exactly one path segment, captures nothing */
+            path_seg = next_segment(&path_cursor, &path_len);
+            continue;
+        }
+        if (pattern_seg[0] == ':') {
+            if (req != NULL && req->param_count < MAX_PARAMS) {
+                const size_t name_len = pattern_len - 1;
+                const size_t name_cap = sizeof(req->param_names[0]) - 1;
+                const size_t value_cap = sizeof(req->param_values[0]) - 1;
+                char *name_slot = req->param_names[req->param_count];
+                char *value_slot = req->param_values[req->param_count];
+                const size_t name_copy = name_len < name_cap ? name_len : name_cap;
+                const size_t value_copy = path_len < value_cap ? path_len : value_cap;
+                memcpy(name_slot, pattern_seg + 1, name_copy);
+                name_slot[name_copy] = '\0';
+                memcpy(value_slot, path_seg, value_copy);
+                value_slot[value_copy] = '\0';
+                req->param_count++;
+            }
+        } else if (pattern_len != path_len || memcmp(pattern_seg, path_seg, pattern_len) != 0) {
+            return 0;
+        }
+        pattern_seg = next_segment(&pattern_cursor, &pattern_len);
+        path_seg = next_segment(&path_cursor, &path_len);
+    }
+
+    /* Both must be fully consumed, otherwise one is longer than the other. */
+    return pattern_seg == NULL && path_seg == NULL;
 }
 
 const Route *match_route(const App *app, Request *req) {
@@ -402,14 +421,13 @@ const Route *match_route(const App *app, Request *req) {
 }
 
 int match_route_allowed_methods(const App *app, const Request *req, char *allowed, size_t allowed_size) {
-    Request scratch = *req;
     char seen[MAX_ROUTES][8];
     int seen_count = 0;
     allowed[0] = '\0';
 
     for (int i = 0; i < app->route_count; i++) {
         const Route *route = &app->routes[i];
-        if (!match_path(route->path, req->path, &scratch)) {
+        if (!match_path(route->path, req->path, NULL)) {
             continue;
         }
 

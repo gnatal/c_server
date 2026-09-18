@@ -4,54 +4,42 @@
 #include "app_types.h"
 
 /*
- * Registers app-wide middleware, run in registration order before every
- * request is dispatched - including requests that end up falling through
- * to a 404. Unscoped: equivalent to app_use_prefix(app, "", mw).
+ * Middleware: void mw(const Request *req, Response *res, MiddlewareChain *chain).
+ * It must do exactly one of:
+ *   - call chain_next(chain) to continue (code after that call runs once the rest of the
+ *     pipeline, including the handler, has finished, so res->status is final there);
+ *   - call chain_error(chain, status, message) to fail the request;
+ *   - write a response itself (res_send ...) and NOT call chain_next.
+ * Route handlers are the terminal node: they get no chain and cannot call chain_next/chain_error.
+ *
+ * Execution order for one request: app-wide middleware in registration order (only those whose
+ * prefix matches req->path, and also for requests that will 404) -> the matched route's own
+ * middleware -> the handler. If no route matched, the pipeline ends in the default 404/405/OPTIONS
+ * answer instead of a handler.
+ * Limits: MAX_MIDDLEWARES (16) app-wide; excess is dropped with a stderr warning.
  */
+
+/* App-wide middleware for every request. Same as app_use_prefix(app, "", mw). */
 void app_use(App *app, Middleware mw);
 
-/*
- * Registers app-wide middleware scoped to a path prefix (the C analogue of
- * Express's app.use('/api', mw)): it only runs for requests whose req->path
- * starts with prefix at a segment boundary (prefix "/api" matches "/api" and
- * "/api/foo", not "/apiary"). prefix "" or "/" behaves like app_use (runs on
- * every request). Still runs ahead of route dispatch and in registration
- * order relative to other app-wide middleware; a request that doesn't match
- * the prefix skips this middleware entirely (its chain_next is never
- * called for it).
- */
+/* App-wide middleware only for paths under `prefix` at a segment boundary: "/api" matches "/api"
+ * and "/api/x", not "/apiary". Prefix "" or "/" matches everything. */
 void app_use_prefix(App *app, const char *prefix, Middleware mw);
 
-/*
- * Registers the app's single centralized error handler. Middleware signals
- * a failure via chain_error() instead of building the error response
- * itself; registering again overwrites the previous handler.
- */
+/* Sets the one app-wide error handler that receives every chain_error(). The last call wins.
+ * Without one, chain_error sends `status` with `message` as a text/plain body. */
 void app_use_error(App *app, ErrorHandler handler);
 
-/*
- * Advances the pipeline by one step: runs the next unrun middleware, or -
- * once all middleware have run - the matched route's handler, or (if no
- * route matched) a 404 if nothing registered matches req->path at all, an
- * auto-OPTIONS 200 + Allow header if the request method is OPTIONS and
- * req->path matches a registered route under some other method (no explicit
- * app_options() route needed), or a 405 + Allow header for any other method
- * in that same "path matches, method doesn't" situation. Middleware calls
- * this to continue the chain.
- */
+/* Continues the pipeline (see above). Call at most once per middleware invocation. */
 void chain_next(MiddlewareChain *chain);
 
-/*
- * Short-circuits the pipeline for an error: hands off to the app's
- * registered error handler, or - if none is registered - falls back to
- * res_status()+res_send() with the given status and message directly.
- */
+/* Ends the pipeline with an error via the app's error handler. Do not call chain_next afterwards. */
 void chain_error(MiddlewareChain *chain, int status, const char *message);
 
 /*
- * Builds a fresh MiddlewareChain for one request (the app's middleware list
- * plus the already-matched route, which may be NULL) and runs it to
- * completion.
+ * Runs the pipeline for one request: `route` is match_route's result (NULL for none).
+ * With no route: 404 when no route matches the path, 405 + Allow when the path exists under other
+ * methods, 200 + Allow for OPTIONS on such a path. A static-file route is served here too.
  */
 void dispatch(App *app, const Route *route, const Request *req, Response *res);
 

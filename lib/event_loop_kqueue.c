@@ -69,77 +69,93 @@ void event_loop_close(App *app) {
     }
 }
 
-int event_loop_watch_read(App *app, int fd, void *udata) {
-    if (app == NULL || app->kq < 0 || fd < 0) {
-        return -1;
+/* The Connection whose interest set is tracked for fd, or NULL (listen socket, or an fd
+ * that is not a client connection). Tracking events_watched lets watch/unwatch skip the
+ * kevent() syscall when the kernel already has the requested state: every keep-alive
+ * response used to cost one failing EV_DELETE (ENOENT) for a write filter never added. */
+static Connection *tracked_conn(const App *app, const int fd, void *udata) {
+    if (udata != NULL) {
+        return (Connection *)udata;
     }
+    if (app->connections != NULL && fd < app->connections_cap) {
+        return app->connections[fd];
+    }
+    return NULL;
+}
+
+static int kevent_change(App *app, const int fd, const int16_t filter, const uint16_t flags, void *udata) {
     struct kevent change;
-    EV_SET(&change, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, udata);
+    EV_SET(&change, fd, filter, flags, 0, 0, udata);
     return kevent(app->kq, &change, 1, NULL, 0, NULL);
 }
 
-int event_loop_unwatch_read(App *app, int fd) {
+static int watch(App *app, const int fd, const int16_t filter, const int bit, void *udata) {
     if (app == NULL || app->kq < 0 || fd < 0) {
         return -1;
     }
-    struct kevent change;
-    EV_SET(&change, fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-    int rc = kevent(app->kq, &change, 1, NULL, 0, NULL);
+    Connection *conn = tracked_conn(app, fd, udata);
+    if (conn != NULL && (conn->events_watched & bit)) {
+        return 0;
+    }
+    const int rc = kevent_change(app, fd, filter, EV_ADD | EV_ENABLE, udata);
+    if (rc == 0 && conn != NULL) {
+        conn->events_watched |= bit;
+    }
+    return rc;
+}
+
+static int unwatch(App *app, const int fd, const int16_t filter, const int bit) {
+    if (app == NULL || app->kq < 0 || fd < 0) {
+        return -1;
+    }
+    Connection *conn = tracked_conn(app, fd, NULL);
+    if (conn != NULL && !(conn->events_watched & bit)) {
+        return 0;
+    }
+    const int rc = kevent_change(app, fd, filter, EV_DELETE, NULL);
+    if (conn != NULL) {
+        conn->events_watched &= ~bit;
+    }
     if (rc < 0 && (errno == ENOENT || errno == EBADF)) {
         return 0;
     }
     return rc;
 }
 
+int event_loop_watch_read(App *app, int fd, void *udata) {
+    return watch(app, fd, EVFILT_READ, EVENT_READ, udata);
+}
+
+int event_loop_unwatch_read(App *app, int fd) {
+    return unwatch(app, fd, EVFILT_READ, EVENT_READ);
+}
+
 int event_loop_watch_write(App *app, int fd, void *udata) {
-    if (app == NULL || app->kq < 0 || fd < 0) {
-        return -1;
-    }
-    struct kevent change;
-    EV_SET(&change, fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, udata);
-    return kevent(app->kq, &change, 1, NULL, 0, NULL);
+    return watch(app, fd, EVFILT_WRITE, EVENT_WRITE, udata);
 }
 
 int event_loop_unwatch_write(App *app, int fd, void *udata) {
     (void)udata;
-    if (app == NULL || app->kq < 0 || fd < 0) {
-        return -1;
-    }
-    struct kevent change;
-    EV_SET(&change, fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-    int rc = kevent(app->kq, &change, 1, NULL, 0, NULL);
-    if (rc < 0 && (errno == ENOENT || errno == EBADF)) {
-        return 0;
-    }
-    return rc;
+    return unwatch(app, fd, EVFILT_WRITE, EVENT_WRITE);
 }
 
 int event_loop_unwatch_all(App *app, int fd) {
     if (app == NULL || app->kq < 0 || fd < 0) {
         return -1;
     }
+    Connection *conn = tracked_conn(app, fd, NULL);
+    if (conn != NULL) {
+        conn->events_watched = 0;
+    }
     struct kevent changes[2];
     EV_SET(&changes[0], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
     EV_SET(&changes[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-    int rc = kevent(app->kq, changes, 2, NULL, 0, NULL);
+    const int rc = kevent(app->kq, changes, 2, NULL, 0, NULL);
     if (rc < 0 && (errno == ENOENT || errno == EBADF)) {
         return 0;
     }
     return rc;
 }
-
-void kq_watch(int kq, int fd, int16_t filter, void *udata) {
-    struct kevent change;
-    EV_SET(&change, fd, filter, EV_ADD | EV_ENABLE, 0, 0, udata);
-    kevent(kq, &change, 1, NULL, 0, NULL);
-}
-
-void kq_unwatch(int kq, int fd, int16_t filter) {
-    struct kevent change;
-    EV_SET(&change, fd, filter, EV_DELETE, 0, 0, NULL);
-    kevent(kq, &change, 1, NULL, 0, NULL);
-}
-
 
 int event_loop_arm_shutdown_timer(App *app) {
     if (app == NULL || app->kq < 0) {

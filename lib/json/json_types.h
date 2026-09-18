@@ -45,11 +45,26 @@ typedef struct {
     char error[128];
 } JsonParser;
 
-/* Growable byte buffer used internally by jsonWriter.c while serializing. */
+/* Growable byte buffer used by json_writer.c (json_stringify and JsonWriter). */
 typedef struct {
     char *data;
     size_t len;
     size_t cap;
 } StrBuf;
+
+#define JSON_WRITER_MAX_DEPTH 32
+
+/* Streaming JSON emitter (jw_* in json.h). Owns buf.data until jw_free().
+ * Commas and quoting are automatic. `failed` is sticky: out of memory, nesting deeper
+ * than JSON_WRITER_MAX_DEPTH, or a misuse (key outside an object, value with no key,
+ * unbalanced end) sets it, and every later jw_* call becomes a no-op. */
+typedef struct {
+    StrBuf buf;
+    int depth;
+    char kind[JSON_WRITER_MAX_DEPTH];      /* '{' or '[' per open container */
+    char has_item[JSON_WRITER_MAX_DEPTH];  /* container already holds an item (next needs a comma) */
+    int expect_value;                      /* a key was just written; next call must be a value */
+    int failed;
+} JsonWriter;
 
 #endif /* JSON_TYPES_H */

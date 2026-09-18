@@ -19,3 +19,15 @@ This project is an attempt to create an HTTP server with a developer experience 
 - **Deny by Default:** Network routers and file servers must use a deny-by-default policy. Return 403/404 unless a route or resource is explicitly matched.
 - **Strict I/O Limits:** Always validate and bound user input. Enforce hard limits on HTTP header sizes (e.g., max 8KB) and payload bodies to prevent buffer overflows and DOS attacks.
 - **Memory Management:** Every `malloc` or `calloc` must have a clearly documented and matching `free`.
+
+
+## Where to start (for coding agents)
+- Writing an app on the engine: `lib/API.md` (every public function, one line each) then `lib/examples/cookbook.c` (tested recipes: JSON in/out, path/query params, middleware, sub-routers, cookies, forms, uploads, streaming, per-worker resources). `app/` is a full worked application.
+- Changing the engine: `lib/CLAUDE.md` (request lifecycle, limits, ownership table, return conventions, hot-path rules, known gaps), then the header of the module you touch.
+- Verify with `make test`, `make SANITIZE=1 BUILD_DIR=build-asan test`, `make fuzz`, `make bench`, `make check-docs`.
+
+
+## Where to start (for coding agents)
+- Writing an app on the engine: `lib/API.md` (every public function, one line each) then `lib/examples/cookbook.c` (tested recipes: JSON in/out, path/query params, middleware, sub-routers, cookies, forms, uploads, streaming, per-worker resources). `app/` is a full worked application.
+- Changing the engine: `lib/CLAUDE.md` (request lifecycle, limits, ownership table, return conventions, hot-path rules, known gaps), then the header of the module you touch.
+- Verify with `make test`, `make SANITIZE=1 BUILD_DIR=build-asan test`, `make fuzz`, `make bench`, `make check-docs`.

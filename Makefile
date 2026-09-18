@@ -10,6 +10,13 @@ else
     EVENT_LOOP_SRC = lib/event_loop_kqueue.c
 endif
 
+# --- Sanitizers: `make SANITIZE=1 test` (use a separate build dir: `make clean` first) ---
+# ASan + UBSan over the whole suite. Memory bugs in the hand-written parsers show up here, not in normal runs.
+ifeq ($(SANITIZE),1)
+    CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1
+    LDFLAGS += -fsanitize=address,undefined
+endif
+
 # --- OpenSSL configuration (Auto-detected with optional NO_TLS=1 override) ---
 ifeq ($(NO_TLS),1)
     CEXPRESS_HAS_TLS = 0
@@ -67,7 +74,7 @@ LIB_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(LIB_SRCS))
 LIB      = $(LIB_DIR)/libcexpress.a
 
 # --- app: the application built on top of the lib ---
-APP_SRCS = app/main.c app/handlers.c app/middlewares.c app/db.c
+APP_SRCS = app/main.c app/handlers.c app/middlewares.c app/db.c app/ping.c
 APP_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(APP_SRCS))
 TARGET   = $(BIN_DIR)/cexpress
 
@@ -76,6 +83,7 @@ JSON_TEST_BIN        = $(BIN_DIR)/test_json
 MIDDLEWARE_TEST_BIN  = $(BIN_DIR)/test_middleware
 ROUTER_TEST_BIN      = $(BIN_DIR)/test_router
 HTTP_PARSER_TEST_BIN = $(BIN_DIR)/test_http_parser
+HTTP_HARDENING_TEST_BIN = $(BIN_DIR)/test_http_hardening
 CONNECTION_TEST_BIN  = $(BIN_DIR)/test_connection
 RESPONSE_TEST_BIN    = $(BIN_DIR)/test_response
 MULTIPART_TEST_BIN   = $(BIN_DIR)/test_multipart
@@ -84,19 +92,26 @@ STATIC_TEST_BIN      = $(BIN_DIR)/test_static
 EVENT_LOOP_TEST_BIN  = $(BIN_DIR)/test_event_loop
 CLUSTER_TEST_BIN     = $(BIN_DIR)/test_cluster
 TLS_TEST_BIN         = $(BIN_DIR)/test_tls
+COOKBOOK_TEST_BIN    = $(BIN_DIR)/test_cookbook
+BENCH_BIN            = $(BIN_DIR)/bench_hotpath
+PING_TEST_BIN        = $(BIN_DIR)/test_ping
 
 TEST_BINS = $(JSON_TEST_BIN) $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
             $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN) $(URLENCODED_TEST_BIN) \
-            $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) $(TLS_TEST_BIN)
+            $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) $(TLS_TEST_BIN) \
+            $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN)
 
-.PHONY: all run test clean test_epoll
+.PHONY: all run test clean test_epoll bench fuzz check-docs
 
 all: cexpress
 
-# Generic compilation rule into $(OBJ_DIR)
+# Generic compilation rule into $(OBJ_DIR). -MMD -MP emits a .d file per object listing the
+# headers it included, so editing a header (e.g. lib/app_types.h) rebuilds every dependent object.
 $(OBJ_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+-include $(shell find $(OBJ_DIR) -name '*.d' 2>/dev/null)
 
 $(LIB): $(LIB_OBJS)
 	@mkdir -p $(LIB_DIR)
@@ -125,6 +140,10 @@ $(ROUTER_TEST_BIN): $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DI
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(HTTP_PARSER_TEST_BIN): $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/tests/test_http_parser.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(HTTP_HARDENING_TEST_BIN): $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/tests/test_http_hardening.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -159,6 +178,36 @@ $(CLUSTER_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_
 $(TLS_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/lib/tls.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_tls.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# Cookbook: lib/examples/cookbook.c is the tested few-shot reference; the test drives every recipe.
+$(COOKBOOK_TEST_BIN): $(OBJ_DIR)/tests/test_cookbook.o $(OBJ_DIR)/lib/examples/cookbook.o $(LIB)
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/tests/test_cookbook.o $(OBJ_DIR)/lib/examples/cookbook.o $(LIB) $(LDFLAGS)
+
+# The demo app's /ping handler, tested against the library only (no SQLite needed).
+$(PING_TEST_BIN): $(OBJ_DIR)/tests/test_ping.o $(OBJ_DIR)/app/ping.o $(LIB)
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/tests/test_ping.o $(OBJ_DIR)/app/ping.o $(LIB) $(LDFLAGS)
+
+# Per-request CPU cost of the pure path (parse -> route -> dispatch -> response), no sockets.
+$(BENCH_BIN): $(OBJ_DIR)/tests/bench_hotpath.o $(LIB)
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/tests/bench_hotpath.o $(LIB) $(LDFLAGS)
+
+bench: $(BENCH_BIN)
+	./$(BENCH_BIN)
+
+# Fails if lib/API.md and the lib headers disagree about which public functions exist.
+check-docs:
+	./scripts/check_docs.sh
+
+# Mutation fuzzing of the request parser under ASan + UBSan (see tests/fuzz_parser.c).
+FUZZ_ITERS ?= 1000000
+fuzz:
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -o $(BIN_DIR)/fuzz_parser \
+	    tests/fuzz_parser.c lib/http_parser.c lib/router.c lib/middleware.c lib/response.c lib/static.c
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$(BIN_DIR)/fuzz_parser $(FUZZ_ITERS)
 
 # Epoll verification on macOS via epoll-shim (if installed)
 EPOLL_SHIM_PREFIX ?= /opt/homebrew/opt/epoll-shim
@@ -210,6 +259,9 @@ test: $(TEST_BINS)
 	./$(EVENT_LOOP_TEST_BIN)
 	./$(CLUSTER_TEST_BIN)
 	./$(TLS_TEST_BIN)
+	./$(COOKBOOK_TEST_BIN)
+	./$(HTTP_HARDENING_TEST_BIN)
+	./$(PING_TEST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer

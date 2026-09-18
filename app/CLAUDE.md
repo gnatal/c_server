@@ -22,11 +22,16 @@ Routes (`main.c`):
 - `GET /` → `handler_home` — serves the Todo UI (`app/public/index.html`,
   a single self-contained file) via `res_send_file` (bounded chunk
   streaming, `lib/response.h`).
+- `GET /ping` → `handler_ping` (`ping.c/h`) — answers `200 pong` (text/plain) with no
+  database access and no JSON: the target for connection stress tests
+  (`PHASES=ping scripts/stress_test.sh`, `scripts/CLAUDE.md`). It lives in its own file so
+  `tests/test_ping.c` links it without SQLite. Like every route it runs the app-wide
+  middleware (`mw_logger` unless `QUIET=1`, `mw_body_size_guard`).
 - `app_serve_static(&app, "/static", "app/public")` — a generic
-  static-file-serving demo (`lib/CLAUDE.md`, "Static file serving"),
+  static-file-serving demo (`lib/CLAUDE.md`, "Behavior reference, Static"),
   unrelated to the Todo UI above, which needs no separate assets.
 - The Todo REST API is built on a `Router` (`todo_router`) and mounted at
-  `/api/todos` via `app_mount` (`lib/CLAUDE.md`, "Sub-router mounting"):
+  `/api/todos` via `app_mount` (`lib/CLAUDE.md`, "Behavior reference, Sub-routers"):
   `GET /` and `GET /:id` (→ `handler_list_todos`/`handler_get_todo`) are
   unprotected; `POST /`, `PUT /:id`, `PATCH /:id`, `DELETE /:id` each
   attach `mw_authenticate` as **per-route** middleware (`router_post_mw`/
@@ -65,7 +70,7 @@ generic worker-lifecycle hook this module consumes (below).
   `app_listen()` might fork. `main()` then registers `db_worker_init` via
   `app_on_worker_start(&app, db_worker_init)` (`lib/connection.h`) — the
   engine's generic per-worker-process init hook, see `lib/CLAUDE.md`
-  ("Worker lifecycle hooks") for the mechanism itself. `db_worker_init`
+  ("Behavior reference, Workers and fork") for the mechanism itself. `db_worker_init`
   opens this process's own private connection (from the path `db_open`
   already validated and stashed in a module-level buffer) and configures
   `sqlite3_busy_timeout` + `PRAGMA journal_mode=WAL` — needed because
@@ -117,20 +122,16 @@ generic worker-lifecycle hook this module consumes (below).
   ordinary read traffic into ~345,000 stderr writes in 15 seconds).
 
 ## Handlers (`handlers.c`)
-- **`todo_to_json(const Todo *)`** builds the JSON representation every
-  handler that returns a todo shares (`{"id", "title", "done",
-  "created_at", "updated_at"}`), via the JSON builder API
-  (`json_new_object`/`json_new_number`/`json_new_string`/`json_new_bool`,
-  `lib/json/json.h`) — `id` is emitted as a JSON number (`json_new_number`
-  taking `(double)todo->id`), `done` as a JSON boolean, everything else as
-  a string. Adding `json_new_number`/`json_new_bool`/`json_new_array`/
-  `json_array_append` to `lib/json/` (`lib/json/CLAUDE.md`) was a
-  prerequisite for this — the builder API previously only had
-  `json_new_string`/`json_new_object` (added for `handler_search`'s
-  flat string-only object), which can't represent a number, a boolean, or
-  the JSON array `handler_list_todos` needs for `GET /api/todos` (a title
-  containing `"` would also corrupt a hand-`snprintf`'d JSON string, unlike
-  `json_new_string` + `json_stringify`, which escape it correctly).
+- **`write_todo(JsonWriter *, const Todo *)`** emits the JSON every todo-returning
+  handler shares (`{"id", "title", "done", "created_at", "updated_at"}`) straight
+  into a `JsonWriter` (`lib/json/json.h`): no intermediate tree, no per-field
+  allocation. `id` is a JSON number (`jw_int`, exact for any 64-bit id), `done`
+  a boolean, the rest strings (escaped by the writer, so a title containing `"`
+  or a newline round-trips). `send_todo_json` and `handler_list_todos` wrap it
+  and answer 500 if `jw_ok` is false. This replaced the tree builders
+  (`json_new_*` + `json_stringify`), which made `GET /api/todos` spend about
+  15 µs per 20 rows in JSON alone and, via `%g` number formatting, printed ids
+  above 999,999 as `1.23457e+06`.
 - **`parse_id_param(req, &id)`** parses the `:id` path param
   (`req_get_param`) as a bounded, non-negative `long long` via `strtoll`,
   rejecting anything malformed (trailing garbage, negative, empty,
@@ -152,11 +153,10 @@ generic worker-lifecycle hook this module consumes (below).
 - **`handler_delete_todo`** responds `204 No Content` with an empty body,
   matching the previous demo's `handler_delete_user` convention.
 - **Error shape**: every handler-level failure responds via a shared
-  `send_error(res, status, message)` helper building `{"error": "..."}"`
-  (same shape `error_handler_json`, `middlewares.c`, produces for
-  middleware-level failures) — handlers have no `MiddlewareChain *` (they
-  are the terminal node of the pipeline, `lib/CLAUDE.md`, "Middleware
-  pipeline"), so they can't call `chain_error` and build the response
+  `send_error(res, status, message)` helper that writes `{"error": "..."}`
+  with a `JsonWriter` (same shape `error_handler_json`, `middlewares.c`,
+  produces for middleware-level failures; both escape the message) — handlers have no `MiddlewareChain *` (they
+  are the terminal node of the pipeline, `lib/CLAUDE.md`, "Behavior reference, Middleware"), so they can't call `chain_error` and build the response
   directly instead, same as the previous demo's `handler_update_user`/
   `handler_patch_user`.
 
@@ -191,9 +191,10 @@ state of their own across requests and don't touch sockets or the database
 connection directly — persistence goes through `app/db.c`'s functions,
 socket I/O happens in `lib/connection.c`, both outside this layer.
 
-Every handler that builds a JSON response (`todo_to_json` + `json_stringify`)
-owns the `JsonValue *` tree and the `char *` from `json_stringify` for the
-duration of the call and releases both (`json_free`, `free`) before
-returning — same convention the previous demo's `handler_echo_json`/
-`handler_search` already followed, see `lib/json/CLAUDE.md` for the json
-library's own memory rules.
+Every handler that builds a JSON response owns a stack `JsonWriter` for the
+duration of the call and releases it with `jw_free` on every path (the response
+layer copies the bytes, so freeing right after `res_json` is safe). A parsed
+request body (`json_parse`) is a separate tree freed with `json_free` after the
+response is built, because strings read from it point into the tree; see
+`lib/json/CLAUDE.md` for the JSON library's own memory rules and
+`lib/examples/cookbook.c` for the same patterns as small tested recipes.

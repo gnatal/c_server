@@ -6,6 +6,7 @@
 #include "response.h"
 #include "middleware.h"
 #include "http_parser.h"
+#include "json/json.h"
 
 static const char *default_api_key = "my-secret-api-key";
 static const char *configured_api_key = NULL;
@@ -41,10 +42,15 @@ void mw_body_size_guard(const Request *req, Response *res, MiddlewareChain *chai
 
 void error_handler_json(int status, const char *message, const Request *req, Response *res) {
     (void)req;
-    char body[512];
-    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
+    JsonWriter w;
+    jw_init(&w);
+    jw_object_begin(&w);
+    jw_key(&w, "error");
+    jw_string(&w, message); /* escaped, unlike snprintf("%s") */
+    jw_object_end(&w);
     res_status(res, status);
-    res_json(res, body);
+    res_json(res, jw_ok(&w) ? jw_data(&w) : "{\"error\":\"internal error\"}");
+    jw_free(&w);
 }
 
 /* Constant-time comparison so a wrong API key can't be distinguished from a

@@ -159,6 +159,176 @@ static void test_syntax_errors(void) {
     assert(json_parse("{} garbage", err, sizeof(err)) == NULL);
 }
 
+/* Returns json_stringify(value) for a lone number, freed by the caller. */
+static char *stringify_number(const double value) {
+    JsonValue *v = json_new_number(value);
+    char *out = json_stringify(v);
+    json_free(v);
+    return out;
+}
+
+static void test_number_formatting(void) {
+    /* Regression: numbers used to go through "%g" (6 significant digits), so 1234567
+     * was emitted as 1.23457e+06 - a corrupted id in any API response past 999999. */
+    const struct { double in; const char *out; } cases[] = {
+        { 0, "0" }, { 42, "42" }, { -5, "-5" }, { 999999, "999999" }, { 1000000, "1000000" },
+        { 1234567, "1234567" }, { 33333333, "33333333" }, { 15000000000.0, "15000000000" },
+        { 9007199254740991.0, "9007199254740991" }, { 0.5, "0.5" }, { -2.25, "-2.25" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *out = stringify_number(cases[i].in);
+        assert(strcmp(out, cases[i].out) == 0);
+        free(out);
+    }
+
+    /* Non-integers keep full precision (round-trip through parse). */
+    char *pi = stringify_number(3.14159265358979);
+    JsonValue *back = json_parse(pi, NULL, 0);
+    assert(json_as_number(back, 0) == 3.14159265358979);
+    json_free(back);
+    free(pi);
+
+    /* NaN / infinity have no JSON form. */
+    volatile double zero = 0.0;
+    char *nan_out = stringify_number(zero / zero);
+    assert(strcmp(nan_out, "null") == 0);
+    free(nan_out);
+    char *inf_out = stringify_number(1.0 / zero);
+    assert(strcmp(inf_out, "null") == 0);
+    free(inf_out);
+
+    /* parse -> stringify keeps a large integer intact. */
+    JsonValue *doc = json_parse("{\"id\":1234567}", NULL, 0);
+    char *round = json_stringify(doc);
+    assert(strcmp(round, "{\"id\":1234567}") == 0);
+    free(round);
+    json_free(doc);
+}
+
+static void test_writer_document(void) {
+    JsonWriter w;
+    jw_init(&w);
+    jw_object_begin(&w);
+    jw_key(&w, "id");    jw_int(&w, 1234567);
+    jw_key(&w, "title"); jw_string(&w, "say \"hi\"\n\t\\ \x01");
+    jw_key(&w, "done");  jw_bool(&w, 1);
+    jw_key(&w, "none");  jw_null(&w);
+    jw_key(&w, "missing"); jw_string(&w, NULL);
+    jw_key(&w, "ratio"); jw_double(&w, 0.5);
+    jw_key(&w, "tags");
+    jw_array_begin(&w);
+    jw_string(&w, "a");
+    jw_int(&w, -7);
+    jw_object_begin(&w);
+    jw_key(&w, "k"); jw_array_begin(&w); jw_array_end(&w);
+    jw_object_end(&w);
+    jw_array_end(&w);
+    jw_key(&w, "empty"); jw_object_begin(&w); jw_object_end(&w);
+    jw_object_end(&w);
+
+    assert(jw_ok(&w));
+    assert(strcmp(jw_data(&w),
+        "{\"id\":1234567,\"title\":\"say \\\"hi\\\"\\n\\t\\\\ \\u0001\",\"done\":true,\"none\":null,"
+        "\"missing\":null,\"ratio\":0.5,\"tags\":[\"a\",-7,{\"k\":[]}],\"empty\":{}}") == 0);
+    assert(jw_len(&w) == strlen(jw_data(&w)));
+
+    /* What the writer emits must be valid JSON the parser accepts. */
+    JsonValue *parsed = json_parse(jw_data(&w), NULL, 0);
+    assert(parsed != NULL);
+    assert(json_as_number(json_object_get(parsed, "id"), 0) == 1234567);
+    json_free(parsed);
+
+    jw_free(&w);
+    jw_free(&w); /* idempotent */
+}
+
+static void test_writer_top_level_values(void) {
+    JsonWriter w;
+    jw_init(&w);
+    jw_int(&w, -9223372036854775807LL - 1);
+    assert(jw_ok(&w));
+    assert(strcmp(jw_data(&w), "-9223372036854775808") == 0);
+    jw_free(&w);
+
+    jw_init(&w);
+    jw_array_begin(&w);
+    jw_array_end(&w);
+    assert(strcmp(jw_data(&w), "[]") == 0);
+    jw_free(&w);
+}
+
+static void test_writer_misuse_fails_cleanly(void) {
+    JsonWriter w;
+
+    /* value inside an object with no key */
+    jw_init(&w); jw_object_begin(&w); jw_int(&w, 1); jw_object_end(&w);
+    assert(!jw_ok(&w)); assert(jw_data(&w) == NULL); assert(jw_len(&w) == 0);
+    jw_free(&w);
+
+    /* key outside an object */
+    jw_init(&w); jw_array_begin(&w); jw_key(&w, "k"); jw_array_end(&w);
+    assert(!jw_ok(&w)); jw_free(&w);
+    jw_init(&w); jw_key(&w, "k");
+    assert(!jw_ok(&w)); jw_free(&w);
+
+    /* key with no value */
+    jw_init(&w); jw_object_begin(&w); jw_key(&w, "k"); jw_object_end(&w);
+    assert(!jw_ok(&w)); jw_free(&w);
+
+    /* two keys in a row */
+    jw_init(&w); jw_object_begin(&w); jw_key(&w, "a"); jw_key(&w, "b");
+    assert(!jw_ok(&w)); jw_free(&w);
+
+    /* mismatched / unbalanced ends */
+    jw_init(&w); jw_object_begin(&w); jw_array_end(&w);
+    assert(!jw_ok(&w)); jw_free(&w);
+    jw_init(&w); jw_object_end(&w);
+    assert(!jw_ok(&w)); jw_free(&w);
+
+    /* incomplete document is not ok; nothing is exposed */
+    jw_init(&w); jw_object_begin(&w);
+    assert(!jw_ok(&w)); assert(jw_data(&w) == NULL); jw_free(&w);
+
+    /* a second top-level value */
+    jw_init(&w); jw_int(&w, 1); jw_int(&w, 2);
+    assert(!jw_ok(&w)); jw_free(&w);
+
+    /* failure is sticky: later valid calls cannot resurrect the document */
+    jw_init(&w); jw_key(&w, "bad"); jw_int(&w, 1);
+    assert(!jw_ok(&w)); jw_free(&w);
+
+    /* nesting past JSON_WRITER_MAX_DEPTH fails instead of overflowing kind[] */
+    jw_init(&w);
+    for (int i = 0; i < JSON_WRITER_MAX_DEPTH + 1; i++) jw_array_begin(&w);
+    assert(!jw_ok(&w)); jw_free(&w);
+    jw_init(&w);
+    for (int i = 0; i < JSON_WRITER_MAX_DEPTH; i++) jw_array_begin(&w);
+    for (int i = 0; i < JSON_WRITER_MAX_DEPTH; i++) jw_array_end(&w);
+    assert(jw_ok(&w)); jw_free(&w);
+}
+
+static void test_writer_matches_tree_serializer(void) {
+    /* The same document through both emitters yields identical bytes. */
+    JsonValue *obj = json_new_object();
+    json_object_set(obj, "id", json_new_number(1234567));
+    json_object_set(obj, "title", json_new_string("a \"q\" \n b"));
+    json_object_set(obj, "done", json_new_bool(0));
+    char *tree_out = json_stringify(obj);
+
+    JsonWriter w;
+    jw_init(&w);
+    jw_object_begin(&w);
+    jw_key(&w, "id");    jw_int(&w, 1234567);
+    jw_key(&w, "title"); jw_string(&w, "a \"q\" \n b");
+    jw_key(&w, "done");  jw_bool(&w, 0);
+    jw_object_end(&w);
+    assert(strcmp(tree_out, jw_data(&w)) == 0);
+
+    jw_free(&w);
+    free(tree_out);
+    json_free(obj);
+}
+
 int main(void) {
     test_primitives();
     test_nested_structure();
@@ -166,6 +336,11 @@ int main(void) {
     test_builders();
     test_number_bool_array_builders();
     test_syntax_errors();
+    test_number_formatting();
+    test_writer_document();
+    test_writer_top_level_values();
+    test_writer_misuse_fails_cleanly();
+    test_writer_matches_tree_serializer();
     printf("all json tests passed\n");
     return 0;
 }

@@ -4,7 +4,7 @@ A lightweight, high-performance, single-threaded HTTP/1.1 server and web framewo
 
 > [!NOTE]
 > **Library Architecture:**
-> The code in `lib/` compiles to a reusable static library (`lib/libcexpress.a`). The code in `app/` is a reference implementation — a SQLite-backed Todo CRUD API — showing how to consume the library. See [`app/CLAUDE.md`](app/CLAUDE.md) for its architecture.
+> The code in `lib/` compiles to a reusable static library (`build/lib/libcexpress.a`). The code in `app/` is a reference implementation — a SQLite-backed Todo CRUD API — showing how to consume the library. See [`app/CLAUDE.md`](app/CLAUDE.md) for its architecture.
 
 ---
 
@@ -26,7 +26,7 @@ A lightweight, high-performance, single-threaded HTTP/1.1 server and web framewo
 ## Purpose
 
 Modern backend applications often rely on high-level runtimes like Node.js or Go. This project brings the ergonomic, developer-friendly routing and middleware design of **Express.js** directly to **C**, providing:
-- **Maximum Performance & Low Latency**: Native execution with minimal CPU overhead, sub-millisecond response times, and over 202,000 requests/sec with multi-worker concurrency (over 167,000 req/sec single-threaded).
+- **Maximum Performance & Low Latency**: Native execution with minimal CPU overhead, sub-millisecond response times, and about 287,000 requests/sec on a minimal endpoint with 4 workers (about 207,000 req/sec with a single process). See [Performance & Benchmarks](#performance--benchmarks).
 - **Minimal Footprint**: `lib/` itself has zero external dependencies beyond standard C and POSIX APIs (optional OpenSSL for TLS). The bundled demo app additionally links SQLite (embedded, no server process) for its Todo persistence layer.
 - **Event-Driven Non-Blocking I/O**: High-performance concurrency powered by native `kqueue` (macOS / BSD) and `epoll` (Linux), following the same architectural pattern as Node.js's underlying `libuv`.
 - **Memory Safety & Control**: Explicit bounded buffers, aggressive `const` correctness, bounded I/O guards, and strict dynamic memory allocation tracking.
@@ -35,29 +35,51 @@ Modern backend applications often rely on high-level runtimes like Node.js or Go
 
 ## Performance & Benchmarks
 
-Benchmarked using `wrk` on macOS (Apple Silicon, 8 threads, keep-alive active) running in multi-worker cluster mode (`QUIET=1 WORKERS=4`):
+Measured with `wrk` (8 threads, keep-alive, 15 s per row) against the server started exactly as
+`QUIET=1 WORKERS=4 ./build/bin/cexpress`, on an Apple M3 Pro laptop with `wrk` running on the same machine
+(so both compete for the same cores). Each row is a single run; repeated runs of the same command varied by about ±1%
+(`/ping`, 100 connections: 289k, 285k, 286k, 287k req/s).
 
-| Concurrency | Threads | Duration | Throughput | Avg Latency | Max Latency | Total Requests | Data Transferred |
-|---|---|---|---|---|---|---|---|
-| **100 connections** | 8 | 15s | **202,118 req/sec** | **473.86 µs** | 2.18 ms | 3,051,948 | 334.71 MB |
-| **1,000 connections** | 8 | 15s | **202,496 req/sec** | **4.92 ms** | 11.57 ms | 3,039,030 | 333.30 MB |
-| **5,000 connections** | 8 | 15s | **184,058 req/sec** | **20.00 ms** | 405.31 ms | 2,767,770 | 303.55 MB |
+**`GET /ping`**: a fixed 4-byte reply, no database, no JSON. This is the engine's connection and request path on its own.
+
+| Concurrency | Throughput | Avg Latency | Max Latency | Total Requests | Data Transferred |
+|---|---|---|---|---|---|
+| **100 connections** | **286,886 req/sec** | **330 µs** | 4.29 ms | 4,331,986 | 380.08 MB |
+| **1,000 connections** | **286,401 req/sec** | **3.47 ms** | 11.70 ms | 4,299,189 | 377.20 MB |
+| **5,000 connections** | **253,306 req/sec** | **17.34 ms** | 51.26 ms | 3,811,353 | 334.40 MB |
+
+**`GET /`**: the Todo UI, a 6,481-byte HTML page streamed from disk (`res_send_file`) on every request.
+
+| Concurrency | Throughput | Avg Latency | Max Latency | Total Requests | Data Transferred |
+|---|---|---|---|---|---|
+| **100 connections** | **69,782 req/sec** | **1.37 ms** | 4.72 ms | 1,053,741 | 6.45 GB |
+| **1,000 connections** | **66,054 req/sec** | **15.07 ms** | 28.52 ms | 991,471 | 6.07 GB |
+| **5,000 connections** | **64,172 req/sec** | **52.36 ms** | 133.37 ms | 965,895 | 5.91 GB |
+
+At 5,000 connections `wrk` also reported read errors (636 on `/ping`, 2,051 on `GET /`; no connect errors, no worker
+crashes); the cause is not identified. With `WORKERS=1` the same test gives 207,026 req/sec on `/ping` (100
+connections) but 70,119 on `GET /`, the same as with 4 workers, so the Todo UI page is not limited by the server's CPU
+count; the reason has not been isolated. Earlier versions of this table (about 202k req/sec) were taken when `GET /`
+returned a 26-byte in-memory string, so they compare with `/ping`, not with today's `GET /`.
 
 > [!TIP]
-> Reproduce these benchmarks with one command (builds, boots a 4-worker cluster, seeds some todos, and runs the full `wrk` sweep against `GET /`, `GET /api/todos`, and `POST /api/todos`):
+> Reproduce the tables above manually (this is the setup they were measured with):
 > ```bash
-> scripts/stress_test.sh
-> ```
-> Tunable via env vars, e.g. `WORKERS=8 CONNS="100 1000 5000 10000" scripts/stress_test.sh` — see [`scripts/CLAUDE.md`](scripts/CLAUDE.md). Or run it manually:
-> ```bash
-> # Start cluster server with 4 workers in quiet mode
+> # Terminal 1: 4-worker cluster, no access logging
 > QUIET=1 WORKERS=4 ./build/bin/cexpress
 >
-> # In another terminal, run wrk against the Todo API:
-> wrk -t8 -c100 -d15s http://127.0.0.1:8080/api/todos
-> wrk -t8 -c1000 -d15s http://127.0.0.1:8080/api/todos
-> wrk -t8 -c5000 -d15s http://127.0.0.1:8080/api/todos
+> # Terminal 2:
+> wrk -t8 -c100  -d15s http://127.0.0.1:8080/ping
+> wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
+> wrk -t8 -c5000 -d15s http://127.0.0.1:8080/ping
+> wrk -t8 -c100  -d15s http://127.0.0.1:8080/        # Todo UI
+> wrk -t8 -c100  -d15s http://127.0.0.1:8080/api/todos
 > ```
+> `scripts/stress_test.sh` automates a full sweep (builds, boots a 4-worker cluster, seeds todos, runs `GET /ping`,
+> connection churn, `GET /`, `GET /api/todos` and `POST /api/todos`, and tracks memory), e.g.
+> `WORKERS=8 CONNS="100 1000 5000 10000" scripts/stress_test.sh` — see [`scripts/CLAUDE.md`](scripts/CLAUDE.md).
+> Its numbers run lower than the manual ones on this machine (about 200–209k req/sec on `/ping` at 100 connections in the same
+> session; the memory sampler accounts for only about 4% of that), so compare figures only within the same method.
 
 ---
 
@@ -88,7 +110,7 @@ The codebase is split into two distinct tiers:
 │   - static.c     : Traversal-safe static file serving  │
 │   - multipart.c  : RFC 7578 multipart/form-data parser│
 │   - urlencoded.c : application/x-www-form-urlencoded   │
-│   - json/        : Recursive-descent JSON AST & writer │
+│   - json/        : JSON parser, AST & streaming writer │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -144,21 +166,21 @@ The codebase is split into two distinct tiers:
 - **Cookie Parsing**: Access request cookies via `req_get_cookie(req, "session")`.
 - **Cookie Setting & Clearing**: `res_set_cookie(res, name, val, &opts)` and `res_clear_cookie(res, name, path)` supporting `Path`, `Domain`, `Max-Age`, `HttpOnly`, `Secure`, and `SameSite` (`Strict`/`Lax`/`None`).
 
-### 9. Built-in JSON Parser & Serializer
-- Pure C recursive-descent JSON parser in `lib/json/`.
-- Dynamic AST supporting `null`, booleans, numbers, escaped strings, arrays, and objects.
-- Serialization back to JSON strings via `json_stringify`.
-- **Builder API** for constructing a tree by hand (not just parsing one): `json_new_string`/`json_new_number`/`json_new_bool`/`json_new_object`/`json_new_array` plus `json_object_set`/`json_array_append`, used by the demo app to serialize database rows to JSON.
+### 9. Built-in JSON Parser & Writer
+- Pure C recursive-descent JSON parser in `lib/json/`: `json_parse` builds a tree (`null`, booleans, numbers, escaped strings, arrays, objects) that you read with `json_object_get` / `json_as_string` / ... and release with `json_free`.
+- **`JsonWriter`** (`jw_object_begin`, `jw_key`, `jw_int`, `jw_string`, ...) emits JSON straight into a buffer: no tree, automatic commas and string escaping, exact 64-bit integers, and one `jw_ok` check at the end. About 4x faster than building a tree; the demo app uses it for every response.
+- A tree builder API (`json_new_*`, `json_object_set`, `json_array_append`) and `json_stringify` remain for editing or forwarding parsed documents.
 
 ---
 
 ## Prerequisites
 
 - **Operating System**: macOS / BSD (native `kqueue`), Linux (native `epoll`), or Docker on any host.
-- **Compiler**: C11 compliant compiler (`gcc-16` or `clang` on macOS; `gcc` on Linux).
+- **Compiler**: C11 compliant compiler (`gcc-16` on macOS; `gcc` on Linux). The `Makefile` picks one by OS; override with `make CC=<compiler>`.
 - **Build Tool**: GNU `make`.
-- **SQLite development headers**: required to build the demo app (`app/db.c`) — `sqlite-dev` on Alpine/Debian, or `brew install sqlite` on macOS. The `Makefile` auto-detects a Homebrew keg, falls back to `pkg-config`, then a bare `-lsqlite3`.
-- **Optional**: Docker (for containerized deployment and automated multi-platform verification).
+- **SQLite development headers**: required to build the demo app (`app/db.c`) — `sqlite-dev` on Alpine, `libsqlite3-dev` on Debian/Ubuntu, or `brew install sqlite` on macOS. The `Makefile` auto-detects a Homebrew keg, falls back to `pkg-config`, then a bare `-lsqlite3`.
+- **OpenSSL development headers** (optional): enables HTTPS. Auto-detected; if absent, or with `make NO_TLS=1`, the server builds without TLS.
+- **Optional**: Docker (containerized run; its build also runs the whole test suite on Linux), and [`wrk`](https://github.com/wg/wrk) for load testing (`brew install wrk` / `apt install wrk`).
 
 > [!TIP]
 > On macOS, `gcc-16` is installed via Homebrew (`brew install gcc`). The default `Makefile` automatically detects macOS (`Darwin`) or Linux (`Linux`), selecting `gcc-16` on Darwin and `gcc` on Linux.
@@ -167,51 +189,111 @@ The codebase is split into two distinct tiers:
 
 ## Building & Running
 
-### 1. Compile the Library and Demo
+All commands run from the repository root. Build output goes to `build/` (never into the source tree).
+
+### 1. Build
 ```bash
-make
+make                # library + demo app
+make NO_TLS=1       # same, without OpenSSL (plaintext only)
+make clean          # remove build/ and the ./cexpress symlink
 ```
 This produces:
-- `build/lib/libcexpress.a`: The core engine static library.
-- `build/bin/cexpress`: The executable demo application (symlinked to `./cexpress`).
+- `build/lib/libcexpress.a`: the core engine static library.
+- `build/bin/cexpress`: the demo application (also symlinked to `./cexpress`).
 
-### 2. Start the Server
+The Makefile tracks header dependencies, so editing a header rebuilds everything that includes it.
+
+### 2. Run the server
 ```bash
-./cexpress
-# or
-make run
+./cexpress          # or: make run
 ```
-By default, the server listens on port `8080`.
+It listens on port `8080` and creates `todos.db` (SQLite) in the current directory. The demo serves its own web UI, so
+open <http://localhost:8080/> in a browser, or check it from another terminal:
+```bash
+curl -i http://localhost:8080/api/todos       # 200 with a JSON array ([] on a fresh database)
+```
+Stop it with `Ctrl+C` (or `kill -TERM $(pgrep cexpress)`): it stops accepting connections, finishes in-flight requests
+and exits within 5 seconds. Common variants (all variables are listed under [Configuration](#configuration)):
+```bash
+PORT=3000 ./cexpress                          # different port
+WORKERS=4 QUIET=1 ./cexpress                  # 4-process cluster, no per-request logging
+WORKERS=auto ./cexpress                       # one worker per CPU core
+TODO_DB_PATH=/tmp/todos.db ./cexpress         # database location
+TLS_CERT=tests/certs/server.crt TLS_KEY=tests/certs/server.key PORT=8443 ./cexpress
+curl -k https://localhost:8443/api/todos      # -k: the bundled test certificate is self-signed
+```
+Write endpoints (`POST`/`PUT`/`PATCH`/`DELETE`) need `Authorization: Bearer <API_KEY>` (default `my-secret-api-key`);
+see [Quick Start & Example Usage](#quick-start--example-usage) for `curl` examples.
 
-### 3. Running via Docker
-CExpress includes an Alpine-based multi-stage `Dockerfile`:
+### 3. Run with Docker
+The multi-stage Alpine `Dockerfile` compiles the engine and **runs the full test suite during `docker build`**, so a
+successful build means the tests passed on Linux (`epoll`, musl):
 ```bash
 docker build -t cexpress .
 docker run --rm -p 8080:8080 cexpress
+docker run --rm -p 8080:8080 -e WORKERS=4 -e API_KEY=change-me cexpress    # with options
 ```
+The database lives inside the container and is discarded with it; mount a volume and set `TODO_DB_PATH` to keep it
+(`-v cexpress-data:/data -e TODO_DB_PATH=/data/todos.db`).
 
 ---
 
 ## Running Tests
 
-The project includes **11 isolated test suites** testing all components:
-
 ```bash
 make test
 ```
 
-This compiles and executes:
-1. `build/bin/test_json`: JSON tokenizer, AST building, and serialization.
-2. `build/bin/test_middleware`: Pipeline ordering, short-circuiting, 404 fallthrough, and error handlers.
-3. `build/bin/test_router`: Literal paths, parameter extraction, and route table bounds.
-4. `build/bin/test_http_parser`: Header parsing, bounds validation, dechunking, and keep-alive.
-5. `build/bin/test_connection`: Non-blocking socket I/O, partial reads, socket file streaming, and lifecycle using POSIX `socketpair(2)`.
-6. `build/bin/test_response`: Headers, cookies, redirects, chunked streaming, trailers, and HEAD suppression.
-7. `build/bin/test_multipart`: RFC 7578 multipart body splitting, file parts, and boundary handling.
-8. `build/bin/test_urlencoded`: URL-encoded key-value parsing and percent-decoding.
-9. `build/bin/test_static`: Path traversal prevention, symlink escape checks, MIME types, and directory index fallback.
-10. `build/bin/test_event_loop`: Event-loop lifecycle, read/write polling across `socketpair`, and idle/shutdown timer verification.
-11. `build/bin/test_cluster`: Multi-worker count resolution, `SO_REUSEPORT` multi-bind, concurrent serving, and graceful shutdown.
+builds and runs every suite (stops at the first failure; each prints `all ... tests passed`). Plain C `assert`
+tests, no framework, no network access needed except loopback. **15 suites:**
+
+| Binary (`build/bin/`) | Covers |
+|---|---|
+| `test_json` | JSON parsing, tree builders, `json_stringify` number formatting, the streaming `JsonWriter` |
+| `test_middleware` | pipeline order, short-circuiting, 404/405/OPTIONS fallthrough, error handler |
+| `test_router` | literal paths, `:params`, wildcards, sub-router mounting, route limits, `match_path` edge cases |
+| `test_http_parser` | request line, headers, query, cookies, `Content-Length`, chunked bodies, keep-alive |
+| `test_http_hardening` | regressions: header-name confusion, strict `Content-Length`, method limits, garbage-filled `Request` |
+| `test_connection` | non-blocking socket I/O over `socketpair(2)`: partial reads, buffer growth, 400/413/414/431, timeouts |
+| `test_response` | headers, cookies, redirects, chunked streaming, trailers, HEAD, header/cookie injection refusal |
+| `test_multipart` / `test_urlencoded` | form and file-upload body parsers |
+| `test_static` | path traversal and symlink escape prevention, MIME types, directory index |
+| `test_event_loop` | event-loop lifecycle, readiness polling, idle/shutdown timers |
+| `test_cluster` | worker count, `SO_REUSEPORT` multi-bind, concurrent serving, graceful drain |
+| `test_tls` | non-blocking TLS handshake and I/O (uses `tests/certs/`) |
+| `test_ping` | the demo app's `GET /ping` handler (the connection stress-test target) |
+| `test_cookbook` | every recipe in `lib/examples/cookbook.c`, driven through the real parse → route → dispatch path |
+
+### Run one suite
+```bash
+make build/bin/test_router && ./build/bin/test_router
+```
+Substitute any name from the table. A failing `assert` prints the file, line and expression.
+
+### Memory-safety checks
+```bash
+make SANITIZE=1 BUILD_DIR=build-asan test     # every suite under AddressSanitizer + UBSan
+make fuzz                                     # mutation fuzzer over parser/router/response (FUZZ_ITERS=n, default 1,000,000)
+```
+Use a separate `BUILD_DIR` for sanitizer builds so instrumented and normal objects never mix. Leak detection is on by
+default on Linux; AddressSanitizer on macOS cannot detect leaks. Run both after touching `lib/http_parser.c`,
+`lib/router.c`, `lib/response.c` or `lib/json/json_writer.c`.
+
+### Performance
+```bash
+make bench             # CPU cost per request (no sockets) and JSON writer vs tree, in ns
+scripts/stress_test.sh # end-to-end wrk sweep against a real cluster (needs wrk); see scripts/CLAUDE.md
+PHASES=ping scripts/stress_test.sh   # only the DB-free /ping connection benchmark (PHASES: ping churn read write)
+```
+
+### Documentation check
+```bash
+make check-docs        # fails if lib/API.md and the lib/ headers disagree about the public functions
+```
+
+### Linux from a Mac
+`docker build -t cexpress .` runs the whole suite on Linux (see above). On macOS, `make test_epoll` additionally exercises
+the epoll backend through `epoll-shim` when it is installed (`brew install epoll-shim`).
 
 ---
 
@@ -225,11 +307,15 @@ The server supports both runtime environment variables and programmatic configur
 | `WORKERS` | `1` | Number of worker processes (`1` = single process, `auto` or `0` = CPU core auto-detection, `N` = fixed count). |
 | `API_KEY` | `my-secret-api-key` | Bearer token verified by the demo authentication middleware. |
 | `TODO_DB_PATH` | `todos.db` | Path to the SQLite database file backing the Todo CRUD demo. |
+| `QUIET` | unset | `1` disables the per-request access log (use it for benchmarks). |
+| `TLS_CERT` / `TLS_KEY` | unset | PEM certificate chain and private key; set **both** to serve HTTPS. |
 
 ### Running with Custom Configuration
 ```bash
 PORT=3000 API_KEY=super-secret-token ./cexpress
 ```
+Environment variables are read by the demo app (`app/main.c`); the engine itself is configured in code (`app.config`,
+`app_enable_tls`, ...).
 
 ### Engine Limits (`lib/app_types.h`)
 - `BUF_SIZE`: Initial buffer per connection (default: `8192` bytes).
@@ -252,6 +338,13 @@ The demo app (`app/`) is a SQLite-backed Todo CRUD API — see
 [`app/CLAUDE.md`](app/CLAUDE.md) for its architecture. Open
 `http://localhost:8080/` in a browser for the built-in Todo UI, or drive the
 REST API directly:
+
+### 0. Ping (GET)
+```bash
+curl -i http://localhost:8080/ping       # 200, body "pong": no database, no JSON
+```
+The connection stress-test target: `PHASES=ping scripts/stress_test.sh` (keep-alive throughput) and
+`PHASES=churn scripts/stress_test.sh` (a new TCP connection per request). See [`scripts/CLAUDE.md`](scripts/CLAUDE.md).
 
 ### 1. Todo UI (GET)
 ```bash
@@ -325,7 +418,9 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 ├── CLAUDE.md             # Project standards, coding guidelines, and workflow rules
 ├── AGENTS.md             # Agent context and workflow guidelines
 ├── lib/                  # Reusable CExpress engine (builds to build/lib/libcexpress.a)
-│   ├── CLAUDE.md         # Engine architecture, data flow, and memory lifecycle
+│   ├── CLAUDE.md         # Engine map: lifecycle, limits, ownership, hot-path rules, known gaps
+│   ├── API.md            # One-line index of every public function (checked by `make check-docs`)
+│   ├── examples/         # cookbook.c: tested recipes (JSON, params, middleware, cookies, uploads, streaming)
 │   ├── app_types.h       # Struct definitions, event loop types, function pointer signatures
 │   ├── cluster.h/c       # Multi-process master supervisor & worker lifecycle
 │   ├── event_loop.h      # Cross-platform event-loop abstraction
@@ -340,7 +435,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │   ├── static.h/c        # Static file serving with path-traversal guards
 │   ├── multipart.h/c     # RFC 7578 multipart/form-data parser
 │   ├── urlencoded.h/c    # application/x-www-form-urlencoded parser
-│   └── json/             # JSON parsing and AST generation subsystem
+│   └── json/             # JSON parser, tree API and streaming JsonWriter
 │       ├── CLAUDE.md     # JSON subsystem architecture and memory rules
 │       ├── json.h        # Public JSON API
 │       ├── json_types.h  # AST enum and node structs
@@ -349,6 +444,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │   ├── CLAUDE.md         # Application wiring, persistence layer & fork-safety notes
 │   ├── main.c            # Application entrypoint and route definitions
 │   ├── handlers.h/c      # Todo CRUD route handlers
+│   ├── ping.h/c          # GET /ping handler (connection stress-test target, no DB)
 │   ├── middlewares.h/c   # Logger, body size guard, and authentication middlewares
 │   ├── db.h/c            # SQLite persistence layer (schema, CRUD, worker-init hook)
 │   ├── todo_types.h      # Todo/TodoList struct definitions
@@ -364,6 +460,11 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │   ├── test_event_loop.c # Event-loop abstraction tests (lifecycle, I/O, timers)
 │   ├── test_cluster.c    # Multi-worker cluster tests (forking, SO_REUSEPORT, drain)
 │   ├── test_http_parser.c# Unit tests for HTTP parser and request dechunking
+│   ├── test_http_hardening.c # Regression tests for parser bugs (framing, method limits, ...)
+│   ├── test_ping.c       # GET /ping handler tests
+│   ├── test_cookbook.c   # Runs every cookbook recipe through parse -> route -> dispatch
+│   ├── bench_hotpath.c   # `make bench`: per-request CPU cost, JSON writer vs tree
+│   ├── fuzz_parser.c     # `make fuzz`: mutation fuzzer under ASan + UBSan
 │   ├── test_middleware.c # Middleware chain dispatching and error handling
 │   ├── test_router.c     # Unit tests for router pattern matching and sub-routers
 │   ├── test_response.c   # Unit tests for headers, cookies, redirects, chunking & trailers
@@ -373,7 +474,8 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │   └── test_json.c       # JSON tokenizer, AST building, and serialization tests
 ├── scripts/               # Benchmarking and utility scripts
 │   ├── CLAUDE.md          # Benchmarking tools documentation
-│   ├── stress_test.sh     # End-to-end wrk benchmark: build, boot cluster, seed, run
+│   ├── stress_test.sh     # End-to-end wrk benchmark: build, boot cluster, seed, run (PHASES=ping|churn|read|write)
+│   ├── check_docs.sh      # `make check-docs`: keeps lib/API.md in sync with the headers
 │   └── wrk_create_todo.lua # wrk load-testing script for POST /api/todos
 └── build/                # Out-of-source build outputs (gitignored)
     ├── bin/              # cexpress executable and test runners

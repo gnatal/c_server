@@ -353,6 +353,47 @@ void flush_connection(App *app, Connection *conn) {
     }
 }
 
+/* Sends `status` with its reason phrase as the body, then closes the connection. */
+static void reject_request(App *app, Connection *conn, const int status) {
+    Response res;
+    res_init(&res, conn);
+    conn->keep_alive = 0;
+    res_status(&res, status);
+    res_send(&res, status_text(status));
+    flush_connection(app, conn);
+}
+
+/*
+ * in_buf is full with headers complete: grow it to fit the body. Returns 1 grown (keep reading),
+ * 0 realloc failed (-> 500), -1 chunked raw-size cap hit (-> 413).
+ * Content-Length: one realloc straight to header_len + content_length + 1 (size is known).
+ * Chunked: doubling, capped at header_len + MAX_BODY_SIZE on the RAW wire size, so a client
+ * cannot inflate memory past that by sending tiny chunks ("1\r\nX\r\n" = 6 raw bytes per byte).
+ * A Content-Length above MAX_BODY_SIZE never gets here: request_is_complete already stopped
+ * buffering and parse_http_request answered 413.
+ */
+static int grow_in_buf(Connection *conn, const size_t header_len, const int chunked, const int content_length) {
+    size_t needed;
+    if (chunked) {
+        const size_t raw_cap = header_len + MAX_BODY_SIZE;
+        if (conn->in_cap >= raw_cap) {
+            return -1;
+        }
+        needed = conn->in_cap * 2 > raw_cap ? raw_cap : conn->in_cap * 2;
+    } else if (content_length >= 0) {
+        needed = header_len + (size_t)content_length + 1;
+    } else {
+        return 0;
+    }
+    char *grown = realloc(conn->in_buf, needed);
+    if (grown == NULL) {
+        return 0;
+    }
+    conn->in_buf = grown;
+    conn->in_cap = needed;
+    return 1;
+}
+
 void handle_readable(App *app, Connection *conn) {
     while (conn->in_len < conn->in_cap - 1) {
         ssize_t n = conn_read(app, conn, conn->in_buf + conn->in_len, conn->in_cap - 1 - conn->in_len);
@@ -374,49 +415,22 @@ void handle_readable(App *app, Connection *conn) {
 
         if (request_is_complete(conn->in_buf, conn->in_len)) {
             Request req;
-            Response res;
-            memset(&res, 0, sizeof(res));
-            res.conn = conn;
-            res.status = 200;
-
             const int parse_status = parse_http_request(conn->in_buf, conn->in_len, &req);
             if (parse_status != 0) {
-                conn->keep_alive = 0;
-                /* parse_http_request distinguishes -2 (request-line path too
-                 * long -> 414) from every other failure (-1). A -1 still
-                 * folds together a Content-Length that's merely too large
-                 * (rather than malformed/negative), which deserves 413, not
-                 * 400 - re-check the same pure function connection.c already
-                 * relies on elsewhere for status-code decisions (cheap: a
-                 * strcasestr + atol scan over headers already sitting in
-                 * conn->in_buf). */
-                if (parse_status == -2) {
-                    res_status(&res, 414);
-                    res_send(&res, "URI Too Long");
-                } else if (req.content_length == -2) {
-                    /* parse_http_request sets this same sentinel whether the
-                     * rejection came from a Content-Length beyond
-                     * MAX_BODY_SIZE or (see lib/CLAUDE.md, "Chunked
-                     * Transfer-Encoding") a chunked body whose decoded size
-                     * exceeds it - one check covers both, connection.c
-                     * doesn't need to know which framing was used. */
-                    res_status(&res, 413);
-                    res_send(&res, "Payload Too Large");
-                } else {
-                    res_status(&res, 400);
-                    res_send(&res, "Bad Request");
-                }
-            } else {
-                conn->keep_alive = !request_wants_close(&req) && !app->is_shutting_down;
-                /* HTTP forbids a body in any response to HEAD, regardless of
-                 * status (see response.c: send_with_content_type). Set ahead
-                 * of dispatch() so it applies uniformly whether the request
-                 * resolves to a route's handler or to a 404/405 built by
-                 * chain_next's fallback. */
-                res.is_head_request = strcmp(req.method, "HEAD") == 0;
-                const Route *route = match_route(app, &req);
-                dispatch(app, route, &req, &res);
+                /* -2: path too long (414). content_length == -2: body over MAX_BODY_SIZE (413),
+                 * for both Content-Length and chunked framing. Anything else: 400. */
+                free(req.body); /* NULL after a failed parse */
+                reject_request(app, conn, parse_status == -2 ? 414 : (req.content_length == -2 ? 413 : 400));
+                return;
             }
+
+            Response res;
+            res_init(&res, conn);
+            conn->keep_alive = !request_wants_close(&req) && !app->is_shutting_down;
+            /* Set before dispatch so HEAD bodies are suppressed for matched routes and 404/405 alike. */
+            res.is_head_request = strcmp(req.method, "HEAD") == 0;
+            const Route *route = match_route(app, &req);
+            dispatch(app, route, &req, &res);
             free(req.body);
 
             flush_connection(app, conn);
@@ -425,106 +439,21 @@ void handle_readable(App *app, Connection *conn) {
     }
 
     if (conn->in_len >= conn->in_cap - 1) {
-        /*
-         * The buffer is full and still doesn't hold a complete request.
-         * Before rejecting outright, tell apart two very different cases:
-         *   - The header block itself hasn't finished arriving yet (no
-         *     "\r\n\r\n" seen) - this is the original oversized-header/
-         *     Slowloris shape, unaffected by body growth below, since
-         *     growth only ever happens once headers are already complete.
-         *     Reject with 431, same as always.
-         *   - Headers ARE complete and this is purely a body that doesn't
-         *     fit in the current capacity yet. A Content-Length beyond
-         *     MAX_BODY_SIZE can never reach this branch in the first place -
-         *     request_is_complete (called on every recv() above, including
-         *     the one that completed the header block) already caught that
-         *     and dispatched a 413 the moment headers arrived (see
-         *     req.content_length == -2 above). So content_length here is
-         *     always valid and within MAX_BODY_SIZE - grow in_buf via
-         *     realloc to exactly header+body+NUL and keep waiting for more
-         *     EVFILT_READ events instead of rejecting - this is what lets a
-         *     body exceed BUF_SIZE (see lib/CLAUDE.md, "Body buffering").
-         *     Only a failed realloc (genuine server-side OOM, not a
-         *     client-declared size problem) falls through to a rejection
-         *     below, as 500. A Transfer-Encoding: chunked body takes a
-         *     separate branch just below instead, since it has no single
-         *     declared size to realloc straight to (see lib/CLAUDE.md,
-         *     "Chunked Transfer-Encoding").
-         */
-        const char *header_end = strstr(conn->in_buf, "\r\n\r\n");
-        if (header_end != NULL) {
-            const size_t header_len = (size_t)(header_end + 4 - conn->in_buf);
-
-            if (request_has_chunked_encoding(conn->in_buf)) {
-                /*
-                 * A chunked body's total size isn't known upfront the way a
-                 * declared Content-Length is (there's no single number to
-                 * realloc straight to) - grow geometrically instead, capped
-                 * at header_len + MAX_BODY_SIZE: the same ceiling a
-                 * Content-Length body gets, applied here to the *raw* wire
-                 * size rather than the decoded size chunked_body_scan/
-                 * request_is_complete already bounds independently. Without
-                 * this raw-side cap too, a client could inflate memory use
-                 * well past MAX_BODY_SIZE by sending the same decoded byte
-                 * count as a pile of pathologically tiny chunks (each
-                 * "1\r\nX\r\n" chunk costs 6 raw bytes per 1 decoded byte)
-                 * before chunked_body_scan's decoded-size check ever
-                 * triggers - see lib/CLAUDE.md, "Chunked Transfer-Encoding".
-                 * By the time this branch runs, request_is_complete already
-                 * requires chunked_body_scan to have returned exactly 0 on
-                 * the current buffer (1/-1/-2 all end the request in the
-                 * dispatch branch above instead) - reaching here always
-                 * means "still incomplete", never "reject this specific
-                 * scan result".
-                 */
-                const size_t raw_cap = header_len + MAX_BODY_SIZE;
-                if (conn->in_cap < raw_cap) {
-                    size_t needed = conn->in_cap * 2;
-                    if (needed > raw_cap) {
-                        needed = raw_cap;
-                    }
-                    char *grown = realloc(conn->in_buf, needed);
-                    if (grown != NULL) {
-                        conn->in_buf = grown;
-                        conn->in_cap = needed;
-                        return; /* wait for more EVFILT_READ events */
-                    }
-                }
-
-                Response res;
-                memset(&res, 0, sizeof(res));
-                res.conn = conn;
-                conn->keep_alive = 0;
-                res_status(&res, 413);
-                res_send(&res, "Payload Too Large");
-                flush_connection(app, conn);
-                return;
-            }
-
-            const int content_length = extract_content_length(conn->in_buf);
-            if (content_length >= 0) {
-                const size_t needed = header_len + (size_t)content_length + 1;
-                char *grown = realloc(conn->in_buf, needed);
-                if (grown != NULL) {
-                    conn->in_buf = grown;
-                    conn->in_cap = needed;
-                    return; /* wait for more EVFILT_READ events */
-                }
-            }
+        /* Buffer full, request still incomplete. No header terminator yet means the headers
+         * themselves are too big (431, the Slowloris shape). With headers complete it is only
+         * a body larger than the buffer, so grow (never masks an oversized-header attack). */
+        size_t header_len;
+        int chunked;
+        const int content_length = request_framing(conn->in_buf, conn->in_len, &header_len, &chunked);
+        if (header_len == 0) {
+            reject_request(app, conn, 431);
+            return;
         }
-
-        Response res;
-        memset(&res, 0, sizeof(res));
-        res.conn = conn;
-        conn->keep_alive = 0;
-        if (header_end == NULL) {
-            res_status(&res, 431);
-            res_send(&res, "Request Header Fields Too Large");
-        } else {
-            res_status(&res, 500);
-            res_send(&res, "Internal Server Error");
+        const int grown = grow_in_buf(conn, header_len, chunked, content_length);
+        if (grown == 1) {
+            return; /* wait for more read events */
         }
-        flush_connection(app, conn);
+        reject_request(app, conn, grown == -1 ? 413 : 500);
     }
 }
 
@@ -549,20 +478,9 @@ void close_idle_connections(App *app) {
         }
 
         if (conn->in_len > 0) {
-            /* A request was in progress when the client went quiet - let it
-             * know why before closing, same shape as the 431/500 rejections
-             * in handle_readable(). */
-            Response res;
-            memset(&res, 0, sizeof(res));
-            res.conn = conn;
-            conn->keep_alive = 0;
-            res_status(&res, 408);
-            res_send(&res, "Request Timeout");
-            flush_connection(app, conn);
+            reject_request(app, conn, 408); /* went quiet mid-request: say why, then close */
         } else {
-            /* Idle keep-alive connection that never sent a next request -
-             * nothing to respond to. */
-            connection_close(app, conn);
+            connection_close(app, conn); /* idle keep-alive: nothing to answer */
         }
     }
 }

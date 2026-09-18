@@ -5,129 +5,67 @@
 #include "app_types.h"
 #include "event_loop.h"
 
-/* Puts a socket into non-blocking mode so recv()/send()/accept() never stall the single thread. */
-int set_nonblocking(int fd);
-
-/* Creates, binds and starts listening on a non-blocking TCP socket for the given port. */
-int create_server_socket(int port);
-
-/* Allocates and zero-initializes per-connection state for a freshly accepted fd. */
-Connection *connection_create(int fd);
-
-/* Deregisters a connection from the event loop, closes its socket and frees its state. */
-void connection_close(App *app, Connection *conn);
-
-
 /*
- * Tears down everything app_init allocated/opened: closes every still-open
- * connection (via connection_close), closes kq/server_fd if valid, and frees
- * app->connections - the documented match for app_init's calloc (app_types.h:
- * App.connections), per this engine's memory-lifecycle convention. Not called
- * from app_listen's event loop (it never returns there today); intended for
- * test teardown and for a future graceful-shutdown path (pending.txt) to
- * build on. Safe to call on an App that's already been through app_init but
- * never app_listen (server_fd/kq still -1, connections_cap slots all NULL).
+ * Server lifecycle. One process runs one single-threaded, non-blocking event loop (kqueue on
+ * macOS/BSD, epoll on Linux). Typical main():
+ *   App app; app_init(&app); ...register middleware and routes...; app_listen(&app, port); app_destroy(&app);
  */
-void app_destroy(App *app);
 
-/* Thin wrapper around EV_SET + kevent() for registering interest in one filter on one fd. */
-void kq_watch(int kq, int fd, int16_t filter, void *udata);
-
-/* Drops interest in one filter on one fd. */
-void kq_unwatch(int kq, int fd, int16_t filter);
-
-/*
- * Accepts every pending connection on the listening socket (kqueue is
- * level-triggered, so more than one can be waiting at once), and registers
- * each new client fd for read readiness.
- */
-void accept_connections(App *app);
-
-/*
- * Non-blocking write of whatever's left in conn->out_buf. If the socket
- * can't take it all right now, remembers how much was sent and asks kqueue
- * to notify us again once the socket is writable. Once everything is sent:
- * a keep-alive connection is reset and left open for the next request; a
- * "Connection: close" one is torn down.
- */
-void flush_connection(App *app, Connection *conn);
-
-/*
- * Non-blocking read of whatever's available on the socket. Once a full
- * request has accumulated in conn->in_buf, parses it, routes it, and runs
- * the app's middleware pipeline (dispatch(), lib/middleware.h) ending at the
- * matched handler, which builds a response via res_send() - then hands off
- * to flush_connection() to actually put it on the wire.
- */
-void handle_readable(App *app, Connection *conn);
-
-/*
- * Sweeps app->connections for connections that have gone IDLE_TIMEOUT_SECONDS
- * without the server receiving any bytes (Connection.last_activity) - the
- * Slowloris-shaped gap where a client trickles a request in too slowly, or
- * never sends a next request on a keep-alive connection, without ever
- * tripping the hard buffer-size limits in handle_readable(). A connection
- * with a write still in flight (conn->out_buf != NULL) is left alone even if
- * its read side is stale - that's a slow-reading client on the response,
- * a different problem this function doesn't try to solve. A timed-out
- * connection with a partial request already buffered (conn->in_len > 0)
- * gets a 408 response before closing; one that's simply idle between
- * requests is closed with no response, same as any other idle keep-alive
- * teardown. Called once per IDLE_SWEEP_INTERVAL_MS from app_listen's event
- * loop, off a dedicated EVFILT_TIMER registration.
- */
-void close_idle_connections(App *app);
-
-/*
- * Returns the number of currently open client connections tracked in
- * app->connections.
- */
-int app_count_connections(const App *app);
-
-/*
- * Initiates graceful shutdown: stops accepting new connections (unwatches and
- * closes server_fd), closes idle keep-alive connections immediately, sets
- * is_shutting_down = 1 so in-flight requests finish with Connection: close,
- * and arms a oneshot shutdown timeout timer (SHUTDOWN_TIMEOUT_SECONDS) on kqueue.
- * Idempotent: safe to call multiple times.
- */
-void app_stop(App *app);
-
-/*
- * Starts listening and runs a single-threaded event loop: kevent() / epoll blocks
- * until a socket is ready, then each event is dispatched to the right
- * handler. Catches SIGINT/SIGTERM for graceful shutdown, draining in-flight
- * requests before returning. If app->config.workers > 1, automatically
- * delegates to cluster_listen().
- */
+/* Runs the server until SIGINT/SIGTERM, then drains and returns. workers > 1 (or 0 = one per CPU)
+ * forks a cluster of SO_REUSEPORT workers under a supervising master (see cluster.h); the master
+ * respawns crashed workers. The first signal starts a graceful drain (SHUTDOWN_TIMEOUT_SECONDS),
+ * a second forces exit. */
 void app_listen(App *app, int port);
 
-/*
- * Runs the single-process event loop directly without cluster delegation.
- * Used internally by cluster workers and standalone instances. Runs every
- * hook registered via app_on_worker_start before doing anything else - see
- * that function and lib/CLAUDE.md ("Worker lifecycle hooks").
- */
+/* Same loop without cluster delegation: what app_listen runs in the standalone case and inside each
+ * forked worker. Runs the app_on_worker_start hooks first, ignores SIGPIPE, sets up TLS, binds. */
 void app_listen_worker(App *app, int port);
 
+/* Forces a cluster of num_workers processes regardless of app->config.workers. */
+void app_listen_cluster(App *app, int port, int num_workers);
+
 /*
- * Registers a hook to run exactly once per worker process, at the very top
- * of app_listen_worker - guaranteed to run after any fork() cluster_listen
- * (lib/cluster.c) may have performed to create that worker, since
- * app_listen_worker is the one function every serving process (standalone,
- * or each individual cluster worker) always calls before starting its event
- * loop. Intended for a resource that isn't safe to open once in main() and
- * then have duplicated across forked workers (e.g. a database connection -
- * see lib/CLAUDE.md, "Worker lifecycle hooks", for the full rationale).
- * Hooks run in registration order. Bounded by MAX_WORKER_INIT_HOOKS; extra
- * registrations past the cap are dropped with a stderr warning, same
- * convention as app_use/MAX_MIDDLEWARES.
+ * Registers `hook` to run once in every serving process, at the top of app_listen_worker, always
+ * AFTER fork. Use it to open anything with OS-level state (database handle, socket, thread): a
+ * resource opened in main() is duplicated into every forked worker, which is unsafe for e.g. SQLite.
+ * Hooks run in registration order; at most MAX_WORKER_INIT_HOOKS (extra are dropped with a warning).
  */
 void app_on_worker_start(App *app, WorkerInitHook hook);
 
+/* Closes every open connection, the event loop and the listen socket, frees app->connections
+ * (the match for app_init's calloc) and TLS state. Safe on an App that never listened. */
+void app_destroy(App *app);
+
+/* Begins graceful shutdown: stop accepting, close idle keep-alive connections at once, mark
+ * in-flight ones Connection: close, arm the shutdown deadline. Idempotent. */
+void app_stop(App *app);
+
+/* Number of open client connections. */
+int app_count_connections(const App *app);
+
 /*
- * Explicitly launches a multi-process cluster with num_workers worker processes.
+ * Engine internals (called from the event loop; exposed for tests).
+ *
+ * handle_readable: recv() into conn->in_buf until EAGAIN. Once request_is_complete, it parses,
+ *   routes and dispatches synchronously, then flush_connection. Rejects with 431 (headers over
+ *   BUF_SIZE), 414 (path over 255), 413 (body over MAX_BODY_SIZE), 400 (malformed), 500 (OOM growing
+ *   the buffer); each rejection closes the connection. in_buf grows to fit a declared body and
+ *   shrinks back to BUF_SIZE once the connection is idle.
+ * flush_connection: non-blocking write of conn->out_buf (and a streamed file, 64 KB per turn).
+ *   On EAGAIN it waits for writability. When done: keep-alive resets the connection, otherwise it closes.
+ * close_idle_connections: run once per second; a connection with no received bytes for
+ *   IDLE_TIMEOUT_SECONDS (60) is closed (408 first if a request was half-received). A connection
+ *   with a response still being written is left alone.
+ * accept_connections: accepts every pending client (non-blocking, TCP_NODELAY) and registers it.
+ * connection_create / connection_close: one Connection per fd, freed exactly once by connection_close.
  */
-void app_listen_cluster(App *app, int port, int num_workers);
+int set_nonblocking(int fd);
+int create_server_socket(int port);
+Connection *connection_create(int fd);
+void connection_close(App *app, Connection *conn);
+void accept_connections(App *app);
+void flush_connection(App *app, Connection *conn);
+void handle_readable(App *app, Connection *conn);
+void close_idle_connections(App *app);
 
 #endif /* CONNECTION_H */

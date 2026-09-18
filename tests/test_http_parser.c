@@ -22,7 +22,7 @@ static void test_extract_content_length(void) {
     assert(extract_content_length("Content-Length: -100\r\n") == -1);
 
     /* A body well beyond the old BUF_SIZE is fine now - body storage is
-     * decoupled from BUF_SIZE (see lib/CLAUDE.md, "Body buffering"). */
+     * decoupled from BUF_SIZE (see lib/CLAUDE.md, "Behavior reference, Buffers"). */
     assert(extract_content_length("Content-Length: 8192\r\n") == 8192);
     assert(extract_content_length("Content-Length: 100000\r\n") == 100000);
 
@@ -74,25 +74,25 @@ static void test_request_wants_close(void) {
     /* Explicit Connection: close */
     memset(&req, 0, sizeof(req));
     strncpy(req.version, "HTTP/1.1", sizeof(req.version) - 1);
-    strncpy(req.headers, "Host: localhost\r\nConnection: close\r\n", sizeof(req.headers) - 1);
+    parse_headers("Host: localhost\r\nConnection: close\r\n", &req);
     assert(request_wants_close(&req) == 1);
 
     /* Explicit Connection: keep-alive overrides HTTP/1.0 */
     memset(&req, 0, sizeof(req));
     strncpy(req.version, "HTTP/1.0", sizeof(req.version) - 1);
-    strncpy(req.headers, "Host: localhost\r\nConnection: keep-alive\r\n", sizeof(req.headers) - 1);
+    parse_headers("Host: localhost\r\nConnection: keep-alive\r\n", &req);
     assert(request_wants_close(&req) == 0);
 
     /* HTTP/1.1 default without Connection header is keep-alive */
     memset(&req, 0, sizeof(req));
     strncpy(req.version, "HTTP/1.1", sizeof(req.version) - 1);
-    strncpy(req.headers, "Host: localhost\r\n", sizeof(req.headers) - 1);
+    parse_headers("Host: localhost\r\n", &req);
     assert(request_wants_close(&req) == 0);
 
     /* HTTP/1.0 default without Connection header is close */
     memset(&req, 0, sizeof(req));
     strncpy(req.version, "HTTP/1.0", sizeof(req.version) - 1);
-    strncpy(req.headers, "Host: localhost\r\n", sizeof(req.headers) - 1);
+    parse_headers("Host: localhost\r\n", &req);
     assert(request_wants_close(&req) == 1);
 
     /* Non-HTTP/1.1 version defaults to close */
@@ -114,7 +114,7 @@ static void test_parse_http_request(void) {
     assert(req.content_length == 0);
     assert(req.body != NULL);
     assert(strcmp(req.body, "") == 0);
-    assert(strstr(req.headers, "Host: example.com") != NULL);
+    assert(strcmp(req_get_header(&req, "Host"), "example.com") == 0);
     free(req.body);
 
     /* Request line with zero header lines before the blank-line terminator
@@ -122,13 +122,12 @@ static void test_parse_http_request(void) {
      * Regression test: this used to make the request-line's own "\r\n"
      * coincide with the start of "\r\n\r\n", producing a negative
      * header_start-to-header_end distance that wrapped to a huge size_t and
-     * caused an out-of-bounds heap read in the memcpy into req->headers
+     * caused an out-of-bounds heap read while copying the header block
      * (found via ASan) - a header-less request is unusual but perfectly
      * legal to receive and must not crash/over-read. */
     const char *raw_no_headers = "GET /ping HTTP/1.1\r\n\r\n";
     assert(parse_http_request(raw_no_headers, strlen(raw_no_headers), &req) == 0);
     assert(strcmp(req.path, "/ping") == 0);
-    assert(strcmp(req.headers, "") == 0);
     assert(req.header_count == 0);
     free(req.body);
 
@@ -193,7 +192,7 @@ static void test_parse_http_request(void) {
     /* A body well beyond the old BUF_SIZE (8192) now parses cleanly -
      * req->body is heap-allocated to fit it exactly rather than being
      * copied into a BUF_SIZE-capped fixed array (see lib/CLAUDE.md,
-     * "Body buffering"). */
+     * "Behavior reference, Buffers"). */
     const size_t big_len = 20000;
     char *big_body = malloc(big_len + 1);
     memset(big_body, 'x', big_len);

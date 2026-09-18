@@ -333,6 +333,190 @@ static void test_send_file_headers_and_fd(void) {
     free_conn(conn);
 }
 
+static void test_res_init_needs_no_zeroed_struct(void) {
+    /* res_init sets only scalars/counts; arrays are never read past their count. Start from garbage. */
+    Connection *conn = make_conn();
+    Response res;
+    memset(&res, 0xA5, sizeof(res));
+    res_init(&res, conn);
+    assert(res.conn == conn && res.status == 200);
+    assert(res.header_count == 0 && res.set_cookie_count == 0 && res.trailer_count == 0);
+    assert(res.is_head_request == 0 && res.is_chunked == 0 && res.headers_sent == 0 && res.stream_ended == 0);
+
+    res_send(&res, "hi");
+    assert(conn->out_buf != NULL);
+    assert(memcmp(conn->out_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi",
+                  conn->out_len) == 0);
+    assert(conn->out_len == strlen("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi"));
+    free_conn(conn);
+}
+
+static void test_exact_head_bytes(void) {
+    /* Pins the wire format of the head builder: order, spacing, CRLFs. */
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    res_status(&res, 201);
+    res_set_header(&res, "X-A", "1");
+    res_set_header(&res, "Content-Type", "application/json");
+    res_set_cookie(&res, "s", "v", NULL);
+    res_json(&res, "{}");
+    const char *expected =
+        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: keep-alive\r\n"
+        "X-A: 1\r\nSet-Cookie: s=v; Path=/\r\n\r\n{}";
+    assert(conn->out_len == strlen(expected));
+    assert(memcmp(conn->out_buf, expected, conn->out_len) == 0);
+    free_conn(conn);
+
+    /* Content-Length of a big body is formatted in full (no truncation in the integer writer). */
+    conn = make_conn();
+    res_init(&res, conn);
+    char *big = malloc(1234568);
+    memset(big, 'x', 1234567);
+    big[1234567] = '\0';
+    res_send(&res, big);
+    const char *big_head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 1234567\r\n";
+    assert(memcmp(conn->out_buf, big_head, strlen(big_head)) == 0);
+    free(big);
+    free_conn(conn);
+}
+
+static void test_second_send_replaces_first_without_leaking(void) {
+    /* A handler that sends twice (e.g. an error path that falls through) gets "last wins";
+     * the first buffer is freed, not leaked. */
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    res_send(&res, "first");
+    res_status(&res, 500);
+    res_send(&res, "second");
+    assert(conn->out_len == strlen("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nsecond"));
+    assert(memcmp(conn->out_buf + conn->out_len - 6, "second", 6) == 0);
+    free_conn(conn);
+}
+
+static void test_oversized_head_drops_connection(void) {
+    /* 16 headers of ~300 bytes cannot exceed the 8 KB head buffer; a cookie storm plus headers can.
+     * Whatever does not fit must abort the response cleanly rather than truncate it. */
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    char value[256];
+    memset(value, 'v', sizeof(value) - 1);
+    value[sizeof(value) - 1] = '\0';
+    for (int i = 0; i < MAX_RESPONSE_HEADERS; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "X-H%d", i);
+        res_set_header(&res, name, value);
+    }
+    static const CookieOptions opts = { .max_age = 0, .path = NULL, .domain = NULL,
+                                        .http_only = 0, .secure = 0, .same_site = COOKIE_SAMESITE_UNSET };
+    char cookie_value[400];
+    memset(cookie_value, 'c', sizeof(cookie_value) - 1);
+    cookie_value[sizeof(cookie_value) - 1] = '\0';
+    for (int i = 0; i < MAX_RESPONSE_COOKIES; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "c%d", i);
+        res_set_cookie(&res, name, cookie_value, &opts);
+    }
+    res_send(&res, "body");
+    /* 16*~262 + 16*~410 = ~10.7 KB > 8 KB head buffer */
+    assert(conn->out_len == 0);
+    assert(conn->keep_alive == 0);
+    free_conn(conn);
+}
+
+static void test_zero_cookie_options_is_a_session_cookie(void) {
+    /* Regression: docs promised {0} meant "session cookie" but it emitted Max-Age=0 (expire now). */
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    const CookieOptions zero = { 0 };
+    res_set_cookie(&res, "s", "v", &zero);
+    res_send(&res, "x");
+    assert(strstr(conn->out_buf, "Set-Cookie: s=v; Path=/\r\n") != NULL);
+    assert(strstr(conn->out_buf, "Max-Age") == NULL);
+    free_conn(conn);
+
+    conn = make_conn();
+    res_init(&res, conn);
+    const CookieOptions expire_now = { .max_age = -1 };
+    res_set_cookie(&res, "s", "", &expire_now);
+    res_send(&res, "x");
+    assert(strstr(conn->out_buf, "Set-Cookie: s=; Path=/; Max-Age=0\r\n") != NULL);
+    free_conn(conn);
+}
+
+static void test_header_injection_is_refused(void) {
+    /* Regression: values were written verbatim, so decoded request data containing CR LF could inject
+     * a second header or a whole second response (HTTP response splitting). */
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    res_set_header(&res, "X-Ok", "fine\tvalue \xC3\xA9");
+    res_set_header(&res, "X-Bad", "a\r\nSet-Cookie: session=attacker");
+    res_set_header(&res, "X-Bad2", "a\nb");
+    res_set_header(&res, "X-Bad3", "a\rb");
+    res_set_header(&res, "X\r\nInjected", "v");
+    res_set_header(&res, "Bad:Name", "v");
+    res_set_header(&res, "", "v");
+    assert(res.header_count == 1);
+    res_send(&res, "x");
+    assert(strstr(conn->out_buf, "X-Ok: fine\tvalue \xC3\xA9\r\n") != NULL);
+    assert(strstr(conn->out_buf, "attacker") == NULL);
+    assert(strstr(conn->out_buf, "Injected") == NULL);
+    free_conn(conn);
+}
+
+static void test_redirect_refuses_injected_location(void) {
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    res_redirect(&res, 302, "/home\r\nSet-Cookie: session=attacker\r\n\r\n<script>");
+    assert(strncmp(conn->out_buf, "HTTP/1.1 500 Internal Server Error", 34) == 0);
+    assert(strstr(conn->out_buf, "attacker") == NULL);
+    assert(strstr(conn->out_buf, "Location") == NULL);
+    free_conn(conn);
+
+    conn = make_conn();
+    res_init(&res, conn);
+    res_redirect(&res, 301, "/a b/c?d=e&f=%20g");
+    assert(strncmp(conn->out_buf, "HTTP/1.1 301 Moved Permanently", 30) == 0);
+    assert(strstr(conn->out_buf, "Location: /a b/c?d=e&f=%20g\r\n") != NULL);
+    free_conn(conn);
+}
+
+static void test_cookie_injection_is_refused(void) {
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    res_set_cookie(&res, "ok", "v", NULL);
+    res_set_cookie(&res, "a", "x\r\nSet-Cookie: b=1", NULL);   /* CR LF in value */
+    res_set_cookie(&res, "a", "x; Domain=evil.example", NULL);  /* attribute injection via ';' */
+    res_set_cookie(&res, "n;ame", "v", NULL);
+    res_set_cookie(&res, "n=ame", "v", NULL);
+    res_set_cookie(&res, "", "v", NULL);
+    const CookieOptions bad_path = { .path = "/;Domain=evil.example" };
+    res_set_cookie(&res, "p", "v", &bad_path);
+    const CookieOptions bad_domain = { .domain = "evil.example\r\nX: y" };
+    res_set_cookie(&res, "d", "v", &bad_domain);
+    assert(res.set_cookie_count == 1);
+    res_send(&res, "x");
+    assert(strstr(conn->out_buf, "Set-Cookie: ok=v; Path=/\r\n") != NULL);
+    assert(strstr(conn->out_buf, "evil") == NULL);
+    free_conn(conn);
+}
+
+static void test_trailer_injection_is_refused(void) {
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    res_set_trailer(&res, "Server-Timing", "db;dur=5");
+    res_set_trailer(&res, "X-Bad", "a\r\nb");
+    assert(res.trailer_count == 1);
+    free_conn(conn);
+}
+
 int main(void) {
     test_custom_header_is_sent();
     test_repeated_set_header_overwrites_case_insensitively();
@@ -353,6 +537,15 @@ int main(void) {
     test_chunked_head_request_omits_body();
     test_send_file_non_existent();
     test_send_file_headers_and_fd();
+    test_res_init_needs_no_zeroed_struct();
+    test_exact_head_bytes();
+    test_second_send_replaces_first_without_leaking();
+    test_oversized_head_drops_connection();
+    test_zero_cookie_options_is_a_session_cookie();
+    test_header_injection_is_refused();
+    test_redirect_refuses_injected_location();
+    test_cookie_injection_is_refused();
+    test_trailer_injection_is_refused();
 
     printf("all response tests passed\n");
     return 0;

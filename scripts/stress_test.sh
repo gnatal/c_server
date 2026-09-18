@@ -13,8 +13,21 @@
 #     during each benchmark and reports the peak TOTAL, which is the number
 #     that matters for "how much RAM does this whole server use".
 #
+# Phases (PHASES, space-separated, default "ping churn read write"):
+#   ping   GET /ping over keep-alive connections: pure engine throughput, no DB, no JSON
+#   churn  GET /ping with "Connection: close": a new TCP connection per request, which
+#          stresses accept/close. Every closed connection leaves a TIME_WAIT socket, and in
+#          longer runs (observed on macOS at 1000+ conns / 5 s+) wrk starts reporting
+#          "connect" errors as they pile up; a 2 s run from a clean state showed none.
+#          Shorten DURATION, lower CONNS, or let TIME_WAIT drain between runs
+#          (`netstat -an -p tcp | grep -c TIME_WAIT`) before trusting a churn number.
+#   read   GET / and GET /api/todos (SQLite read path)
+#   write  POST /api/todos (SQLite write path)
+#
 # Usage: scripts/stress_test.sh
-# Tunable via env vars: PORT, WORKERS, THREADS, DURATION, CONNS, DB_PATH,
+#        PHASES=ping scripts/stress_test.sh          # connection stress only
+#        PHASES="ping churn" CONNS="1000 5000" DURATION=10s scripts/stress_test.sh
+# Tunable via env vars: PORT, WORKERS, THREADS, DURATION, CONNS, PHASES, DB_PATH,
 # API_KEY, MEASURE_MEMORY.
 
 set -euo pipefail
@@ -25,6 +38,7 @@ WORKERS="${WORKERS:-4}"
 THREADS="${THREADS:-8}"
 DURATION="${DURATION:-15s}"
 CONNS="${CONNS:-100 1000 5000}"
+PHASES="${PHASES:-ping churn read write}"
 DB_PATH="${DB_PATH:-stress_todos.db}"
 MEASURE_MEMORY="${MEASURE_MEMORY:-1}"
 export API_KEY="${API_KEY:-my-secret-api-key}"
@@ -176,21 +190,41 @@ run_bench() {
     fi
 }
 
-# Reads run first, against the small 20-row seeded table, at every
-# concurrency level - this keeps read numbers comparable across tiers and
-# well under TODO_LIST_MAX (app/todo_types.h), so db_list_todos never
-# truncates. Writes run last, in their own pass: each POST benchmark grows
-# the table further, which would otherwise silently make later read
-# benchmarks measure against a bigger (eventually truncated) dataset if the
-# phases were interleaved.
-for c in $CONNS; do
-    run_bench "GET / (Todo UI)         threads=$THREADS conns=$c" -c"$c" "$BASE/"
-    run_bench "GET /api/todos (read)   threads=$THREADS conns=$c" -c"$c" "$BASE/api/todos"
-done
+phase_enabled() {
+    case " $PHASES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
 
-for c in $CONNS; do
-    run_bench "POST /api/todos (write) threads=$THREADS conns=$c" -c"$c" -s scripts/wrk_create_todo.lua "$BASE/api/todos"
-done
+# /ping runs first: it never touches the table, so it cannot disturb the read numbers.
+# Reads run next, against the small 20-row seeded table, at every concurrency level -
+# this keeps read numbers comparable across tiers and well under TODO_LIST_MAX
+# (app/todo_types.h), so db_list_todos never truncates. Writes run last, in their own
+# pass: each POST benchmark grows the table further, which would otherwise silently
+# make later read benchmarks measure against a bigger (eventually truncated) dataset
+# if the phases were interleaved.
+if phase_enabled ping; then
+    for c in $CONNS; do
+        run_bench "GET /ping (keep-alive)  threads=$THREADS conns=$c" -c"$c" "$BASE/ping"
+    done
+fi
+
+if phase_enabled churn; then
+    for c in $CONNS; do
+        run_bench "GET /ping (conn: close) threads=$THREADS conns=$c" -c"$c" -H "Connection: close" "$BASE/ping"
+    done
+fi
+
+if phase_enabled read; then
+    for c in $CONNS; do
+        run_bench "GET / (Todo UI)         threads=$THREADS conns=$c" -c"$c" "$BASE/"
+        run_bench "GET /api/todos (read)   threads=$THREADS conns=$c" -c"$c" "$BASE/api/todos"
+    done
+fi
+
+if phase_enabled write; then
+    for c in $CONNS; do
+        run_bench "POST /api/todos (write) threads=$THREADS conns=$c" -c"$c" -s scripts/wrk_create_todo.lua "$BASE/api/todos"
+    done
+fi
 
 if [ "$MEASURE_MEMORY" = "1" ]; then
     read -r end_total end_procs <<<"$(server_rss)"

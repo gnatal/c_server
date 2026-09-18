@@ -14,31 +14,34 @@ uses it).
 (`app/handlers.c`) are responsible for getting bytes into a NUL-terminated buffer
 first.
 
-## Building a tree by hand
-`json_new_string`/`json_new_object`/`json_new_number`/`json_new_bool`/
-`json_new_array`/`json_object_set`/`json_array_append` (`json_value.c`) let a
-caller construct a `JsonValue` tree without going through `json_parse` - for
-serializing data the app already has in memory (e.g. `app/handlers.c:
-handler_search` turning parsed query-string params, `lib/http_parser.c`,
-into a JSON object; `app/db.c`/`app/handlers.c: todo_to_json` turning a
-`Todo` row into `{"id", "title", "done", "created_at", "updated_at"}`,
-`app/CLAUDE.md`). They follow the same allocation shape as the parser's
-internal `value_new`/growth pattern (`json_parser.c`) but are a separate,
-independent implementation - `value_new` is `static` to `json_parser.c` and
-not shared - since keeping the builders in `json_value.c` alongside the
-other tree-level operations reads better than reaching into the parser file
-for them. `json_object_set`/`json_array_append` always consume the `value`
-they're given, attaching it on success or calling `json_free(value)` on
-failure (bad `object`/`array`/`key`, or an allocation failure) - a caller
-never frees a `JsonValue` it has already handed to either function, checking
-the return value for success/failure only. Neither builder function ever
-needs `key`/`value` to stay alive past the call - `json_new_string` and
-`json_object_set` copy their string input rather than retaining the
-caller's pointer (`copy_string`, a malloc+memcpy helper used in place of
-`strdup` - a POSIX extension, not portable libc - or `strcpy`, banned
-project-wide); `json_new_number`/`json_new_bool` copy their scalar argument
-by value, same as the parser itself does for `JSON_NUMBER`/`JSON_BOOL`
-nodes.
+## Emitting JSON: `JsonWriter` (preferred)
+`jw_*` (`json.h`, state in `JsonWriter`, `json_types.h`; implementation in `json_writer.c`) appends a
+document straight into a growable buffer in document order, with no tree. Commas and quoting are
+automatic; strings are escaped in runs (one `memcpy` per clean span). Protocol: inside an object every
+value is preceded by `jw_key`; inside an array or at top level there is no key. Misuse (value without
+key, key outside an object, unbalanced end, second top-level value, nesting past
+`JSON_WRITER_MAX_DEPTH`, out of memory) sets a sticky `failed` flag; every later call is a no-op, and
+`jw_ok` / `jw_data` / `jw_len` expose the result only when the document is complete and valid
+(`jw_data` is `NULL` otherwise). Ownership: the writer owns its buffer until `jw_free` (idempotent, safe
+after failure); `jw_data` is NUL-terminated and valid until then. About 4x faster than the tree path for
+a 20-row list (`make bench`), and there is no ownership transfer to get wrong.
+
+**Number formatting** (`append_number`, shared by `json_stringify` and `jw_double`): integers with
+`|value| < 2^53` print exactly as integers; other finite doubles print with `%.17g` (round-trips);
+NaN and infinity print `null`. The previous `%g` (6 significant digits) turned `1234567` into
+`1.23457e+06`. `jw_int` prints any `long long` exactly, including `LLONG_MIN`. No `<math.h>`, so no `-lm`.
+
+## Building a tree by hand (editing or forwarding parsed documents)
+`json_new_string`/`json_new_object`/`json_new_number`/`json_new_bool`/`json_new_array`/`json_object_set`/
+`json_array_append` (`json_value.c`) construct a `JsonValue` tree without `json_parse`: useful to modify or
+forward a parsed document. To emit JSON from application data use `JsonWriter` above (`app/handlers.c` does).
+`json_object_set` / `json_array_append` always consume the `value` they are given: attached on success,
+`json_free(value)` on failure (bad `object` / `array` / `key`, or allocation failure), so a caller never
+frees a value it has handed over and only checks the return code. `json_new_string` and `json_object_set`
+copy their string input (`copy_string`, malloc+memcpy: `strdup` is POSIX-only and `strcpy` is banned here);
+`json_new_number` / `json_new_bool` copy scalars by value. Builders are a separate implementation from the
+parser's internal `value_new` (which is `static` to `json_parser.c`); each `json_object_set` /
+`json_array_append` grows its container by one element with `realloc`, fine for small documents.
 
 ## Memory lifecycle
 - Every `JsonValue` (root or nested) is heap-allocated (`value_new` in
@@ -58,7 +61,10 @@ nodes.
 - `json_stringify` returns one `malloc`'d (via `StrBuf`'s `realloc`-doubling)
   NUL-terminated string; the caller owns it and must `free()` it (documented on the
   declaration in `json.h`).
+- `JsonWriter` buffer: `StrBuf.data` grown by `realloc` doubling from 2 KiB; freed only by `jw_free`.
 
 ## Testing
 `tests/test_json.c` covers primitives, nested structures, a parse→stringify→parse round
-trip, and syntax-error rejection.
+trip, syntax-error rejection, number formatting (regression for the `%g` bug, precision
+round-trip, NaN/infinity), the writer (a full document, escaping, top-level scalars, every misuse
+path, depth limit, byte-identical output versus `json_stringify`).
