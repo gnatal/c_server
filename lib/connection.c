@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include "connection.h"
+#include "cluster.h"
 #include "event_loop.h"
 #include "http_parser.h"
 #include "router.h"
@@ -38,9 +39,15 @@ int create_server_socket(int port) {
 
     const int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
+        perror("setsockopt SO_REUSEADDR");
         exit(EXIT_FAILURE);
     }
+
+#ifdef SO_REUSEPORT
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt SO_REUSEPORT");
+    }
+#endif
 
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
@@ -524,7 +531,7 @@ void close_idle_connections(App *app) {
     }
 }
 
-void app_listen(App *app, int port) {
+void app_listen_worker(App *app, int port) {
     app->server_fd = create_server_socket(port);
     if (event_loop_init(app) != 0) {
         perror("event_loop_init");
@@ -532,7 +539,9 @@ void app_listen(App *app, int port) {
     }
     event_loop_watch_read(app, app->server_fd, NULL);
 
-    printf("Listening on port %d\n", port);
+    if (!cluster_is_worker() || cluster_worker_id() == 0) {
+        printf("Listening on port %d\n", port);
+    }
 
     LoopEvent events[MAX_EVENTS];
     while (1) {
@@ -612,3 +621,17 @@ void app_listen(App *app, int port) {
 shutdown_complete:
     event_loop_close(app);
 }
+
+void app_listen(App *app, int port) {
+    int workers = cluster_resolve_worker_count(app->config.workers);
+    if (workers > 1 && !cluster_is_worker()) {
+        cluster_listen(app, port, workers);
+        return;
+    }
+    app_listen_worker(app, port);
+}
+
+void app_listen_cluster(App *app, int port, int num_workers) {
+    cluster_listen(app, port, num_workers);
+}
+

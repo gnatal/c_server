@@ -94,12 +94,23 @@ int app_count_connections(const App *app);
 void app_stop(App *app);
 
 /*
- * Starts listening and runs a single-threaded event loop: kevent() blocks
+ * Starts listening and runs a single-threaded event loop: kevent() / epoll blocks
  * until a socket is ready, then each event is dispatched to the right
- * handler - no blocking syscalls anywhere in this loop, and no threads.
- * Catches SIGINT/SIGTERM via kqueue EVFILT_SIGNAL for graceful shutdown,
- * draining in-flight requests before returning.
+ * handler. Catches SIGINT/SIGTERM for graceful shutdown, draining in-flight
+ * requests before returning. If app->config.workers > 1, automatically
+ * delegates to cluster_listen().
  */
 void app_listen(App *app, int port);
+
+/*
+ * Runs the single-process event loop directly without cluster delegation.
+ * Used internally by cluster workers and standalone instances.
+ */
+void app_listen_worker(App *app, int port);
+
+/*
+ * Explicitly launches a multi-process cluster with num_workers worker processes.
+ */
+void app_listen_cluster(App *app, int port, int num_workers);
 
 #endif /* CONNECTION_H */

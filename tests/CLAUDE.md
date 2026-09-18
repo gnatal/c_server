@@ -24,6 +24,9 @@ Standalone unit and integration test suites compiled independently into `build/b
 - `test_event_loop.c`: Cross-platform event-loop lifecycle (`event_loop_init`,
   `event_loop_close`), read/write readiness polling via `socketpair(2)`, and
   idle/shutdown timer expiration verification.
+- `test_cluster.c`: Worker count resolution, `SO_REUSEPORT` multi-bind,
+  master supervisor process lifecycle, concurrent HTTP serving across workers,
+  and synchronized graceful shutdown.
 
 ## Socket Mocking Strategy (`test_connection.c`)
 - Sockets are created in pairs via `socketpair(AF_UNIX, SOCK_STREAM, 0, fds)`.

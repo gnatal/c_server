@@ -19,7 +19,7 @@ BIN_DIR   = $(BUILD_DIR)/bin
 LIB_DIR   = $(BUILD_DIR)/lib
 
 # --- lib: the reusable engine ---
-LIB_SRCS = lib/connection.c $(EVENT_LOOP_SRC) lib/http_parser.c lib/router.c lib/response.c lib/middleware.c \
+LIB_SRCS = lib/connection.c $(EVENT_LOOP_SRC) lib/cluster.c lib/http_parser.c lib/router.c lib/response.c lib/middleware.c \
            lib/multipart.c lib/urlencoded.c lib/static.c \
            lib/json/json_parser.c lib/json/json_value.c lib/json/json_writer.c
 LIB_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(LIB_SRCS))
@@ -41,10 +41,11 @@ MULTIPART_TEST_BIN   = $(BIN_DIR)/test_multipart
 URLENCODED_TEST_BIN  = $(BIN_DIR)/test_urlencoded
 STATIC_TEST_BIN      = $(BIN_DIR)/test_static
 EVENT_LOOP_TEST_BIN  = $(BIN_DIR)/test_event_loop
+CLUSTER_TEST_BIN     = $(BIN_DIR)/test_cluster
 
 TEST_BINS = $(JSON_TEST_BIN) $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
             $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN) $(URLENCODED_TEST_BIN) \
-            $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN)
+            $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN)
 
 .PHONY: all run test clean test_epoll
 
@@ -85,7 +86,7 @@ $(HTTP_PARSER_TEST_BIN): $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/tests/test_http
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(CONNECTION_TEST_BIN): $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_connection.o
+$(CONNECTION_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_connection.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -105,7 +106,11 @@ $(STATIC_TEST_BIN): $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(EVENT_LOOP_TEST_BIN): $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_event_loop.o
+$(EVENT_LOOP_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_event_loop.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(CLUSTER_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_cluster.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -133,13 +138,14 @@ $(OBJ_DIR)/tests/test_connection_shim.o: tests/test_connection.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
 
-$(EPOLL_TEST_BIN): $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_event_loop_shim.o
+$(EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_event_loop_shim.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS)
 
-$(CONNECTION_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_connection_shim.o
+$(CONNECTION_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_connection_shim.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS)
+
 
 test_epoll: $(EPOLL_TEST_BIN) $(CONNECTION_EPOLL_TEST_BIN)
 	./$(EPOLL_TEST_BIN)
@@ -157,6 +163,8 @@ test: $(TEST_BINS)
 	./$(URLENCODED_TEST_BIN)
 	./$(STATIC_TEST_BIN)
 	./$(EVENT_LOOP_TEST_BIN)
+	./$(CLUSTER_TEST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer
+

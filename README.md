@@ -68,6 +68,7 @@ The codebase is split into two distinct tiers:
 ┌───────────────────────────▼────────────────────────────┐
 │              lib/ (Core Engine - libcexpress.a)        │
 │   - connection.c : Portable socket I/O & lifecycle     │
+│   - cluster.c/h  : Multi-worker SO_REUSEPORT supervisor│
 │   - event_loop.h : Cross-platform event-loop interface │
 │   - event_loop_kqueue.c: Native macOS/BSD kqueue loop  │
 │   - event_loop_epoll.c : Native Linux epoll loop       │
@@ -101,7 +102,9 @@ The codebase is split into two distinct tiers:
 - **Centralized Error Handling**: `chain_error(chain, status, message)` mirrors Express's `(err, req, res, next)`.
 - **Built-in Demo Middlewares**: `mw_logger`, `mw_body_size_guard`, `mw_authenticate` (constant-time token verification), and `error_handler_json`.
 
-### 3. Non-Blocking Event-Driven Networking
+### 3. Non-Blocking Event-Driven Networking & Multi-Worker Concurrency
+- **Multi-Worker Process Model (`SO_REUSEPORT`)**: Scale across all CPU cores with zero lock contention. Dedicated listening sockets per worker with kernel-level TCP connection distribution (see [concurrency.md](concurrency.md)).
+- **Master Process Supervision**: Automatically reaps dead children, prevents container zombie leaks, respawns crashed workers on the fly, and coordinates clean graceful drains.
 - **Cross-Platform Event Loop**: Native `kqueue` on macOS/BSD and native `epoll` (`epoll_create1`, `timerfd`, `signalfd`) on Linux with zero external dependencies.
 - **Dynamic Connection Table**: Bounded only by `RLIMIT_NOFILE`, growing dynamically via `ensure_connection_capacity`.
 - **HTTP/1.1 Keep-Alive**: Persistent connections with idle connection timeout sweeps.
@@ -180,7 +183,7 @@ docker run --rm -p 8080:8080 cexpress
 
 ## Running Tests
 
-The project includes **10 isolated test suites** testing all components:
+The project includes **11 isolated test suites** testing all components:
 
 ```bash
 make test
@@ -197,6 +200,7 @@ This compiles and executes:
 8. `build/bin/test_urlencoded`: URL-encoded key-value parsing and percent-decoding.
 9. `build/bin/test_static`: Path traversal prevention, symlink escape checks, MIME types, and directory index fallback.
 10. `build/bin/test_event_loop`: Event-loop lifecycle, read/write polling across `socketpair`, and idle/shutdown timer verification.
+11. `build/bin/test_cluster`: Multi-worker count resolution, `SO_REUSEPORT` multi-bind, concurrent serving, and graceful shutdown.
 
 ---
 
@@ -207,6 +211,7 @@ The server supports both runtime environment variables and programmatic configur
 | Environment Variable | Default Value | Description |
 |---|---|---|
 | `PORT` | `8080` | TCP port the server binds to (valid range: `1`–`65535`). |
+| `WORKERS` | `1` | Number of worker processes (`1` = single process, `auto` or `0` = CPU core auto-detection, `N` = fixed count). |
 | `API_KEY` | `my-secret-api-key` | Bearer token verified by the demo authentication middleware. |
 
 ### Running with Custom Configuration
@@ -315,6 +320,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 ├── Dockerfile            # Multi-stage container build and test harness
 ├── .dockerignore         # Build context exclusions
 ├── README.md             # Project documentation
+├── concurrency.md        # Multi-worker concurrency & SO_REUSEPORT architecture guide
 ├── CLAUDE.md             # Project standards, coding guidelines, and workflow rules
 ├── AGENTS.md             # Agent context and workflow guidelines
 ├── pending.txt           # Feature tracking and architectural backlog
@@ -322,6 +328,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 ├── lib/                  # Reusable CExpress engine (builds to build/lib/libcexpress.a)
 │   ├── CLAUDE.md         # Engine architecture, data flow, and memory lifecycle
 │   ├── app_types.h       # Struct definitions, event loop types, function pointer signatures
+│   ├── cluster.h/c       # Multi-process master supervisor & worker lifecycle
 │   ├── event_loop.h      # Cross-platform event-loop abstraction
 │   ├── event_loop_kqueue.c # Native BSD/macOS kqueue backend
 │   ├── event_loop_epoll.c  # Native Linux epoll backend (timerfd + signalfd)
@@ -350,6 +357,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │   ├── CLAUDE.md         # Test harness architecture and socket mocking strategy
 │   ├── test_connection.c # Socket I/O and lifecycle tests via socketpair(2)
 │   ├── test_event_loop.c # Event-loop abstraction tests (lifecycle, I/O, timers)
+│   ├── test_cluster.c    # Multi-worker cluster tests (forking, SO_REUSEPORT, drain)
 │   ├── test_http_parser.c# Unit tests for HTTP parser and request dechunking
 │   ├── test_middleware.c # Middleware chain dispatching and error handling
 │   ├── test_router.c     # Unit tests for router pattern matching and sub-routers
@@ -381,6 +389,7 @@ Check [pending.txt](pending.txt) and [plan.md](plan.md) for the complete archite
 - [x] Graceful shutdown on `SIGINT`/`SIGTERM` with in-flight request draining
 - [x] Streaming & chunked responses (`res_write`, `res_end`, `res_set_trailer`, `res_send_file`)
 - [x] Cross-platform event backend (`epoll` for Linux, `kqueue` for macOS/BSD)
-- [ ] Multi-threaded / multi-process worker model (`SO_REUSEPORT`)
+- [x] Multi-threaded / multi-process worker model (`SO_REUSEPORT`)
 - [ ] TLS / HTTPS support (OpenSSL/LibreSSL non-blocking handshake integration)
+
 

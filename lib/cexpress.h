@@ -7,6 +7,7 @@ extern "C" {
 
 #include "app_types.h"
 #include "connection.h"
+#include "cluster.h"
 #include "http_parser.h"
 #include "router.h"
 #include "response.h"

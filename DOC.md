@@ -395,6 +395,14 @@ free(json_str);
 json_free(obj);
 ```
 
+### Multi-Worker Concurrency (`SO_REUSEPORT`)
+CExpress scales linearly across CPU cores using a multi-process worker model powered by kernel-level `SO_REUSEPORT` socket load balancing.
+1. Master process manages worker lifecycle, tracks PIDs, and intercepts termination signals.
+2. Each worker opens an independent listening socket with `SO_REUSEPORT` on the same port and runs an isolated event loop.
+3. Master automatically detects crashed workers and respawns replacement workers.
+4. Graceful cluster shutdown coordinates draining across all workers within a 5-second deadline.
+5. See [concurrency.md](concurrency.md) for full architecture details and container guidelines.
+
 ### Graceful Shutdown
 CExpress intercepts `SIGINT` (`Ctrl+C`) and `SIGTERM` directly in the native event loop (`EVFILT_SIGNAL` on kqueue, `signalfd` on Linux):
 1. Stops accepting incoming TCP connections immediately.
@@ -410,7 +418,13 @@ CExpress intercepts `SIGINT` (`Ctrl+C`) and `SIGTERM` directly in the native eve
 | Function | File | Description |
 |---|---|---|
 | `app_init(App *app)` | `router.h` | Initializes an application instance and connection table. |
-| `app_listen(App *app, int port)` | `connection.h` | Starts the non-blocking event loop (`kqueue` or `epoll`). |
+| `app_listen(App *app, int port)` | `connection.h` | Starts the server (delegates to cluster if `config.workers > 1`). |
+| `app_listen_worker(App *app, int port)` | `connection.h` | Runs the single-process event loop directly. |
+| `app_listen_cluster(App *app, port, n)` | `connection.h` | Explicitly launches a multi-process cluster of `n` workers. |
+| `cluster_listen(App *app, port, n)` | `cluster.h` | Master supervisor coordinating `n` worker processes. |
+| `cluster_resolve_worker_count(n)` | `cluster.h` | Resolves worker count (auto-detects CPU cores if `n <= 0`). |
+| `cluster_is_worker()` | `cluster.h` | Returns 1 if running inside a cluster worker process. |
+| `cluster_worker_id()` | `cluster.h` | Returns 0-indexed worker ID or -1 if master. |
 | `app_stop(App *app)` | `connection.h` | Initiates graceful shutdown and connection draining. |
 | `app_destroy(App *app)` | `connection.h` | Releases connections table, event loop descriptors, and resources. |
 | `app_get(...)` / `app_post(...)` | `router.h` | Registers verb routes. |

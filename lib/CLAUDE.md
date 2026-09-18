@@ -38,8 +38,10 @@ layer stays pure and unit-testable independent of sockets:
   directory traversal prevention (`..` rejection, symlink escape checks).
 - `tests/test_event_loop.c` tests cross-platform event loop lifecycle (`event_loop_init`/
   `close`), read/write readiness polling across `socketpair`, and idle/shutdown timers.
+- `tests/test_cluster.c` tests worker count resolution, `SO_REUSEPORT` multi-bind,
+  worker identification, and multi-process HTTP serving with graceful drain.
 
-`App` carries `ServerConfig config` (`app_types.h`), storing runtime parameters such as `config.port` (defaulting to `DEFAULT_PORT` in `app_init`).
+`App` carries `ServerConfig config` (`app_types.h`), storing runtime parameters such as `config.port` and `config.workers`.
 
 ## Middleware pipeline
 `dispatch(app, route, req, res)` (`middleware.c`) builds one `MiddlewareChain` per
@@ -933,3 +935,14 @@ CExpress supports incremental chunked responses and event-loop-driven bounded fi
 `Handler` (`app_types.h`) takes `const Request *`: routing (`match_path`/`match_route`)
 is the only code that mutates a `Request` (filling in path params before dispatch);
 once a handler runs, the request is read-only for the rest of its lifetime.
+
+## Multi-worker cluster (`cluster.h`, `cluster.c`)
+CExpress scales across CPU cores via a multi-process worker model (`fork()` + `SO_REUSEPORT`):
+- **Zero-Lock Architecture**: Each worker owns an independent event loop and connection table.
+  Master supervises workers, handles signals, and reaps dead children (`waitpid`).
+- **SO_REUSEPORT Multi-Bind**: Every worker binds its own listening socket to the same port.
+  The kernel balances incoming TCP connections across workers with zero IPC overhead.
+- **Worker Crash Recovery**: If a worker exits abnormally during operation, master detects the
+  exit and immediately respawns a replacement worker to maintain full capacity.
+- **Graceful Cluster Drain**: Master catches `SIGTERM`/`SIGINT`, signals workers to drain
+  connections within 5 seconds, and cleanly exits without zombie processes.

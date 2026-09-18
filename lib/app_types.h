@@ -478,6 +478,7 @@ struct MiddlewareChain {
 
 typedef struct {
     int port;
+    int workers; /* 1 = single process (default); > 1 = cluster mode; 0 = auto-detect CPU cores */
 } ServerConfig;
 
 typedef struct {

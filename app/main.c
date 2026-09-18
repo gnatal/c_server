@@ -2,6 +2,7 @@
 #include "handlers.h"
 #include "middlewares.h"
 #include <stdlib.h>
+#include <string.h>
 
 int main(void) {
   App app;
@@ -15,12 +16,27 @@ int main(void) {
     }
   }
 
+  const char *workers_env = getenv("WORKERS");
+  if (workers_env != NULL) {
+    if (strcmp(workers_env, "auto") == 0) {
+      app.config.workers = 0; /* 0 triggers auto-detection of CPU cores */
+    } else {
+      int parsed_workers = atoi(workers_env);
+      if (parsed_workers >= 0) {
+        app.config.workers = parsed_workers;
+      }
+    }
+  }
+
   const char *api_key_env = getenv("API_KEY");
   if (api_key_env != NULL && api_key_env[0] != '\0') {
     mw_authenticate_set_key(api_key_env);
   }
 
-  app_use(&app, mw_logger);
+  const char *quiet_env = getenv("QUIET");
+  if (quiet_env == NULL || strcmp(quiet_env, "1") != 0) {
+    app_use(&app, mw_logger);
+  }
   app_use(&app, mw_body_size_guard);
   app_use_error(&app, error_handler_json);
 

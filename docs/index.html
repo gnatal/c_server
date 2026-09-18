@@ -1180,7 +1180,17 @@ free(out);
               <tr data-cat="routing">
                 <td><code>app_listen(App *app, int port)</code></td>
                 <td><code>connection.h</code></td>
-                <td>Starts non-blocking event loop (kqueue or epoll).</td>
+                <td>Starts event loop (delegates to cluster if workers > 1).</td>
+              </tr>
+              <tr data-cat="routing">
+                <td><code>app_listen_cluster(App *app, port, n)</code></td>
+                <td><code>connection.h</code></td>
+                <td>Launches multi-process cluster of n workers (SO_REUSEPORT).</td>
+              </tr>
+              <tr data-cat="routing">
+                <td><code>cluster_listen(App *app, port, n)</code></td>
+                <td><code>cluster.h</code></td>
+                <td>Cluster supervisor managing worker processes and crash recovery.</td>
               </tr>
               <tr data-cat="routing">
                 <td><code>app_destroy(App *app)</code></td>
