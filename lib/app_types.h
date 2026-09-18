@@ -26,6 +26,11 @@
 #define MAX_RESPONSE_TRAILERS 8
 #define MAX_FORM_FIELDS 32
 
+/* Bounds App.worker_init_hooks (below) - a small, fixed number of
+ * per-process resource-init callbacks, same truncate-with-warning
+ * convention as MAX_MIDDLEWARES/MAX_ROUTES. */
+#define MAX_WORKER_INIT_HOOKS 4
+
 /* Bounded chunk size for streaming files off disk in flush_connection (connection.c) */
 #define STREAM_CHUNK_SIZE (16 * 1024)
 
@@ -380,6 +385,18 @@ typedef struct {
 /* req is never mutated by a handler once routing has filled in its params. */
 typedef void (*Handler)(const Request *req, Response *res);
 
+/*
+ * Registered via app_on_worker_start (lib/connection.h) and run once per
+ * worker process, from app_listen_worker (lib/connection.c) - see
+ * lib/CLAUDE.md ("Worker lifecycle hooks") for why this exists: a resource
+ * opened in main() before app_listen() gets duplicated into every forked
+ * cluster worker (lib/cluster.c) along with the rest of that process's
+ * memory, which is unsafe for some resources (e.g. a SQLite connection).
+ * This hook lets an app (re)initialize such a resource in whichever process
+ * actually ends up serving requests, standalone or forked, instead.
+ */
+typedef void (*WorkerInitHook)(void);
+
 /* Forward-declared: Middleware/ErrorHandler take a MiddlewareChain *, and
  * MiddlewareChain in turn holds a Middleware array, so the chain's tag name
  * has to exist before either function-pointer typedef below. Declared here
@@ -527,6 +544,14 @@ typedef struct {
      * matches this malloc per this engine's memory-lifecycle convention. */
     Connection **connections;
     int connections_cap;
+
+    /* Registered via app_on_worker_start (lib/connection.h), run in
+     * registration order from the top of app_listen_worker
+     * (lib/connection.c) - once per worker process, always after any
+     * cluster fork (lib/cluster.c) has already happened. See
+     * lib/CLAUDE.md ("Worker lifecycle hooks"). */
+    WorkerInitHook worker_init_hooks[MAX_WORKER_INIT_HOOKS];
+    int worker_init_hook_count;
 
     /* Graceful shutdown state: set to 1 by app_stop (connection.c) when a
      * SIGINT/SIGTERM arrives or shutdown is initiated programmatically.

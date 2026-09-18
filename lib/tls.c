@@ -27,7 +27,13 @@ int tls_init_app(App *app) {
         return -1;
     }
 
-    /* Ignore SIGPIPE so writing to an abruptly closed SSL socket does not kill the process */
+    /* Ignore SIGPIPE so writing to an abruptly closed SSL socket does not
+     * kill the process - connection.c: app_listen_worker now does this
+     * unconditionally for the full server (see lib/CLAUDE.md, "SIGPIPE
+     * handling"), but this call still matters in its own right: it's what
+     * protects any caller that exercises real TLS socket teardown without
+     * going through app_listen_worker, e.g. tests/test_tls.c. signal() is
+     * idempotent, so calling it again here is harmless. */
     signal(SIGPIPE, SIG_IGN);
 
     const SSL_METHOD *method = TLS_server_method();

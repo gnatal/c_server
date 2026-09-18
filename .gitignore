@@ -60,3 +60,14 @@ Thumbs.db
 # --- Runtime test artifacts ---
 # handler_upload (app/handlers.c) writes uploaded files here for manual testing.
 temp.txt
+
+# --- Runtime data ---
+# db_open's default TODO_DB_PATH (app/main.c) - the Todo CRUD demo's SQLite
+# database and its WAL sidecar files (see lib/CLAUDE.md, "Worker lifecycle
+# hooks", for why WAL mode is on).
+todos.db
+todos.db-shm
+todos.db-wal
+*.db
+*.db-shm
+*.db-wal

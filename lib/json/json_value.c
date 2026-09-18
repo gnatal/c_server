@@ -109,6 +109,35 @@ JsonValue *json_new_object(void) {
     return v;
 }
 
+JsonValue *json_new_number(double value) {
+    JsonValue *v = calloc(1, sizeof(JsonValue));
+    if (v == NULL) {
+        return NULL;
+    }
+    v->type = JSON_NUMBER;
+    v->as.number = value;
+    return v;
+}
+
+JsonValue *json_new_bool(int value) {
+    JsonValue *v = calloc(1, sizeof(JsonValue));
+    if (v == NULL) {
+        return NULL;
+    }
+    v->type = JSON_BOOL;
+    v->as.boolean = value ? 1 : 0;
+    return v;
+}
+
+JsonValue *json_new_array(void) {
+    JsonValue *v = calloc(1, sizeof(JsonValue));
+    if (v == NULL) {
+        return NULL;
+    }
+    v->type = JSON_ARRAY;
+    return v;
+}
+
 int json_object_set(JsonValue *object, const char *key, JsonValue *value) {
     if (object == NULL || object->type != JSON_OBJECT || key == NULL) {
         json_free(value);
@@ -138,5 +167,28 @@ int json_object_set(JsonValue *object, const char *key, JsonValue *value) {
     object->as.object.members[object->as.object.count].key = key_copy;
     object->as.object.members[object->as.object.count].value = value;
     object->as.object.count++;
+    return 1;
+}
+
+int json_array_append(JsonValue *array, JsonValue *value) {
+    if (array == NULL || array->type != JSON_ARRAY) {
+        json_free(value);
+        return 0;
+    }
+    if (value == NULL) {
+        return 0;
+    }
+
+    /* One item per call, same reasoning as json_object_set above - builder
+     * arrays are small. */
+    JsonValue **grown = realloc(array->as.array.items,
+                                 (array->as.array.count + 1) * sizeof(JsonValue *));
+    if (grown == NULL) {
+        json_free(value);
+        return 0;
+    }
+    array->as.array.items = grown;
+    array->as.array.items[array->as.array.count] = value;
+    array->as.array.count++;
     return 1;
 }

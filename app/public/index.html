@@ -1,55 +1,209 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Express Static Server Test</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #f4f4f9;
-            color: #333;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-        }
-        .container {
-            background-color: #fff;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-            text-align: center;
-            max-width: 400px;
-            width: 100%;
-        }
-        h1 {
-            color: #4CAF50;
-            font-size: 24px;
-        }
-        .info {
-            text-align: left;
-            margin-top: 20px;
-            font-size: 18px;
-        }
-        .info p {
-            margin: 10px 0;
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CExpress Todo</title>
+<style>
+    :root { color-scheme: light dark; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        max-width: 640px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        color: #222;
+        background: #f4f4f9;
+    }
+    h1 { font-size: 1.4rem; }
+    p.sub { color: #666; margin-top: -0.5rem; font-size: 0.9rem; }
+    .card {
+        background: #fff;
+        border-radius: 8px;
+        padding: 1rem 1.25rem;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        margin-bottom: 1rem;
+    }
+    label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.25rem; }
+    input[type=text], input[type=password] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.5rem;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 1rem;
+    }
+    form.add-form { display: flex; gap: 0.5rem; }
+    form.add-form input[type=text] { flex: 1; }
+    button {
+        padding: 0.5rem 0.9rem;
+        border: none;
+        border-radius: 4px;
+        background: #4CAF50;
+        color: #fff;
+        font-size: 1rem;
+        cursor: pointer;
+    }
+    button.danger { background: #d9534f; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    ul { list-style: none; padding: 0; margin: 0; }
+    li {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.6rem 0;
+        border-bottom: 1px solid #eee;
+    }
+    li:last-child { border-bottom: none; }
+    li span.title { flex: 1; }
+    li span.title.done { text-decoration: line-through; color: #999; }
+    li span.meta { font-size: 0.75rem; color: #999; }
+    #error { color: #d9534f; font-size: 0.9rem; min-height: 1.2em; }
+    #empty { color: #999; font-size: 0.9rem; padding: 0.5rem 0; }
+</style>
 </head>
 <body>
+    <h1>CExpress Todo</h1>
+    <p class="sub">A SQLite-backed CRUD demo served by the CExpress C HTTP engine.</p>
 
-    <div class="container">
-        <h1>Express Server is Working! 🚀</h1>
-        <p>This is a static HTML file served by Express.</p>
-        
-        <div class="info">
-            <p><strong>Name:</strong> Guilherme Natal</p>
-            <p><strong>Age:</strong> 31</p>
-            <p><strong>Location:</strong> Argentina</p>
-        </div>
+    <div class="card">
+        <label for="apiKey">API key (required to add / edit / delete)</label>
+        <input type="password" id="apiKey" placeholder="Bearer token for mutating requests">
     </div>
 
+    <div class="card">
+        <form class="add-form" id="addForm">
+            <input type="text" id="newTitle" placeholder="What needs doing?" required maxlength="255">
+            <button type="submit">Add</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <div id="error"></div>
+        <ul id="list"></ul>
+        <div id="empty" style="display:none;">No todos yet - add one above.</div>
+    </div>
+
+<script>
+(function () {
+    const API = "/api/todos";
+    const listEl = document.getElementById("list");
+    const emptyEl = document.getElementById("empty");
+    const errorEl = document.getElementById("error");
+    const apiKeyEl = document.getElementById("apiKey");
+    const addForm = document.getElementById("addForm");
+    const newTitleEl = document.getElementById("newTitle");
+
+    function authHeaders() {
+        const key = apiKeyEl.value.trim();
+        const headers = { "Content-Type": "application/json" };
+        if (key) {
+            headers["Authorization"] = "Bearer " + key;
+        }
+        return headers;
+    }
+
+    function showError(message) {
+        errorEl.textContent = message || "";
+    }
+
+    async function request(path, options) {
+        const res = await fetch(API + path, options);
+        if (res.status === 204) {
+            return null;
+        }
+        const body = await res.json().catch(() => null);
+        if (!res.ok) {
+            throw new Error((body && body.error) || ("Request failed (" + res.status + ")"));
+        }
+        return body;
+    }
+
+    function todoRow(todo) {
+        const li = document.createElement("li");
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = !!todo.done;
+        checkbox.addEventListener("change", async () => {
+            checkbox.disabled = true;
+            try {
+                await request("/" + todo.id, {
+                    method: "PATCH",
+                    headers: authHeaders(),
+                    body: JSON.stringify({ done: checkbox.checked })
+                });
+                showError("");
+                load();
+            } catch (e) {
+                showError(e.message);
+                checkbox.checked = !checkbox.checked;
+                checkbox.disabled = false;
+            }
+        });
+
+        const title = document.createElement("span");
+        title.className = "title" + (todo.done ? " done" : "");
+        title.textContent = todo.title;
+
+        const meta = document.createElement("span");
+        meta.className = "meta";
+        meta.textContent = "#" + todo.id;
+
+        const del = document.createElement("button");
+        del.className = "danger";
+        del.textContent = "Delete";
+        del.addEventListener("click", async () => {
+            del.disabled = true;
+            try {
+                await request("/" + todo.id, { method: "DELETE", headers: authHeaders() });
+                showError("");
+                load();
+            } catch (e) {
+                showError(e.message);
+                del.disabled = false;
+            }
+        });
+
+        li.append(checkbox, title, meta, del);
+        return li;
+    }
+
+    async function load() {
+        try {
+            const todos = await request("", { method: "GET" });
+            listEl.innerHTML = "";
+            emptyEl.style.display = todos.length === 0 ? "block" : "none";
+            for (const todo of todos) {
+                listEl.appendChild(todoRow(todo));
+            }
+            showError("");
+        } catch (e) {
+            showError(e.message);
+        }
+    }
+
+    addForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const title = newTitleEl.value.trim();
+        if (!title) {
+            return;
+        }
+        try {
+            await request("", {
+                method: "POST",
+                headers: authHeaders(),
+                body: JSON.stringify({ title: title })
+            });
+            newTitleEl.value = "";
+            showError("");
+            load();
+        } catch (e) {
+            showError(e.message);
+        }
+    });
+
+    load();
+})();
+</script>
 </body>
 </html>

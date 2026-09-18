@@ -2,13 +2,24 @@
 
 ## Architecture
 Utility and load-testing scripts used to benchmark latency, throughput, and memory stability of the server under high concurrency:
-- `wrk_echo_json.lua`: Lua request generator script for `wrk` benchmarking against the `POST /echo/json` endpoint.
+- `wrk_create_todo.lua`: Lua request generator for `wrk` benchmarking `POST /api/todos` (Todo CRUD demo, `app/`) - reads the `API_KEY` env var (`os.getenv`, falls back to the server's default) so the bearer token can be kept in sync with whatever the server under test is actually configured with, rather than every write 401ing against a mismatched hardcoded token.
+- `stress_test.sh`: End-to-end orchestration - builds `build/bin/cexpress`, boots it in cluster mode (`WORKERS`, default 4) against a scratch SQLite file (`DB_PATH`, default `stress_todos.db`, deleted on exit via a `trap ... EXIT` alongside the server process itself), seeds 20 todos, then runs `wrk` against `GET /` and `GET /api/todos` (SQLite read path) at each concurrency level in `CONNS` (default `100 1000 5000`), and only *afterward* against `POST /api/todos` (SQLite write path, via `wrk_create_todo.lua`) at each level. Tunable entirely via env vars (`PORT`/`WORKERS`/`THREADS`/`DURATION`/`CONNS`/`DB_PATH`/`API_KEY`) - no flags to remember. **Phase ordering matters**: reads run first, in their own pass, against the small seeded 20-row table - each `POST` benchmark inserts tens of thousands of rows, so interleaving read and write phases per concurrency tier (an earlier version of this script) made later read benchmarks measure against a table already grown past `TODO_LIST_MAX` (`app/todo_types.h`), silently truncating every list response and (before the log-once fix, see `app/CLAUDE.md`) flooding stderr on every request.
+
+## Memory tracking (`stress_test.sh`, on by default, `MEASURE_MEMORY=0` to disable)
+Two independent measurements, because neither alone is accurate for a forked cluster:
+- **`/usr/bin/time -l`** (macOS; `-v` on Linux) wraps the server. Its rusage is collected by `wait4` on the master, which has reaped the workers, so `maximum resident set size` (bytes) is the **largest single process**, not the sum, while user/sys CPU time is summed across master and workers. `instructions retired`, `cycles elapsed` and `peak memory footprint` cover the master only (44-75M cycles against ~120 CPU-seconds proves it) and must not be quoted as whole-server figures. Under `time`, `$!` is `time`'s own PID, so the script resolves the real master with `pgrep -P` and signals that instead - `SIGTERM` sent to `time` itself would kill it before it prints the report. The server's stderr (and therefore `time`'s report, and any `terminated by signal` worker-crash messages from `cluster.c`) is redirected to a temp log printed at the end; the script reports the crash count from it.
+- **A `ps`-based sampler** (every 250 ms, per benchmark) sums RSS across the master and all its children and records the peak total plus the peak single process. This is the whole-server number; the single-process peak agrees with `time -l`'s maximum RSS, which cross-checks the two.
+- **RSS is a high-water mark**: the allocator does not return freed pages to the OS, so a later benchmark inherits memory grown by an earlier, higher-connection one (the `POST` phases run after the 5,000-connection read phases and report ~45 MB largest-process for that reason, not because of the writes). Summed RSS also counts shared pages (binary, libc, SQLite, fork copy-on-write) once per process, so totals overstate physical memory.
+- Observed on an Apple M3 Pro with `WORKERS=4`: ~12 MB total idle, ~13 MB at 58k req/s over 100 connections, ~50 MB total at 5,000 connections - growth tracks open connections (~7 KB each, consistent with the 8 KB `BUF_SIZE` receive buffer), not request rate. Full results in `../stress_tests/stress_test_report.md`.
+- Known open item: at 5,000 connections `wrk` intermittently reports read errors (0.2-0.7% of requests) in longer runs; not reproduced in 18 short runs, no worker crashes, cause unidentified.
 
 ## Execution & Concurrency
-- Designed to test keep-alive connection reuse and JSON payload processing under high concurrent connection loads (e.g. 5,000 connections over 8 threads).
+- Designed to test keep-alive connection reuse, routing/middleware overhead, and SQLite read/write throughput under high concurrent connection loads (e.g. 5,000 connections over 8 threads) and multi-process cluster contention (`stress_test.sh`'s default `WORKERS=4` is the scenario `lib/CLAUDE.md`'s "Worker lifecycle hooks" fork-safety fix specifically has to hold up under - multiple worker processes hitting the same SQLite file concurrently).
 - Benchmarking should run against a release-optimized build with keep-alive active to verify zero TCP round-trip latency anomalies (avoiding Nagle/delayed ACK interaction).
+- `stress_test.sh` requires `wrk` on `PATH` (`brew install wrk` / `apt install wrk`) and exits early with a clear message if it's missing.
 
-- Commands:
-wrk -t8 -c5000 -d15s http://127.0.0.1:8080/
-wrk -t8 -c1000 -d15s http://127.0.0.1:8080/
-wrk -t8 -c100 -d15s http://127.0.0.1:8080/
+- Equivalent manual commands (what `stress_test.sh` automates):
+QUIET=1 WORKERS=4 ./build/bin/cexpress
+wrk -t8 -c5000 -d15s http://127.0.0.1:8080/api/todos
+wrk -t8 -c1000 -d15s http://127.0.0.1:8080/api/todos
+wrk -t8 -c100 -d15s http://127.0.0.1:8080/api/todos

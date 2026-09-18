@@ -104,9 +104,26 @@ void app_listen(App *app, int port);
 
 /*
  * Runs the single-process event loop directly without cluster delegation.
- * Used internally by cluster workers and standalone instances.
+ * Used internally by cluster workers and standalone instances. Runs every
+ * hook registered via app_on_worker_start before doing anything else - see
+ * that function and lib/CLAUDE.md ("Worker lifecycle hooks").
  */
 void app_listen_worker(App *app, int port);
+
+/*
+ * Registers a hook to run exactly once per worker process, at the very top
+ * of app_listen_worker - guaranteed to run after any fork() cluster_listen
+ * (lib/cluster.c) may have performed to create that worker, since
+ * app_listen_worker is the one function every serving process (standalone,
+ * or each individual cluster worker) always calls before starting its event
+ * loop. Intended for a resource that isn't safe to open once in main() and
+ * then have duplicated across forked workers (e.g. a database connection -
+ * see lib/CLAUDE.md, "Worker lifecycle hooks", for the full rationale).
+ * Hooks run in registration order. Bounded by MAX_WORKER_INIT_HOOKS; extra
+ * registrations past the cap are dropped with a stderr warning, same
+ * convention as app_use/MAX_MIDDLEWARES.
+ */
+void app_on_worker_start(App *app, WorkerInitHook hook);
 
 /*
  * Explicitly launches a multi-process cluster with num_workers worker processes.

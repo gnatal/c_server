@@ -2,7 +2,7 @@
 FROM alpine:3.20 AS builder
 
 # Install build toolchain and OpenSSL development headers
-RUN apk add --no-cache gcc musl-dev make openssl-dev openssl-libs-static
+RUN apk add --no-cache gcc musl-dev make openssl-dev openssl-libs-static sqlite-dev
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ RUN make clean && make && make test
 # Minimal runtime image
 FROM alpine:3.20
 
-RUN apk add --no-cache libssl3 libcrypto3
+RUN apk add --no-cache libssl3 libcrypto3 sqlite-libs
 
 WORKDIR /app
 

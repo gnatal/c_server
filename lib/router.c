@@ -14,6 +14,7 @@ void app_init(App *app) {
     app->route_count = 0;
     app->middleware_count = 0;
     app->error_handler = NULL;
+    app->worker_init_hook_count = 0;
     app->server_fd = -1;
     app->loop_fd = -1;
     app->timer_idle_fd = -1;

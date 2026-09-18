@@ -35,6 +35,22 @@ endif
 CFLAGS += $(OPENSSL_CFLAGS)
 LDFLAGS += $(OPENSSL_LDFLAGS)
 
+# --- SQLite configuration (required - the demo app is SQL-backed) ---
+SQLITE_PREFIX ?= $(shell brew --prefix sqlite3 2>/dev/null || brew --prefix sqlite 2>/dev/null || echo /opt/homebrew/opt/sqlite)
+ifeq ($(shell test -d $(SQLITE_PREFIX)/include && echo yes),yes)
+    SQLITE_CFLAGS = -I$(SQLITE_PREFIX)/include
+    SQLITE_LDFLAGS = -L$(SQLITE_PREFIX)/lib -lsqlite3
+else ifeq ($(shell pkg-config --exists sqlite3 2>/dev/null && echo yes),yes)
+    SQLITE_CFLAGS = $(shell pkg-config --cflags sqlite3)
+    SQLITE_LDFLAGS = $(shell pkg-config --libs sqlite3)
+else
+    SQLITE_CFLAGS =
+    SQLITE_LDFLAGS = -lsqlite3
+endif
+
+CFLAGS += $(SQLITE_CFLAGS)
+LDFLAGS += $(SQLITE_LDFLAGS)
+
 AR = ar
 
 # --- Build output directories (strictly out-of-source) ---
@@ -51,7 +67,7 @@ LIB_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(LIB_SRCS))
 LIB      = $(LIB_DIR)/libcexpress.a
 
 # --- app: the application built on top of the lib ---
-APP_SRCS = app/main.c app/handlers.c app/middlewares.c
+APP_SRCS = app/main.c app/handlers.c app/middlewares.c app/db.c
 APP_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(APP_SRCS))
 TARGET   = $(BIN_DIR)/cexpress
 

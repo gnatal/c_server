@@ -109,6 +109,46 @@ static void test_builders(void) {
     json_free(not_an_object);
 }
 
+static void test_number_bool_array_builders(void) {
+    JsonValue *arr = json_new_array();
+    assert(arr != NULL);
+    assert(json_array_append(arr, json_new_number(1.5)) == 1);
+    assert(json_array_append(arr, json_new_bool(1)) == 1);
+    assert(json_array_append(arr, json_new_bool(0)) == 1);
+
+    assert(json_array_count(arr) == 3);
+    assert(json_as_number(json_array_get(arr, 0), 0) == 1.5);
+    assert(json_as_bool(json_array_get(arr, 1), 0) == 1);
+    assert(json_as_bool(json_array_get(arr, 2), 1) == 0);
+
+    JsonValue *obj = json_new_object();
+    assert(json_object_set(obj, "id", json_new_number(42)) == 1);
+    assert(json_object_set(obj, "done", json_new_bool(1)) == 1);
+    assert(json_object_set(obj, "items", arr) == 1);
+
+    /* Round-trips through json_stringify/json_parse, same as the string
+     * builders in test_builders above. */
+    char *out = json_stringify(obj);
+    assert(out != NULL);
+
+    JsonValue *reparsed = json_parse(out, NULL, 0);
+    assert(reparsed != NULL);
+    assert(json_as_number(json_object_get(reparsed, "id"), 0) == 42.0);
+    assert(json_as_bool(json_object_get(reparsed, "done"), 0) == 1);
+    assert(json_array_count(json_object_get(reparsed, "items")) == 3);
+
+    free(out);
+    json_free(reparsed);
+    json_free(obj);
+
+    /* json_array_append rejects a non-array target and still frees value
+     * (no leak - verified via ASan/valgrind in CI), same convention as
+     * json_object_set rejecting a non-object target above. */
+    JsonValue *not_an_array = json_parse("42", NULL, 0);
+    assert(json_array_append(not_an_array, json_new_number(1)) == 0);
+    json_free(not_an_array);
+}
+
 static void test_syntax_errors(void) {
     char err[128];
 
@@ -124,6 +164,7 @@ int main(void) {
     test_nested_structure();
     test_round_trip();
     test_builders();
+    test_number_bool_array_builders();
     test_syntax_errors();
     printf("all json tests passed\n");
     return 0;

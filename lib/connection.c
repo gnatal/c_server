@@ -567,7 +567,34 @@ void close_idle_connections(App *app) {
     }
 }
 
+void app_on_worker_start(App *app, WorkerInitHook hook) {
+    if (app->worker_init_hook_count >= MAX_WORKER_INIT_HOOKS) {
+        fprintf(stderr, "app_on_worker_start: MAX_WORKER_INIT_HOOKS (%d) exceeded, dropping hook\n",
+                MAX_WORKER_INIT_HOOKS);
+        return;
+    }
+    app->worker_init_hooks[app->worker_init_hook_count++] = hook;
+}
+
+static void run_worker_init_hooks(App *app) {
+    for (int i = 0; i < app->worker_init_hook_count; i++) {
+        app->worker_init_hooks[i]();
+    }
+}
+
 void app_listen_worker(App *app, int port) {
+    /* Ignore SIGPIPE so a write() to a socket the peer already closed
+     * (a client disconnecting mid-response - routine under real load, not
+     * an error condition) returns EPIPE instead of terminating this
+     * process outright. Unconditional (not just under TLS - see
+     * lib/tls.c's history) and set here rather than once in main(), since
+     * this is the one function every serving process (standalone, or each
+     * individual forked cluster worker) always runs before touching a
+     * socket - same choke point run_worker_init_hooks (above) relies on. */
+    signal(SIGPIPE, SIG_IGN);
+
+    run_worker_init_hooks(app);
+
     if (app->config.tls_enabled && app->ssl_ctx == NULL) {
         if (tls_init_app(app) != 0) {
             fprintf(stderr, "Failed to initialize TLS with cert '%s' and key '%s'\n",

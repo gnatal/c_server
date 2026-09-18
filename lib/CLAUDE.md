@@ -947,6 +947,74 @@ CExpress scales across CPU cores via a multi-process worker model (`fork()` + `S
 - **Graceful Cluster Drain**: Master catches `SIGTERM`/`SIGINT`, signals workers to drain
   connections within 5 seconds, and cleanly exits without zombie processes.
 
+## Worker lifecycle hooks (`app_on_worker_start`)
+`fork()` (see "Multi-worker cluster" above) duplicates a process's entire
+memory, including any resource an app opened in `main()` before
+`app_listen()` - for most app state that's harmless, but a resource with its
+own live OS-level state (a database connection is the motivating case) can
+be actively unsafe to use from more than one process after being forked:
+SQLite's own documentation calls this out explicitly as a locking-corruption
+risk. Rather than push every app built on this engine toward rediscovering
+that problem and hand-rolling a fix, the engine exposes a supported
+extension point for it.
+
+- **The one correct choke point**: every process that ends up serving
+  requests - the standalone (non-cluster) case, *and* each freshly-forked
+  cluster worker - always calls `app_listen_worker` (`connection.c`) before
+  starting its event loop: directly, for the standalone case
+  (`app_listen`), and from inside each forked child in `cluster.c`
+  (`spawn_worker`, both the `workers <= 1` fallback and the real fork path).
+  That makes `app_listen_worker` the one place guaranteed to run exactly
+  once per process, always *after* any relevant fork has already completed.
+- **`app_on_worker_start(App *app, WorkerInitHook hook)`** (`connection.h`)
+  registers a `void (*)(void)` callback (`WorkerInitHook`, `app_types.h`)
+  into `App.worker_init_hooks` (bounded by `MAX_WORKER_INIT_HOOKS`, same
+  truncate-with-stderr-warning convention as `MAX_MIDDLEWARES`). A `static
+  run_worker_init_hooks` helper runs every registered hook, in registration
+  order, at the very top of `app_listen_worker` - before TLS init, before
+  the listening socket is created, before anything else.
+- **Usage pattern**: an app with a fork-unsafe resource opens it once in
+  `main()` *before* `app_listen()` only to validate config and do one-time
+  setup (e.g. a schema migration), closes it again immediately, then
+  registers a hook via `app_on_worker_start` that does the real, per-process
+  open. Since the hook always runs after any fork, each worker (or the
+  single standalone process) ends up with its own independent resource
+  instance rather than a duplicated, unsafely-shared one. See `app/db.c`
+  (`db_open`/`db_worker_init`) and `app/CLAUDE.md` for the concrete
+  SQLite-backed example this was built for.
+- `router.c: app_init` resets `worker_init_hook_count` to `0` along with
+  every other `App` field, same as `route_count`/`middleware_count`.
+
+## SIGPIPE handling
+`app_listen_worker` (`connection.c`) calls `signal(SIGPIPE, SIG_IGN)` as its
+very first action - unconditionally, for every serving process (standalone
+or a forked cluster worker), not just when TLS is enabled. A `write()` to a
+socket the peer already closed (a client disconnecting mid-response - a
+routine event under real load, not a bug) raises `SIGPIPE` by default, which
+terminates the process outright *before* `write()` even returns, regardless
+of how carefully the caller checks its return value/`errno` - ignoring the
+signal is what turns that into an ordinary `EPIPE` error instead. This was
+previously only done inside `tls_init_app` (`tls.c`), which no-ops when
+`app->config.tls_enabled` is false - the plaintext path (the common case)
+had no protection at all until this moved to the universal per-process
+choke point above. Found via `scripts/stress_test.sh`: a worker reproducibly
+died with `signal 13` (`SIGPIPE`) under `wrk` load against a plaintext
+listener, auto-respawned by the cluster master's crash recovery ("Multi-worker
+cluster" above) - meaning the bug was silently self-healing (service stayed
+up) but real: rapidly connecting/disconnecting clients were killing worker
+processes on every occurrence.
+
+`tls_init_app` (`tls.c`) still calls `signal(SIGPIPE, SIG_IGN)` itself too -
+`signal()` is idempotent, so this isn't a conflict, it's covering a second,
+narrower case: any caller that exercises real TLS socket teardown *without*
+going through `app_listen_worker` (`tests/test_tls.c`'s later sub-tests rely
+on exactly this - an earlier successful `tls_init_app` call sets `SIG_IGN`
+process-wide, which then protects the rest of that test binary's socket
+teardown scenarios too, since a signal disposition persists for a process's
+whole lifetime once set). Removing either call regresses a different
+scenario - the production plaintext path if the `tls.c` one is kept alone,
+or `test_tls.c` if the `connection.c` one is kept alone - so both stay.
+
 ## TLS / HTTPS Support (`tls.h`, `tls.c`)
 Non-blocking TLS encryption integrated into the event loop via OpenSSL/LibreSSL:
 - **Architecture**: TLS operations are isolated in `lib/tls.h`/`tls.c`. When enabled via

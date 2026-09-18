@@ -4,7 +4,7 @@ A lightweight, high-performance, single-threaded HTTP/1.1 server and web framewo
 
 > [!NOTE]
 > **Library Architecture:**
-> The code in `lib/` compiles to a reusable static library (`lib/libcexpress.a`). The code in `app/` is a reference implementation and demo application showcasing how to consume the library.
+> The code in `lib/` compiles to a reusable static library (`lib/libcexpress.a`). The code in `app/` is a reference implementation — a SQLite-backed Todo CRUD API — showing how to consume the library. See [`app/CLAUDE.md`](app/CLAUDE.md) for its architecture.
 
 ---
 
@@ -27,7 +27,7 @@ A lightweight, high-performance, single-threaded HTTP/1.1 server and web framewo
 
 Modern backend applications often rely on high-level runtimes like Node.js or Go. This project brings the ergonomic, developer-friendly routing and middleware design of **Express.js** directly to **C**, providing:
 - **Maximum Performance & Low Latency**: Native execution with minimal CPU overhead, sub-millisecond response times, and over 202,000 requests/sec with multi-worker concurrency (over 167,000 req/sec single-threaded).
-- **Minimal Footprint**: Lightweight static binary with zero external dependencies beyond standard C and POSIX APIs (optional OpenSSL for TLS).
+- **Minimal Footprint**: `lib/` itself has zero external dependencies beyond standard C and POSIX APIs (optional OpenSSL for TLS). The bundled demo app additionally links SQLite (embedded, no server process) for its Todo persistence layer.
 - **Event-Driven Non-Blocking I/O**: High-performance concurrency powered by native `kqueue` (macOS / BSD) and `epoll` (Linux), following the same architectural pattern as Node.js's underlying `libuv`.
 - **Memory Safety & Control**: Explicit bounded buffers, aggressive `const` correctness, bounded I/O guards, and strict dynamic memory allocation tracking.
 
@@ -44,15 +44,19 @@ Benchmarked using `wrk` on macOS (Apple Silicon, 8 threads, keep-alive active) r
 | **5,000 connections** | 8 | 15s | **184,058 req/sec** | **20.00 ms** | 405.31 ms | 2,767,770 | 303.55 MB |
 
 > [!TIP]
-> Reproduce these benchmarks against the running cluster server using:
+> Reproduce these benchmarks with one command (builds, boots a 4-worker cluster, seeds some todos, and runs the full `wrk` sweep against `GET /`, `GET /api/todos`, and `POST /api/todos`):
+> ```bash
+> scripts/stress_test.sh
+> ```
+> Tunable via env vars, e.g. `WORKERS=8 CONNS="100 1000 5000 10000" scripts/stress_test.sh` — see [`scripts/CLAUDE.md`](scripts/CLAUDE.md). Or run it manually:
 > ```bash
 > # Start cluster server with 4 workers in quiet mode
 > QUIET=1 WORKERS=4 ./build/bin/cexpress
 >
-> # In another terminal, run wrk:
-> wrk -t8 -c100 -d15s http://127.0.0.1:8080/
-> wrk -t8 -c1000 -d15s http://127.0.0.1:8080/
-> wrk -t8 -c5000 -d15s http://127.0.0.1:8080/
+> # In another terminal, run wrk against the Todo API:
+> wrk -t8 -c100 -d15s http://127.0.0.1:8080/api/todos
+> wrk -t8 -c1000 -d15s http://127.0.0.1:8080/api/todos
+> wrk -t8 -c5000 -d15s http://127.0.0.1:8080/api/todos
 > ```
 
 ---
@@ -63,10 +67,11 @@ The codebase is split into two distinct tiers:
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│                   app/ (Demo App)                      │
+│        app/ (Demo App: SQLite-backed Todo CRUD)        │
 │   - main.c (Configures routes, routers & boots server) │
-│   - handlers.c (Route handlers & streaming endpoints)  │
+│   - handlers.c (Todo CRUD route handlers)              │
 │   - middlewares.c (Auth, logging, body size guards)    │
+│   - db.c (SQLite schema, CRUD, worker-init hook)       │
 └───────────────────────────┬────────────────────────────┘
                             │ links against
 ┌───────────────────────────▼────────────────────────────┐
@@ -143,6 +148,7 @@ The codebase is split into two distinct tiers:
 - Pure C recursive-descent JSON parser in `lib/json/`.
 - Dynamic AST supporting `null`, booleans, numbers, escaped strings, arrays, and objects.
 - Serialization back to JSON strings via `json_stringify`.
+- **Builder API** for constructing a tree by hand (not just parsing one): `json_new_string`/`json_new_number`/`json_new_bool`/`json_new_object`/`json_new_array` plus `json_object_set`/`json_array_append`, used by the demo app to serialize database rows to JSON.
 
 ---
 
@@ -151,6 +157,7 @@ The codebase is split into two distinct tiers:
 - **Operating System**: macOS / BSD (native `kqueue`), Linux (native `epoll`), or Docker on any host.
 - **Compiler**: C11 compliant compiler (`gcc-16` or `clang` on macOS; `gcc` on Linux).
 - **Build Tool**: GNU `make`.
+- **SQLite development headers**: required to build the demo app (`app/db.c`) — `sqlite-dev` on Alpine/Debian, or `brew install sqlite` on macOS. The `Makefile` auto-detects a Homebrew keg, falls back to `pkg-config`, then a bare `-lsqlite3`.
 - **Optional**: Docker (for containerized deployment and automated multi-platform verification).
 
 > [!TIP]
@@ -217,6 +224,7 @@ The server supports both runtime environment variables and programmatic configur
 | `PORT` | `8080` | TCP port the server binds to (valid range: `1`–`65535`). |
 | `WORKERS` | `1` | Number of worker processes (`1` = single process, `auto` or `0` = CPU core auto-detection, `N` = fixed count). |
 | `API_KEY` | `my-secret-api-key` | Bearer token verified by the demo authentication middleware. |
+| `TODO_DB_PATH` | `todos.db` | Path to the SQLite database file backing the Todo CRUD demo. |
 
 ### Running with Custom Configuration
 ```bash
@@ -240,71 +248,60 @@ Start the server:
 PORT=8080 ./cexpress
 ```
 
-### 1. Basic Welcome Route (GET)
+The demo app (`app/`) is a SQLite-backed Todo CRUD API — see
+[`app/CLAUDE.md`](app/CLAUDE.md) for its architecture. Open
+`http://localhost:8080/` in a browser for the built-in Todo UI, or drive the
+REST API directly:
+
+### 1. Todo UI (GET)
 ```bash
 curl -i http://localhost:8080/
 ```
+A single self-contained page (`app/public/index.html`) served via bounded
+file streaming (`res_send_file`) — list/add/toggle/delete todos, with an
+API-key field for the protected routes below.
 
-### 2. Path Parameter Route (GET)
+### 2. List Todos, Optionally Filtered (GET)
 ```bash
-curl -i http://localhost:8080/users/42
+curl -i http://localhost:8080/api/todos
+curl -i "http://localhost:8080/api/todos?done=true"
 ```
 
-### 3. Chunked Response Streaming with Trailers (GET)
-```bash
-curl -i --raw http://localhost:8080/stream
-```
-**Response:**
-```http
-HTTP/1.1 200 OK
-Content-Type: text/plain
-Transfer-Encoding: chunked
-Connection: keep-alive
-Trailer: Server-Timing
-
-f
-chunk 1: hello
-
-19
-chunk 2: streaming world
-
-e
-chunk 3: done
-
-0
-Server-Timing: demo;dur=12.5
-
-```
-
-### 4. Bounded File Streaming (GET)
-```bash
-curl -i http://localhost:8080/download
-```
-
-### 5. Protected JSON Echo Route (POST)
+### 3. Create a Todo (POST, protected)
 ```bash
 curl -i -X POST \
   -H "Authorization: Bearer my-secret-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"name":"Ada Lovelace","skills":["Math","Computing"]}' \
-  http://localhost:8080/echo/json
+  -d '{"title":"Buy milk"}' \
+  http://localhost:8080/api/todos
 ```
 
-### 6. Sub-Router Endpoint (GET)
+### 4. Get a Todo by ID (GET)
 ```bash
-curl -i -H "Authorization: Bearer my-secret-api-key" http://localhost:8080/api/status
+curl -i http://localhost:8080/api/todos/1
 ```
 
-### 7. Cookie Session Demo
+### 5. Replace a Todo (PUT, protected)
 ```bash
-# Set cookie
-curl -i -c cookies.txt http://localhost:8080/login
+curl -i -X PUT \
+  -H "Authorization: Bearer my-secret-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Buy oat milk","done":false}' \
+  http://localhost:8080/api/todos/1
+```
 
-# Read cookie
-curl -i -b cookies.txt http://localhost:8080/whoami
+### 6. Partially Update a Todo (PATCH, protected)
+```bash
+curl -i -X PATCH \
+  -H "Authorization: Bearer my-secret-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"done":true}' \
+  http://localhost:8080/api/todos/1
+```
 
-# Clear cookie
-curl -i -b cookies.txt http://localhost:8080/logout
+### 7. Delete a Todo (DELETE, protected)
+```bash
+curl -i -X DELETE -H "Authorization: Bearer my-secret-api-key" http://localhost:8080/api/todos/1
 ```
 
 ### 8. Graceful Shutdown
@@ -348,14 +345,17 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │       ├── json.h        # Public JSON API
 │       ├── json_types.h  # AST enum and node structs
 │       └── json_*.c      # Parser, value accessors, and stringifier
-├── app/                  # Reference demo application
-│   ├── CLAUDE.md         # Application wiring and middleware architecture
+├── app/                  # Reference demo application: SQLite-backed Todo CRUD
+│   ├── CLAUDE.md         # Application wiring, persistence layer & fork-safety notes
 │   ├── main.c            # Application entrypoint and route definitions
-│   ├── handlers.h/c      # Route handlers, streaming & download handlers
+│   ├── handlers.h/c      # Todo CRUD route handlers
 │   ├── middlewares.h/c   # Logger, body size guard, and authentication middlewares
+│   ├── db.h/c            # SQLite persistence layer (schema, CRUD, worker-init hook)
+│   ├── todo_types.h      # Todo/TodoList struct definitions
 │   └── public/           # Static asset directory (served via app_serve_static)
-│       ├── index.html    # Demo HTML document
-│       └── style.css     # Demo stylesheet
+│       ├── index.html    # Self-contained Todo UI (served directly at GET /)
+│       ├── style.css     # Static-file-serving demo asset
+│       └── docs/         # Directory-index fallback demo
 ├── tests/                # Isolated test suites (built into build/bin/test_*)
 │   ├── CLAUDE.md         # Test harness architecture and socket mocking strategy
 │   ├── certs/            # RSA test certificates for TLS verification
@@ -371,9 +371,10 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │   ├── test_urlencoded.c # Unit tests for urlencoded parser
 │   ├── test_static.c     # Unit tests for static file serving and traversal guards
 │   └── test_json.c       # JSON tokenizer, AST building, and serialization tests
-├── scripts/              # Benchmarking and utility scripts
-│   ├── CLAUDE.md         # Benchmarking tools documentation
-│   └── wrk_echo_json.lua # wrk load-testing script
+├── scripts/               # Benchmarking and utility scripts
+│   ├── CLAUDE.md          # Benchmarking tools documentation
+│   ├── stress_test.sh     # End-to-end wrk benchmark: build, boot cluster, seed, run
+│   └── wrk_create_todo.lua # wrk load-testing script for POST /api/todos
 └── build/                # Out-of-source build outputs (gitignored)
     ├── bin/              # cexpress executable and test runners
     ├── lib/              # libcexpress.a static library

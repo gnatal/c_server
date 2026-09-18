@@ -25,6 +25,11 @@ void json_free(JsonValue *value);
 JsonValue *json_new_string(const char *value);
 JsonValue *json_new_object(void);
 
+/* Same allocation shape as json_new_string/json_new_object above. */
+JsonValue *json_new_number(double value);
+JsonValue *json_new_bool(int value);
+JsonValue *json_new_array(void);
+
 /*
  * Attaches value under key on object (which must be a JSON_OBJECT, e.g. from
  * json_new_object), copying key. Takes ownership of value on both success and
@@ -34,6 +39,14 @@ JsonValue *json_new_object(void);
  * value is released only as part of object's own json_free.
  */
 int json_object_set(JsonValue *object, const char *key, JsonValue *value);
+
+/*
+ * Appends value to the end of array (which must be a JSON_ARRAY, e.g. from
+ * json_new_array). Same takes-ownership-either-way contract as
+ * json_object_set: value is freed on failure (array is NULL/not an array,
+ * value is NULL, or allocation failure), attached on success.
+ */
+int json_array_append(JsonValue *array, JsonValue *value);
 
 /* Accessors: return the given default/NULL when value is NULL or the wrong type, never crash. */
 const JsonValue *json_object_get(const JsonValue *object, const char *key);

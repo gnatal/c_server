@@ -375,24 +375,32 @@ Parse and construct JSON ASTs without external dependencies:
 char err[128];
 JsonValue *root = json_parse(req->body, err, sizeof(err));
 if (root != NULL) {
-    const JsonValue *title = json_object_get(root, "title");
-    if (title && title->type == JSON_STRING) {
-        printf("Title: %s\n", title->string_val);
+    const char *title = json_as_string(json_object_get(root, "title"), NULL);
+    if (title != NULL) {
+        printf("Title: %s\n", title);
     }
     json_free(root);
 }
 ```
 
-Construct JSON:
+Construct JSON by hand - `json_new_string`/`json_new_number`/`json_new_bool`/
+`json_new_object`/`json_new_array` build individual nodes, `json_object_set`/
+`json_array_append` attach them (both take ownership of the value passed in,
+even on failure - the caller never frees it separately):
 ```c
-JsonValue *obj = json_new_object();
-json_object_set(obj, "status", json_new_string("healthy"));
-char *json_str = json_stringify(obj);
+JsonValue *todo = json_new_object();
+json_object_set(todo, "id", json_new_number(42));
+json_object_set(todo, "title", json_new_string("Buy milk"));
+json_object_set(todo, "done", json_new_bool(0));
 
+JsonValue *list = json_new_array();
+json_array_append(list, todo);
+
+char *json_str = json_stringify(list);
 res_json(res, json_str);
 
 free(json_str);
-json_free(obj);
+json_free(list); /* also frees todo, which list now owns */
 ```
 
 ### Multi-Worker Concurrency (`SO_REUSEPORT`)
@@ -402,6 +410,25 @@ CExpress scales linearly across CPU cores using a multi-process worker model pow
 3. Master automatically detects crashed workers and respawns replacement workers.
 4. Graceful cluster shutdown coordinates draining across all workers within a 5-second deadline.
 5. See [concurrency.md](concurrency.md) for full architecture details and container guidelines.
+
+**Worker lifecycle hooks (`app_on_worker_start`)**: a resource opened once in
+`main()` before `app_listen()` gets duplicated into every forked worker along
+with the rest of that process's memory - fine for most state, but unsafe for
+a resource with its own live OS-level state (a database connection is the
+motivating case; see `app/db.c` for a full worked example with SQLite).
+Register a callback instead of opening such a resource directly:
+```c
+void my_resource_init(void) {
+    /* Runs once per worker process, always after any fork has already
+     * happened - safe to open a private, per-process connection/handle here. */
+}
+
+app_on_worker_start(&app, my_resource_init);
+app_listen(&app, port);
+```
+`app_listen_worker` (the function every serving process - standalone or a
+forked cluster worker - always calls before starting its event loop) runs
+every registered hook, in registration order, before doing anything else.
 
 ### Graceful Shutdown
 CExpress intercepts `SIGINT` (`Ctrl+C`) and `SIGTERM` directly in the native event loop (`EVFILT_SIGNAL` on kqueue, `signalfd` on Linux):
@@ -421,6 +448,7 @@ CExpress intercepts `SIGINT` (`Ctrl+C`) and `SIGTERM` directly in the native eve
 | `app_listen(App *app, int port)` | `connection.h` | Starts the server (delegates to cluster if `config.workers > 1`). |
 | `app_listen_worker(App *app, int port)` | `connection.h` | Runs the single-process event loop directly. |
 | `app_listen_cluster(App *app, port, n)` | `connection.h` | Explicitly launches a multi-process cluster of `n` workers. |
+| `app_on_worker_start(App *app, hook)` | `connection.h` | Registers a callback run once per worker process, after any fork. |
 | `cluster_listen(App *app, port, n)` | `cluster.h` | Master supervisor coordinating `n` worker processes. |
 | `cluster_resolve_worker_count(n)` | `cluster.h` | Resolves worker count (auto-detects CPU cores if `n <= 0`). |
 | `cluster_is_worker()` | `cluster.h` | Returns 1 if running inside a cluster worker process. |

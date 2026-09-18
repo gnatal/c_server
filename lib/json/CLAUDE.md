@@ -15,23 +15,30 @@ uses it).
 first.
 
 ## Building a tree by hand
-`json_new_string`/`json_new_object`/`json_object_set` (`json_value.c`) let a caller
-construct a `JsonValue` tree without going through `json_parse` - for serializing
-data the app already has in memory (e.g. `app/handlers.c: handler_search` turning
-parsed query-string params, `lib/http_parser.c`, into a JSON object). They follow
-the same allocation shape as the parser's internal `value_new`/growth pattern
-(`json_parser.c`) but are a separate, independent implementation - `value_new` is
-`static` to `json_parser.c` and not shared - since keeping the builders in
-`json_value.c` alongside the other tree-level operations reads better than
-reaching into the parser file for them. `json_object_set` always consumes the
-`value` it's given, attaching it on success or calling `json_free(value)` on
-failure (bad `object`/`key`, or an allocation failure) - a caller never frees a
-`JsonValue` it has already handed to `json_object_set`, checking the return value
-for success/failure only. Neither builder function ever needs `key`/`value` to
-stay alive past the call - both `json_new_string` and `json_object_set` copy their
-string input rather than retaining the caller's pointer (`copy_string`, a
-malloc+memcpy helper used in place of `strdup` - a POSIX extension, not portable
-libc - or `strcpy`, banned project-wide).
+`json_new_string`/`json_new_object`/`json_new_number`/`json_new_bool`/
+`json_new_array`/`json_object_set`/`json_array_append` (`json_value.c`) let a
+caller construct a `JsonValue` tree without going through `json_parse` - for
+serializing data the app already has in memory (e.g. `app/handlers.c:
+handler_search` turning parsed query-string params, `lib/http_parser.c`,
+into a JSON object; `app/db.c`/`app/handlers.c: todo_to_json` turning a
+`Todo` row into `{"id", "title", "done", "created_at", "updated_at"}`,
+`app/CLAUDE.md`). They follow the same allocation shape as the parser's
+internal `value_new`/growth pattern (`json_parser.c`) but are a separate,
+independent implementation - `value_new` is `static` to `json_parser.c` and
+not shared - since keeping the builders in `json_value.c` alongside the
+other tree-level operations reads better than reaching into the parser file
+for them. `json_object_set`/`json_array_append` always consume the `value`
+they're given, attaching it on success or calling `json_free(value)` on
+failure (bad `object`/`array`/`key`, or an allocation failure) - a caller
+never frees a `JsonValue` it has already handed to either function, checking
+the return value for success/failure only. Neither builder function ever
+needs `key`/`value` to stay alive past the call - `json_new_string` and
+`json_object_set` copy their string input rather than retaining the
+caller's pointer (`copy_string`, a malloc+memcpy helper used in place of
+`strdup` - a POSIX extension, not portable libc - or `strcpy`, banned
+project-wide); `json_new_number`/`json_new_bool` copy their scalar argument
+by value, same as the parser itself does for `JSON_NUMBER`/`JSON_BOOL`
+nodes.
 
 ## Memory lifecycle
 - Every `JsonValue` (root or nested) is heap-allocated (`value_new` in
