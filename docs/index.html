@@ -591,6 +591,268 @@
       color: white;
       border-color: var(--primary);
     }
+
+    /* Benchmark Show-off & Interactive Tabs */
+    .bench-highlight {
+      background: linear-gradient(135deg, rgba(56, 189, 248, 0.12), rgba(99, 102, 241, 0.08));
+      border: 1px solid var(--border-accent);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+      margin: 1.5rem 0 2rem 0;
+      box-shadow: 0 8px 32px rgba(56, 189, 248, 0.08);
+      position: relative;
+    }
+
+    .bench-highlight-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+
+    .bench-highlight-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .bench-highlight-badge {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      font-weight: 700;
+      font-size: 0.75rem;
+      padding: 0.25rem 0.7rem;
+      border-radius: 9999px;
+      letter-spacing: 0.03em;
+      font-family: 'Fira Code', monospace;
+    }
+
+    .bench-highlight-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 1rem;
+    }
+
+    .bench-metric-card {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.15rem;
+      transition: var(--transition);
+    }
+
+    .bench-metric-card:hover {
+      border-color: var(--border-accent);
+      transform: translateY(-2px);
+    }
+
+    .bench-metric-val {
+      font-size: 1.85rem;
+      font-weight: 800;
+      font-feature-settings: "tnum";
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+    }
+
+    .bench-metric-sub {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-top: 0.4rem;
+      line-height: 1.45;
+    }
+
+    /* Tabs */
+    .bench-tabs {
+      display: flex;
+      gap: 0.4rem;
+      border-bottom: 1px solid var(--border-subtle);
+      margin: 1.75rem 0 1.25rem 0;
+      overflow-x: auto;
+      scrollbar-width: none;
+      padding-bottom: 2px;
+    }
+
+    .bench-tabs::-webkit-scrollbar { display: none; }
+
+    .bench-tab {
+      background: transparent;
+      border: 1px solid transparent;
+      border-bottom: 2px solid transparent;
+      color: var(--text-muted);
+      padding: 0.6rem 1rem;
+      font-size: 0.86rem;
+      font-weight: 600;
+      cursor: pointer;
+      border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+      transition: var(--transition);
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .bench-tab:hover {
+      color: var(--text-main);
+      background: var(--bg-surface-elevated);
+    }
+
+    .bench-tab.active {
+      color: var(--primary);
+      border-bottom-color: var(--primary);
+      background: var(--bg-surface);
+    }
+
+    .bench-pane {
+      display: none;
+      animation: benchFadeIn 0.25s ease-in-out;
+    }
+
+    .bench-pane.active {
+      display: block;
+    }
+
+    @keyframes benchFadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Comparison Bar Chart */
+    .comparison-chart {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+      margin: 1.5rem 0;
+    }
+
+    .comparison-chart-title {
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: var(--text-main);
+      margin-bottom: 1.1rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .bar-row {
+      display: flex;
+      align-items: center;
+      margin-bottom: 0.85rem;
+      font-size: 0.82rem;
+    }
+
+    .bar-row:last-child { margin-bottom: 0; }
+
+    .bar-label {
+      width: 150px;
+      color: var(--text-muted);
+      font-weight: 500;
+      flex-shrink: 0;
+    }
+
+    .bar-track {
+      flex: 1;
+      height: 24px;
+      background: var(--bg-surface-elevated);
+      border-radius: 6px;
+      overflow: hidden;
+      margin: 0 1rem;
+      position: relative;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: 6px;
+      transition: width 1s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      padding-right: 0.6rem;
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: white;
+    }
+
+    .bar-fill.cexpress {
+      background: linear-gradient(90deg, #0284c7, #38bdf8);
+      box-shadow: 0 0 14px rgba(56, 189, 248, 0.4);
+    }
+
+    .bar-fill.go { background: #00add8; }
+    .bar-fill.fastify { background: #475569; }
+    .bar-fill.express { background: #334155; }
+    .bar-fill.fastapi { background: #059669; }
+
+    .bar-val {
+      width: 105px;
+      text-align: right;
+      font-weight: 700;
+      font-feature-settings: "tnum";
+      color: var(--text-main);
+      flex-shrink: 0;
+    }
+
+    /* Test Grid */
+    .test-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+      gap: 1rem;
+      margin: 1.5rem 0;
+    }
+
+    .test-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1rem 1.15rem;
+      transition: var(--transition);
+    }
+
+    .test-card:hover {
+      border-color: var(--border-accent);
+      transform: translateY(-2px);
+    }
+
+    .test-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.4rem;
+    }
+
+    .test-name {
+      font-family: 'Fira Code', monospace;
+      font-size: 0.84rem;
+      font-weight: 600;
+      color: var(--primary);
+    }
+
+    .test-status-pill {
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 0.15rem 0.5rem;
+      border-radius: 9999px;
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      text-transform: uppercase;
+    }
+
+    .test-desc {
+      font-size: 0.81rem;
+      color: var(--text-muted);
+      line-height: 1.45;
+    }
   </style>
 </head>
 <body>
@@ -609,9 +871,9 @@
     </div>
 
     <div class="nav-right">
-      <div class="stat-pill" title="Tested on macOS with wrk (WORKERS=4)">
+      <div class="stat-pill" title="Tested on Apple Silicon with wrk (WORKERS=4)">
         <span class="stat-dot"></span>
-        <span>202k req/sec</span>
+        <span>217k req/sec · 357µs</span>
       </div>
       <button id="theme-toggle" class="btn-icon" title="Toggle Theme" aria-label="Toggle dark/light theme">
         🌙
@@ -628,7 +890,8 @@
       <div class="sidebar-group">
         <div class="sidebar-title">Getting Started</div>
         <a href="#overview" class="sidebar-link active">Overview</a>
-        <a href="#benchmarks" class="sidebar-link">Benchmarks</a>
+        <a href="#benchmarks" class="sidebar-link">Benchmarks & Stress</a>
+        <a href="#testing" class="sidebar-link">Testing & Hardening</a>
         <a href="#installation" class="sidebar-link">Installation & Linking</a>
         <a href="#hello-world" class="sidebar-link">Hello World</a>
       </div>
@@ -687,74 +950,648 @@
 
         <div class="stats-grid">
           <div class="stat-card">
-            <div class="stat-val" style="color: #38bdf8;">202,496</div>
-            <div class="stat-label">Requests / Second (4 Workers)</div>
+            <div class="stat-val" style="color: #38bdf8;">217,278</div>
+            <div class="stat-label">Peak Req/Sec (4 Workers, /ping)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #34d399;">473 µs</div>
+            <div class="stat-val" style="color: #34d399;">358 µs</div>
             <div class="stat-label">Average Latency (100 conns)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #a855f7;">&lt; 3 MB</div>
-            <div class="stat-label">Idle Memory Footprint</div>
+            <div class="stat-val" style="color: #a855f7;">12.0 MB</div>
+            <div class="stat-label">Cluster Idle RAM (5 processes)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #fb923c;">0</div>
-            <div class="stat-label">External Dependencies</div>
+            <div class="stat-val" style="color: #fb923c;">245 ns</div>
+            <div class="stat-label">Hotpath CPU Cycle (make bench)</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" style="color: #10b981;">15 / 15</div>
+            <div class="stat-label">Passing Test Suites (ASan/UBSan)</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" style="color: #ec4899;">154</div>
+            <div class="stat-label">Audited Public APIs (Zero Drift)</div>
           </div>
         </div>
       </section>
 
       <!-- Benchmarks Section -->
       <section id="benchmarks">
-        <h2>📊 Performance & Benchmarks</h2>
+        <h2>📊 Performance & Stress Benchmarks</h2>
         <p>
-          Measured with <code>wrk</code> on macOS (Apple Silicon, 8 threads, keep-alive active, 15-second benchmark runs in cluster mode <code>QUIET=1 WORKERS=4</code>):
+          CExpress is engineered from the ground up for extreme throughput, deterministic microsecond latency, and tiny memory consumption. All benchmarks below were executed on Apple Silicon (M3 Pro 12-core, 18 GB RAM, macOS) in multi-worker cluster mode (<code>QUIET=1 WORKERS=4</code>) using <code>wrk</code> over 8 threads.
         </p>
 
-        <div class="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>Concurrency</th>
-                <th>Threads</th>
-                <th>Throughput</th>
-                <th>Avg Latency</th>
-                <th>Max Latency</th>
-                <th>Requests Served</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td><strong>100 connections</strong></td>
-                <td>8</td>
-                <td><strong style="color: var(--primary);">202,118 req/s</strong></td>
-                <td>473.86 µs</td>
-                <td>2.18 ms</td>
-                <td>3,051,948</td>
-              </tr>
-              <tr>
-                <td><strong>1,000 connections</strong></td>
-                <td>8</td>
-                <td><strong style="color: var(--primary);">202,496 req/s</strong></td>
-                <td>4.92 ms</td>
-                <td>11.57 ms</td>
-                <td>3,039,030</td>
-              </tr>
-              <tr>
-                <td><strong>5,000 connections</strong></td>
-                <td>8</td>
-                <td><strong style="color: var(--primary);">184,058 req/s</strong></td>
-                <td>20.00 ms</td>
-                <td>405.31 ms</td>
-                <td>2,767,770</td>
-              </tr>
-            </tbody>
-          </table>
+        <!-- Spotlight: wrk /ping running against 4-worker cluster -->
+        <div class="bench-highlight">
+          <div class="bench-highlight-header">
+            <div class="bench-highlight-title">
+              <span>🚀 Standalone Engine Peak: <code>wrk /ping</code></span>
+            </div>
+            <span class="bench-highlight-badge">QUIET=1 WORKERS=4 ./build/bin/cexpress</span>
+          </div>
+          <p style="margin-bottom: 1.25rem; font-size: 0.92rem;">
+            Measuring raw CExpress request-response dispatch over persistent keep-alive TCP sockets (fixed 4-byte response, zero database I/O, zero JSON overhead).
+          </p>
+          <div class="bench-highlight-grid">
+            <div class="bench-metric-card">
+              <div class="bench-metric-val" style="color: var(--primary);">209,165 <span style="font-size: 1rem; font-weight: 600;">req/s</span></div>
+              <div class="bench-metric-sub"><strong>100 connections</strong> · 357.66 µs avg latency · 3.15M requests in 15s · 18.35 MB/s</div>
+            </div>
+            <div class="bench-metric-card">
+              <div class="bench-metric-val" style="color: #34d399;">217,278 <span style="font-size: 1rem; font-weight: 600;">req/s</span></div>
+              <div class="bench-metric-sub"><strong>1,000 connections</strong> · 4.35 ms avg latency · 3.26M requests in 15s · 19.06 MB/s</div>
+            </div>
+            <div class="bench-metric-card">
+              <div class="bench-metric-val" style="color: #a855f7;">206,036 <span style="font-size: 1rem; font-weight: 600;">req/s</span></div>
+              <div class="bench-metric-sub"><strong>5,000 connections</strong> · 18.71 ms avg latency · 2.06M requests in 10s · 0 crashes</div>
+            </div>
+          </div>
         </div>
 
-        <div class="alert alert-tip" style="margin-top: 1rem;">
-          <strong>Reproduce benchmarks:</strong> Start the server with <code>QUIET=1 WORKERS=4 ./build/bin/cexpress</code> and benchmark using <code>wrk -t8 -c100 -d15s http://127.0.0.1:8080/</code>.
+        <!-- Comparative Framework Benchmark Chart -->
+        <div class="comparison-chart">
+          <div class="comparison-chart-title">
+            <span>HTTP/1.1 Throughput Comparison (Requests per Second)</span>
+            <span style="font-size: 0.75rem; color: var(--text-faint); font-weight: 400;">Higher is better</span>
+          </div>
+          <div class="bar-row">
+            <div class="bar-label"><strong>⚡ CExpress (C11)</strong></div>
+            <div class="bar-track">
+              <div class="bar-fill cexpress" style="width: 100%;">217,278 req/s</div>
+            </div>
+            <div class="bar-val" style="color: var(--primary);">217,278 req/s</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-label">Go (net/http stdlib)</div>
+            <div class="bar-track">
+              <div class="bar-fill go" style="width: 42.4%;">92,200</div>
+            </div>
+            <div class="bar-val">~92,200 req/s</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-label">Node.js (Fastify)</div>
+            <div class="bar-track">
+              <div class="bar-fill fastify" style="width: 18.9%;">41,100</div>
+            </div>
+            <div class="bar-val">~41,100 req/s</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-label">Python (FastAPI+Uvicorn)</div>
+            <div class="bar-track">
+              <div class="bar-fill fastapi" style="width: 10.6%;">23,000</div>
+            </div>
+            <div class="bar-val">~23,000 req/s</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-label">Node.js (Express.js)</div>
+            <div class="bar-track">
+              <div class="bar-fill express" style="width: 7.1%;">15,500</div>
+            </div>
+            <div class="bar-val">~15,500 req/s</div>
+          </div>
+        </div>
+
+        <!-- Interactive Benchmark Category Tabs -->
+        <div class="bench-tabs">
+          <button class="bench-tab active" onclick="switchTab('tab-ping', this)">⚡ Ping Engine</button>
+          <button class="bench-tab" onclick="switchTab('tab-db', this)">🗃️ SQLite Read & Write</button>
+          <button class="bench-tab" onclick="switchTab('tab-static', this)">🌐 Static UI Streaming</button>
+          <button class="bench-tab" onclick="switchTab('tab-churn', this)">🔄 Connection Churn</button>
+          <button class="bench-tab" onclick="switchTab('tab-memory', this)">🧠 Memory & Scaling</button>
+          <button class="bench-tab" onclick="switchTab('tab-micro', this)">⏱️ Hotpath Microbench</button>
+        </div>
+
+        <!-- Tab 1: Ping Engine -->
+        <div id="tab-ping" class="bench-pane active">
+          <p>
+            The <code>/ping</code> endpoint measures raw server event-loop throughput and kernel socket multiplexing with zero disk or database overhead. The response is a pre-formatted 4-byte payload.
+          </p>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Concurrency</th>
+                  <th>Threads</th>
+                  <th>Throughput</th>
+                  <th>Avg Latency</th>
+                  <th>Max Latency</th>
+                  <th>Data Transferred</th>
+                  <th>Stability</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>100 conns</strong></td>
+                  <td>8</td>
+                  <td><strong style="color: var(--primary);">209,165 req/s</strong></td>
+                  <td>357.66 µs</td>
+                  <td>3.92 ms</td>
+                  <td>18.35 MB/s (277.1 MB read)</td>
+                  <td><span class="test-status-pill">✓ 0 errors</span></td>
+                </tr>
+                <tr>
+                  <td><strong>1,000 conns</strong></td>
+                  <td>8</td>
+                  <td><strong style="color: var(--primary);">217,278 req/s</strong></td>
+                  <td>4.35 ms</td>
+                  <td>12.09 ms</td>
+                  <td>19.06 MB/s (286.2 MB read)</td>
+                  <td><span class="test-status-pill">✓ 0 errors</span></td>
+                </tr>
+                <tr>
+                  <td><strong>5,000 conns</strong></td>
+                  <td>8</td>
+                  <td><strong style="color: var(--primary);">206,036 req/s</strong></td>
+                  <td>18.71 ms</td>
+                  <td>58.26 ms</td>
+                  <td>18.08 MB/s (181.6 MB read)</td>
+                  <td><span class="test-status-pill">✓ 0 crashes</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="alert alert-note">
+            <strong>Engine Architecture:</strong> Uses non-blocking sockets with edge-triggered <code>kqueue</code> / <code>epoll</code> notifications, zero-copy buffer slicing, and vectorized <code>writev</code> writes for maximal kernel efficiency.
+          </div>
+        </div>
+
+        <!-- Tab 2: SQLite Read & Write -->
+        <div id="tab-db" class="bench-pane">
+          <p>
+            Real-world CRUD benchmark against an embedded SQLite database in WAL (Write-Ahead Logging) mode with <code>busy_timeout=5000</code>. Four worker processes concurrently execute reads and writes against the same shared SQLite database file.
+          </p>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Benchmark Phase</th>
+                  <th>Concurrency</th>
+                  <th>Throughput</th>
+                  <th>Avg Latency</th>
+                  <th>Max Latency</th>
+                  <th>Bandwidth</th>
+                  <th>Lock Errors</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>GET /api/todos (Read)</strong></td>
+                  <td>100 conns</td>
+                  <td><strong style="color: var(--accent-emerald);">59,765 req/s</strong></td>
+                  <td>1.61 ms</td>
+                  <td>3.86 ms</td>
+                  <td>148.19 MB/s</td>
+                  <td><span class="test-status-pill">✓ 0 locks</span></td>
+                </tr>
+                <tr>
+                  <td><strong>GET /api/todos (Read)</strong></td>
+                  <td>1,000 conns</td>
+                  <td><strong style="color: var(--accent-emerald);">55,063 req/s</strong></td>
+                  <td>17.98 ms</td>
+                  <td>36.96 ms</td>
+                  <td>136.53 MB/s</td>
+                  <td><span class="test-status-pill">✓ 0 locks</span></td>
+                </tr>
+                <tr>
+                  <td><strong>GET /api/todos (Read)</strong></td>
+                  <td>5,000 conns</td>
+                  <td><strong style="color: var(--accent-emerald);">53,539 req/s</strong></td>
+                  <td>83.31 ms</td>
+                  <td>183.89 ms</td>
+                  <td>132.75 MB/s</td>
+                  <td><span class="test-status-pill">✓ 0 locks</span></td>
+                </tr>
+                <tr>
+                  <td><strong>POST /api/todos (Write)</strong></td>
+                  <td>100 conns</td>
+                  <td><strong style="color: var(--accent-amber);">24,730 req/s</strong></td>
+                  <td>3.97 ms</td>
+                  <td>56.66 ms</td>
+                  <td>5.51 MB/s</td>
+                  <td><span class="test-status-pill">✓ 0 locks</span></td>
+                </tr>
+                <tr>
+                  <td><strong>POST /api/todos (Write)</strong></td>
+                  <td>1,000 conns</td>
+                  <td><strong style="color: var(--accent-amber);">24,644 req/s</strong></td>
+                  <td>40.11 ms</td>
+                  <td>63.23 ms</td>
+                  <td>5.50 MB/s</td>
+                  <td><span class="test-status-pill">✓ 0 locks</span></td>
+                </tr>
+                <tr>
+                  <td><strong>POST /api/todos (Write)</strong></td>
+                  <td>5,000 conns</td>
+                  <td><strong style="color: var(--accent-amber);">23,729 req/s</strong></td>
+                  <td>93.14 ms</td>
+                  <td>274.47 ms</td>
+                  <td>5.30 MB/s</td>
+                  <td><span class="test-status-pill">✓ 0 locks</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="alert alert-tip">
+            <strong>Fork-Safe SQLite & WAL:</strong> Each worker maintains a private SQLite connection opened after <code>fork()</code>. Over 750,000 concurrent rows were inserted across the write phases with <strong>zero SQLITE_BUSY locking errors</strong> and <strong>zero worker crashes</strong>.
+          </div>
+        </div>
+
+        <!-- Tab 3: Static UI Streaming -->
+        <div id="tab-static" class="bench-pane">
+          <p>
+            Serves the responsive single-page Todo application HTML directly from disk via CExpress's bounded streaming engine (<code>res_send_file_custom</code>).
+          </p>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Concurrency</th>
+                  <th>Threads</th>
+                  <th>Throughput</th>
+                  <th>Avg Latency</th>
+                  <th>Max Latency</th>
+                  <th>Transfer Rate</th>
+                  <th>Total Read</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>100 conns</strong></td>
+                  <td>8</td>
+                  <td><strong style="color: var(--primary);">62,474 req/s</strong></td>
+                  <td>747.44 µs</td>
+                  <td>22.77 ms</td>
+                  <td>391.50 MB/s</td>
+                  <td>3.86 GB</td>
+                </tr>
+                <tr>
+                  <td><strong>1,000 conns</strong></td>
+                  <td>8</td>
+                  <td><strong style="color: var(--primary);">60,316 req/s</strong></td>
+                  <td>16.45 ms</td>
+                  <td>32.37 ms</td>
+                  <td>377.98 MB/s</td>
+                  <td>3.70 GB</td>
+                </tr>
+                <tr>
+                  <td><strong>5,000 conns</strong></td>
+                  <td>8</td>
+                  <td><strong style="color: var(--primary);">55,954 req/s</strong></td>
+                  <td>52.85 ms</td>
+                  <td>162.77 ms</td>
+                  <td>350.65 MB/s</td>
+                  <td>3.44 GB</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="alert alert-note">
+            <strong>Bounded Buffer Streaming:</strong> File content is streamed in 64 KB chunks directly from disk descriptor to client socket, ensuring RAM consumption stays bounded even when saturation pushes throughput past 390 megabytes per second.
+          </div>
+        </div>
+
+        <!-- Tab 4: Connection Churn -->
+        <div id="tab-churn" class="bench-pane">
+          <p>
+            Benchmarks server performance when clients send <code>Connection: close</code>, requiring a full TCP handshake, HTTP request parsing, response delivery, and connection teardown on every single transaction.
+          </p>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Benchmark Mode</th>
+                  <th>Concurrency</th>
+                  <th>New Conns / Second</th>
+                  <th>Avg Latency</th>
+                  <th>Max Latency</th>
+                  <th>Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>GET /ping (Connection: close)</strong></td>
+                  <td>100 conns</td>
+                  <td><strong style="color: var(--accent-purple);">16,747 conn/s</strong></td>
+                  <td>2.46 ms</td>
+                  <td>171.55 ms</td>
+                  <td>Clean accept/close lifecycle; 168k connections completed in 10s</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="alert alert-warn">
+            <strong>TIME_WAIT & Port Exhaustion:</strong> At 1,000+ connections with <code>Connection: close</code>, client load generators on macOS quickly exhaust the ~16k ephemeral port range because closed sockets linger in <code>TIME_WAIT</code> for 30–60 seconds. For maximum performance in production, always leverage persistent HTTP keep-alive.
+          </div>
+        </div>
+
+        <!-- Tab 5: Memory Profile & Scaling -->
+        <div id="tab-memory" class="bench-pane">
+          <p>
+            Resident set size (RSS) was measured throughout the battery using a background sampler polling <code>ps</code> every 250 ms across the master and all 4 worker processes, cross-verified with <code>/usr/bin/time -l</code>.
+          </p>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Execution Phase</th>
+                  <th>Total Cluster RSS (5 Procs)</th>
+                  <th>Largest Single Worker</th>
+                  <th>Avg RSS per Process</th>
+                  <th>Memory Scaling Behavior</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Idle (boot & seeded)</strong></td>
+                  <td>12.0 MB</td>
+                  <td>2.5 MB</td>
+                  <td>2.4 MB</td>
+                  <td>Baseline master + 4 pre-forked workers</td>
+                </tr>
+                <tr>
+                  <td><strong>Under 100 conns (200k req/s)</strong></td>
+                  <td>12.8 MB</td>
+                  <td>3.3 MB</td>
+                  <td>2.5 MB</td>
+                  <td>+0.8 MB total under 200,000 requests/sec load</td>
+                </tr>
+                <tr>
+                  <td><strong>Under 1,000 conns</strong></td>
+                  <td>20.0 MB</td>
+                  <td>10.5 MB</td>
+                  <td>4.0 MB</td>
+                  <td>Linear scaling with active socket buffers</td>
+                </tr>
+                <tr>
+                  <td><strong>Under 5,000 conns</strong></td>
+                  <td>51.9 MB</td>
+                  <td>42.5 MB</td>
+                  <td>10.3 MB</td>
+                  <td>~7.8 KB per active connection (8 KB recv buffer)</td>
+                </tr>
+                <tr>
+                  <td><strong>Master Process Footprint</strong></td>
+                  <td><strong>1.3 MB</strong></td>
+                  <td>1.3 MB</td>
+                  <td>1.3 MB</td>
+                  <td>Master manages supervisor loop, signals & worker reaping</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="alert alert-tip">
+            <strong>Zero Memory Leaks:</strong> All request structures, parser buffers, and route context are allocated on the stack or in fixed connection slots. Total page reclaims during 150 seconds of intense stress: 5,904; page faults: 15; swaps: <strong>0</strong>. Worker crashes: <strong>0</strong>.
+          </div>
+        </div>
+
+        <!-- Tab 6: Hotpath Microbenchmarks -->
+        <div id="tab-micro" class="bench-pane">
+          <p>
+            Measured with <code>make bench</code> (compiled with <code>-O2</code>). Gauges the raw CPU cycle cost of the core framework pipeline (parsing, routing, dispatching, response generation) isolated from operating system socket I/O.
+          </p>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Pipeline Operation</th>
+                  <th>Latency per Request</th>
+                  <th>Single-Core Theoretical Capacity</th>
+                  <th>Dynamic Allocations</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Minimal GET (2 headers)</strong></td>
+                  <td><strong style="color: var(--primary);">245 ns</strong></td>
+                  <td>~4,081,000 requests / sec</td>
+                  <td>0 heap allocs</td>
+                </tr>
+                <tr>
+                  <td><strong>404 Route Miss</strong></td>
+                  <td><strong>257 ns</strong></td>
+                  <td>~3,891,000 requests / sec</td>
+                  <td>0 heap allocs</td>
+                </tr>
+                <tr>
+                  <td><strong>POST with JSON Body</strong></td>
+                  <td><strong>360 ns</strong></td>
+                  <td>~2,777,000 requests / sec</td>
+                  <td>0 heap allocs</td>
+                </tr>
+                <tr>
+                  <td><strong>Browser GET (10 headers, cookies, query)</strong></td>
+                  <td><strong>869 ns</strong></td>
+                  <td>~1,150,000 requests / sec</td>
+                  <td>0 heap allocs</td>
+                </tr>
+                <tr>
+                  <td><strong>JsonWriter (20-row list serialization)</strong></td>
+                  <td><strong>1,790 ns</strong></td>
+                  <td>3.8x faster than AST tree stringification (6,717 ns)</td>
+                  <td>0 heap allocs</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="alert alert-note">
+            <strong>Zero-Allocation Architecture:</strong> <code>sizeof(Request) = 19,000 B</code>, <code>sizeof(Response) = 15,912 B</code>, <code>sizeof(Connection) = 120 B</code>. Every connection is handled without <code>malloc()</code> or <code>free()</code> on the fast path.
+          </div>
+        </div>
+
+        <!-- Reproduce benchmarks -->
+        <div class="code-block" style="margin-top: 1.5rem;">
+          <div class="code-header">
+            <span class="code-lang">bash — Reproduce Benchmarks Locally</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="com"># 1. Build release binary</span>
+make clean && make
+
+<span class="com"># 2. Launch 4-worker cluster in background</span>
+QUIET=1 WORKERS=4 ./build/bin/cexpress
+
+<span class="com"># 3. In another terminal, run standalone wrk benchmarks on /ping</span>
+wrk -t8 -c100 -d15s http://127.0.0.1:8080/ping
+wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
+
+<span class="com"># 4. Or run the full automated stress battery with memory profiling</span>
+./scripts/stress_test.sh</code></pre>
+        </div>
+      </section>
+
+      <!-- Testing & Hardening Section -->
+      <section id="testing">
+        <h2>🛡️ Reliability, Hardening & Test Matrix</h2>
+        <p>
+          High throughput is meaningless without correctness and rock-solid memory safety. CExpress is rigorously verified across 15 dedicated automated test suites, AddressSanitizer and UndefinedBehaviorSanitizer instrumentation, continuous mutation fuzzing, and automated API documentation audits.
+        </p>
+
+        <div class="stats-grid" style="margin-bottom: 2rem;">
+          <div class="stat-card">
+            <div class="stat-val" style="color: #10b981;">15 / 15</div>
+            <div class="stat-label">Automated Test Suites Passing</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" style="color: #38bdf8;">154 / 154</div>
+            <div class="stat-label">Public APIs Audited (check_docs.sh)</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" style="color: #a855f7;">1,000,000+</div>
+            <div class="stat-label">Mutation Fuzz Iterations Clean</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" style="color: #fb923c;">0 Leaks</div>
+            <div class="stat-label">ASan & UBSan Sanitizer Verified</div>
+          </div>
+        </div>
+
+        <h3>Automated Test Suites (<code>make test</code>)</h3>
+        <div class="test-grid">
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_json</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Recursive descent parser, streaming <code>JsonWriter</code>, string escaping, unicode escape sequences, null/boolean handling.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_middleware</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Pipeline ordering, next() sequencing, prefix-scoped middleware, route-level guards, and centralized error handler invocation.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_router</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Exact route matching, parameterized paths (<code>:id</code>), wildcard capturing (<code>*</code>), sub-router mounting via <code>app_mount()</code>.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_http_parser</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Zero-copy HTTP/1.1 parsing, header line folding rejection, pipelined requests, and chunked transfer decoding.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_http_hardening</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">RFC 7230 compliance: request smuggling defense, conflicting Content-Length & Transfer-Encoding rejection, CRLF header injection guards.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_connection</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Non-blocking TCP state machine, EAGAIN/EWOULDBLOCK retry loops, buffer overflow protection, keep-alive connection reuse.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_response</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Header serialization, cookie attributes (<code>HttpOnly</code>, <code>SameSite</code>, <code>Secure</code>, <code>Max-Age</code>), chunked body streaming, trailers.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_multipart</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Streaming <code>multipart/form-data</code> parser, MIME boundary matching, file upload fields, and truncated payload resilience.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_urlencoded</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc"><code>application/x-www-form-urlencoded</code> decoding, URL query string parameter extraction, and percent-encoding normalization.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_static</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Static asset delivery, MIME resolution, <code>index.html</code> fallbacks, and directory traversal defense (blocking <code>../</code> and null bytes).</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_event_loop</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Unified event loop abstraction verifying <code>kqueue</code> (macOS/BSD) and <code>epoll</code> (Linux) edge-triggered registration and timers.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_cluster</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Multi-process cluster management, <code>SO_REUSEPORT</code> load distribution, automatic worker crash recovery, and graceful drain on <code>SIGTERM</code>.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_tls</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Native OpenSSL TLS/HTTPS engine, ALPN negotiation, SSL handshake state transitions, certificate loading, and TLS I/O error states.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_cookbook</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">End-to-end recipes from the CExpress Cookbook: authentication tokens, API keys, body parsing, custom responses, and sub-routers.</div>
+          </div>
+
+          <div class="test-card">
+            <div class="test-card-header">
+              <span class="test-name">test_ping</span>
+              <span class="test-status-pill">✓ Passing</span>
+            </div>
+            <div class="test-desc">Fast-path lightweight endpoint verification validating 4-byte response format, headers, and keep-alive stability.</div>
+          </div>
+        </div>
+
+        <h3>Automated Documentation Parity (<code>scripts/check_docs.sh</code>)</h3>
+        <p>
+          To prevent documentation drift, <code>check_docs.sh</code> (invoked via <code>make check-docs</code>) audits the entire public C API against the documentation:
+        </p>
+        <div class="alert alert-tip">
+          <strong>154 of 154 Public Functions Covered:</strong> Fails immediately if any function declared in <code>lib/*.h</code> is missing from the documentation, or if the documentation references any function not declared in a header.
+        </div>
+
+        <h3>Memory Sanitizers & Fuzzing (<code>make SANITIZE=1 test</code> & <code>make fuzz</code>)</h3>
+        <p>
+          Memory safety in C requires rigorous automated verification. The entire suite can be compiled under AddressSanitizer and UndefinedBehaviorSanitizer:
+        </p>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">bash</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="com"># Run entire test suite under ASan + UBSan</span>
+make clean && make SANITIZE=1 test
+
+<span class="com"># Run mutation fuzzer on HTTP parser (1,000,000 iterations)</span>
+make fuzz</code></pre>
         </div>
       </section>
 
@@ -1336,7 +2173,8 @@ free(out);
     <aside class="toc">
       <div class="toc-title">On this page</div>
       <a href="#overview" class="toc-link">Overview</a>
-      <a href="#benchmarks" class="toc-link">Benchmarks</a>
+      <a href="#benchmarks" class="toc-link">Benchmarks & Stress</a>
+      <a href="#testing" class="toc-link">Testing & Hardening</a>
       <a href="#installation" class="toc-link">Installation</a>
       <a href="#hello-world" class="toc-link">Hello World</a>
       <a href="#routing-basics" class="toc-link">Routing & Verbs</a>
@@ -1448,6 +2286,17 @@ free(out);
     }, { threshold: 0.25 });
 
     document.querySelectorAll('section').forEach(sec => observer.observe(sec));
+
+    // Benchmark Category Tab Switching
+    function switchTab(tabId, btn) {
+      document.querySelectorAll('.bench-tab').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.bench-pane').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      const target = document.getElementById(tabId);
+      if (target) {
+        target.classList.add('active');
+      }
+    }
   </script>
 </body>
 </html>
