@@ -218,6 +218,13 @@ typedef struct {
     int field_count;
 } UrlEncodedForm;
 
+typedef enum {
+    TLS_STATE_NONE = 0,
+    TLS_STATE_HANDSHAKE,
+    TLS_STATE_CONNECTED,
+    TLS_STATE_CLOSING
+} TlsState;
+
 /* Per-connection state that persists across event-loop turns. */
 typedef struct Connection {
     int fd;
@@ -254,6 +261,13 @@ typedef struct Connection {
 
     /* Events actively registered with the event loop backend (EVENT_READ | EVENT_WRITE) */
     int events_watched;
+
+    /* TLS / HTTPS state: opaque handle to SSL * when TLS is active on this connection,
+     * NULL for plaintext connections. Tracked via non-blocking handshake states. */
+    void *ssl;
+    TlsState tls_state;
+    int tls_want_read;
+    int tls_want_write;
 } Connection;
 
 typedef enum {
@@ -479,6 +493,9 @@ struct MiddlewareChain {
 typedef struct {
     int port;
     int workers; /* 1 = single process (default); > 1 = cluster mode; 0 = auto-detect CPU cores */
+    int tls_enabled;
+    char tls_cert_file[PATH_MAX];
+    char tls_key_file[PATH_MAX];
 } ServerConfig;
 
 typedef struct {
@@ -497,6 +514,9 @@ typedef struct {
     int timer_idle_fd;
     int timer_shutdown_fd;
     int signal_fd;
+
+    /* TLS / HTTPS SSL_CTX handle: initialized if config.tls_enabled, NULL otherwise. */
+    void *ssl_ctx;
 
     /* Heap-allocated (app_init), indexed directly by fd - a Connection* for
      * an open connection, NULL otherwise. Starts at

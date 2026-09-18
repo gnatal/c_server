@@ -609,9 +609,9 @@
     </div>
 
     <div class="nav-right">
-      <div class="stat-pill" title="Tested on macOS with wrk">
+      <div class="stat-pill" title="Tested on macOS with wrk (WORKERS=4)">
         <span class="stat-dot"></span>
-        <span>167k req/sec</span>
+        <span>202k req/sec</span>
       </div>
       <button id="theme-toggle" class="btn-icon" title="Toggle Theme" aria-label="Toggle dark/light theme">
         🌙
@@ -665,6 +665,7 @@
         <a href="#form-parsing" class="sidebar-link">Multipart & URL-Encoded</a>
         <a href="#json-engine" class="sidebar-link">Built-in JSON Parser</a>
         <a href="#graceful-shutdown" class="sidebar-link">Graceful Shutdown</a>
+        <a href="#tls-support" class="sidebar-link">TLS / HTTPS Support</a>
       </div>
 
       <div class="sidebar-group">
@@ -686,11 +687,11 @@
 
         <div class="stats-grid">
           <div class="stat-card">
-            <div class="stat-val" style="color: #38bdf8;">167,902</div>
-            <div class="stat-label">Requests / Second (1 Core)</div>
+            <div class="stat-val" style="color: #38bdf8;">202,496</div>
+            <div class="stat-label">Requests / Second (4 Workers)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #34d399;">573 µs</div>
+            <div class="stat-val" style="color: #34d399;">473 µs</div>
             <div class="stat-label">Average Latency (100 conns)</div>
           </div>
           <div class="stat-card">
@@ -708,7 +709,7 @@
       <section id="benchmarks">
         <h2>📊 Performance & Benchmarks</h2>
         <p>
-          Measured with <code>wrk</code> on macOS (Apple Silicon, keep-alive active, 15-second benchmark runs):
+          Measured with <code>wrk</code> on macOS (Apple Silicon, 8 threads, keep-alive active, 15-second benchmark runs in cluster mode <code>QUIET=1 WORKERS=4</code>):
         </p>
 
         <div class="table-container">
@@ -727,29 +728,33 @@
               <tr>
                 <td><strong>100 connections</strong></td>
                 <td>8</td>
-                <td><strong style="color: var(--primary);">167,902 req/s</strong></td>
-                <td>573.86 µs</td>
-                <td>4.32 ms</td>
-                <td>2,535,418</td>
+                <td><strong style="color: var(--primary);">202,118 req/s</strong></td>
+                <td>473.86 µs</td>
+                <td>2.18 ms</td>
+                <td>3,051,948</td>
               </tr>
               <tr>
                 <td><strong>1,000 connections</strong></td>
                 <td>8</td>
-                <td><strong style="color: var(--primary);">159,373 req/s</strong></td>
-                <td>6.25 ms</td>
-                <td>22.67 ms</td>
-                <td>2,391,896</td>
+                <td><strong style="color: var(--primary);">202,496 req/s</strong></td>
+                <td>4.92 ms</td>
+                <td>11.57 ms</td>
+                <td>3,039,030</td>
               </tr>
               <tr>
                 <td><strong>5,000 connections</strong></td>
                 <td>8</td>
-                <td><strong style="color: var(--primary);">154,621 req/s</strong></td>
-                <td>26.40 ms</td>
-                <td>109.22 ms</td>
-                <td>2,325,396</td>
+                <td><strong style="color: var(--primary);">184,058 req/s</strong></td>
+                <td>20.00 ms</td>
+                <td>405.31 ms</td>
+                <td>2,767,770</td>
               </tr>
             </tbody>
           </table>
+        </div>
+
+        <div class="alert alert-tip" style="margin-top: 1rem;">
+          <strong>Reproduce benchmarks:</strong> Start the server with <code>QUIET=1 WORKERS=4 ./build/bin/cexpress</code> and benchmark using <code>wrk -t8 -c100 -d15s http://127.0.0.1:8080/</code>.
         </div>
       </section>
 
@@ -1150,6 +1155,29 @@ free(out);
         </div>
       </section>
 
+      <!-- TLS / HTTPS Support -->
+      <section id="tls-support">
+        <h2>🔒 TLS / HTTPS Support</h2>
+        <p>
+          CExpress features non-blocking, event-driven TLS 1.2+ encryption powered by OpenSSL/LibreSSL. Handshakes proceed asynchronously across <code>kqueue</code> and <code>epoll</code> event loops without blocking worker threads:
+        </p>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">c</span>
+            <button class="btn-copy" onclick="copyCode(this)">Copy</button>
+          </div>
+          <pre><code><span class="com">/* Enable TLS programmatically */</span>
+<span class="fn">app_enable_tls</span>(&amp;app, <span class="str">"certs/server.crt"</span>, <span class="str">"certs/server.key"</span>);
+
+<span class="com">/* Or via environment variables at startup:
+ * TLS_CERT=certs/server.crt TLS_KEY=certs/server.key ./build/bin/cexpress
+ */</span></code></pre>
+        </div>
+        <div class="alert alert-tip">
+          <strong>Zero-Dependency Mode:</strong> When OpenSSL is absent or when compiling with <code>make NO_TLS=1</code>, CExpress automatically compiles with zero external library dependencies.
+        </div>
+      </section>
+
       <!-- API Cheat Sheet -->
       <section id="api-index">
         <h2>📖 API Cheat Sheet</h2>
@@ -1176,6 +1204,11 @@ free(out);
                 <td><code>app_init(App *app)</code></td>
                 <td><code>router.h</code></td>
                 <td>Initializes server app and dynamic connection table.</td>
+              </tr>
+              <tr data-cat="routing">
+                <td><code>app_enable_tls(App *app, cert, key)</code></td>
+                <td><code>router.h</code></td>
+                <td>Enables HTTPS and configures certificate chain and private key.</td>
               </tr>
               <tr data-cat="routing">
                 <td><code>app_listen(App *app, int port)</code></td>
@@ -1318,6 +1351,7 @@ free(out);
       <a href="#form-parsing" class="toc-link">Multipart / Forms</a>
       <a href="#json-engine" class="toc-link">JSON Engine</a>
       <a href="#graceful-shutdown" class="toc-link">Graceful Shutdown</a>
+      <a href="#tls-support" class="toc-link">TLS / HTTPS Support</a>
       <a href="#api-index" class="toc-link">API Cheat Sheet</a>
     </aside>
   </div>

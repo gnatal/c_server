@@ -26,26 +26,30 @@ A lightweight, high-performance, single-threaded HTTP/1.1 server and web framewo
 ## Purpose
 
 Modern backend applications often rely on high-level runtimes like Node.js or Go. This project brings the ergonomic, developer-friendly routing and middleware design of **Express.js** directly to **C**, providing:
-- **Maximum Performance & Low Latency**: Native execution with minimal CPU overhead, sub-millisecond response times, and over 160,000 requests/sec on a single thread.
-- **Minimal Footprint**: Lightweight static binary with zero external dependencies beyond standard C and POSIX APIs.
-- **Event-Driven Non-Blocking I/O**: Single-threaded concurrency powered by native `kqueue` (macOS / BSD) and `epoll` (Linux), following the same architectural pattern as Node.js's underlying `libuv`.
+- **Maximum Performance & Low Latency**: Native execution with minimal CPU overhead, sub-millisecond response times, and over 202,000 requests/sec with multi-worker concurrency (over 167,000 req/sec single-threaded).
+- **Minimal Footprint**: Lightweight static binary with zero external dependencies beyond standard C and POSIX APIs (optional OpenSSL for TLS).
+- **Event-Driven Non-Blocking I/O**: High-performance concurrency powered by native `kqueue` (macOS / BSD) and `epoll` (Linux), following the same architectural pattern as Node.js's underlying `libuv`.
 - **Memory Safety & Control**: Explicit bounded buffers, aggressive `const` correctness, bounded I/O guards, and strict dynamic memory allocation tracking.
 
 ---
 
 ## Performance & Benchmarks
 
-Benchmarked using `wrk` on macOS (Apple Silicon, 8 threads, keep-alive active):
+Benchmarked using `wrk` on macOS (Apple Silicon, 8 threads, keep-alive active) running in multi-worker cluster mode (`QUIET=1 WORKERS=4`):
 
 | Concurrency | Threads | Duration | Throughput | Avg Latency | Max Latency | Total Requests | Data Transferred |
 |---|---|---|---|---|---|---|---|
-| **100 connections** | 8 | 15s | **167,902 req/sec** | **573.86 µs** | 4.32 ms | 2,535,418 | 278.07 MB |
-| **1,000 connections** | 8 | 15s | **159,373 req/sec** | **6.25 ms** | 22.67 ms | 2,391,896 | 262.33 MB |
-| **5,000 connections** | 8 | 15s | **154,621 req/sec** | **26.40 ms** | 109.22 ms | 2,325,396 | 255.03 MB |
+| **100 connections** | 8 | 15s | **202,118 req/sec** | **473.86 µs** | 2.18 ms | 3,051,948 | 334.71 MB |
+| **1,000 connections** | 8 | 15s | **202,496 req/sec** | **4.92 ms** | 11.57 ms | 3,039,030 | 333.30 MB |
+| **5,000 connections** | 8 | 15s | **184,058 req/sec** | **20.00 ms** | 405.31 ms | 2,767,770 | 303.55 MB |
 
 > [!TIP]
-> Reproduce these benchmarks against the running server using the scripts in `scripts/CLAUDE.md`:
+> Reproduce these benchmarks against the running cluster server using:
 > ```bash
+> # Start cluster server with 4 workers in quiet mode
+> QUIET=1 WORKERS=4 ./build/bin/cexpress
+>
+> # In another terminal, run wrk:
 > wrk -t8 -c100 -d15s http://127.0.0.1:8080/
 > wrk -t8 -c1000 -d15s http://127.0.0.1:8080/
 > wrk -t8 -c5000 -d15s http://127.0.0.1:8080/
@@ -323,8 +327,6 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 ├── concurrency.md        # Multi-worker concurrency & SO_REUSEPORT architecture guide
 ├── CLAUDE.md             # Project standards, coding guidelines, and workflow rules
 ├── AGENTS.md             # Agent context and workflow guidelines
-├── pending.txt           # Feature tracking and architectural backlog
-├── plan.md               # Architectural roadmap and task estimates
 ├── lib/                  # Reusable CExpress engine (builds to build/lib/libcexpress.a)
 │   ├── CLAUDE.md         # Engine architecture, data flow, and memory lifecycle
 │   ├── app_types.h       # Struct definitions, event loop types, function pointer signatures
@@ -333,6 +335,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │   ├── event_loop_kqueue.c # Native BSD/macOS kqueue backend
 │   ├── event_loop_epoll.c  # Native Linux epoll backend (timerfd + signalfd)
 │   ├── connection.h/c    # Portable non-blocking socket I/O & graceful shutdown
+│   ├── tls.h/c           # OpenSSL/LibreSSL non-blocking TLS lifecycle & fallback
 │   ├── http_parser.h/c   # HTTP/1.1 parser, query string, chunked decoding
 │   ├── router.h/c        # Path pattern matching, route table, sub-routers
 │   ├── response.h/c      # Response builder, streaming chunks & trailers, file streaming
@@ -355,7 +358,9 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │       └── style.css     # Demo stylesheet
 ├── tests/                # Isolated test suites (built into build/bin/test_*)
 │   ├── CLAUDE.md         # Test harness architecture and socket mocking strategy
+│   ├── certs/            # RSA test certificates for TLS verification
 │   ├── test_connection.c # Socket I/O and lifecycle tests via socketpair(2)
+│   ├── test_tls.c        # Non-blocking TLS handshake, I/O & session tests
 │   ├── test_event_loop.c # Event-loop abstraction tests (lifecycle, I/O, timers)
 │   ├── test_cluster.c    # Multi-worker cluster tests (forking, SO_REUSEPORT, drain)
 │   ├── test_http_parser.c# Unit tests for HTTP parser and request dechunking
@@ -379,7 +384,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 
 ## Roadmap
 
-Check [pending.txt](pending.txt) and [plan.md](plan.md) for the complete architectural backlog:
+All 11 architectural milestones have been successfully completed:
 - [x] Sub-routers & prefix mounting (`app_mount`, `Router`)
 - [x] Additional HTTP verbs (`PUT`, `DELETE`, `PATCH`, `OPTIONS`, `HEAD`)
 - [x] Query string parser (`req_get_query`) & URL percent-decoding (`url_decode`)
@@ -390,6 +395,6 @@ Check [pending.txt](pending.txt) and [plan.md](plan.md) for the complete archite
 - [x] Streaming & chunked responses (`res_write`, `res_end`, `res_set_trailer`, `res_send_file`)
 - [x] Cross-platform event backend (`epoll` for Linux, `kqueue` for macOS/BSD)
 - [x] Multi-threaded / multi-process worker model (`SO_REUSEPORT`)
-- [ ] TLS / HTTPS support (OpenSSL/LibreSSL non-blocking handshake integration)
+- [x] TLS / HTTPS support (OpenSSL/LibreSSL non-blocking handshake integration)
 
 

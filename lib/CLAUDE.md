@@ -946,3 +946,23 @@ CExpress scales across CPU cores via a multi-process worker model (`fork()` + `S
   exit and immediately respawns a replacement worker to maintain full capacity.
 - **Graceful Cluster Drain**: Master catches `SIGTERM`/`SIGINT`, signals workers to drain
   connections within 5 seconds, and cleanly exits without zombie processes.
+
+## TLS / HTTPS Support (`tls.h`, `tls.c`)
+Non-blocking TLS encryption integrated into the event loop via OpenSSL/LibreSSL:
+- **Architecture**: TLS operations are isolated in `lib/tls.h`/`tls.c`. When enabled via
+  `app_enable_tls(app, cert, key)` or env vars `TLS_CERT`/`TLS_KEY`, `tls_init_app` creates an
+  `SSL_CTX`, enforces TLS 1.2+ minimum, disables SSLv2/v3 and TLS 1.0/1.1, and enables partial write
+  mode (`SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER`). Conditional compilation
+  via `CEXPRESS_HAS_TLS` provides zero-dependency stub fallbacks when built with `NO_TLS=1`.
+- **Non-Blocking Handshake**: `accept_connections` allocates `SSL *` via `tls_connection_init` and
+  starts `tls_connection_handshake`. `SSL_ERROR_WANT_READ` watches `EVENT_READ`; `SSL_ERROR_WANT_WRITE`
+  watches `EVENT_WRITE`. When complete, the connection transitions to `TLS_STATE_CONNECTED` and read interest.
+- **Encrypted Socket I/O**: `conn_read`/`conn_write` in `connection.c` route to `tls_connection_read`
+  and `tls_connection_write` when `conn->ssl != NULL`. Translates `SSL_ERROR_WANT_READ`/`WANT_WRITE` to
+  `EAGAIN`, `SSL_ERROR_ZERO_RETURN` to clean EOF (`0`), and handles SSL protocol errors cleanly.
+- **Pipelined Data Handling**: `tls_has_pending` checks `SSL_pending(conn->ssl) > 0` on keep-alive
+  transitions in `flush_connection` and main loop sweeps, preventing pipelined HTTP requests buffered in
+  OpenSSL memory from stalling when the OS socket buffer is empty.
+- **Memory Lifecycle**: `Connection.ssl` is freed via `tls_connection_close` (`SSL_shutdown` + `SSL_free`)
+  inside `connection_close`. `App.ssl_ctx` is freed via `tls_cleanup_app` inside `app_destroy`.
+

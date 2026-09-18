@@ -1,8 +1,8 @@
 # Multi-stage build for lightweight Linux container image
 FROM alpine:3.20 AS builder
 
-# Install build toolchain
-RUN apk add --no-cache gcc musl-dev make
+# Install build toolchain and OpenSSL development headers
+RUN apk add --no-cache gcc musl-dev make openssl-dev openssl-libs-static
 
 WORKDIR /app
 
@@ -14,6 +14,8 @@ RUN make clean && make && make test
 
 # Minimal runtime image
 FROM alpine:3.20
+
+RUN apk add --no-cache libssl3 libcrypto3
 
 WORKDIR /app
 

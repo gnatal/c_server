@@ -264,4 +264,10 @@ void app_mount(App *app, const char *prefix, const Router *router);
  */
 void app_serve_static(App *app, const char *prefix, const char *root_dir);
 
+/*
+ * Configures TLS certificate and private key paths for the application.
+ * Returns 0 on success, -1 on failure (e.g. invalid arguments or path exceeding PATH_MAX).
+ */
+int app_enable_tls(App *app, const char *cert_file, const char *key_file);
+
 #endif /* ROUTER_H */

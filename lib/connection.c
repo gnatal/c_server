@@ -16,6 +16,21 @@
 #include "router.h"
 #include "response.h"
 #include "middleware.h"
+#include "tls.h"
+
+static ssize_t conn_read(App *app, Connection *conn, void *buf, size_t count) {
+    if (conn->ssl != NULL) {
+        return tls_connection_read(app, conn, buf, count);
+    }
+    return recv(conn->fd, buf, count, 0);
+}
+
+static ssize_t conn_write(App *app, Connection *conn, const void *buf, size_t count) {
+    if (conn->ssl != NULL) {
+        return tls_connection_write(app, conn, buf, count);
+    }
+    return write(conn->fd, buf, count);
+}
 
 int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -95,6 +110,8 @@ void connection_close(App *app, Connection *conn) {
         conn->file_fd = -1;
     }
 
+    tls_connection_close(app, conn);
+
     close(conn->fd);
     app->connections[conn->fd] = NULL;
     free(conn->in_buf);
@@ -113,6 +130,7 @@ void app_destroy(App *app) {
         close(app->server_fd);
         app->server_fd = -1;
     }
+    tls_cleanup_app(app);
     free(app->connections);
     app->connections = NULL;
     app->connections_cap = 0;
@@ -228,7 +246,20 @@ void accept_connections(App *app) {
             continue;
         }
         app->connections[client_fd] = conn;
-        event_loop_watch_read(app, client_fd, conn);
+
+        if (app->ssl_ctx != NULL) {
+            if (tls_connection_init(app, conn) != 0) {
+                connection_close(app, conn);
+                continue;
+            }
+            int hs = tls_connection_handshake(app, conn);
+            if (hs < 0) {
+                connection_close(app, conn);
+                continue;
+            }
+        } else {
+            event_loop_watch_read(app, client_fd, conn);
+        }
     }
 }
 
@@ -238,7 +269,7 @@ void flush_connection(App *app, Connection *conn) {
 
     while (1) {
         while (conn->out_sent < conn->out_len) {
-            ssize_t n = write(conn->fd, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
+            ssize_t n = conn_write(app, conn, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     event_loop_watch_write(app, conn->fd, conn);
@@ -312,6 +343,11 @@ void flush_connection(App *app, Connection *conn) {
                 conn->in_cap = BUF_SIZE;
             }
         }
+
+        if (tls_has_pending(conn)) {
+            handle_readable(app, conn);
+            return;
+        }
     } else {
         connection_close(app, conn);
     }
@@ -319,7 +355,7 @@ void flush_connection(App *app, Connection *conn) {
 
 void handle_readable(App *app, Connection *conn) {
     while (conn->in_len < conn->in_cap - 1) {
-        ssize_t n = recv(conn->fd, conn->in_buf + conn->in_len, conn->in_cap - 1 - conn->in_len, 0);
+        ssize_t n = conn_read(app, conn, conn->in_buf + conn->in_len, conn->in_cap - 1 - conn->in_len);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -532,6 +568,14 @@ void close_idle_connections(App *app) {
 }
 
 void app_listen_worker(App *app, int port) {
+    if (app->config.tls_enabled && app->ssl_ctx == NULL) {
+        if (tls_init_app(app) != 0) {
+            fprintf(stderr, "Failed to initialize TLS with cert '%s' and key '%s'\n",
+                    app->config.tls_cert_file, app->config.tls_key_file);
+            exit(EXIT_FAILURE);
+        }
+    }
+
     app->server_fd = create_server_socket(port);
     if (event_loop_init(app) != 0) {
         perror("event_loop_init");
@@ -540,7 +584,11 @@ void app_listen_worker(App *app, int port) {
     event_loop_watch_read(app, app->server_fd, NULL);
 
     if (!cluster_is_worker() || cluster_worker_id() == 0) {
-        printf("Listening on port %d\n", port);
+        if (app->config.tls_enabled) {
+            printf("Listening on port %d (HTTPS / TLS)\n", port);
+        } else {
+            printf("Listening on port %d\n", port);
+        }
     }
 
     LoopEvent events[MAX_EVENTS];
@@ -605,10 +653,32 @@ void app_listen_worker(App *app, int port) {
                 continue;
             }
 
+            if (conn->tls_state == TLS_STATE_HANDSHAKE) {
+                int hs = tls_connection_handshake(app, conn);
+                if (hs < 0) {
+                    connection_close(app, conn);
+                } else if (hs == 1) {
+                    if (tls_has_pending(conn)) {
+                        handle_readable(app, conn);
+                    }
+                }
+                continue;
+            }
+
             if (ev->type == LOOP_EVENT_READ) {
                 handle_readable(app, conn);
             } else if (ev->type == LOOP_EVENT_WRITE) {
                 flush_connection(app, conn);
+            }
+        }
+
+        if (app->ssl_ctx != NULL) {
+            for (int fd = 0; fd < app->connections_cap; fd++) {
+                Connection *c = app->connections[fd];
+                if (c != NULL && c->tls_state == TLS_STATE_CONNECTED &&
+                    c->out_buf == NULL && tls_has_pending(c)) {
+                    handle_readable(app, c);
+                }
             }
         }
 
