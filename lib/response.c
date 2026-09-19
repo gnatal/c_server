@@ -195,8 +195,17 @@ static void send_with_content_type(Response *res, const char *content_type, cons
     char head[RESPONSE_HEADER_BUF_SIZE];
     Connection *conn = res->conn;
 
+    if (conn->file_fd >= 0) {
+        close(conn->file_fd);
+        conn->file_fd = -1;
+        conn->file_remaining = 0;
+    }
+
     const size_t head_len = build_response_head(res, content_type, body_len, head, sizeof(head));
     if (head_len == 0) {
+        free(conn->out_buf);
+        conn->out_buf = NULL;
+        conn->out_cap = 0;
         abort_response(conn); /* headers do not fit: drop rather than send a malformed response */
         return;
     }
@@ -213,6 +222,7 @@ static void send_with_content_type(Response *res, const char *content_type, cons
      * keep-alive response finishes or by connection_close() on any error/close path. */
     conn->out_buf = malloc(head_len + sent_body_len + 1);
     if (conn->out_buf == NULL) {
+        conn->out_cap = 0;
         abort_response(conn);
         return;
     }
@@ -368,6 +378,11 @@ static int commit_chunked_headers(Response *res) {
     if (conn == NULL) {
         return -1;
     }
+    if (conn->file_fd >= 0) {
+        close(conn->file_fd);
+        conn->file_fd = -1;
+        conn->file_remaining = 0;
+    }
     if (res->status == 0) {
         res->status = 200;
     }
@@ -375,6 +390,9 @@ static int commit_chunked_headers(Response *res) {
     char head[RESPONSE_HEADER_BUF_SIZE];
     const size_t head_len = build_response_head(res, "text/plain", CHUNKED_BODY, head, sizeof(head));
     if (head_len == 0) {
+        free(conn->out_buf);
+        conn->out_buf = NULL;
+        conn->out_cap = 0;
         abort_response(conn);
         return -1;
     }

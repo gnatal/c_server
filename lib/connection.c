@@ -103,7 +103,15 @@ Connection *connection_create(int fd) {
 }
 
 void connection_close(App *app, Connection *conn) {
-    event_loop_unwatch_all(app, conn->fd);
+    if (conn == NULL) {
+        return;
+    }
+    if (app != NULL) {
+        event_loop_unwatch_all(app, conn->fd);
+        if (app->connections != NULL && conn->fd >= 0 && conn->fd < app->connections_cap) {
+            app->connections[conn->fd] = NULL;
+        }
+    }
 
     if (conn->file_fd >= 0) {
         close(conn->file_fd);
@@ -112,17 +120,26 @@ void connection_close(App *app, Connection *conn) {
 
     tls_connection_close(app, conn);
 
-    close(conn->fd);
-    app->connections[conn->fd] = NULL;
+    if (conn->fd >= 0) {
+        close(conn->fd);
+        conn->fd = -1;
+    }
     free(conn->in_buf);
+    conn->in_buf = NULL;
     free(conn->out_buf);
+    conn->out_buf = NULL;
     free(conn);
 }
 
 void app_destroy(App *app) {
-    for (int fd = 0; fd < app->connections_cap; fd++) {
-        if (app->connections[fd] != NULL) {
-            connection_close(app, app->connections[fd]);
+    if (app == NULL) {
+        return;
+    }
+    if (app->connections != NULL) {
+        for (int fd = 0; fd < app->connections_cap; fd++) {
+            if (app->connections[fd] != NULL) {
+                connection_close(app, app->connections[fd]);
+            }
         }
     }
     event_loop_close(app);
@@ -634,6 +651,13 @@ void app_listen_worker(App *app, int port) {
     }
 
 shutdown_complete:
+    if (app->connections != NULL) {
+        for (int fd = 0; fd < app->connections_cap; fd++) {
+            if (app->connections[fd] != NULL) {
+                connection_close(app, app->connections[fd]);
+            }
+        }
+    }
     event_loop_close(app);
 }
 

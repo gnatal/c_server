@@ -77,6 +77,11 @@ static void test_builders(void) {
     assert(strcmp(json_as_string(json_object_get(obj, "name"), ""), "natal") == 0);
     assert(strcmp(json_as_string(json_object_get(obj, "quote"), ""), "say \"hi\"") == 0);
 
+    /* Overwriting an existing key replaces the value in-place without duplicating keys */
+    assert(json_object_set(obj, "name", json_new_string("alice")) == 1);
+    assert(strcmp(json_as_string(json_object_get(obj, "name"), ""), "alice") == 0);
+    assert(obj->as.object.count == 2);
+
     /* Round-trips through json_stringify with correct escaping - a raw '"'
      * in the value doesn't corrupt the surrounding JSON syntax. */
     char *out = json_stringify(obj);

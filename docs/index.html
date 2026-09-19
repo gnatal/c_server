@@ -1,13 +1,17 @@
 <!DOCTYPE html>
 <html lang="en" class="dark">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CExpress — High-Performance C11 Web Framework</title>
-  <meta name="description" content="A lightweight, high-performance, single-threaded HTTP/1.1 web framework and server written in C11, inspired by Express.js and powered by native kqueue and epoll.">
+  <meta name="description"
+    content="A lightweight, high-performance, single-threaded HTTP/1.1 web framework and server written in C11, inspired by Express.js and powered by native kqueue and epoll.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link
+    href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&display=swap"
+    rel="stylesheet">
   <style>
     :root {
       --bg-main: #0a0d14;
@@ -182,8 +186,17 @@
     }
 
     @keyframes pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.5; transform: scale(0.85); }
+
+      0%,
+      100% {
+        opacity: 1;
+        transform: scale(1);
+      }
+
+      50% {
+        opacity: 0.5;
+        transform: scale(0.85);
+      }
     }
 
     .btn-icon {
@@ -274,14 +287,29 @@
     }
 
     @media (max-width: 1200px) {
-      .main-content { margin-right: 0; }
-      .toc { display: none; }
+      .main-content {
+        margin-right: 0;
+      }
+
+      .toc {
+        display: none;
+      }
     }
 
     @media (max-width: 800px) {
-      .sidebar { transform: translateX(-100%); transition: transform 0.3s ease; }
-      .sidebar.open { transform: translateX(0); }
-      .main-content { margin-left: 0; padding: 1.5rem; }
+      .sidebar {
+        transform: translateX(-100%);
+        transition: transform 0.3s ease;
+      }
+
+      .sidebar.open {
+        transform: translateX(0);
+      }
+
+      .main-content {
+        margin-left: 0;
+        padding: 1.5rem;
+      }
     }
 
     /* Right TOC */
@@ -315,14 +343,16 @@
       line-height: 1.4;
     }
 
-    .toc-link:hover { color: var(--primary); }
+    .toc-link:hover {
+      color: var(--primary);
+    }
 
     /* Hero Banner */
     .hero {
       padding: 2.5rem 2rem;
       background: radial-gradient(circle at top right, rgba(56, 189, 248, 0.12), transparent 60%),
-                  radial-gradient(circle at bottom left, rgba(99, 102, 241, 0.1), transparent 50%),
-                  var(--bg-surface);
+        radial-gradient(circle at bottom left, rgba(99, 102, 241, 0.1), transparent 50%),
+        var(--bg-surface);
       border: 1px solid var(--border-subtle);
       border-radius: var(--radius-lg);
       margin-bottom: 3rem;
@@ -425,7 +455,9 @@
       color: var(--text-muted);
     }
 
-    strong { color: var(--text-main); }
+    strong {
+      color: var(--text-main);
+    }
 
     /* Code Snippets */
     .code-block {
@@ -489,7 +521,8 @@
       font-size: 0.85em;
     }
 
-    p code, li code {
+    p code,
+    li code {
       background: var(--bg-surface-elevated);
       color: var(--primary);
       padding: 0.15rem 0.4rem;
@@ -498,12 +531,37 @@
     }
 
     /* Syntax Highlighting primitives */
-    .kw { color: #f472b6; }        /* keyword (void, int, const, return) */
-    .type { color: #38bdf8; }      /* types (Request, Response, App) */
-    .fn { color: #a78bfa; }        /* functions (app_get, res_send) */
-    .str { color: #34d399; }       /* string literals ("Hello") */
-    .num { color: #fb923c; }       /* numbers (8080, 200) */
-    .com { color: #64748b; font-style: italic; } /* comments */
+    .kw {
+      color: #f472b6;
+    }
+
+    /* keyword (void, int, const, return) */
+    .type {
+      color: #38bdf8;
+    }
+
+    /* types (Request, Response, App) */
+    .fn {
+      color: #a78bfa;
+    }
+
+    /* functions (app_get, res_send) */
+    .str {
+      color: #34d399;
+    }
+
+    /* string literals ("Hello") */
+    .num {
+      color: #fb923c;
+    }
+
+    /* numbers (8080, 200) */
+    .com {
+      color: #64748b;
+      font-style: italic;
+    }
+
+    /* comments */
 
     /* Alerts */
     .alert {
@@ -560,7 +618,9 @@
       color: var(--text-muted);
     }
 
-    tr:last-child td { border-bottom: none; }
+    tr:last-child td {
+      border-bottom: none;
+    }
 
     tr:hover td {
       background: rgba(255, 255, 255, 0.02);
@@ -586,7 +646,8 @@
       transition: var(--transition);
     }
 
-    .filter-btn:hover, .filter-btn.active {
+    .filter-btn:hover,
+    .filter-btn.active {
       background: var(--primary);
       color: white;
       border-color: var(--primary);
@@ -678,7 +739,9 @@
       padding-bottom: 2px;
     }
 
-    .bench-tabs::-webkit-scrollbar { display: none; }
+    .bench-tabs::-webkit-scrollbar {
+      display: none;
+    }
 
     .bench-tab {
       background: transparent;
@@ -718,8 +781,15 @@
     }
 
     @keyframes benchFadeIn {
-      from { opacity: 0; transform: translateY(4px); }
-      to { opacity: 1; transform: translateY(0); }
+      from {
+        opacity: 0;
+        transform: translateY(4px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
     }
 
     /* Comparison Bar Chart */
@@ -748,7 +818,9 @@
       font-size: 0.82rem;
     }
 
-    .bar-row:last-child { margin-bottom: 0; }
+    .bar-row:last-child {
+      margin-bottom: 0;
+    }
 
     .bar-label {
       width: 150px;
@@ -785,11 +857,25 @@
       box-shadow: 0 0 14px rgba(56, 189, 248, 0.4);
     }
 
-    .bar-fill.rust { background: #ce422b; }
-    .bar-fill.go { background: #00add8; }
-    .bar-fill.fastify { background: #475569; }
-    .bar-fill.express { background: #334155; }
-    .bar-fill.fastapi { background: #059669; }
+    .bar-fill.rust {
+      background: #ce422b;
+    }
+
+    .bar-fill.go {
+      background: #00add8;
+    }
+
+    .bar-fill.fastify {
+      background: #475569;
+    }
+
+    .bar-fill.express {
+      background: #334155;
+    }
+
+    .bar-fill.fastapi {
+      background: #059669;
+    }
 
     .bar-val {
       width: 105px;
@@ -856,6 +942,7 @@
     }
   </style>
 </head>
+
 <body>
 
   <!-- Top Header Navigation -->
@@ -866,7 +953,8 @@
         <span class="brand-badge">v1.0</span>
       </a>
       <div class="search-box">
-        <input type="text" id="api-search" class="search-input" placeholder="Search functions, routes..." aria-label="Search docs">
+        <input type="text" id="api-search" class="search-input" placeholder="Search functions, routes..."
+          aria-label="Search docs">
         <span class="search-shortcut">⌘K</span>
       </div>
     </div>
@@ -879,8 +967,13 @@
       <button id="theme-toggle" class="btn-icon" title="Toggle Theme" aria-label="Toggle dark/light theme">
         🌙
       </button>
-      <a href="https://github.com/guilhermenatal/c_server" target="_blank" class="btn-icon" title="View Source" aria-label="GitHub Repository">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>
+      <a href="https://github.com/gnatal/c_server" target="_blank" class="btn-icon" title="View Source"
+        aria-label="GitHub Repository">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path
+            d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22">
+          </path>
+        </svg>
       </a>
     </div>
   </header>
@@ -946,7 +1039,8 @@
         <div class="hero-tagline">Native C11 Web Framework</div>
         <h1>The Simplicity of Express.js.<br>The Speed of Native C.</h1>
         <p>
-          CExpress is a lightweight, single-threaded HTTP/1.1 web framework and server designed with Express.js ergonomics, running directly on native BSD/macOS <code>kqueue</code> and Linux <code>epoll</code> event loops.
+          CExpress is a lightweight, single-threaded HTTP/1.1 web framework and server designed with Express.js
+          ergonomics, running directly on native BSD/macOS <code>kqueue</code> and Linux <code>epoll</code> event loops.
         </p>
 
         <div class="stats-grid">
@@ -981,7 +1075,9 @@
       <section id="benchmarks">
         <h2>📊 Performance & Stress Benchmarks</h2>
         <p>
-          CExpress is engineered from the ground up for extreme throughput, deterministic microsecond latency, and tiny memory consumption. All benchmarks below were executed on Apple Silicon (M3 Pro 12-core, 18 GB RAM, macOS) in multi-worker cluster mode (<code>QUIET=1 WORKERS=4</code>) using <code>wrk</code> over 8 threads.
+          CExpress is engineered from the ground up for extreme throughput, deterministic microsecond latency, and tiny
+          memory consumption. All benchmarks below were executed on Apple Silicon (M3 Pro 12-core, 18 GB RAM, macOS) in
+          multi-worker cluster mode (<code>QUIET=1 WORKERS=4</code>) using <code>wrk</code> over 8 threads.
         </p>
 
         <!-- Spotlight: wrk /ping running against 4-worker cluster -->
@@ -993,20 +1089,27 @@
             <span class="bench-highlight-badge">QUIET=1 WORKERS=4 ./build/bin/cexpress</span>
           </div>
           <p style="margin-bottom: 1.25rem; font-size: 0.92rem;">
-            Measuring raw CExpress request-response dispatch over persistent keep-alive TCP sockets (fixed 4-byte response, zero database I/O, zero JSON overhead).
+            Measuring raw CExpress request-response dispatch over persistent keep-alive TCP sockets (fixed 4-byte
+            response, zero database I/O, zero JSON overhead).
           </p>
           <div class="bench-highlight-grid">
             <div class="bench-metric-card">
-              <div class="bench-metric-val" style="color: var(--primary);">209,165 <span style="font-size: 1rem; font-weight: 600;">req/s</span></div>
-              <div class="bench-metric-sub"><strong>100 connections</strong> · 357.66 µs avg latency · 3.15M requests in 15s · 18.35 MB/s</div>
+              <div class="bench-metric-val" style="color: var(--primary);">209,165 <span
+                  style="font-size: 1rem; font-weight: 600;">req/s</span></div>
+              <div class="bench-metric-sub"><strong>100 connections</strong> · 357.66 µs avg latency · 3.15M requests in
+                15s · 18.35 MB/s</div>
             </div>
             <div class="bench-metric-card">
-              <div class="bench-metric-val" style="color: #34d399;">217,278 <span style="font-size: 1rem; font-weight: 600;">req/s</span></div>
-              <div class="bench-metric-sub"><strong>1,000 connections</strong> · 4.35 ms avg latency · 3.26M requests in 15s · 19.06 MB/s</div>
+              <div class="bench-metric-val" style="color: #34d399;">217,278 <span
+                  style="font-size: 1rem; font-weight: 600;">req/s</span></div>
+              <div class="bench-metric-sub"><strong>1,000 connections</strong> · 4.35 ms avg latency · 3.26M requests in
+                15s · 19.06 MB/s</div>
             </div>
             <div class="bench-metric-card">
-              <div class="bench-metric-val" style="color: #a855f7;">206,036 <span style="font-size: 1rem; font-weight: 600;">req/s</span></div>
-              <div class="bench-metric-sub"><strong>5,000 connections</strong> · 18.71 ms avg latency · 2.06M requests in 10s · 0 crashes</div>
+              <div class="bench-metric-val" style="color: #a855f7;">206,036 <span
+                  style="font-size: 1rem; font-weight: 600;">req/s</span></div>
+              <div class="bench-metric-sub"><strong>5,000 connections</strong> · 18.71 ms avg latency · 2.06M requests
+                in 10s · 0 crashes</div>
             </div>
           </div>
         </div>
@@ -1015,7 +1118,8 @@
         <div class="comparison-chart">
           <div class="comparison-chart-title">
             <span>HTTP/1.1 Throughput Comparison (1,000 Connections, 4 Cores/Workers)</span>
-            <span style="font-size: 0.75rem; color: var(--accent-emerald); font-weight: 600;">✓ Live benchmarked on this machine</span>
+            <span style="font-size: 0.75rem; color: var(--accent-emerald); font-weight: 600;">✓ Live benchmarked on this
+              machine</span>
           </div>
           <div class="bar-row">
             <div class="bar-label"><strong>⚡ CExpress (C11)</strong></div>
@@ -1054,21 +1158,34 @@
           </div>
 
           <!-- Memory & Latency Footprint Comparison -->
-          <div style="margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border-subtle); display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0.75rem;">
-            <div style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
-              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">Memory (4 Workers)</div>
-              <div style="font-size: 1.15rem; font-weight: 800; color: var(--primary); margin-top: 0.2rem;">20.0 MB <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">CExpress</span></div>
-              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Rust: 58 MB · Go: 45 MB · Express: 507 MB</div>
+          <div
+            style="margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border-subtle); display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0.75rem;">
+            <div
+              style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">
+                Memory (4 Workers)</div>
+              <div style="font-size: 1.15rem; font-weight: 800; color: var(--primary); margin-top: 0.2rem;">20.0 MB
+                <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">CExpress</span></div>
+              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Rust: 58 MB · Go: 45 MB ·
+                Express: 507 MB</div>
             </div>
-            <div style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
-              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">5,000 Conns Max Latency</div>
-              <div style="font-size: 1.15rem; font-weight: 800; color: #34d399; margin-top: 0.2rem;">58.26 ms <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">CExpress</span></div>
-              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Rust Actix: 769 ms (13x lower spike)</div>
+            <div
+              style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">
+                5,000 Conns Max Latency</div>
+              <div style="font-size: 1.15rem; font-weight: 800; color: #34d399; margin-top: 0.2rem;">58.26 ms <span
+                  style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">CExpress</span></div>
+              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Rust Actix: 769 ms (13x
+                lower spike)</div>
             </div>
-            <div style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
-              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">Zero Runtime Overhead</div>
-              <div style="font-size: 1.15rem; font-weight: 800; color: #a855f7; margin-top: 0.2rem;">0 ns GC <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">C11 stack</span></div>
-              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Direct kqueue/epoll multiplexing</div>
+            <div
+              style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">
+                Zero Runtime Overhead</div>
+              <div style="font-size: 1.15rem; font-weight: 800; color: #a855f7; margin-top: 0.2rem;">0 ns GC <span
+                  style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">C11 stack</span></div>
+              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Direct kqueue/epoll
+                multiplexing</div>
             </div>
           </div>
         </div>
@@ -1086,7 +1203,8 @@
         <!-- Tab 1: Ping Engine -->
         <div id="tab-ping" class="bench-pane active">
           <p>
-            The <code>/ping</code> endpoint measures raw server event-loop throughput and kernel socket multiplexing with zero disk or database overhead. The response is a pre-formatted 4-byte payload.
+            The <code>/ping</code> endpoint measures raw server event-loop throughput and kernel socket multiplexing
+            with zero disk or database overhead. The response is a pre-formatted 4-byte payload.
           </p>
           <div class="table-container">
             <table>
@@ -1133,14 +1251,18 @@
             </table>
           </div>
           <div class="alert alert-note">
-            <strong>Engine Architecture:</strong> Uses non-blocking sockets with edge-triggered <code>kqueue</code> / <code>epoll</code> notifications, zero-copy buffer slicing, and vectorized <code>writev</code> writes for maximal kernel efficiency.
+            <strong>Engine Architecture:</strong> Uses non-blocking sockets with edge-triggered <code>kqueue</code> /
+            <code>epoll</code> notifications, zero-copy buffer slicing, and vectorized <code>writev</code> writes for
+            maximal kernel efficiency.
           </div>
         </div>
 
         <!-- Tab 2: SQLite Read & Write -->
         <div id="tab-db" class="bench-pane">
           <p>
-            Real-world CRUD benchmark against an embedded SQLite database in WAL (Write-Ahead Logging) mode with <code>busy_timeout=5000</code>. Four worker processes concurrently execute reads and writes against the same shared SQLite database file.
+            Real-world CRUD benchmark against an embedded SQLite database in WAL (Write-Ahead Logging) mode with
+            <code>busy_timeout=5000</code>. Four worker processes concurrently execute reads and writes against the same
+            shared SQLite database file.
           </p>
           <div class="table-container">
             <table>
@@ -1214,14 +1336,17 @@
             </table>
           </div>
           <div class="alert alert-tip">
-            <strong>Fork-Safe SQLite & WAL:</strong> Each worker maintains a private SQLite connection opened after <code>fork()</code>. Over 750,000 concurrent rows were inserted across the write phases with <strong>zero SQLITE_BUSY locking errors</strong> and <strong>zero worker crashes</strong>.
+            <strong>Fork-Safe SQLite & WAL:</strong> Each worker maintains a private SQLite connection opened after
+            <code>fork()</code>. Over 750,000 concurrent rows were inserted across the write phases with <strong>zero
+              SQLITE_BUSY locking errors</strong> and <strong>zero worker crashes</strong>.
           </div>
         </div>
 
         <!-- Tab 3: Static UI Streaming -->
         <div id="tab-static" class="bench-pane">
           <p>
-            Serves the responsive single-page Todo application HTML directly from disk via CExpress's bounded streaming engine (<code>res_send_file_custom</code>).
+            Serves the responsive single-page Todo application HTML directly from disk via CExpress's bounded streaming
+            engine (<code>res_send_file_custom</code>).
           </p>
           <div class="table-container">
             <table>
@@ -1268,14 +1393,17 @@
             </table>
           </div>
           <div class="alert alert-note">
-            <strong>Bounded Buffer Streaming:</strong> File content is streamed in 64 KB chunks directly from disk descriptor to client socket, ensuring RAM consumption stays bounded even when saturation pushes throughput past 390 megabytes per second.
+            <strong>Bounded Buffer Streaming:</strong> File content is streamed in 64 KB chunks directly from disk
+            descriptor to client socket, ensuring RAM consumption stays bounded even when saturation pushes throughput
+            past 390 megabytes per second.
           </div>
         </div>
 
         <!-- Tab 4: Connection Churn -->
         <div id="tab-churn" class="bench-pane">
           <p>
-            Benchmarks server performance when clients send <code>Connection: close</code>, requiring a full TCP handshake, HTTP request parsing, response delivery, and connection teardown on every single transaction.
+            Benchmarks server performance when clients send <code>Connection: close</code>, requiring a full TCP
+            handshake, HTTP request parsing, response delivery, and connection teardown on every single transaction.
           </p>
           <div class="table-container">
             <table>
@@ -1302,14 +1430,19 @@
             </table>
           </div>
           <div class="alert alert-warn">
-            <strong>TIME_WAIT & Port Exhaustion:</strong> At 1,000+ connections with <code>Connection: close</code>, client load generators on macOS quickly exhaust the ~16k ephemeral port range because closed sockets linger in <code>TIME_WAIT</code> for 30–60 seconds. For maximum performance in production, always leverage persistent HTTP keep-alive.
+            <strong>TIME_WAIT & Port Exhaustion:</strong> At 1,000+ connections with <code>Connection: close</code>,
+            client load generators on macOS quickly exhaust the ~16k ephemeral port range because closed sockets linger
+            in <code>TIME_WAIT</code> for 30–60 seconds. For maximum performance in production, always leverage
+            persistent HTTP keep-alive.
           </div>
         </div>
 
         <!-- Tab 5: Memory Profile & Scaling -->
         <div id="tab-memory" class="bench-pane">
           <p>
-            Resident set size (RSS) was measured throughout the battery using a background sampler polling <code>ps</code> every 250 ms across the master and all 4 worker processes, cross-verified with <code>/usr/bin/time -l</code>.
+            Resident set size (RSS) was measured throughout the battery using a background sampler polling
+            <code>ps</code> every 250 ms across the master and all 4 worker processes, cross-verified with
+            <code>/usr/bin/time -l</code>.
           </p>
           <div class="table-container">
             <table>
@@ -1362,14 +1495,18 @@
             </table>
           </div>
           <div class="alert alert-tip">
-            <strong>Zero Memory Leaks:</strong> All request structures, parser buffers, and route context are allocated on the stack or in fixed connection slots. Total page reclaims during 150 seconds of intense stress: 5,904; page faults: 15; swaps: <strong>0</strong>. Worker crashes: <strong>0</strong>.
+            <strong>Zero Memory Leaks:</strong> All request structures, parser buffers, and route context are allocated
+            on the stack or in fixed connection slots. Total page reclaims during 150 seconds of intense stress: 5,904;
+            page faults: 15; swaps: <strong>0</strong>. Worker crashes: <strong>0</strong>.
           </div>
         </div>
 
         <!-- Tab 6: Hotpath Microbenchmarks -->
         <div id="tab-micro" class="bench-pane">
           <p>
-            Measured with <code>make bench</code> (compiled with <code>-O2</code>). Gauges the raw CPU cycle cost of the core framework pipeline (parsing, routing, dispatching, response generation) isolated from operating system socket I/O.
+            Measured with <code>make bench</code> (compiled with <code>-O2</code>). Gauges the raw CPU cycle cost of the
+            core framework pipeline (parsing, routing, dispatching, response generation) isolated from operating system
+            socket I/O.
           </p>
           <div class="table-container">
             <table>
@@ -1416,7 +1553,9 @@
             </table>
           </div>
           <div class="alert alert-note">
-            <strong>Zero-Allocation Architecture:</strong> <code>sizeof(Request) = 19,000 B</code>, <code>sizeof(Response) = 15,912 B</code>, <code>sizeof(Connection) = 120 B</code>. Every connection is handled without <code>malloc()</code> or <code>free()</code> on the fast path.
+            <strong>Zero-Allocation Architecture:</strong> <code>sizeof(Request) = 19,000 B</code>,
+            <code>sizeof(Response) = 15,912 B</code>, <code>sizeof(Connection) = 120 B</code>. Every connection is
+            handled without <code>malloc()</code> or <code>free()</code> on the fast path.
           </div>
         </div>
 
@@ -1445,7 +1584,9 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
       <section id="testing">
         <h2>🛡️ Reliability, Hardening & Test Matrix</h2>
         <p>
-          High throughput is meaningless without correctness and rock-solid memory safety. CExpress is rigorously verified across 15 dedicated automated test suites, AddressSanitizer and UndefinedBehaviorSanitizer instrumentation, continuous mutation fuzzing, and automated API documentation audits.
+          High throughput is meaningless without correctness and rock-solid memory safety. CExpress is rigorously
+          verified across 15 dedicated automated test suites, AddressSanitizer and UndefinedBehaviorSanitizer
+          instrumentation, continuous mutation fuzzing, and automated API documentation audits.
         </p>
 
         <div class="stats-grid" style="margin-bottom: 2rem;">
@@ -1474,7 +1615,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_json</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Recursive descent parser, streaming <code>JsonWriter</code>, string escaping, unicode escape sequences, null/boolean handling.</div>
+            <div class="test-desc">Recursive descent parser, streaming <code>JsonWriter</code>, string escaping, unicode
+              escape sequences, null/boolean handling.</div>
           </div>
 
           <div class="test-card">
@@ -1482,7 +1624,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_middleware</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Pipeline ordering, next() sequencing, prefix-scoped middleware, route-level guards, and centralized error handler invocation.</div>
+            <div class="test-desc">Pipeline ordering, next() sequencing, prefix-scoped middleware, route-level guards,
+              and centralized error handler invocation.</div>
           </div>
 
           <div class="test-card">
@@ -1490,7 +1633,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_router</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Exact route matching, parameterized paths (<code>:id</code>), wildcard capturing (<code>*</code>), sub-router mounting via <code>app_mount()</code>.</div>
+            <div class="test-desc">Exact route matching, parameterized paths (<code>:id</code>), wildcard capturing
+              (<code>*</code>), sub-router mounting via <code>app_mount()</code>.</div>
           </div>
 
           <div class="test-card">
@@ -1498,7 +1642,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_http_parser</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Zero-copy HTTP/1.1 parsing, header line folding rejection, pipelined requests, and chunked transfer decoding.</div>
+            <div class="test-desc">Zero-copy HTTP/1.1 parsing, header line folding rejection, pipelined requests, and
+              chunked transfer decoding.</div>
           </div>
 
           <div class="test-card">
@@ -1506,7 +1651,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_http_hardening</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">RFC 7230 compliance: request smuggling defense, conflicting Content-Length & Transfer-Encoding rejection, CRLF header injection guards.</div>
+            <div class="test-desc">RFC 7230 compliance: request smuggling defense, conflicting Content-Length &
+              Transfer-Encoding rejection, CRLF header injection guards.</div>
           </div>
 
           <div class="test-card">
@@ -1514,7 +1660,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_connection</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Non-blocking TCP state machine, EAGAIN/EWOULDBLOCK retry loops, buffer overflow protection, keep-alive connection reuse.</div>
+            <div class="test-desc">Non-blocking TCP state machine, EAGAIN/EWOULDBLOCK retry loops, buffer overflow
+              protection, keep-alive connection reuse.</div>
           </div>
 
           <div class="test-card">
@@ -1522,7 +1669,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_response</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Header serialization, cookie attributes (<code>HttpOnly</code>, <code>SameSite</code>, <code>Secure</code>, <code>Max-Age</code>), chunked body streaming, trailers.</div>
+            <div class="test-desc">Header serialization, cookie attributes (<code>HttpOnly</code>,
+              <code>SameSite</code>, <code>Secure</code>, <code>Max-Age</code>), chunked body streaming, trailers.</div>
           </div>
 
           <div class="test-card">
@@ -1530,7 +1678,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_multipart</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Streaming <code>multipart/form-data</code> parser, MIME boundary matching, file upload fields, and truncated payload resilience.</div>
+            <div class="test-desc">Streaming <code>multipart/form-data</code> parser, MIME boundary matching, file
+              upload fields, and truncated payload resilience.</div>
           </div>
 
           <div class="test-card">
@@ -1538,7 +1687,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_urlencoded</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc"><code>application/x-www-form-urlencoded</code> decoding, URL query string parameter extraction, and percent-encoding normalization.</div>
+            <div class="test-desc"><code>application/x-www-form-urlencoded</code> decoding, URL query string parameter
+              extraction, and percent-encoding normalization.</div>
           </div>
 
           <div class="test-card">
@@ -1546,7 +1696,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_static</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Static asset delivery, MIME resolution, <code>index.html</code> fallbacks, and directory traversal defense (blocking <code>../</code> and null bytes).</div>
+            <div class="test-desc">Static asset delivery, MIME resolution, <code>index.html</code> fallbacks, and
+              directory traversal defense (blocking <code>../</code> and null bytes).</div>
           </div>
 
           <div class="test-card">
@@ -1554,7 +1705,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_event_loop</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Unified event loop abstraction verifying <code>kqueue</code> (macOS/BSD) and <code>epoll</code> (Linux) edge-triggered registration and timers.</div>
+            <div class="test-desc">Unified event loop abstraction verifying <code>kqueue</code> (macOS/BSD) and
+              <code>epoll</code> (Linux) edge-triggered registration and timers.</div>
           </div>
 
           <div class="test-card">
@@ -1562,7 +1714,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_cluster</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Multi-process cluster management, <code>SO_REUSEPORT</code> load distribution, automatic worker crash recovery, and graceful drain on <code>SIGTERM</code>.</div>
+            <div class="test-desc">Multi-process cluster management, <code>SO_REUSEPORT</code> load distribution,
+              automatic worker crash recovery, and graceful drain on <code>SIGTERM</code>.</div>
           </div>
 
           <div class="test-card">
@@ -1570,7 +1723,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_tls</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Native OpenSSL TLS/HTTPS engine, ALPN negotiation, SSL handshake state transitions, certificate loading, and TLS I/O error states.</div>
+            <div class="test-desc">Native OpenSSL TLS/HTTPS engine, ALPN negotiation, SSL handshake state transitions,
+              certificate loading, and TLS I/O error states.</div>
           </div>
 
           <div class="test-card">
@@ -1578,7 +1732,8 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_cookbook</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">End-to-end recipes from the CExpress Cookbook: authentication tokens, API keys, body parsing, custom responses, and sub-routers.</div>
+            <div class="test-desc">End-to-end recipes from the CExpress Cookbook: authentication tokens, API keys, body
+              parsing, custom responses, and sub-routers.</div>
           </div>
 
           <div class="test-card">
@@ -1586,21 +1741,26 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-name">test_ping</span>
               <span class="test-status-pill">✓ Passing</span>
             </div>
-            <div class="test-desc">Fast-path lightweight endpoint verification validating 4-byte response format, headers, and keep-alive stability.</div>
+            <div class="test-desc">Fast-path lightweight endpoint verification validating 4-byte response format,
+              headers, and keep-alive stability.</div>
           </div>
         </div>
 
         <h3>Automated Documentation Parity (<code>scripts/check_docs.sh</code>)</h3>
         <p>
-          To prevent documentation drift, <code>check_docs.sh</code> (invoked via <code>make check-docs</code>) audits the entire public C API against the documentation:
+          To prevent documentation drift, <code>check_docs.sh</code> (invoked via <code>make check-docs</code>) audits
+          the entire public C API against the documentation:
         </p>
         <div class="alert alert-tip">
-          <strong>154 of 154 Public Functions Covered:</strong> Fails immediately if any function declared in <code>lib/*.h</code> is missing from the documentation, or if the documentation references any function not declared in a header.
+          <strong>154 of 154 Public Functions Covered:</strong> Fails immediately if any function declared in
+          <code>lib/*.h</code> is missing from the documentation, or if the documentation references any function not
+          declared in a header.
         </div>
 
         <h3>Memory Sanitizers & Fuzzing (<code>make SANITIZE=1 test</code> & <code>make fuzz</code>)</h3>
         <p>
-          Memory safety in C requires rigorous automated verification. The entire suite can be compiled under AddressSanitizer and UndefinedBehaviorSanitizer:
+          Memory safety in C requires rigorous automated verification. The entire suite can be compiled under
+          AddressSanitizer and UndefinedBehaviorSanitizer:
         </p>
         <div class="code-block">
           <div class="code-header">
@@ -1701,9 +1861,12 @@ make fuzz</code></pre>
 
         <div class="alert alert-note">
           <strong>Automatic Protocol Conformance:</strong><br>
-          • <strong>HEAD Requests:</strong> Executes the matching <code>GET</code> handler while automatically suppressing the message body.<br>
-          • <strong>OPTIONS Requests:</strong> Returns <code>204 No Content</code> with the computed <code>Allow</code> header.<br>
-          • <strong>405 Method Not Allowed:</strong> Emitted automatically if the route path exists but the verb is not registered.
+          • <strong>HEAD Requests:</strong> Executes the matching <code>GET</code> handler while automatically
+          suppressing the message body.<br>
+          • <strong>OPTIONS Requests:</strong> Returns <code>204 No Content</code> with the computed <code>Allow</code>
+          header.<br>
+          • <strong>405 Method Not Allowed:</strong> Emitted automatically if the route path exists but the verb is not
+          registered.
         </div>
       </section>
 
@@ -1736,7 +1899,8 @@ make fuzz</code></pre>
       <section id="sub-routers">
         <h3>Sub-Routers (app_mount)</h3>
         <p>
-          Modularize routes into isolated <code>Router</code> instances and mount them under path prefixes (like Express's <code>app.use('/api', apiRouter)</code>):
+          Modularize routes into isolated <code>Router</code> instances and mount them under path prefixes (like
+          Express's <code>app.use('/api', apiRouter)</code>):
         </p>
 
         <div class="code-block">
@@ -1760,7 +1924,8 @@ make fuzz</code></pre>
       <section id="middleware-pipeline">
         <h2>🛡️ Middleware Pipeline</h2>
         <p>
-          Middleware functions match <code>void (*Middleware)(const Request *req, Response *res, MiddlewareChain *chain)</code>.
+          Middleware functions match
+          <code>void (*Middleware)(const Request *req, Response *res, MiddlewareChain *chain)</code>.
           Advance with <code>chain_next(chain)</code> or terminate early:
         </p>
 
@@ -1878,7 +2043,8 @@ make fuzz</code></pre>
       <section id="streaming">
         <h2>🌊 Streaming & Chunked Responses</h2>
         <p>
-          Emit HTTP/1.1 chunked responses incrementally using <code>res_write()</code>, attach RFC 7230 chunked trailers with <code>res_set_trailer()</code>, and finalize with <code>res_end()</code>:
+          Emit HTTP/1.1 chunked responses incrementally using <code>res_write()</code>, attach RFC 7230 chunked trailers
+          with <code>res_set_trailer()</code>, and finalize with <code>res_end()</code>:
         </p>
 
         <div class="code-block">
@@ -1907,7 +2073,8 @@ make fuzz</code></pre>
       <section id="file-streaming">
         <h3>Bounded File Streaming (res_send_file)</h3>
         <p>
-          Stream large files directly from the filesystem in bounded 16KB chunks through the non-blocking event loop. Memory is bounded and whole files are never buffered into RAM:
+          Stream large files directly from the filesystem in bounded 16KB chunks through the non-blocking event loop.
+          Memory is bounded and whole files are never buffered into RAM:
         </p>
 
         <div class="code-block">
@@ -2001,7 +2168,8 @@ free(out);
       <section id="graceful-shutdown">
         <h2>🛑 Graceful Shutdown</h2>
         <p>
-          CExpress intercepts <code>SIGINT</code> and <code>SIGTERM</code> synchronously in the native event loop (<code>EVFILT_SIGNAL</code> on kqueue, <code>signalfd</code> on Linux):
+          CExpress intercepts <code>SIGINT</code> and <code>SIGTERM</code> synchronously in the native event loop
+          (<code>EVFILT_SIGNAL</code> on kqueue, <code>signalfd</code> on Linux):
         </p>
         <div class="alert alert-tip">
           1. Stops accepting incoming TCP connections.<br>
@@ -2016,7 +2184,9 @@ free(out);
       <section id="tls-support">
         <h2>🔒 TLS / HTTPS Support</h2>
         <p>
-          CExpress features non-blocking, event-driven TLS 1.2+ encryption powered by OpenSSL/LibreSSL. Handshakes proceed asynchronously across <code>kqueue</code> and <code>epoll</code> event loops without blocking worker threads:
+          CExpress features non-blocking, event-driven TLS 1.2+ encryption powered by OpenSSL/LibreSSL. Handshakes
+          proceed asynchronously across <code>kqueue</code> and <code>epoll</code> event loops without blocking worker
+          threads:
         </p>
         <div class="code-block">
           <div class="code-header">
@@ -2031,7 +2201,8 @@ free(out);
  */</span></code></pre>
         </div>
         <div class="alert alert-tip">
-          <strong>Zero-Dependency Mode:</strong> When OpenSSL is absent or when compiling with <code>make NO_TLS=1</code>, CExpress automatically compiles with zero external library dependencies.
+          <strong>Zero-Dependency Mode:</strong> When OpenSSL is absent or when compiling with
+          <code>make NO_TLS=1</code>, CExpress automatically compiles with zero external library dependencies.
         </div>
       </section>
 
@@ -2319,4 +2490,5 @@ free(out);
     }
   </script>
 </body>
+
 </html>

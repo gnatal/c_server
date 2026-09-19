@@ -19,6 +19,13 @@ static void free_conn(Connection *conn) {
     free(conn);
 }
 
+static void cleanup_app(App *app) {
+    if (app != NULL) {
+        free(app->connections);
+        app->connections = NULL;
+    }
+}
+
 static int g_order[8];
 static int g_order_len;
 static int g_handler_called;
@@ -78,6 +85,7 @@ static void test_middlewares_run_in_order_then_handler(void) {
     assert(strstr(conn->out_buf, "ok") != NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void mw_short_circuit(const Request *req, Response *res, MiddlewareChain *chain) {
@@ -107,6 +115,7 @@ static void test_middleware_can_short_circuit(void) {
     assert(strstr(conn->out_buf, "forbidden") != NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void mw_passthrough(const Request *req, Response *res, MiddlewareChain *chain) {
@@ -131,6 +140,7 @@ static void test_dispatch_falls_through_to_404_without_route(void) {
     assert(strstr(conn->out_buf, "Not Found") != NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_dispatch_returns_405_when_path_matches_other_method(void) {
@@ -157,6 +167,7 @@ static void test_dispatch_returns_405_when_path_matches_other_method(void) {
     assert(strstr(conn->out_buf, "Allow: GET, POST") != NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_dispatch_returns_404_when_path_matches_nothing(void) {
@@ -178,6 +189,7 @@ static void test_dispatch_returns_404_when_path_matches_nothing(void) {
     assert(strstr(conn->out_buf, "Allow:") == NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static int g_error_status;
@@ -220,6 +232,7 @@ static void test_chain_error_invokes_registered_error_handler(void) {
     assert(res.status == 400);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_chain_error_default_fallback_without_handler(void) {
@@ -239,6 +252,7 @@ static void test_chain_error_default_fallback_without_handler(void) {
     assert(strstr(conn->out_buf, "bad input") != NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void mw_c(const Request *req, Response *res, MiddlewareChain *chain) {
@@ -275,6 +289,7 @@ static void test_route_middleware_runs_after_app_wide_before_handler(void) {
     assert(res.status == 200);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_route_without_middleware_only_runs_app_wide(void) {
@@ -298,6 +313,7 @@ static void test_route_without_middleware_only_runs_app_wide(void) {
     assert(g_order[0] == 1 && g_order[1] == 3);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void mw_route_short_circuit(const Request *req, Response *res, MiddlewareChain *chain) {
@@ -332,6 +348,7 @@ static void test_route_middleware_can_short_circuit_before_handler(void) {
     assert(strstr(conn->out_buf, "route unauthorized") != NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void mw_prefixed(const Request *req, Response *res, MiddlewareChain *chain) {
@@ -365,6 +382,7 @@ static void test_prefixed_middleware_runs_when_path_matches(void) {
     assert(res.status == 200);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_prefixed_middleware_skipped_when_path_does_not_match(void) {
@@ -391,6 +409,7 @@ static void test_prefixed_middleware_skipped_when_path_does_not_match(void) {
     assert(res.status == 200);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_prefixed_middleware_does_not_match_similar_sibling_path(void) {
@@ -415,6 +434,7 @@ static void test_prefixed_middleware_does_not_match_similar_sibling_path(void) {
     assert(g_order[0] == 3);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_dispatch_auto_options_lists_allowed_methods(void) {
@@ -444,6 +464,7 @@ static void test_dispatch_auto_options_lists_allowed_methods(void) {
     assert(strstr(conn->out_buf, "Content-Length: 0") != NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_dispatch_auto_options_without_get_omits_head(void) {
@@ -466,6 +487,7 @@ static void test_dispatch_auto_options_without_get_omits_head(void) {
     assert(strstr(conn->out_buf, "HEAD") == NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_dispatch_options_still_404s_unknown_path(void) {
@@ -486,6 +508,7 @@ static void test_dispatch_options_still_404s_unknown_path(void) {
     assert(res.status == 404);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 static void test_dispatch_explicit_options_route_wins_over_auto(void) {
@@ -513,6 +536,7 @@ static void test_dispatch_explicit_options_route_wins_over_auto(void) {
     assert(strstr(conn->out_buf, "ok") != NULL);
 
     free_conn(conn);
+    cleanup_app(&app);
 }
 
 int main(void) {

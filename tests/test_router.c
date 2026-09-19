@@ -27,6 +27,13 @@ static void dummy_mw_b(const Request *req, Response *res, MiddlewareChain *chain
     (void)chain;
 }
 
+static void cleanup_app(App *app) {
+    if (app != NULL) {
+        free(app->connections);
+        app->connections = NULL;
+    }
+}
+
 static void test_match_path_exact_literals(void) {
     Request req;
     memset(&req, 0, sizeof(req));
@@ -165,6 +172,7 @@ static void test_match_route(void) {
     strncpy(req.method, "GET", sizeof(req.method) - 1);
     strncpy(req.path, "/notfound", sizeof(req.path) - 1);
     assert(match_route(&app, &req) == NULL);
+    cleanup_app(&app);
 }
 
 static void test_match_route_allowed_methods(void) {
@@ -204,6 +212,7 @@ static void test_match_route_allowed_methods(void) {
     count = match_route_allowed_methods(&app, &req, allowed, sizeof(allowed));
     assert(count == 0);
     assert(allowed[0] == '\0');
+    cleanup_app(&app);
 }
 
 static void test_app_add_route_overflow(void) {
@@ -221,6 +230,7 @@ static void test_app_add_route_overflow(void) {
     /* Exceeding MAX_ROUTES should be rejected safely */
     app_get(&app, "/overflow", dummy_handler_a);
     assert(app.route_count == MAX_ROUTES);
+    cleanup_app(&app);
 }
 
 static void test_app_get_mw_stores_route_middleware(void) {
@@ -239,6 +249,7 @@ static void test_app_get_mw_stores_route_middleware(void) {
     /* app_get (no middleware) still yields a route with zero middleware. */
     app_get(&app, "/open", dummy_handler_a);
     assert(app.routes[1].middleware_count == 0);
+    cleanup_app(&app);
 }
 
 static void test_app_post_mw_stores_route_middleware(void) {
@@ -251,6 +262,7 @@ static void test_app_post_mw_stores_route_middleware(void) {
     assert(app.route_count == 1);
     assert(app.routes[0].middleware_count == 1);
     assert(app.routes[0].middlewares[0] == dummy_mw_a);
+    cleanup_app(&app);
 }
 
 static void test_app_add_route_mw_truncates_overflow(void) {
@@ -266,6 +278,7 @@ static void test_app_add_route_mw_truncates_overflow(void) {
 
     assert(app.route_count == 1);
     assert(app.routes[0].middleware_count == MAX_ROUTE_MIDDLEWARES);
+    cleanup_app(&app);
 }
 
 static void test_app_put_patch_delete_register_correct_methods(void) {
@@ -295,6 +308,7 @@ static void test_app_put_patch_delete_register_correct_methods(void) {
     strncpy(req.path, "/users/7", sizeof(req.path) - 1);
     matched = match_route(&app, &req);
     assert(matched != NULL && strcmp(matched->method, "PUT") == 0);
+    cleanup_app(&app);
 }
 
 static void test_app_put_patch_delete_mw_store_route_middleware(void) {
@@ -311,6 +325,7 @@ static void test_app_put_patch_delete_mw_store_route_middleware(void) {
         assert(app.routes[i].middleware_count == 1);
         assert(app.routes[i].middlewares[0] == dummy_mw_a);
     }
+    cleanup_app(&app);
 }
 
 static void test_router_put_patch_delete_register_correct_methods(void) {
@@ -339,6 +354,7 @@ static void test_router_put_patch_delete_register_correct_methods(void) {
     app_mount(&app, "/api", &router);
     assert(app.route_count == 6);
     assert(strcmp(app.routes[0].path, "/api/users/:id") == 0);
+    cleanup_app(&app);
 }
 
 static void test_app_mount_prefixes_router_routes(void) {
@@ -371,6 +387,7 @@ static void test_app_mount_prefixes_router_routes(void) {
     strncpy(req.method, "GET", sizeof(req.method) - 1);
     strncpy(req.path, "/users", sizeof(req.path) - 1);
     assert(match_route(&app, &req) == NULL);
+    cleanup_app(&app);
 }
 
 static void test_app_mount_carries_route_middleware(void) {
@@ -388,6 +405,7 @@ static void test_app_mount_carries_route_middleware(void) {
     assert(strcmp(app.routes[0].path, "/api/protected") == 0);
     assert(app.routes[0].middleware_count == 1);
     assert(app.routes[0].middlewares[0] == dummy_mw_a);
+    cleanup_app(&app);
 }
 
 static void test_app_mount_scopes_router_middleware_to_prefix(void) {
@@ -403,6 +421,7 @@ static void test_app_mount_scopes_router_middleware_to_prefix(void) {
     assert(app.middleware_count == 1);
     assert(app.middlewares[0].fn == dummy_mw_a);
     assert(strcmp(app.middlewares[0].prefix, "/api") == 0);
+    cleanup_app(&app);
 }
 
 static void test_app_mount_strips_trailing_slash_from_prefix(void) {
@@ -417,6 +436,7 @@ static void test_app_mount_strips_trailing_slash_from_prefix(void) {
 
     assert(app.route_count == 1);
     assert(strcmp(app.routes[0].path, "/api/users") == 0);
+    cleanup_app(&app);
 }
 
 static void test_app_mount_root_prefix_is_unscoped(void) {
@@ -434,6 +454,7 @@ static void test_app_mount_root_prefix_is_unscoped(void) {
     assert(strcmp(app.routes[0].path, "/users") == 0);
     assert(app.middleware_count == 1);
     assert(app.middlewares[0].prefix[0] == '\0');
+    cleanup_app(&app);
 }
 
 static void test_app_mount_respects_max_routes(void) {
@@ -453,6 +474,7 @@ static void test_app_mount_respects_max_routes(void) {
 
     app_mount(&app, "/api", &router);
     assert(app.route_count == MAX_ROUTES);
+    cleanup_app(&app);
 }
 
 static void test_app_head_options_register_correct_methods(void) {
@@ -472,6 +494,7 @@ static void test_app_head_options_register_correct_methods(void) {
     assert(app.route_count == 4);
     assert(app.routes[2].middleware_count == 1 && app.routes[2].middlewares[0] == dummy_mw_a);
     assert(app.routes[3].middleware_count == 1 && app.routes[3].middlewares[0] == dummy_mw_a);
+    cleanup_app(&app);
 }
 
 static void test_router_head_options_register_correct_methods(void) {
@@ -514,6 +537,7 @@ static void test_match_route_head_falls_back_to_get(void) {
     strncpy(req.method, "HEAD", sizeof(req.method) - 1);
     strncpy(req.path, "/notfound", sizeof(req.path) - 1);
     assert(match_route(&app, &req) == NULL);
+    cleanup_app(&app);
 }
 
 static void test_match_route_explicit_head_wins_over_get_fallback(void) {
@@ -533,6 +557,7 @@ static void test_match_route_explicit_head_wins_over_get_fallback(void) {
     /* The explicit HEAD route, not the GET fallback. */
     assert(matched->handler == dummy_handler_b);
     assert(strcmp(matched->method, "HEAD") == 0);
+    cleanup_app(&app);
 }
 
 static void test_match_path_without_request_captures_nothing(void) {
@@ -594,7 +619,7 @@ static void test_allowed_methods_does_not_touch_request(void) {
     assert(match_route_allowed_methods(&app, &req, allowed, sizeof(allowed)) == 2);
     assert(strcmp(allowed, "GET, PUT") == 0);
     assert(req.param_count == 0); /* no scratch capture leaked into the caller's request */
-    free(app.connections); /* app_init's table; app_destroy lives in connection.c, not linked here */
+    cleanup_app(&app); /* app_init's table; app_destroy lives in connection.c, not linked here */
 }
 
 int main(void) {

@@ -27,6 +27,11 @@ int tls_init_app(App *app) {
         return -1;
     }
 
+    if (app->ssl_ctx != NULL) {
+        SSL_CTX_free((SSL_CTX *)app->ssl_ctx);
+        app->ssl_ctx = NULL;
+    }
+
     /* Ignore SIGPIPE so writing to an abruptly closed SSL socket does not
      * kill the process - connection.c: app_listen_worker now does this
      * unconditionally for the full server (see lib/CLAUDE.md, "Behavior reference, Workers and fork"), but this call still matters in its own right: it's what
@@ -93,6 +98,11 @@ void tls_cleanup_app(App *app) {
 int tls_connection_init(App *app, Connection *conn) {
     if (app == NULL || app->ssl_ctx == NULL || conn == NULL) {
         return -1;
+    }
+
+    if (conn->ssl != NULL) {
+        SSL_free((SSL *)conn->ssl);
+        conn->ssl = NULL;
     }
 
     SSL *ssl = SSL_new((SSL_CTX *)app->ssl_ctx);

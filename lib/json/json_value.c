@@ -147,6 +147,15 @@ int json_object_set(JsonValue *object, const char *key, JsonValue *value) {
         return 0;
     }
 
+    /* If the key already exists, replace value in-place and free old value */
+    for (size_t i = 0; i < object->as.object.count; i++) {
+        if (strcmp(object->as.object.members[i].key, key) == 0) {
+            json_free(object->as.object.members[i].value);
+            object->as.object.members[i].value = value;
+            return 1;
+        }
+    }
+
     char *key_copy = copy_string(key, strlen(key));
     if (key_copy == NULL) {
         json_free(value);
