@@ -265,3 +265,7 @@ test: $(TEST_BINS)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer
+
+export:
+	@if [ -z "$(DEST)" ]; then echo "Usage: make export DEST=/path/to/target/vendor/cexpress"; exit 1; fi
+	@./scripts/export_framework.sh "$(DEST)"
