@@ -6,7 +6,7 @@
 #include "response.h"
 #include "middleware.h"
 #include "http_parser.h"
-#include "json/json.h"
+#include "vendor/yyjson/yyjson.h"
 
 static const char *default_api_key = "my-secret-api-key";
 static const char *configured_api_key = NULL;
@@ -42,15 +42,21 @@ void mw_body_size_guard(const Request *req, Response *res, MiddlewareChain *chai
 
 void error_handler_json(int status, const char *message, const Request *req, Response *res) {
     (void)req;
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "error");
-    jw_string(&w, message); /* escaped, unlike snprintf("%s") */
-    jw_object_end(&w);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_str(doc, obj, "error", message);
+
     res_status(res, status);
-    res_json(res, jw_ok(&w) ? jw_data(&w) : "{\"error\":\"internal error\"}");
-    jw_free(&w);
+    size_t len;
+    char *json = yyjson_mut_write(doc, 0, &len);
+    if (json) {
+        res_json(res, json);
+        free(json);
+    } else {
+        res_json(res, "{\"error\":\"internal error\"}");
+    }
+    yyjson_mut_doc_free(doc);
 }
 
 /* Constant-time comparison so a wrong API key can't be distinguished from a

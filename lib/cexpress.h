@@ -16,7 +16,7 @@ extern "C" {
 #include "multipart.h"
 #include "urlencoded.h"
 #include "tls.h"
-#include "json/json.h"
+#include "vendor/yyjson/yyjson.h"
 
 #ifdef __cplusplus
 }

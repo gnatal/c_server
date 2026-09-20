@@ -150,3 +150,33 @@ No SQLite flags, no `/app` collisions, and zero unwanted demo code.
 1. **Clean Namespace**: When CExpress is cloned or submoduled into another project, there is no `app/` folder in the CExpress root to conflict with the host project.
 2. **Zero SQLite Requirement for Framework**: A user can run `make` and `make test` on a machine with **no SQLite development headers or libraries installed**, and the library + test suite build and pass completely.
 3. **Pure Express-like Consumption**: A consumer project can create its own `/app/main.c`, include `"cexpress.h"`, link `libcexpress.a`, and spin up a server with zero SQLite baggage.
+
+---
+
+## 6. Performance Upgrades (Future)
+
+To push CExpress from its current simplicity-first design to advanced, state-of-the-art C performance, the following architectural upgrades should be considered:
+
+1. **Replace the JSON Parser (simdjson / yyjson)**
+   - **Current**: Custom parser using `malloc` and `memcpy` for every string (`json_value.c`).
+   - **Upgrade**: Use [simdjson](https://simdjson.org/) or [yyjson](https://github.com/ibireme/yyjson) to leverage SIMD instructions. This allows gigabytes of JSON to be parsed per second, often parsing payloads in-place without per-key allocations.
+
+2. **Implement an Arena Allocator (Bump Allocator)**
+   - **Current**: Heavy reliance on `malloc`/`free` (`req->body`, `conn->out_buf`, strings).
+   - **Upgrade**: Pre-allocate a fixed slab (e.g., 64KB) per connection. When parsing or building responses, simply bump a pointer forward. Reset pointer to 0 when the response is sent, dropping allocation and fragmentation overhead to effectively zero.
+
+3. **Replace the HTTP Parser (`picohttpparser`)**
+   - **Current**: Custom byte-by-byte parser (`lib/http_parser.c`) using `memchr`.
+   - **Upgrade**: Integrate [picohttpparser](https://github.com/h2o/picohttpparser). It uses SIMD (AVX2/SSE4) to parse HTTP headers extremely quickly, serving as the backbone for some of the world's fastest web servers.
+
+4. **Upgrade the Router to a Radix Trie**
+   - **Current**: Route matching is likely linear O(N) iterating over registered routes in `lib/router.c`.
+   - **Upgrade**: Implement a Radix Trie (Prefix Tree) similar to Go's `httprouter` or Fastify. This makes route matching O(k) (where k is path length), maintaining high performance even with thousands of routes.
+
+5. **Adopt `io_uring` (Linux Only)**
+   - **Current**: Uses `kqueue` (macOS) and `epoll` (Linux) via multi-process workers.
+   - **Upgrade**: Replace `epoll` with Linux's `io_uring` to perform asynchronous I/O that bypasses standard syscall overhead, allowing massive concurrency with zero user-kernel context switches.
+
+6. **Non-Blocking Database Drivers / Thread Pool**
+   - **Current**: SQLite operations (e.g., in the demo) block the worker process entirely.
+   - **Upgrade**: Use async/non-blocking drivers for databases (like `libpq` for PostgreSQL) within the event loop, or implement a `libuv`-style thread pool for strictly blocking I/O (like SQLite or file reads) so the main event loop never stalls.

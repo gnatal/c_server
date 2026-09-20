@@ -6,20 +6,25 @@
 #include "router.h"
 #include "response.h"
 #include "http_parser.h"
-#include "json/json.h"
+#include "vendor/yyjson/yyjson.h"
 #include "db.h"
 
 /* Sends {"error": message} with `status`. JsonWriter escapes the message. */
 static void send_error(Response *res, int status, const char *message) {
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "error");
-    jw_string(&w, message);
-    jw_object_end(&w);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_str(doc, obj, "error", message);
     res_status(res, status);
-    res_json(res, jw_ok(&w) ? jw_data(&w) : "{\"error\":\"internal error\"}");
-    jw_free(&w);
+    size_t len;
+    char *json = yyjson_mut_write(doc, 0, &len);
+    if (json) {
+        res_json(res, json);
+        free(json);
+    } else {
+        res_json(res, "{\"error\":\"internal error\"}");
+    }
+    yyjson_mut_doc_free(doc);
 }
 
 /* True when Content-Type declares a JSON body - an optional ";charset=..."
@@ -50,28 +55,29 @@ static int parse_id_param(const Request *req, long long *out) {
 }
 
 /* Writes one todo as a JSON object into `w` (no allocation beyond the writer's own buffer). */
-static void write_todo(JsonWriter *w, const Todo *todo) {
-    jw_object_begin(w);
-    jw_key(w, "id");         jw_int(w, todo->id);
-    jw_key(w, "title");      jw_string(w, todo->title);
-    jw_key(w, "done");       jw_bool(w, todo->done);
-    jw_key(w, "created_at"); jw_string(w, todo->created_at);
-    jw_key(w, "updated_at"); jw_string(w, todo->updated_at);
-    jw_object_end(w);
+static yyjson_mut_val *write_todo(yyjson_mut_doc *doc, const Todo *todo) {
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, obj, "id", todo->id);
+    yyjson_mut_obj_add_str(doc, obj, "title", todo->title);
+    yyjson_mut_obj_add_bool(doc, obj, "done", todo->done);
+    yyjson_mut_obj_add_str(doc, obj, "created_at", todo->created_at);
+    yyjson_mut_obj_add_str(doc, obj, "updated_at", todo->updated_at);
+    return obj;
 }
 
 static void send_todo_json(Response *res, int status, const Todo *todo) {
-    JsonWriter w;
-    jw_init(&w);
-    write_todo(&w, todo);
-    if (!jw_ok(&w)) {
-        jw_free(&w);
-        send_error(res, 500, "failed to encode todo");
-        return;
-    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_doc_set_root(doc, write_todo(doc, todo));
     res_status(res, status);
-    res_json(res, jw_data(&w));
-    jw_free(&w);
+    size_t len;
+    char *json = yyjson_mut_write(doc, 0, &len);
+    if (json) {
+        res_json(res, json);
+        free(json);
+    } else {
+        send_error(res, 500, "failed to encode todo");
+    }
+    yyjson_mut_doc_free(doc);
 }
 
 void handler_home(const Request *req, Response *res) {
@@ -105,20 +111,21 @@ void handler_list_todos(const Request *req, Response *res) {
         return;
     }
 
-    JsonWriter w;
-    jw_init(&w);
-    jw_array_begin(&w);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, arr);
     for (int i = 0; i < list.count; i++) {
-        write_todo(&w, &list.items[i]);
+        yyjson_mut_arr_append(arr, write_todo(doc, &list.items[i]));
     }
-    jw_array_end(&w);
-    if (!jw_ok(&w)) {
-        jw_free(&w);
+    size_t len;
+    char *json = yyjson_mut_write(doc, 0, &len);
+    if (json) {
+        res_json(res, json);
+        free(json);
+    } else {
         send_error(res, 500, "failed to encode todos");
-        return;
     }
-    res_json(res, jw_data(&w));
-    jw_free(&w);
+    yyjson_mut_doc_free(doc);
 }
 
 void handler_get_todo(const Request *req, Response *res) {
@@ -147,23 +154,23 @@ void handler_create_todo(const Request *req, Response *res) {
         return;
     }
 
-    char err[128];
-    JsonValue *body = json_parse(req->body, err, sizeof(err));
-    if (body == NULL) {
-        send_error(res, 400, err);
+    yyjson_doc *doc = yyjson_read(req->body, strlen(req->body), 0);
+    if (doc == NULL) {
+        send_error(res, 400, "invalid json");
         return;
     }
+    yyjson_val *body = yyjson_doc_get_root(doc);
 
-    const char *title = json_as_string(json_object_get(body, "title"), NULL);
+    const char *title = yyjson_get_str(yyjson_obj_get(body, "title"));
     if (!todo_title_is_valid(title)) {
-        json_free(body);
+        yyjson_doc_free(doc);
         send_error(res, 400, "title is required and must be 1-255 characters");
         return;
     }
 
     Todo todo;
     int rc = db_create_todo(title, &todo);
-    json_free(body);
+    yyjson_doc_free(doc);
     if (rc != 0) {
         send_error(res, 500, "failed to create todo");
         return;
@@ -182,25 +189,25 @@ void handler_replace_todo(const Request *req, Response *res) {
         return;
     }
 
-    char err[128];
-    JsonValue *body = json_parse(req->body, err, sizeof(err));
-    if (body == NULL) {
-        send_error(res, 400, err);
+    yyjson_doc *doc = yyjson_read(req->body, strlen(req->body), 0);
+    if (doc == NULL) {
+        send_error(res, 400, "invalid json");
         return;
     }
+    yyjson_val *body = yyjson_doc_get_root(doc);
 
-    const char *title = json_as_string(json_object_get(body, "title"), NULL);
-    const JsonValue *done_value = json_object_get(body, "done");
+    const char *title = yyjson_get_str(yyjson_obj_get(body, "title"));
+    yyjson_val *done_value = yyjson_obj_get(body, "done");
     if (!todo_title_is_valid(title) || done_value == NULL) {
-        json_free(body);
+        yyjson_doc_free(doc);
         send_error(res, 400, "title and done are both required for a full replace");
         return;
     }
-    int done = json_as_bool(done_value, 0);
+    int done = yyjson_get_bool(done_value);
 
     Todo todo;
     int result = db_replace_todo(id, title, done, &todo);
-    json_free(body);
+    yyjson_doc_free(doc);
     if (result < 0) {
         send_error(res, 500, "failed to update todo");
         return;
@@ -223,32 +230,32 @@ void handler_patch_todo(const Request *req, Response *res) {
         return;
     }
 
-    char err[128];
-    JsonValue *body = json_parse(req->body, err, sizeof(err));
-    if (body == NULL) {
-        send_error(res, 400, err);
+    yyjson_doc *doc = yyjson_read(req->body, strlen(req->body), 0);
+    if (doc == NULL) {
+        send_error(res, 400, "invalid json");
         return;
     }
+    yyjson_val *body = yyjson_doc_get_root(doc);
 
-    const JsonValue *title_value = json_object_get(body, "title");
-    const char *title = json_as_string(title_value, NULL);
+    yyjson_val *title_value = yyjson_obj_get(body, "title");
+    const char *title = yyjson_get_str(title_value);
     if (title_value != NULL && !todo_title_is_valid(title)) {
-        json_free(body);
+        yyjson_doc_free(doc);
         send_error(res, 400, "title must be 1-255 characters");
         return;
     }
 
-    const JsonValue *done_value = json_object_get(body, "done");
+    yyjson_val *done_value = yyjson_obj_get(body, "done");
     int done_storage = 0;
     const int *done = NULL;
     if (done_value != NULL) {
-        done_storage = json_as_bool(done_value, 0);
+        done_storage = yyjson_get_bool(done_value);
         done = &done_storage;
     }
 
     Todo todo;
     int result = db_patch_todo(id, title, done, &todo);
-    json_free(body);
+    yyjson_doc_free(doc);
     if (result < 0) {
         send_error(res, 500, "failed to update todo");
         return;

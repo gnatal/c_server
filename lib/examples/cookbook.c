@@ -38,26 +38,27 @@
  * Finishes a JsonWriter into a response: 500 if the writer failed, otherwise `status` + body.
  * Always frees the writer.
  * ------------------------------------------------------------------------------------------- */
-static void send_json(Response *res, const int status, JsonWriter *w) {
-    if (!jw_ok(w)) {
+static void send_json(Response *res, const int status, yyjson_mut_doc *doc) {
+    size_t len;
+    char *json = yyjson_mut_write(doc, 0, &len);
+    if (json) {
+        res_status(res, status);
+        res_json(res, json);
+        free(json);
+    } else {
         res_status(res, 500);
         res_json(res, "{\"error\":\"json encoding failed\"}");
-    } else {
-        res_status(res, status);
-        res_json(res, jw_data(w));
     }
-    jw_free(w);
+    yyjson_mut_doc_free(doc);
 }
 
 /* Sends {"error": message} with `status`. */
 static void send_error(Response *res, const int status, const char *message) {
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "error");
-    jw_string(&w, message);
-    jw_object_end(&w);
-    send_json(res, status, &w);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_str(doc, obj, "error", message);
+    send_json(res, status, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -81,13 +82,12 @@ static void recipe_square(const Request *req, Response *res) {
         send_error(res, 400, "n must be an integer between -1000000 and 1000000");
         return;
     }
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "n");      jw_int(&w, n);
-    jw_key(&w, "square"); jw_int(&w, n * n);
-    jw_object_end(&w);
-    send_json(res, 200, &w);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_int(doc, obj, "n", n);
+    yyjson_mut_obj_add_int(doc, obj, "square", n * n);
+    send_json(res, 200, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -115,28 +115,27 @@ static void recipe_create_note(const Request *req, Response *res) {
         return;
     }
 
-    char err[128];
-    JsonValue *body = json_parse(req->body, err, sizeof(err)); /* req->body is NUL-terminated */
-    if (body == NULL) {
-        send_error(res, 400, err);
+    yyjson_doc *doc = yyjson_read(req->body, strlen(req->body), 0);
+    if (doc == NULL) {
+        send_error(res, 400, "invalid json");
         return;
     }
+    yyjson_val *body = yyjson_doc_get_root(doc);
 
-    const char *title = json_as_string(json_object_get(body, "title"), NULL);
+    const char *title = yyjson_get_str(yyjson_obj_get(body, "title"));
     if (title == NULL || title[0] == '\0' || strlen(title) > 255) {
-        json_free(body);
+        yyjson_doc_free(doc);
         send_error(res, 400, "title is required (1-255 characters)");
         return;
     }
 
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "id");    jw_int(&w, 1);
-    jw_key(&w, "title"); jw_string(&w, title);
-    jw_object_end(&w);
-    json_free(body); /* safe now: the writer copied the title */
-    send_json(res, 201, &w);
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *obj = yyjson_mut_obj(mdoc);
+    yyjson_mut_doc_set_root(mdoc, obj);
+    yyjson_mut_obj_add_int(mdoc, obj, "id", 1);
+    yyjson_mut_obj_add_str(mdoc, obj, "title", title);
+    send_json(res, 201, mdoc);
+    yyjson_doc_free(doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -150,17 +149,16 @@ static void recipe_numbers(const Request *req, Response *res) {
         send_error(res, 400, "count must be between 0 and 100");
         return;
     }
-    JsonWriter w;
-    jw_init(&w);
-    jw_array_begin(&w);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, arr);
     for (long i = 0; i < count; i++) {
-        jw_object_begin(&w);
-        jw_key(&w, "i");    jw_int(&w, i);
-        jw_key(&w, "even"); jw_bool(&w, i % 2 == 0);
-        jw_object_end(&w);
+        yyjson_mut_val *obj = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, obj, "i", i);
+        yyjson_mut_obj_add_bool(doc, obj, "even", i % 2 == 0);
+        yyjson_mut_arr_append(arr, obj);
     }
-    jw_array_end(&w);
-    send_json(res, 200, &w);
+    send_json(res, 200, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -224,13 +222,11 @@ static void recipe_list_notes(const Request *req, Response *res) {
 }
 
 static void recipe_get_note(const Request *req, Response *res) {
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "id");
-    jw_string(&w, req_get_param(req, "id"));
-    jw_object_end(&w);
-    send_json(res, 200, &w);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_str(doc, obj, "id", req_get_param(req, "id"));
+    send_json(res, 200, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -309,13 +305,12 @@ static void recipe_upload(const Request *req, Response *res) {
         send_error(res, 400, "missing file part");
         return;
     }
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "filename"); jw_string(&w, file->filename);
-    jw_key(&w, "bytes");    jw_int(&w, (long long)file->data_len);
-    jw_object_end(&w);
-    send_json(res, 200, &w);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_str(doc, obj, "filename", file->filename);
+    yyjson_mut_obj_add_int(doc, obj, "bytes", (long long)file->data_len);
+    send_json(res, 200, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------

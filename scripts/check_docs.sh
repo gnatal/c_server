@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DOC=lib/API.md
-HEADERS=(lib/*.h lib/json/json.h)
+HEADERS=(lib/*.h lib/vendor/yyjson/yyjson.h)
 status=0
 
 # Function names declared in headers: "type name(" at column 0 (skips typedefs, macros, comments).

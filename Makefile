@@ -54,7 +54,7 @@ LIB_DIR   = $(BUILD_DIR)/lib
 # --- lib: the reusable engine ---
 LIB_SRCS = lib/connection.c $(EVENT_LOOP_SRC) lib/cluster.c lib/tls.c lib/http_parser.c lib/router.c lib/response.c lib/middleware.c \
            lib/multipart.c lib/urlencoded.c lib/static.c \
-           lib/json/json_parser.c lib/json/json_value.c lib/json/json_writer.c
+           lib/vendor/yyjson/yyjson.c
 LIB_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(LIB_SRCS))
 LIB      = $(LIB_DIR)/libcexpress.a
 
@@ -77,7 +77,7 @@ COOKBOOK_TEST_BIN    = $(BIN_DIR)/test_cookbook
 BENCH_BIN            = $(BIN_DIR)/bench_hotpath
 PING_TEST_BIN        = $(BIN_DIR)/test_ping
 
-TEST_BINS = $(JSON_TEST_BIN) $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
+TEST_BINS = $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
             $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN) $(URLENCODED_TEST_BIN) \
             $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) $(TLS_TEST_BIN) \
             $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN)
@@ -102,9 +102,6 @@ $(LIB): $(LIB_OBJS)
 	$(AR) rcs $@ $(LIB_OBJS)
 
 
-$(JSON_TEST_BIN): $(OBJ_DIR)/lib/json/json_parser.o $(OBJ_DIR)/lib/json/json_value.o $(OBJ_DIR)/lib/json/json_writer.o $(OBJ_DIR)/tests/test_json.o
-	@mkdir -p $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $^
 
 $(MIDDLEWARE_TEST_BIN): $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/tests/test_middleware.o
 	@mkdir -p $(BIN_DIR)
@@ -222,7 +219,6 @@ test_epoll: $(EPOLL_TEST_BIN) $(CONNECTION_EPOLL_TEST_BIN)
 endif
 
 test: $(TEST_BINS)
-	./$(JSON_TEST_BIN)
 	./$(MIDDLEWARE_TEST_BIN)
 	./$(ROUTER_TEST_BIN)
 	./$(HTTP_PARSER_TEST_BIN)
