@@ -3,7 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "cexpress.h"
-#include "../app/ping.h"
+
+static void handler_ping(const Request *req, Response *res) {
+    (void)req;
+    res_send(res, "pong");
+}
 
 /* Same fake-connection harness as test_cookbook.c: real parse -> route -> dispatch, no sockets. */
 static char *fetch(App *app, const char *raw) {

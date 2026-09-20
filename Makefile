@@ -42,21 +42,6 @@ endif
 CFLAGS += $(OPENSSL_CFLAGS)
 LDFLAGS += $(OPENSSL_LDFLAGS)
 
-# --- SQLite configuration (required - the demo app is SQL-backed) ---
-SQLITE_PREFIX ?= $(shell brew --prefix sqlite3 2>/dev/null || brew --prefix sqlite 2>/dev/null || echo /opt/homebrew/opt/sqlite)
-ifeq ($(shell test -d $(SQLITE_PREFIX)/include && echo yes),yes)
-    SQLITE_CFLAGS = -I$(SQLITE_PREFIX)/include
-    SQLITE_LDFLAGS = -L$(SQLITE_PREFIX)/lib -lsqlite3
-else ifeq ($(shell pkg-config --exists sqlite3 2>/dev/null && echo yes),yes)
-    SQLITE_CFLAGS = $(shell pkg-config --cflags sqlite3)
-    SQLITE_LDFLAGS = $(shell pkg-config --libs sqlite3)
-else
-    SQLITE_CFLAGS =
-    SQLITE_LDFLAGS = -lsqlite3
-endif
-
-CFLAGS += $(SQLITE_CFLAGS)
-LDFLAGS += $(SQLITE_LDFLAGS)
 
 AR = ar
 
@@ -73,10 +58,6 @@ LIB_SRCS = lib/connection.c $(EVENT_LOOP_SRC) lib/cluster.c lib/tls.c lib/http_p
 LIB_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(LIB_SRCS))
 LIB      = $(LIB_DIR)/libcexpress.a
 
-# --- app: the application built on top of the lib ---
-APP_SRCS = app/main.c app/handlers.c app/middlewares.c app/db.c app/ping.c
-APP_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(APP_SRCS))
-TARGET   = $(BIN_DIR)/cexpress
 
 # --- test binaries ---
 JSON_TEST_BIN        = $(BIN_DIR)/test_json
@@ -101,9 +82,12 @@ TEST_BINS = $(JSON_TEST_BIN) $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PA
             $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) $(TLS_TEST_BIN) \
             $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN)
 
-.PHONY: all run test clean test_epoll bench fuzz check-docs
+.PHONY: all demo test clean test_epoll bench fuzz check-docs
 
-all: cexpress
+all: $(LIB)
+
+demo: $(LIB)
+	$(MAKE) -C examples/todo_sqlite
 
 # Generic compilation rule into $(OBJ_DIR). -MMD -MP emits a .d file per object listing the
 # headers it included, so editing a header (e.g. lib/app_types.h) rebuilds every dependent object.
@@ -117,15 +101,6 @@ $(LIB): $(LIB_OBJS)
 	@mkdir -p $(LIB_DIR)
 	$(AR) rcs $@ $(LIB_OBJS)
 
-$(TARGET): $(APP_OBJS) $(LIB)
-	@mkdir -p $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $(APP_OBJS) $(LIB) $(LDFLAGS)
-
-cexpress: $(TARGET)
-	@ln -sf $(TARGET) cexpress
-
-run: $(TARGET)
-	./$(TARGET)
 
 $(JSON_TEST_BIN): $(OBJ_DIR)/lib/json/json_parser.o $(OBJ_DIR)/lib/json/json_value.o $(OBJ_DIR)/lib/json/json_writer.o $(OBJ_DIR)/tests/test_json.o
 	@mkdir -p $(BIN_DIR)
@@ -184,10 +159,10 @@ $(COOKBOOK_TEST_BIN): $(OBJ_DIR)/tests/test_cookbook.o $(OBJ_DIR)/lib/examples/c
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/tests/test_cookbook.o $(OBJ_DIR)/lib/examples/cookbook.o $(LIB) $(LDFLAGS)
 
-# The demo app's /ping handler, tested against the library only (no SQLite needed).
-$(PING_TEST_BIN): $(OBJ_DIR)/tests/test_ping.o $(OBJ_DIR)/app/ping.o $(LIB)
+# The /ping handler test.
+$(PING_TEST_BIN): $(OBJ_DIR)/tests/test_ping.o $(LIB)
 	@mkdir -p $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/tests/test_ping.o $(OBJ_DIR)/app/ping.o $(LIB) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/tests/test_ping.o $(LIB) $(LDFLAGS)
 
 # Per-request CPU cost of the pure path (parse -> route -> dispatch -> response), no sockets.
 $(BENCH_BIN): $(OBJ_DIR)/tests/bench_hotpath.o $(LIB)
@@ -265,6 +240,7 @@ test: $(TEST_BINS)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer
+	$(MAKE) -C examples/todo_sqlite clean || true
 
 export:
 	@if [ -z "$(DEST)" ]; then echo "Usage: make export DEST=/path/to/target/vendor/cexpress"; exit 1; fi

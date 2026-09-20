@@ -1,4 +1,4 @@
-# app/ — application layer
+# examples/todo_sqlite/ — application layer
 
 ## Architecture
 Thin layer on top of `lib/libcexpress.a`: `main.c` builds one `App`, wires up
@@ -19,7 +19,7 @@ echoing input back. It deliberately does not exercise every `lib/` feature
 lives in `tests/` and `lib/CLAUDE.md`, not in this app.
 
 Routes (`main.c`):
-- `GET /` → `handler_home` — serves the Todo UI (`app/public/index.html`,
+- `GET /` → `handler_home` — serves the Todo UI (`examples/todo_sqlite/public/index.html`,
   a single self-contained file) via `res_send_file` (bounded chunk
   streaming, `lib/response.h`).
 - `GET /ping` → `handler_ping` (`ping.c/h`) — answers `200 pong` (text/plain) with no
@@ -27,7 +27,7 @@ Routes (`main.c`):
   (`PHASES=ping scripts/stress_test.sh`, `scripts/CLAUDE.md`). It lives in its own file so
   `tests/test_ping.c` links it without SQLite. Like every route it runs the app-wide
   middleware (`mw_logger` unless `QUIET=1`, `mw_body_size_guard`).
-- `app_serve_static(&app, "/static", "app/public")` — a generic
+- `app_serve_static(&app, "/static", "examples/todo_sqlite/public")` — a generic
   static-file-serving demo (`lib/CLAUDE.md`, "Behavior reference, Static"),
   unrelated to the Todo UI above, which needs no separate assets.
 - The Todo REST API is built on a `Router` (`todo_router`) and mounted at
@@ -41,8 +41,8 @@ Routes (`main.c`):
   middleware in the same route set, rather than showing each mechanism in
   isolation the way the previous demo did.
 
-## Persistence layer (`app/db.c`/`app/db.h`/`app/todo_types.h`)
-Lives under `app/`, not `lib/` — this is app-specific persistence, not a
+## Persistence layer (`examples/todo_sqlite/db.c`/`examples/todo_sqlite/db.h`/`examples/todo_sqlite/todo_types.h`)
+Lives under `examples/todo_sqlite/`, not `lib/` — this is app-specific persistence, not a
 generic engine capability (Express itself ships no DB layer either; you'd
 bring your own). `lib/` has no SQLite dependency at all except for the
 generic worker-lifecycle hook this module consumes (below).
@@ -56,7 +56,7 @@ generic worker-lifecycle hook this module consumes (below).
 - **No connection handle type is exposed.** `Handler` (`lib/app_types.h`)
   takes only `(const Request *, Response *)` — there's no context parameter
   to inject a `Db *` through — so the connection is module-level state in
-  `db.c` (`static sqlite3 *g_db`), the same pattern `app/middlewares.c:
+  `db.c` (`static sqlite3 *g_db`), the same pattern `examples/todo_sqlite/middlewares.c:
   mw_authenticate_set_key`/`mw_authenticate_get_key` already uses for the
   configured API key.
 - **Fork safety, and why `db_open`/`db_worker_init` are two separate
@@ -160,16 +160,16 @@ generic worker-lifecycle hook this module consumes (below).
   directly instead, same as the previous demo's `handler_update_user`/
   `handler_patch_user`.
 
-## Frontend (`app/public/index.html`)
+## Frontend (`examples/todo_sqlite/public/index.html`)
 A single self-contained page (inline `<style>`+`<script>`, no build step,
 no external assets) — the served page *is* the Todo UI, not a static-asset
 demo. Vanilla `fetch()` calls against `/api/todos`; an API-key `<input>`
 attaches `Authorization: Bearer <key>` to mutating requests only (`POST`/
-`PUT`/`PATCH`/`DELETE`), so `mw_authenticate` (`app/middlewares.c`) is
+`PUT`/`PATCH`/`DELETE`), so `mw_authenticate` (`examples/todo_sqlite/middlewares.c`) is
 reachable interactively from the browser, not just via `curl`. Failed
 requests surface the server's `{"error": "..."}"` message inline rather
-than failing silently. `app/public/style.css` and
-`app/public/docs/index.html` are unrelated leftovers from the previous
+than failing silently. `examples/todo_sqlite/public/style.css` and
+`examples/todo_sqlite/public/docs/index.html` are unrelated leftovers from the previous
 static-file demo, still reachable via the generic `/static` mount above.
 
 ## Runtime Configuration
@@ -188,7 +188,7 @@ routes like `/api/todos/:id`, already populated with path params — see
 `req_get_param`) and a `Response *` it must call
 `res_send`/`res_json`/`res_status` on to produce output. Handlers hold no
 state of their own across requests and don't touch sockets or the database
-connection directly — persistence goes through `app/db.c`'s functions,
+connection directly — persistence goes through `examples/todo_sqlite/db.c`'s functions,
 socket I/O happens in `lib/connection.c`, both outside this layer.
 
 Every handler that builds a JSON response owns a stack `JsonWriter` for the

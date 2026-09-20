@@ -22,12 +22,12 @@ This project is an attempt to create an HTTP server with a developer experience 
 
 
 ## Where to start (for coding agents)
-- Writing an app on the engine: `lib/API.md` (every public function, one line each) then `lib/examples/cookbook.c` (tested recipes: JSON in/out, path/query params, middleware, sub-routers, cookies, forms, uploads, streaming, per-worker resources). `app/` is a full worked application.
+- Writing an app on the engine: `lib/API.md` (every public function, one line each) then `lib/examples/cookbook.c` (tested recipes: JSON in/out, path/query params, middleware, sub-routers, cookies, forms, uploads, streaming, per-worker resources). `examples/todo_sqlite/` is a full worked application.
 - Changing the engine: `lib/CLAUDE.md` (request lifecycle, limits, ownership table, return conventions, hot-path rules, known gaps), then the header of the module you touch.
 - Verify with `make test`, `make SANITIZE=1 BUILD_DIR=build-asan test`, `make fuzz`, `make bench`, `make check-docs`.
 
 
 ## Where to start (for coding agents)
-- Writing an app on the engine: `lib/API.md` (every public function, one line each) then `lib/examples/cookbook.c` (tested recipes: JSON in/out, path/query params, middleware, sub-routers, cookies, forms, uploads, streaming, per-worker resources). `app/` is a full worked application.
+- Writing an app on the engine: `lib/API.md` (every public function, one line each) then `lib/examples/cookbook.c` (tested recipes: JSON in/out, path/query params, middleware, sub-routers, cookies, forms, uploads, streaming, per-worker resources). `examples/todo_sqlite/` is a full worked application.
 - Changing the engine: `lib/CLAUDE.md` (request lifecycle, limits, ownership table, return conventions, hot-path rules, known gaps), then the header of the module you touch.
 - Verify with `make test`, `make SANITIZE=1 BUILD_DIR=build-asan test`, `make fuzz`, `make bench`, `make check-docs`.

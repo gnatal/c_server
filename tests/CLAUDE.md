@@ -32,7 +32,7 @@ Standalone unit and integration test suites compiled independently into `build/b
   (`parse_http_request` → `match_route` → `dispatch`) with a fake `Connection` and asserts exact status
   lines and bodies (JSON in/out, middleware kinds, sub-router, cookies, forms, multipart with an embedded
   NUL, redirect safety, chunked streaming, HEAD, worker hook registration). Links the static library.
-- `test_ping.c`: the demo app's `GET /ping` handler (`app/ping.c`) through parse → route → dispatch: exact response bytes, `Connection: close` detection, HEAD, 405 + `Allow`, 404. Links only the library plus `ping.o` (no SQLite).
+- `test_ping.c`: the demo app's `GET /ping` handler (`examples/todo_sqlite/ping.c`) through parse → route → dispatch: exact response bytes, `Connection: close` detection, HEAD, 405 + `Allow`, 404. Links only the library plus `ping.o` (no SQLite).
 - `bench_hotpath.c` (`make bench`): not a test. Prints ns/request for the pure request path and the JSON writer
   versus the tree serializer.
 - `fuzz_parser.c` (`make fuzz [FUZZ_ITERS=n]`): mutation fuzzer over `request_framing`, `request_is_complete`,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Stress-tests the Todo CRUD demo (app/) under multi-worker cluster mode
+# Stress-tests the Todo CRUD demo (examples/todo_sqlite/) under multi-worker cluster mode
 # using wrk. Builds a fresh binary, boots the server in the background,
 # seeds a few todos, runs a battery of read + write benchmarks at
 # increasing concurrency, then tears everything down.
@@ -62,14 +62,14 @@ SERVER_LOG="$(mktemp -t cexpress_server.XXXXXX)"
 PEAK_FILE="$(mktemp -t cexpress_peak.XXXXXX)"
 
 echo "==> Building release binary"
-make -s
+make demo -s
 
 rm -f "$DB_PATH" "${DB_PATH}-shm" "${DB_PATH}-wal"
 
 echo "==> Starting server (WORKERS=$WORKERS, QUIET=1, TODO_DB_PATH=$DB_PATH, memory tracking: $([ ${#TIME_CMD[@]} -gt 0 ] && echo "${TIME_CMD[*]}" || echo off))"
 # stderr (server warnings + the time(1) report) goes to $SERVER_LOG, printed at the end.
 QUIET=1 WORKERS="$WORKERS" PORT="$PORT" TODO_DB_PATH="$DB_PATH" API_KEY="$API_KEY" \
-    ${TIME_CMD[@]+"${TIME_CMD[@]}"} ./build/bin/cexpress 2>"$SERVER_LOG" &
+    ${TIME_CMD[@]+"${TIME_CMD[@]}"} ./examples/todo_sqlite/cexpress_demo 2>"$SERVER_LOG" &
 SERVER_PID=$!
 
 # Under time(1), $SERVER_PID is time itself - the real server master is its child.
@@ -197,7 +197,7 @@ phase_enabled() {
 # /ping runs first: it never touches the table, so it cannot disturb the read numbers.
 # Reads run next, against the small 20-row seeded table, at every concurrency level -
 # this keeps read numbers comparable across tiers and well under TODO_LIST_MAX
-# (app/todo_types.h), so db_list_todos never truncates. Writes run last, in their own
+# (examples/todo_sqlite/todo_types.h), so db_list_todos never truncates. Writes run last, in their own
 # pass: each POST benchmark grows the table further, which would otherwise silently
 # make later read benchmarks measure against a bigger (eventually truncated) dataset
 # if the phases were interleaved.

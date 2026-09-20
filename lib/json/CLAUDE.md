@@ -11,7 +11,7 @@ uses it).
 
 `json_parse` is a single-pass recursive-descent parser over a `JsonParser` cursor
 (`pos`/`len` into the input, no separate tokenizing pass). It does no I/O; callers
-(`app/handlers.c`) are responsible for getting bytes into a NUL-terminated buffer
+(`examples/todo_sqlite/handlers.c`) are responsible for getting bytes into a NUL-terminated buffer
 first.
 
 ## Emitting JSON: `JsonWriter` (preferred)
@@ -34,7 +34,7 @@ NaN and infinity print `null`. The previous `%g` (6 significant digits) turned `
 ## Building a tree by hand (editing or forwarding parsed documents)
 `json_new_string`/`json_new_object`/`json_new_number`/`json_new_bool`/`json_new_array`/`json_object_set`/
 `json_array_append` (`json_value.c`) construct a `JsonValue` tree without `json_parse`: useful to modify or
-forward a parsed document. To emit JSON from application data use `JsonWriter` above (`app/handlers.c` does).
+forward a parsed document. To emit JSON from application data use `JsonWriter` above (`examples/todo_sqlite/handlers.c` does).
 `json_object_set` / `json_array_append` always consume the `value` they are given: attached on success,
 `json_free(value)` on failure (bad `object` / `array` / `key`, or allocation failure), so a caller never
 frees a value it has handed over and only checks the return code. `json_new_string` and `json_object_set`

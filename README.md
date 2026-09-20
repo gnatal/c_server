@@ -4,7 +4,7 @@ A lightweight, high-performance, single-threaded HTTP/1.1 server and web framewo
 
 > [!NOTE]
 > **Library Architecture:**
-> The code in `lib/` compiles to a reusable static library (`build/lib/libcexpress.a`). The code in `app/` is a reference implementation — a SQLite-backed Todo CRUD API — showing how to consume the library. See [`app/CLAUDE.md`](app/CLAUDE.md) for its architecture.
+> The code in `lib/` compiles to a reusable static library (`build/lib/libcexpress.a`). The code in `examples/todo_sqlite/` is a reference implementation — a SQLite-backed Todo CRUD API — showing how to consume the library. See [`examples/todo_sqlite/CLAUDE.md`](examples/todo_sqlite/CLAUDE.md) for its architecture.
 
 ---
 
@@ -89,7 +89,7 @@ The codebase is split into two distinct tiers:
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│        app/ (Demo App: SQLite-backed Todo CRUD)        │
+│        examples/todo_sqlite/ (Demo App: SQLite-backed Todo CRUD)        │
 │   - main.c (Configures routes, routers & boots server) │
 │   - handlers.c (Todo CRUD route handlers)              │
 │   - middlewares.c (Auth, logging, body size guards)    │
@@ -153,7 +153,7 @@ The codebase is split into two distinct tiers:
 - **Bounded 16KB File Streaming**: `res_send_file(res, content_type, filepath)` streams files in 16KB chunks directly through `flush_connection` with 64KB cooperative yielding per event-loop turn, never buffering whole files into RAM.
 
 ### 6. Static File Serving
-- **Mounted Route Serving**: `app_serve_static(app, "/static", "app/public")`.
+- **Mounted Route Serving**: `app_serve_static(app, "/static", "examples/todo_sqlite/public")`.
 - **Path-Traversal Protection**: Pure textual `..` segment rejection paired with realpath canonical containment checks against symlink escapes.
 - **Directory Index Fallback**: Automatically serves `index.html` for directory requests.
 - **Built-in MIME Registry**: Automatic Content-Type resolution for CSS, JS, HTML, PNG, JPEG, SVG, JSON, and binaries.
@@ -178,7 +178,7 @@ The codebase is split into two distinct tiers:
 - **Operating System**: macOS / BSD (native `kqueue`), Linux (native `epoll`), or Docker on any host.
 - **Compiler**: C11 compliant compiler (`gcc-16` on macOS; `gcc` on Linux). The `Makefile` picks one by OS; override with `make CC=<compiler>`.
 - **Build Tool**: GNU `make`.
-- **SQLite development headers**: required to build the demo app (`app/db.c`) — `sqlite-dev` on Alpine, `libsqlite3-dev` on Debian/Ubuntu, or `brew install sqlite` on macOS. The `Makefile` auto-detects a Homebrew keg, falls back to `pkg-config`, then a bare `-lsqlite3`.
+- **SQLite development headers**: required to build the demo app (`examples/todo_sqlite/db.c`) — `sqlite-dev` on Alpine, `libsqlite3-dev` on Debian/Ubuntu, or `brew install sqlite` on macOS. The `Makefile` auto-detects a Homebrew keg, falls back to `pkg-config`, then a bare `-lsqlite3`.
 - **OpenSSL development headers** (optional): enables HTTPS. Auto-detected; if absent, or with `make NO_TLS=1`, the server builds without TLS.
 - **Optional**: Docker (containerized run; its build also runs the whole test suite on Linux), and [`wrk`](https://github.com/wg/wrk) for load testing (`brew install wrk` / `apt install wrk`).
 
@@ -314,7 +314,7 @@ The server supports both runtime environment variables and programmatic configur
 ```bash
 PORT=3000 API_KEY=super-secret-token ./cexpress
 ```
-Environment variables are read by the demo app (`app/main.c`); the engine itself is configured in code (`app.config`,
+Environment variables are read by the demo app (`examples/todo_sqlite/main.c`); the engine itself is configured in code (`app.config`,
 `app_enable_tls`, ...).
 
 ### Engine Limits (`lib/app_types.h`)
@@ -334,8 +334,8 @@ Start the server:
 PORT=8080 ./cexpress
 ```
 
-The demo app (`app/`) is a SQLite-backed Todo CRUD API — see
-[`app/CLAUDE.md`](app/CLAUDE.md) for its architecture. Open
+The demo app (`examples/todo_sqlite/`) is a SQLite-backed Todo CRUD API — see
+[`examples/todo_sqlite/CLAUDE.md`](examples/todo_sqlite/CLAUDE.md) for its architecture. Open
 `http://localhost:8080/` in a browser for the built-in Todo UI, or drive the
 REST API directly:
 
@@ -350,7 +350,7 @@ The connection stress-test target: `PHASES=ping scripts/stress_test.sh` (keep-al
 ```bash
 curl -i http://localhost:8080/
 ```
-A single self-contained page (`app/public/index.html`) served via bounded
+A single self-contained page (`examples/todo_sqlite/public/index.html`) served via bounded
 file streaming (`res_send_file`) — list/add/toggle/delete todos, with an
 API-key field for the protected routes below.
 
@@ -440,7 +440,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │       ├── json.h        # Public JSON API
 │       ├── json_types.h  # AST enum and node structs
 │       └── json_*.c      # Parser, value accessors, and stringifier
-├── app/                  # Reference demo application: SQLite-backed Todo CRUD
+├── examples/todo_sqlite/                  # Reference demo application: SQLite-backed Todo CRUD
 │   ├── CLAUDE.md         # Application wiring, persistence layer & fork-safety notes
 │   ├── main.c            # Application entrypoint and route definitions
 │   ├── handlers.h/c      # Todo CRUD route handlers

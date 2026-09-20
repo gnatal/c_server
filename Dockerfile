@@ -10,7 +10,7 @@ WORKDIR /app
 COPY . .
 
 # Compile static library, application, and test binaries on native Linux
-RUN make clean && make && make test
+RUN make clean && make test && make demo
 
 # Minimal runtime image
 FROM alpine:3.20
@@ -20,10 +20,10 @@ RUN apk add --no-cache libssl3 libcrypto3 sqlite-libs
 WORKDIR /app
 
 # Copy compiled binary and static assets from builder
-COPY --from=builder /app/build/bin/cexpress /app/cexpress
-COPY --from=builder /app/app/public /app/app/public
+COPY --from=builder /app/examples/todo_sqlite/cexpress_demo /app/cexpress_demo
+COPY --from=builder /app/examples/todo_sqlite/public /app/public
 
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["/app/cexpress"]
+CMD ["/app/cexpress_demo"]

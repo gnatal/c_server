@@ -2,10 +2,14 @@
 #include "handlers.h"
 #include "middlewares.h"
 #include "db.h"
-#include "ping.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static void handler_ping(const Request *req, Response *res) {
+    (void)req;
+    res_send(res, "pong");
+}
 
 int main(void) {
   App app;
@@ -52,7 +56,7 @@ int main(void) {
    * app_on_worker_start registers db_worker_init to open this app's actual,
    * per-process connection later, always after any cluster fork has
    * happened. See lib/CLAUDE.md ("Behavior reference, Workers and fork") and
-   * app/CLAUDE.md for why this two-step dance is necessary. */
+   * examples/todo_sqlite/CLAUDE.md for why this two-step dance is necessary. */
   const char *db_path_env = getenv("TODO_DB_PATH");
   const char *db_path = (db_path_env != NULL && db_path_env[0] != '\0') ? db_path_env : "todos.db";
   if (db_open(db_path) != 0) {
@@ -77,9 +81,9 @@ int main(void) {
   app_get(&app, "/ping", handler_ping);
 
   /* Generic static-file-serving demo (lib/router.h: app_serve_static),
-   * unrelated to the Todo UI above - serves whatever's in app/public/
+   * unrelated to the Todo UI above - serves whatever's in public/
    * (e.g. GET /static/style.css). */
-  app_serve_static(&app, "/static", "app/public");
+  app_serve_static(&app, "/static", "public");
 
   /* Todo REST API, mounted under /api/todos via a Router (app_mount) - the
    * C analogue of Express's app.use('/api/todos', router). Reads (GET) are

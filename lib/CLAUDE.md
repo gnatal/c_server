@@ -1,7 +1,7 @@
 # lib/ — CExpress engine
 
 Read order for a new task: this file → `API.md` (every public function) → `examples/cookbook.c`
-(tested recipes) → the header of the module you touch. `app/` is a full worked application.
+(tested recipes) → the header of the module you touch. `examples/todo_sqlite/` is a full worked application.
 
 ## Model
 A process runs one single-threaded, non-blocking event loop (kqueue on macOS/BSD, epoll on Linux).
@@ -98,7 +98,7 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   SIGTERM, waits 6 s, then SIGKILLs.
 - **Workers and fork.** Never open a database or socket in `main()` before `app_listen`; register `app_on_worker_start`
   and open there (runs once per serving process, after fork). `SIGPIPE` is ignored per process in `app_listen_worker`.
-- **TLS.** `app_enable_tls` (or `TLS_CERT` / `TLS_KEY` in `app/main.c`). TLS 1.2+, non-blocking handshake driven by the loop,
+- **TLS.** `app_enable_tls` (or `TLS_CERT` / `TLS_KEY` in `examples/todo_sqlite/main.c`). TLS 1.2+, non-blocking handshake driven by the loop,
   `SSL_pending` checked so pipelined bytes buffered inside OpenSSL are not stranded. `make NO_TLS=1` removes the dependency.
 - **Event loop.** `Connection.events_watched` mirrors what the kernel has registered on both backends; `watch_*` / `unwatch_*`
   skip the syscall when the state already matches (a keep-alive response costs no extra `kevent` / `epoll_ctl`).

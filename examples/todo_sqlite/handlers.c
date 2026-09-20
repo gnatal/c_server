@@ -76,7 +76,7 @@ static void send_todo_json(Response *res, int status, const Todo *todo) {
 
 void handler_home(const Request *req, Response *res) {
     (void)req;
-    if (res_send_file(res, "text/html", "app/public/index.html") != 0) {
+    if (res_send_file(res, "text/html", "public/index.html") != 0) {
         res_status(res, 404);
         res_send(res, "Not Found");
     }
