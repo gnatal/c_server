@@ -12,9 +12,9 @@
 #define TODO_TIMESTAMP_MAX 32
 
 /* Bounds TodoList.items (below) - the max number of rows db_list_todos
- * (app/db.h) returns in one call. Extra rows past this cap are not
- * returned (see app/CLAUDE.md), same truncate convention as
- * MAX_MULTIPART_PARTS/MAX_ROUTES elsewhere in this project. */
+ * (db.h) returns in one call. Extra rows past this cap are not
+ * returned (see CLAUDE.md in this directory), same truncate convention as
+ * MAX_MULTIPART_PARTS/MAX_ROUTER_ROUTES elsewhere in this project. */
 #define TODO_LIST_MAX 256
 
 typedef struct {

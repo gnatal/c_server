@@ -2,7 +2,7 @@
  * `make bench`: CPU cost per request of the pure path parse -> route -> dispatch -> response
  * build, and of emitting a 20-row JSON list, with no sockets. Not a test: prints numbers.
  * Compare before/after when touching lib/http_parser.c, router.c, middleware.c, response.c or
- * lib/json. Numbers are single-core and machine-dependent; only ratios are meaningful.
+ * lib/arena.c. Numbers are single-core and machine-dependent; only ratios are meaningful.
  */
 #include <stdio.h>
 #include <stdlib.h>

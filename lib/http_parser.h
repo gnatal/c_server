@@ -16,14 +16,16 @@
  *               oversized Content-Length, chunked + Content-Length together, bad chunk framing)
  *           -2  request-target path >= sizeof(req->path) (256)  -> caller sends 414
  *   On -1, req->content_length == -2 means "body too large"      -> caller sends 413.
- *   Ownership: on success req->body is malloc'd (content_length + 1, NUL-terminated,
- *   never NULL, may hold NUL bytes: use content_length, not strlen). The CALLER free()s it
- *   on every path; it is NULL after any failure, so free(req.body) is always safe.
- *   Only the fields behind *_count are initialized; read arrays through the accessors.
+ *   Ownership: on success req->body is allocated from `arena` (content_length + 1 bytes, NUL-terminated,
+ *   never NULL, may hold NUL bytes: use content_length, not strlen). Nobody free()s it: it is reclaimed
+ *   when the arena is reset (the engine passes Connection.arena; tests pass their own Arena). It is NULL
+ *   after any failure. Only the fields behind *_count are initialized; read arrays through the accessors.
  *   Decoding: req->path is percent-decoded; req->query stays raw; query names/values are
  *   percent- and '+'-decoded; header and cookie values are not decoded.
- *   Limits (excess is dropped or truncated, never overflowed): method 7 chars (longer -> -1),
- *   query 255, MAX_QUERY_PARAMS, MAX_HEADERS (name 63, value 255), MAX_COOKIES.
+ *   Limits (never overflowed): method 7 chars (longer -> -1); more than MAX_HEADERS headers -> -1 (the
+ *   request is rejected, not truncated); header name 63 / value 255 chars, query 255, MAX_QUERY_PARAMS and
+ *   MAX_COOKIES are silently truncated or dropped. The request line and header block are parsed by the
+ *   vendored picohttpparser (HTTP/1.x only; bare '\n' line endings are accepted).
  */
 int parse_http_request(const char *raw, size_t raw_len, Request *req, Arena *arena);
 
@@ -41,6 +43,8 @@ int request_framing(const char *buf, size_t len, size_t *header_len_out, int *ch
  * request_is_complete: 1 when buf[0..len) holds a full request (headers + framed body), or
  * when framing is invalid/oversized (stop buffering, parse_http_request reports it).
  * 0 means "read more bytes". Called after every recv().
+ * Known gap: a request line or header block that picohttpparser rejects (no HTTP version, "HTTP/2.0", garbage)
+ * also returns 0, so the connection waits for more bytes instead of getting a 400 (lib/CLAUDE.md, "Known gaps").
  */
 int request_is_complete(const char *buf, size_t len);
 

@@ -14,8 +14,11 @@
  *                     segment and captures nothing
  *   trailing '*'      as the LAST segment (files, then '*') matches one or more remaining segments;
  *                     the bare prefix ("/files") does not match
- * First registered match wins. HEAD falls back to the GET route for the same path unless an explicit
- * HEAD route exists. OPTIONS on a known path answers 200 + Allow without an explicit route.
+ * Matching walks a per-method tree of path segments: a literal segment beats ':name', which beats '*',
+ * whatever the registration order ("/users/me" wins over "/users/:id"). A second registration of the same pattern
+ * is ignored with a warning. Use the same ':name' at the same position in every route: the capture is stored under
+ * the name of the first route registered there (lib/CLAUDE.md, "Known gaps"). HEAD falls back to the GET route for
+ * the same path unless an explicit HEAD route exists. OPTIONS on a known path answers 200 + Allow without an explicit route.
  * Limits: dynamically allocated routes per App, MAX_ROUTER_ROUTES (64) per Router, MAX_ROUTE_MIDDLEWARES (8) per route; excess is dropped with
  * a stderr warning, not overflowed. Strings are copied, the caller's buffers need not outlive the call.
  */

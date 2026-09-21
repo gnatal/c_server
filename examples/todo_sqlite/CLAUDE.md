@@ -18,16 +18,23 @@ echoing input back. It deliberately does not exercise every `lib/` feature
 (cookies, multipart, chunked streaming, route wildcards) — that coverage
 lives in `tests/` and `lib/CLAUDE.md`, not in this app.
 
+**Working directory matters.** The demo opens `public/index.html`, mounts `public/` and defaults the database to
+`todos.db`, all relative to the process's working directory. Build it from the repository root with `make demo`
+(output: `examples/todo_sqlite/cexpress_demo`, linking `build/lib/libcexpress.a`; the demo Makefile does not track
+the library, so rebuild with `make -B -C examples/todo_sqlite` after engine changes) and start it from
+`examples/todo_sqlite/` (the Docker image uses `WORKDIR /app` with `public/` copied next to the binary). Started from
+anywhere else, `GET /` answers 404 and `app_serve_static` logs `root directory "public" does not exist, not registered`.
+
 Routes (`main.c`):
-- `GET /` → `handler_home` — serves the Todo UI (`examples/todo_sqlite/public/index.html`,
-  a single self-contained file) via `res_send_file` (bounded chunk
+- `GET /` → `handler_home` — serves the Todo UI (`public/index.html`,
+  a single self-contained file, 6,481 bytes) via `res_send_file` (bounded chunk
   streaming, `lib/response.h`).
-- `GET /ping` → `handler_ping` (`ping.c/h`) — answers `200 pong` (text/plain) with no
+- `GET /ping` → `handler_ping` (defined inline in `main.c`) — answers `200 pong` (text/plain) with no
   database access and no JSON: the target for connection stress tests
-  (`PHASES=ping scripts/stress_test.sh`, `scripts/CLAUDE.md`). It lives in its own file so
-  `tests/test_ping.c` links it without SQLite. Like every route it runs the app-wide
+  (`PHASES=ping scripts/stress_test.sh`, `scripts/CLAUDE.md`). `tests/test_ping.c` carries its own copy of the
+  same three-line handler, so it does not link any demo code. Like every route it runs the app-wide
   middleware (`mw_logger` unless `QUIET=1`, `mw_body_size_guard`).
-- `app_serve_static(&app, "/static", "examples/todo_sqlite/public")` — a generic
+- `app_serve_static(&app, "/static", "public")` — a generic
   static-file-serving demo (`lib/CLAUDE.md`, "Behavior reference, Static"),
   unrelated to the Todo UI above, which needs no separate assets.
 - The Todo REST API is built on a `Router` (`todo_router`) and mounted at
@@ -122,16 +129,18 @@ generic worker-lifecycle hook this module consumes (below).
   ordinary read traffic into ~345,000 stderr writes in 15 seconds).
 
 ## Handlers (`handlers.c`)
-- **`write_todo(JsonWriter *, const Todo *)`** emits the JSON every todo-returning
-  handler shares (`{"id", "title", "done", "created_at", "updated_at"}`) straight
-  into a `JsonWriter` (`lib/json/json.h`): no intermediate tree, no per-field
-  allocation. `id` is a JSON number (`jw_int`, exact for any 64-bit id), `done`
-  a boolean, the rest strings (escaped by the writer, so a title containing `"`
-  or a newline round-trips). `send_todo_json` and `handler_list_todos` wrap it
-  and answer 500 if `jw_ok` is false. This replaced the tree builders
-  (`json_new_*` + `json_stringify`), which made `GET /api/todos` spend about
-  15 µs per 20 rows in JSON alone and, via `%g` number formatting, printed ids
-  above 999,999 as `1.23457e+06`.
+- **`write_todo(yyjson_mut_doc *, const Todo *)`** builds the JSON object every todo-returning
+  handler shares (`{"id", "title", "done", "created_at", "updated_at"}`) in a yyjson
+  mutable document (`lib/vendor/yyjson`, included by `cexpress.h`). `id` is a JSON integer
+  (`yyjson_mut_obj_add_int`, exact for any 64-bit id), `done` a boolean, the rest strings
+  (escaped on write, so a title containing `"` or a newline round-trips). The string values are
+  borrowed from the stack `Todo`, not copied, which is safe because the document is serialized before
+  the handler returns. `send_todo_json` and `handler_list_todos` create the document over the
+  connection arena (`arena_yyjson_alc(&res->conn->arena)`), serialize with `yyjson_mut_write`, hand the
+  text to `res_json`, `free` it (the serialized string is libc-malloc'd even for an arena document)
+  and call `yyjson_mut_doc_free` (a no-op for an arena document). A `NULL` result answers 500.
+  History: the first version used `json_new_*` + `json_stringify` (a `%g` bug printed ids
+  above 999,999 as `1.23457e+06`), then an in-repo streaming `JsonWriter`; both are gone.
 - **`parse_id_param(req, &id)`** parses the `:id` path param
   (`req_get_param`) as a bounded, non-negative `long long` via `strtoll`,
   rejecting anything malformed (trailing garbage, negative, empty,
@@ -154,8 +163,8 @@ generic worker-lifecycle hook this module consumes (below).
   matching the previous demo's `handler_delete_user` convention.
 - **Error shape**: every handler-level failure responds via a shared
   `send_error(res, status, message)` helper that writes `{"error": "..."}`
-  with a `JsonWriter` (same shape `error_handler_json`, `middlewares.c`,
-  produces for middleware-level failures; both escape the message) — handlers have no `MiddlewareChain *` (they
+  with yyjson over the connection arena (same shape `error_handler_json`, `middlewares.c`,
+  produces for middleware-level failures, there with a `NULL`-allocator yyjson document; both escape the message) — handlers have no `MiddlewareChain *` (they
   are the terminal node of the pipeline, `lib/CLAUDE.md`, "Behavior reference, Middleware"), so they can't call `chain_error` and build the response
   directly instead, same as the previous demo's `handler_update_user`/
   `handler_patch_user`.
@@ -177,6 +186,8 @@ static-file demo, still reachable via the generic `/static` mount above.
   (bounded between 1 and 65535) with fallback to `DEFAULT_PORT` (8080), stored in `app.config.port`.
 - API authentication secret is configured via `API_KEY` environment variable in `main.c`
   or dynamically via `mw_authenticate_set_key`.
+- `WORKERS` (`N`, or `auto` = one per CPU core), `QUIET=1` (no access log) and `TLS_CERT` + `TLS_KEY` (both required to
+  serve HTTPS) are read in `main.c` too.
 - SQLite database path is configured via `TODO_DB_PATH` (default `"todos.db"`,
   relative to the server's working directory) — see "Persistence layer" above
   for why it's read once in `main.c` and handed to `db_open`/stashed for
@@ -191,10 +202,13 @@ state of their own across requests and don't touch sockets or the database
 connection directly — persistence goes through `examples/todo_sqlite/db.c`'s functions,
 socket I/O happens in `lib/connection.c`, both outside this layer.
 
-Every handler that builds a JSON response owns a stack `JsonWriter` for the
-duration of the call and releases it with `jw_free` on every path (the response
-layer copies the bytes, so freeing right after `res_json` is safe). A parsed
-request body (`json_parse`) is a separate tree freed with `json_free` after the
-response is built, because strings read from it point into the tree; see
-`lib/json/CLAUDE.md` for the JSON library's own memory rules and
+Every handler that builds a JSON response creates a yyjson mutable document over the connection arena,
+serializes it once with `yyjson_mut_write`, and `free`s that string on every path (the response layer copies
+the bytes, so freeing right after `res_json` is safe). A request body is parsed with `yyjson_read_opts` over the same
+arena; strings read from it (`yyjson_get_str`) point into that document, so they are passed to the
+database layer before `yyjson_doc_free` (a no-op for an arena document, but the ordering keeps the code valid for a
+`NULL`-allocator document too). The arena is reset when the keep-alive response has been flushed, so nothing
+allocated from it may be kept in a module-level variable. The handlers parse the body with `strlen(req->body)` rather than
+`req->content_length`, so a body containing a NUL byte is cut short there (invalid JSON either way);
+see `lib/CLAUDE.md` ("Memory model", "Ownership") for the arena rules and
 `lib/examples/cookbook.c` for the same patterns as small tested recipes.

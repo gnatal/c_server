@@ -78,8 +78,9 @@ typedef struct {
 
     int content_length;      /* body size in bytes (decoded size for chunked); -2 after a failed parse = too large */
 
-    /* malloc'd by parse_http_request (never NULL after success, NUL-terminated, may contain NUL bytes:
-     * use content_length, not strlen). Freed by the engine after dispatch; handlers must not free it. */
+    /* Allocated by parse_http_request from the connection arena (never NULL after success, NUL-terminated,
+     * may contain NUL bytes: use content_length, not strlen). Reclaimed with the arena after the response is
+     * flushed; nobody frees it, and handlers must not keep it past their return. */
     char *body;
 } Request;
 
@@ -127,9 +128,10 @@ typedef struct Connection {
     size_t in_cap;
     size_t in_len;
 
-    /* Output: one malloc'd response built by res_send / res_json / res_write, freed by flush_connection (keep-alive
-     * done) or connection_close. out_buf != NULL means a response is pending. For responses built by
-     * the response layer, out_buf[out_len] == '\0' (not sent). */
+    /* Output: one response built by res_send / res_json / res_write into memory from `arena` (not malloc'd
+     * and never freed individually: flush_connection drops the pointer and resets the arena when a keep-alive
+     * response is done, connection_close destroys the arena). out_buf != NULL means a response is pending. For responses
+     * built by the response layer, out_buf[out_len] == '\0' (not sent). */
     char *out_buf;
     size_t out_len;
     size_t out_sent;
@@ -146,7 +148,8 @@ typedef struct Connection {
     int tls_want_read;
     int tls_want_write;
 
-    Arena arena;            /* Per-connection arena allocator (64KB default) */
+    Arena arena;            /* Per-request bump allocator: a 64 KiB buffer allocated in the same calloc as this struct
+                             * (connection_create), plus malloc'd fallback blocks. Reset after each keep-alive response. */
 } Connection;
 
 typedef enum {
@@ -314,7 +317,8 @@ typedef struct {
     char tls_key_file[PATH_MAX];
 } ServerConfig;
 
-/* The whole server. ~48 KB: declare it static or on main's stack. Create with app_init, end with app_destroy. */
+/* The whole server. About 4.6 KB on macOS (PATH_MAX 1024) and more on Linux (two PATH_MAX TLS paths), routes live on the heap:
+ * a local or static App is fine. A Router is much larger (64 routes, about 88 KB on macOS): make it static if it is big. Create with app_init, end with app_destroy. */
 typedef struct {
     ServerConfig config;
     MethodTree method_trees[16];
@@ -325,7 +329,7 @@ typedef struct {
     int server_fd;
     union {
         int kq;          /* macOS/BSD */
-        int epoll_fd;    /* Linux (legacy/fallback) */
+        int epoll_fd;    /* Linux epoll backend (-DCEXPRESS_USE_EPOLL) */
         void *ring;      /* Linux io_uring (struct io_uring*) */
         int loop_fd;     /* platform-neutral int name */
     };

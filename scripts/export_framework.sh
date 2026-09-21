@@ -3,7 +3,7 @@ set -euo pipefail
 
 # -----------------------------------------------------------------------------
 # CExpress Framework Exporter
-# Exports ONLY the CExpress engine (lib/) without any demo app/ or SQLite code.
+# Exports ONLY the CExpress engine (lib/) without the demo app (examples/todo_sqlite/) or SQLite code.
 # -----------------------------------------------------------------------------
 
 if [ "$#" -lt 1 ]; then
@@ -27,10 +27,17 @@ cat << 'MAKEFILE_EOF' > "${DEST_DIR}/Makefile"
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Linux)
-    CC ?= gcc
+    # Linux uses io_uring (liburing) for readiness polling: link -luring when you link libcexpress.a.
+    ifeq ($(origin CC),default)
+        CC = gcc
+    endif
     PLATFORM_CFLAGS = -D_GNU_SOURCE
-    EVENT_LOOP_SRC = lib/event_loop_epoll.c
-    OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null)
+    EVENT_LOOP_SRC = lib/event_loop_io_uring.c
+    ifeq ($(shell pkg-config --exists openssl 2>/dev/null && echo yes),yes)
+        OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl) -DCEXPRESS_HAS_TLS=1
+    else
+        OPENSSL_CFLAGS = -DCEXPRESS_HAS_TLS=0
+    endif
 else
     ifneq ($(shell which gcc-16 2>/dev/null),)
         CC = gcc-16
@@ -58,7 +65,8 @@ LIB_DIR   = $(BUILD_DIR)/lib
 
 LIB_SRCS = lib/connection.c $(EVENT_LOOP_SRC) lib/cluster.c lib/tls.c lib/http_parser.c \
            lib/router.c lib/response.c lib/middleware.c lib/multipart.c lib/urlencoded.c \
-           lib/static.c lib/json/json_parser.c lib/json/json_value.c lib/json/json_writer.c
+           lib/static.c lib/arena.c \
+           lib/vendor/yyjson/yyjson.c lib/vendor/picohttpparser/picohttpparser.c
 LIB_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(LIB_SRCS))
 LIB      = $(LIB_DIR)/libcexpress.a
 
@@ -91,7 +99,8 @@ This directory contains the standalone CExpress engine without any application c
 - `lib/cexpress.h`: Primary header to include.
 - `lib/API.md`: Public API function reference.
 - `lib/examples/cookbook.c`: Reference recipes for common HTTP patterns.
-- `build/lib/libcexpress.a`: Compiled engine archive built via `make`.
+- `lib/vendor/`: vendored yyjson (JSON) and picohttpparser (HTTP parsing); nothing else to install.
+- `build/lib/libcexpress.a`: Compiled engine archive built via `make`. Link it with `-lssl -lcrypto` (when built with TLS) and, on Linux, `-luring`.
 README_EOF
 
 echo "==> CExpress framework successfully exported to ${DEST_DIR}"

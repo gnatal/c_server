@@ -9,7 +9,7 @@
 #include "vendor/yyjson/yyjson.h"
 #include "db.h"
 
-/* Sends {"error": message} with `status`. JsonWriter escapes the message. */
+/* Sends {"error": message} with `status`. yyjson escapes the message. */
 static void send_error(Response *res, int status, const char *message) {
     yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
     yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
@@ -55,7 +55,7 @@ static int parse_id_param(const Request *req, long long *out) {
     return 0;
 }
 
-/* Writes one todo as a JSON object into `w` (no allocation beyond the writer's own buffer). */
+/* Builds one todo as a JSON object in `doc`. String values are borrowed from `todo`, so `todo` must outlive the write. */
 static yyjson_mut_val *write_todo(yyjson_mut_doc *doc, const Todo *todo) {
     yyjson_mut_val *obj = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_int(doc, obj, "id", todo->id);

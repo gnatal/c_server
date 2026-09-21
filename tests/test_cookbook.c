@@ -93,7 +93,7 @@ static void test_json_body_recipe(App *app) {
     expect(app,
            "POST /notes HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{\"title\":\"buy milk\"}",
            "HTTP/1.1 201 Created", "{\"id\":1,\"title\":\"buy milk\"}");
-    /* The title is escaped by JsonWriter, not pasted into the output. */
+    /* The title is escaped by yyjson, not pasted into the output. */
     expect(app,
            "POST /notes HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 16\r\n\r\n{\"title\":\"a\\\"b\"}",
            "HTTP/1.1 201 Created", "{\"id\":1,\"title\":\"a\\\"b\"}");

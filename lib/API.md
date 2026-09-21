@@ -2,16 +2,18 @@
 
 One line per function, grouped by task. Semantics, limits and ownership are in the header comments
 (`lib/*.h`); worked, tested examples are in `lib/examples/cookbook.c`. Include everything with
-`#include "cexpress.h"`. `make check-docs` fails if this file and the headers disagree.
+`#include "cexpress.h"` (it also pulls in the vendored yyjson header). `make check-docs` fails if this file and the
+`lib/*.h` headers disagree; the yyjson subset listed below is only checked for names that do not exist.
 
 Conventions: functions return `0`/`-1` (or a count) unless noted; `NULL` from an accessor means
 "absent"; strings you pass in are copied; pointers you get back belong to the object they came from
-(see "Ownership" in `lib/CLAUDE.md`).
+and, for anything on a `Request` or `Response`, die when the handler returns (see "Memory model" and
+"Ownership" in `lib/CLAUDE.md`).
 
 ## Start a server (`connection.h`, `router.h`)
-- `app_init(App *)` — reset an App and allocate its connection table. `App` is ~48 KB: use `static` or main's stack.
+- `app_init(App *)` — reset an App and allocate its connection table. `App` is small (about 4.6 KB on macOS; routes are heap-allocated); a `Router` is about 88 KB on macOS (64 route slots), so prefer `static` for it.
 - `app_listen(App *, int port)` — run until SIGINT/SIGTERM (cluster if `config.workers` != 1).
-- `app_destroy(App *)` — free everything `app_init` allocated; call after `app_listen` returns.
+- `app_destroy(App *)` — free everything `app_init` and route registration allocated; call after `app_listen` returns.
 - `app_on_worker_start(App *, WorkerInitHook)` — run a hook once per serving process, after fork (open DB handles here).
 - `app_enable_tls(App *, cert_pem, key_pem)` — enable HTTPS; `0` ok, `-1` bad args.
 - `app_listen_worker(App *, int port)`, `app_listen_cluster(App *, int port, int workers)`, `app_stop(App *)`, `app_count_connections(const App *)` — lower-level lifecycle.
@@ -25,8 +27,10 @@ Conventions: functions return `0`/`-1` (or a count) unless noted; `NULL` from an
 - `router_get_mw` / `router_post_mw` / `router_put_mw` / `router_patch_mw` / `router_delete_mw` / `router_head_mw` / `router_options_mw` `(Router *, path, Handler, const Middleware *, int count)` — same with per-route middleware.
 - `router_add_route(Router *, method, path, Handler)`, `router_add_route_mw(...)` — generic forms.
 - `app_mount(App *, prefix, const Router *)` — copy a router's routes and middleware into the app under a prefix.
-- `app_serve_static(App *, prefix, root_dir)` — serve files from a directory (traversal-safe).
+- `app_serve_static(App *, prefix, root_dir)` — serve files from a directory (traversal-safe; the root is resolved against the working directory).
 - `match_route(const App *, Request *)`, `match_path(pattern, path, Request *)`, `match_route_allowed_methods(...)` — matching (engine/tests).
+- `app_free_routes(App *)` — free the route trees (engine: `app_destroy` calls it).
+- Path rules that surprise: a literal segment beats `:name` beats `*` regardless of registration order; use the same `:name` at the same position in every route (`lib/CLAUDE.md`, "Known gaps").
 
 ## Middleware (`middleware.h`)
 - `app_use(App *, Middleware)`, `app_use_prefix(App *, prefix, Middleware)` — app-wide middleware, optionally path-scoped.
@@ -39,44 +43,44 @@ Conventions: functions return `0`/`-1` (or a count) unless noted; `NULL` from an
 - `req_get_query(req, name)` — query value, decoded, case-sensitive name.
 - `req_get_header(req, name)` — header value, case-insensitive name.
 - `req_get_cookie(req, name)` — cookie value, case-sensitive name.
-- Also on `Request`: `method`, `path`, `version`, `query` (raw), `body` (NUL-terminated; binary-safe with `content_length`), `content_length`.
+- Also on `Request`: `method`, `path`, `version`, `query` (raw), `body` (NUL-terminated; binary-safe with `content_length`; lives in the connection arena, never free it), `content_length`.
 - `url_decode(src, dst, dst_size, decode_plus)` — percent-decode a string.
 
 ## Build the response (`response.h`)
 - `res_status(res, code)`, `res_set_header(res, name, value)` — before sending.
-- `res_send(res, text)`, `res_json(res, json_text)`, `res_send_bytes(res, type, data, len)` — send a whole body.
+- `res_send(res, text)`, `res_json(res, json_text)`, `res_send_bytes(res, type, data, len)` — send a whole body (copied).
 - `res_redirect(res, status, location)` — 3xx + Location (status 0 = 302).
 - `res_set_cookie(res, name, value, const CookieOptions *)`, `res_clear_cookie(res, name, path)` — cookies.
 - `res_write(res, data, len)`, `res_end(res)`, `res_set_trailer(res, name, value)` — chunked streaming.
 - `res_send_file(res, content_type, path)` — stream a file; `0` ok, `-1` nothing sent.
 - `res_init(res, conn)` — engine/tests: prepare a Response.
 
-## JSON output (`json/json.h`) — prefer JsonWriter
-- `jw_init(JsonWriter *)`, `jw_free(JsonWriter *)` — lifecycle; always `jw_free`.
-- `jw_object_begin` / `jw_object_end` / `jw_array_begin` / `jw_array_end` — containers.
-- `jw_key(w, key)` — object member name; every object value needs one first.
-- `jw_string(w, text)` (NULL → null), `jw_int(w, long long)`, `jw_double(w, double)`, `jw_bool(w, int)`, `jw_null(w)` — values.
-- `jw_ok(w)`, `jw_data(w)`, `jw_len(w)` — result; `jw_data` is NULL unless the document is complete and valid.
+## Per-request memory (`arena.h`)
+- `arena_yyjson_alc(Arena *)` — a `yyjson_alc` that allocates from an arena; use `&res->conn->arena`. Documents built or read with it need no free; the arena is reclaimed after the response is written.
+- `arena_alloc(Arena *, size)` — bump-allocate 8-byte-aligned bytes, valid until the request ends (falls back to `malloc` when the 64 KiB buffer is full; `NULL` only on OOM). Handlers may use it for scratch data.
+- `arena_init(Arena *, buf, cap)`, `arena_reset(Arena *)`, `arena_destroy(Arena *)` — engine/tests: lifecycle. Tests give a fake `Connection` a static buffer with `arena_init`.
 
-## JSON input and trees (`json/json.h`)
-- `json_parse(text, err, err_size)` → `JsonValue *` or NULL; `json_free(root)`.
-- `json_object_get(obj, key)`, `json_array_get(arr, i)`, `json_array_count(arr)`, `json_is_null(v)` — navigate (NULL-safe).
-- `json_as_string(v, default)`, `json_as_number(v, default)`, `json_as_bool(v, default)` — typed reads; strings point into the tree.
-- `json_stringify(v)` → malloc'd string that the caller frees with the C library `free`.
-- `json_new_string` / `json_new_number` / `json_new_bool` / `json_new_object` / `json_new_array`, `json_object_set(obj, key, value)`, `json_array_append(arr, value)` — tree builders; the last two take ownership of `value` even on failure.
+## JSON (yyjson 0.13, `vendor/yyjson/yyjson.h`) — the subset this repo uses
+Full reference: <https://ibireme.github.io/yyjson/doc/doxygen/html/>. Pattern: build with a document that uses the arena,
+serialize once, `free` the string.
+- Write: `yyjson_mut_doc_new(&alc)` (`alc` from `arena_yyjson_alc`), `yyjson_mut_obj(doc)`, `yyjson_mut_arr(doc)`, `yyjson_mut_doc_set_root(doc, root)`.
+- Add members: `yyjson_mut_obj_add_str(doc, obj, key, value)`, `yyjson_mut_obj_add_int(doc, obj, key, value)`, `yyjson_mut_obj_add_bool(doc, obj, key, value)`, `yyjson_mut_arr_append(arr, val)`. Keys and string values are borrowed, not copied: they must outlive the write (the `yyjson_mut_obj_add_strcpy` family copies).
+- Serialize: `yyjson_mut_write(doc, 0, &len)` → NUL-terminated string from **libc malloc**, always freed by the caller with `free`, even when the doc uses the arena. `NULL` on failure. Then `yyjson_mut_doc_free(doc)` (a no-op for an arena doc, required for a `NULL`-allocator doc).
+- Read: `yyjson_read_opts(body, len, 0, &alc, NULL)` → `yyjson_doc *` or `NULL` (flags `0` copies the input, so `req->body` is untouched). `yyjson_doc_get_root(doc)`, then `yyjson_obj_get(obj, key)`, `yyjson_arr_size(arr)`, `yyjson_arr_get(arr, i)`, `yyjson_get_str(v)`, `yyjson_get_sint(v)`, `yyjson_get_bool(v)`. Getters return `NULL` / `0` on a missing or wrong-typed value. Strings point into the doc and die with the arena (or `yyjson_doc_free` for a `NULL`-allocator doc).
+- Finish with `yyjson_doc_free(doc)` for reads.
 
 ## Forms and uploads (`urlencoded.h`, `multipart.h`)
 - `parse_urlencoded_body(body, len, UrlEncodedForm *)`, `urlencoded_get_field(form, name)`.
 - `multipart_parse_boundary(content_type, out, out_size)` → 1/0, `parse_multipart_body(body, len, boundary, MultipartForm *)` → part count or -1, `multipart_get_part(form, name)`.
 
 ## Parser internals (`http_parser.h`) — engine and tests
-- `parse_http_request(raw, raw_len, Request *)`, `request_is_complete(buf, len)`, `request_framing(buf, len, &header_len, &chunked)`, `request_wants_close(req)`.
+- `parse_http_request(raw, raw_len, Request *, Arena *)`, `request_is_complete(buf, len)`, `request_framing(buf, len, &header_len, &chunked)`, `request_wants_close(req)`.
 - `extract_content_length(block)`, `request_has_chunked_encoding(block)`, `chunked_body_scan(...)`, `chunked_body_decode(...)`.
 - `parse_query_string(query, req)`, `parse_headers(block, req)`, `parse_cookies(value, req)`, `status_text(code)`.
 
 ## Engine internals — do not call from app code
 - Connections (`connection.h`): `set_nonblocking`, `create_server_socket`, `connection_create`, `connection_close`, `accept_connections`, `handle_readable`, `flush_connection`, `close_idle_connections`.
-- Event loop (`event_loop.h`, kqueue or epoll): `event_loop_init`, `event_loop_close`, `event_loop_watch_read`, `event_loop_unwatch_read`, `event_loop_watch_write`, `event_loop_unwatch_write`, `event_loop_unwatch_all`, `event_loop_arm_shutdown_timer`, `event_loop_poll`.
+- Event loop (`event_loop.h`; kqueue on macOS/BSD, io_uring on Linux, epoll behind `CEXPRESS_USE_EPOLL`): `event_loop_init`, `event_loop_close`, `event_loop_watch_read`, `event_loop_unwatch_read`, `event_loop_watch_write`, `event_loop_unwatch_write`, `event_loop_unwatch_all`, `event_loop_arm_shutdown_timer`, `event_loop_poll`.
 - Cluster (`cluster.h`): `cluster_listen`, `cluster_resolve_worker_count`, `cluster_is_worker`, `cluster_worker_id`.
 - TLS (`tls.h`): `tls_is_available`, `tls_init_app`, `tls_cleanup_app`, `tls_connection_init`, `tls_connection_handshake`, `tls_connection_read`, `tls_connection_write`, `tls_connection_close`, `tls_has_pending`.
 - Static files (`static.h`): `static_serve_file`, `static_resolve_relative_path`, `static_mime_type`.

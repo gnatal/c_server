@@ -10,19 +10,24 @@
  *
  * DON'T (each of these is a real bug pattern, see lib/CLAUDE.md "Ownership"):
  *  1. free() or keep anything reached through `req`: it dies when the handler returns. That covers
- *     req->body and every pointer from req_get_param / req_get_query / req_get_header / req_get_cookie.
+ *     req->body (it lives in the connection arena) and every pointer from req_get_param / req_get_query /
+ *     req_get_header / req_get_cookie.
  *  2. strlen(req->body) for binary bodies: use req->content_length (bodies may hold NUL bytes).
- *  3. json_free() a parsed tree before you have finished using strings borrowed from it
- *     (json_as_string returns a pointer INTO the tree).
- *  4. use jw_data() after jw_free(); or forget jw_free() on the error path.
+ *  3. keep a string borrowed from a parsed yyjson document (yyjson_get_str) or anything from arena_alloc past the
+ *     request: it lives in the connection arena, which is reset when the response has been written. Copy what you
+ *     need to keep.
+ *  4. forget free() on the string that yyjson_mut_write returns, or use it after free(): it is allocated by libc
+ *     even when the document itself uses the arena. (The document needs no free with the arena allocator.)
  *  5. call chain_next() from a handler, or in a middleware call it more than once or after responding.
  *  6. open a database/socket in main() and then fork workers: open it in an app_on_worker_start hook.
- *  7. build JSON with snprintf("%s"): the text is not escaped. Use JsonWriter.
+ *  7. build JSON with snprintf("%s"): the text is not escaped. Use yyjson.
+ *  8. register two routes that name the same path position differently ("/orders/:id/items" and "/orders/:oid/notes"):
+ *     both capture under the first name. Use one name per position.
  *
- * Limits (excess is truncated or dropped, never overflowed): 32 routes, 16 app middlewares,
- * 8 per-route middlewares, 8 path params (value 63 chars), 16 query params (name/value 63 chars),
- * 32 request headers (value 255 chars), 16 cookies (value 255 chars), 16 response headers,
- * 16 Set-Cookie lines, request body 10 MiB, request headers 8 KiB.
+ * Limits (excess is truncated or dropped, never overflowed; a 33rd request header is rejected with 400):
+ * no cap on routes per app (64 per Router), 16 app middlewares, 8 per-route middlewares, 8 path params (value 63 chars),
+ * 16 query params (name/value 63 chars), 32 request headers (value 255 chars), 16 cookies (value 255 chars),
+ * 16 response headers, 16 Set-Cookie lines, request body 10 MiB, request headers 8 KiB.
  */
 
 #include <errno.h>
@@ -35,8 +40,8 @@
 
 /* ---------------------------------------------------------------------------------------------
  * RECIPE 0 - JSON reply helper. Used by most recipes below.
- * Finishes a JsonWriter into a response: 500 if the writer failed, otherwise `status` + body.
- * Always frees the writer.
+ * Serializes a yyjson document into a response: 500 if serialization failed, otherwise `status` + body.
+ * Always frees the serialized string (libc-malloc'd) and the document (a no-op for an arena document).
  * ------------------------------------------------------------------------------------------- */
 static void send_json(Response *res, const int status, yyjson_mut_doc *doc) {
     size_t len;
@@ -374,7 +379,7 @@ static void recipe_stream(const Request *req, Response *res) {
  * fork() copies main()'s memory into every cluster worker, so never open such a resource before
  * app_listen. Validate and migrate in main(), close it, and open the real one in a hook:
  * the hook runs once in each serving process, after any fork.
- *   app/db.c (db_open / db_worker_init) is the full SQLite version of this pattern.
+ *   examples/todo_sqlite/db.c (db_open / db_worker_init) is the full SQLite version of this pattern.
  * ------------------------------------------------------------------------------------------- */
 static int g_worker_resource_opened;
 static void open_resource_for_this_process(void) {

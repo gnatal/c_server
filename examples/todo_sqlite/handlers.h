@@ -3,7 +3,7 @@
 
 #include "app_types.h"
 
-/* Serves the Todo UI (app/public/index.html) via res_send_file. */
+/* Serves the Todo UI (public/index.html, relative to the working directory) via res_send_file. */
 void handler_home(const Request *req, Response *res);
 
 /* GET /api/todos[?done=true|false] - list all todos, optionally filtered. */

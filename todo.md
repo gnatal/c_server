@@ -1,25 +1,34 @@
 # Running the Todo CRUD demo
 
+(This file is a run cheat sheet for the demo, not a task list. Project docs: `README.md`, `DOC.md`, `lib/CLAUDE.md`.)
+
 ## Build & run (local)
 
 ```bash
-make            # builds build/bin/cexpress
-make run        # or: ./build/bin/cexpress
-make test       # runs the full lib/ test suite
-make clean      # wipe build/ output
+make demo                       # from the repo root: builds build/lib/libcexpress.a and examples/todo_sqlite/cexpress_demo
+cd examples/todo_sqlite
+./cexpress_demo                 # or: make run
+cd ../.. && make test           # runs the full test suite (14 suites)
+make clean                      # wipe build/ and the demo's objects and binary
 ```
+
+The demo loads `public/` and creates `todos.db` relative to the directory it is started from, so run it from
+`examples/todo_sqlite/`. (After changing `lib/`, rebuild the demo with `make -B -C examples/todo_sqlite`; its
+Makefile does not track the library.)
 
 Server listens on `http://localhost:8080` by default. Useful env vars:
 
 ```bash
-PORT=3000 API_KEY=my-secret-api-key TODO_DB_PATH=todos.db ./build/bin/cexpress
-WORKERS=4 ./build/bin/cexpress   # multi-process cluster mode
-QUIET=1 ./build/bin/cexpress     # disable per-request access logging
+PORT=3000 API_KEY=my-secret-api-key TODO_DB_PATH=todos.db ./cexpress_demo
+WORKERS=4 ./cexpress_demo   # multi-process cluster mode
+QUIET=1 ./cexpress_demo     # disable per-request access logging
 ```
 
 Open `http://localhost:8080/` in a browser for the built-in Todo UI.
 
 ## Build & run (Docker)
+
+The image compiles the library and the demo on Alpine (io_uring event loop) and does not run the tests.
 
 ```bash
 docker build -t cexpress-todo .
@@ -74,9 +83,8 @@ curl -s -X DELETE $BASE/api/todos/1 -H "Authorization: Bearer $KEY"
 
 ## Stress test / benchmark
 
-Requires `wrk` (`brew install wrk`). One command builds, boots a 4-worker
-cluster, seeds some todos, and runs `wrk` against `GET /`, `GET /api/todos`,
-and `POST /api/todos` at 100/1000/5000 connections:
+Requires `wrk` (`brew install wrk`). `scripts/stress_test.sh` builds the demo, boots a 4-worker cluster, seeds some
+todos, and runs `wrk` against `/ping`, `GET /`, `GET /api/todos` and `POST /api/todos`:
 
 ```bash
 scripts/stress_test.sh
@@ -88,7 +96,7 @@ Tunable via env vars:
 WORKERS=8 THREADS=8 DURATION=15s CONNS="100 1000 5000 10000" scripts/stress_test.sh
 ```
 
-The script also tracks memory: it runs the server under `/usr/bin/time -l`,
-samples the RSS of the master and every worker during each benchmark, and prints
-a memory summary at the end. Add `MEASURE_MEMORY=0` to turn that off. Results of a
-full run are in `stress_tests/stress_test_report.md`.
+Read `scripts/CLAUDE.md` first: as of 2026-09-21 the script starts the server from the repository root (so its
+`GET /` rows measure a 404), and its memory sampler output is not credible. It tracks memory by running the server
+under `/usr/bin/time -l` and sampling the RSS of the master and every worker; add `MEASURE_MEMORY=0` to turn that
+off. Results and the manual `wrk` commands are in `stress_tests/stress_test_report.md`.

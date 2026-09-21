@@ -8,7 +8,7 @@
  * Pure: checks whether content_type declares a multipart/form-data body
  * (prefix match against "multipart/form-data", case-insensitive - trailing
  * parameters/casing don't break the match, same convention as
- * app/handlers.c: has_json_content_type) and, if so, extracts its
+ * examples/todo_sqlite/handlers.c: has_json_content_type) and, if so, extracts its
  * "boundary=" parameter into boundary_out. RFC 2046 allows the boundary
  * value to be double-quoted or bare; either form is accepted, and quotes
  * are stripped either way.
@@ -27,7 +27,7 @@ int multipart_parse_boundary(const char *content_type, char *boundary_out, size_
  * delimiters ("--boundary\r\n" between parts, "--boundary--" after the
  * last one) into form->parts, bounded by MAX_MULTIPART_PARTS (extra parts
  * past the cap are dropped with a stderr warning rather than overflowing
- * the fixed array, same convention as MAX_ROUTES/MAX_HEADERS elsewhere).
+ * the fixed array, same convention as MAX_ROUTER_ROUTES/MAX_HEADERS elsewhere).
  *
  * Each part's own header block (Content-Disposition, optionally
  * Content-Type) is parsed for its form field `name` and, for a file part,

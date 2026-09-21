@@ -22,7 +22,8 @@ Rather than relying on thread pools with shared mutable state, mutexes, and race
 ┌──────────────▼──────────────┐ ┌──────────────▼──────────────┐
 │       Worker 0 (PID W0)     │ │       Worker 1 (PID W1)     │
 │ - Dedicated SO_REUSEPORT fd │ │ - Dedicated SO_REUSEPORT fd │
-│ - Private kqueue/epoll loop │ │ - Private kqueue/epoll loop │
+│ - Private kqueue/io_uring   │ │ - Private kqueue/io_uring   │
+│   event loop                │ │   event loop                │
 │ - Private connection table  │ │ - Private connection table  │
 │ - Zero-lock request routing │ │ - Zero-lock request routing │
 │ - Drains & exits on SIGTERM │ │ - Drains & exits on SIGTERM │
@@ -30,9 +31,9 @@ Rather than relying on thread pools with shared mutable state, mutexes, and race
 ```
 
 ### Key Architectural Invariants
-1. **Zero Lock Contention**: Each worker process executes an isolated single-threaded event loop (`kqueue` on macOS/BSD, `epoll` on Linux) with its own private connection table and memory space. Request routing, HTTP parsing, and response serialization remain completely lock-free.
+1. **Zero Lock Contention**: Each worker process executes an isolated single-threaded event loop (`kqueue` on macOS/BSD, `io_uring` readiness polling on Linux) with its own private connection table and memory space. Request routing, HTTP parsing, and response serialization remain completely lock-free.
 2. **Total Fault Isolation**: A crash, assertion failure, or segmentation fault in one worker process cannot corrupt the memory space or bring down other workers or the master supervisor.
-3. **Hardware Scaling**: Allows CExpress to scale linearly across all CPU cores on modern multi-core servers.
+3. **Hardware Scaling**: The design lets throughput scale with CPU cores, but linear scaling has not been demonstrated in this repository. On an Apple M3 Pro with `wrk` on the same machine, `GET /ping` at 100 connections reached about 222k req/s with 1 worker and about 250k with 4 (single runs, 21 Sep 2026): the load generator competes for the same cores, so those runs are client-bound. Measure on separate machines before quoting a scaling factor.
 
 ---
 
@@ -50,12 +51,16 @@ Traditional UNIX networking allows only one process to bind to a given IP/port. 
 
 ### Platform-Specific Kernel Behavior
 
-| Feature | macOS / BSD (`kqueue`) | Linux (`epoll`) |
+| Feature | macOS / BSD | Linux |
 |---|---|---|
-| **Distribution** | Incoming connections are accepted by available workers. | Kernel performs 4-tuple hashing (`src_ip`, `src_port`, `dst_ip`, `dst_port`) across worker sockets. |
+| **Distribution** | Intended: incoming connections are accepted by available workers. Observed: uneven, see below. | Kernel performs 4-tuple hashing (`src_ip`, `src_port`, `dst_ip`, `dst_port`) across worker sockets (documented kernel behavior, not measured here). |
 | **Accept Queues** | Independent per-socket accept queue. | Lockless per-socket accept queue in kernel network stack. |
 | **Thundering Herd** | Prevented: each worker only wakes up when its own socket is ready. | Prevented: kernel wakes only the specific socket selected by the hash. |
 | **Overhead** | Zero inter-process communication (IPC) on the network path. | Zero IPC overhead; zero cross-worker locks. |
+
+`test_cluster` checks that several workers bind the same port and serve requests concurrently.
+
+**Measured on macOS (21 Sep 2026): connections were not balanced.** With `WORKERS=4` and 5,000 keep-alive connections opened from one client, one worker process held nearly all of them: its resident memory was 124 MB of the 134 MB total across the master and four workers (at 100 connections, 7.7 of 17.1 MB). The macOS column above therefore describes the intended `SO_REUSEPORT` behavior, not what the kernel did in this test; treat multi-worker mode on macOS as a development convenience, not a scaling mechanism, until that is understood. The Linux distribution (4-tuple hashing) was not measured here.
 
 ---
 
@@ -64,11 +69,11 @@ Traditional UNIX networking allows only one process to bind to a given IP/port. 
 The multi-process architecture is specifically engineered to operate cleanly and reliably in containerized environments (Docker, Podman, Kubernetes):
 
 ### A. PID 1 & Zombie Reaping in Docker
-* In a Docker container, the binary specified in `CMD ["/app/cexpress"]` is assigned **PID 1** inside the container's PID namespace.
+* In a Docker container, the binary specified in `CMD ["/app/cexpress_demo"]` is assigned **PID 1** inside the container's PID namespace.
 * Standard POSIX processes become zombies if their parent process does not explicitly call `waitpid()`. In typical applications, dead child processes can leak kernel resources.
 * **Master as Init Supervisor**:
   * The CExpress master process acts as a robust init system for the container.
-  * It handles `SIGCHLD` and actively reaps dead child processes using `waitpid(-1, &status, WNOHANG)`.
+  * It installs a `SIGCHLD` handler and its supervision loop (waking every 50 ms) reaps dead child processes using `waitpid(-1, &status, WNOHANG)`.
   * No external init system (such as `tini` or `dumb-init`) is required.
 
 ### B. Container Network Namespaces
@@ -76,7 +81,7 @@ The multi-process architecture is specifically engineered to operate cleanly and
 * Linux kernel `SO_REUSEPORT` works natively within network namespaces:
   1. Docker forwards host traffic (`-p 8080:8080`) into `eth0:8080` inside the container.
   2. The Linux kernel distributes incoming TCP SYN packets across the container workers' sockets.
-  3. Workers accept connections directly from their individual `epoll` instances with zero virtualization overhead inside the container.
+  3. Workers accept connections directly from their individual event loops (`io_uring` on Linux) with zero virtualization overhead inside the container.
 
 ### C. Dynamic CPU Detection
 * In container orchestration (Docker / Kubernetes), CPU limits are configured via `--cpus` or CPU quotas.
@@ -84,7 +89,13 @@ The multi-process architecture is specifically engineered to operate cleanly and
   * CExpress calls `sysconf(_SC_NPROCESSORS_ONLN)`.
   * It detects the actual number of online CPU cores allocated to the container environment and spawns the exact number of workers needed to saturate hardware.
 
-### D. Orchestration Signals & Rolling Updates
+### D. io_uring in Containers
+* The Linux build polls for readiness with `io_uring` (liburing, multishot poll: kernel 5.13 or newer). The `Dockerfile` installs `liburing-dev` in the builder and `liburing` in the runtime image.
+* If `io_uring_queue_init` fails (for example because the container runtime's seccomp profile blocks the `io_uring_*` syscalls), `event_loop_init` returns `-1` and `app_listen_worker` prints the error and exits with a failure status. There is no runtime fallback to `epoll`. In cluster mode the master treats that as an abnormal worker exit and respawns the worker (from reading `lib/cluster.c`; a blocked-io_uring crash loop was not reproduced).
+* `scripts/docker_stress_test.sh` runs the server with `--security-opt seccomp=unconfined --ulimit memlock=-1:-1`. Whether Docker's default profile actually blocks io_uring on a given host was not tested for this document; if the server exits immediately in a container, try those flags first.
+* An `epoll` backend (`lib/event_loop_epoll.c`, selected by `-DCEXPRESS_USE_EPOLL`) is kept in the tree but is not wired into the Linux `Makefile`.
+
+### E. Orchestration Signals & Rolling Updates
 * When `docker stop` or Kubernetes pod termination occurs, the container runtime sends `SIGTERM` to PID 1 (the master process).
 * The master process catches `SIGTERM` and coordinates graceful connection draining across all workers within the stop timeout (default 10s in Docker, 5s deadline in CExpress).
 
@@ -163,13 +174,16 @@ If a worker terminates abnormally (e.g. unhandled segmentation fault or non-zero
 | `WORKERS` | `N` (e.g. `4`) | Spawns exactly $N$ worker processes (up to `MAX_CLUSTER_WORKERS = 128`). |
 | `WORKERS` | `1` (or unset)| Runs in single-process mode (default). |
 
+`WORKERS` is read by the demo app (`examples/todo_sqlite/main.c`); the engine itself uses `app.config.workers`, where `0` means one per CPU core and values above `MAX_CLUSTER_WORKERS` are clamped.
+
 ### Example CLI Usage
 ```bash
+# From examples/todo_sqlite/ after `make demo` at the repository root.
 # Auto-detect CPU cores (e.g. 8 cores -> 8 workers):
-WORKERS=auto ./cexpress
+WORKERS=auto ./cexpress_demo
 
 # Explicitly launch 4 workers:
-WORKERS=4 ./cexpress
+WORKERS=4 ./cexpress_demo
 
 # In Docker:
 docker run -e WORKERS=auto -p 8080:8080 cexpress

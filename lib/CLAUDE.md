@@ -2,90 +2,114 @@
 
 Read order for a new task: this file → `API.md` (every public function) → `examples/cookbook.c`
 (tested recipes) → the header of the module you touch. `examples/todo_sqlite/` is a full worked application.
+`../tradeoffs.md` explains why the arena, yyjson, picohttpparser and the Patricia router exist.
 
 ## Model
-A process runs one single-threaded, non-blocking event loop (kqueue on macOS/BSD, epoll on Linux).
-`workers != 1` forks N such processes sharing the port via `SO_REUSEPORT`; a master respawns any that
-die. Handlers run synchronously on the loop: a blocking call (DB, sleep) stalls that whole worker, so
-scale with workers, not threads. State is per process; there is no shared memory.
+A process runs one single-threaded, non-blocking event loop: kqueue on macOS/BSD, io_uring on Linux
+(readiness only: multishot `POLL_ADD` on each fd, then ordinary `recv`/`write`; needs liburing and a kernel with
+multishot poll, 5.13+). An epoll backend (`event_loop_epoll.c`) is kept for `-DCEXPRESS_USE_EPOLL`; the Makefile does not select it
+on Linux, and on macOS it is only built for `make test_epoll` through epoll-shim. `workers != 1` forks N such processes sharing
+the port via `SO_REUSEPORT`; a master respawns any that die. Handlers run synchronously on the loop: a blocking call (DB,
+sleep) stalls that whole worker, so scale with workers, not threads. State is per process; there is no shared memory.
+If `event_loop_init` fails (for example io_uring is blocked by the runtime), `app_listen_worker` prints the error and exits; there is no runtime fallback to epoll.
 
 Per request (`connection.c: handle_readable`):
-1. `recv` into `conn->in_buf` until `request_is_complete` (`http_parser.c`, header-scoped, no body scan).
-2. `parse_http_request` → `Request` on the stack. Failure → reject (400 / 413 / 414), close.
+1. `recv` into `conn->in_buf` until `request_is_complete` (`http_parser.c`: runs picohttpparser over the headers, plus a chunked scan when the body is chunked).
+2. `parse_http_request(in_buf, in_len, &req, &conn->arena)` → `Request` on the stack (copies method/path/headers/cookies into its fixed arrays; the body is copied into the connection arena). Failure → reject (400 / 413 / 414), close.
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
-4. `match_route` (linear, first match, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
+4. `match_route` (per-method Patricia tree, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
-5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf`.
-6. `free(req.body)`; `flush_connection` writes; keep-alive resets the connection, otherwise closes.
+5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf` (allocated from the arena).
+6. `flush_connection` writes. Keep-alive: `arena_reset`, `in_len = 0`, shrink `in_buf`. Otherwise `connection_close`.
 
 Only `connection.c`, `event_loop_*.c`, `tls.c`, `cluster.c` do I/O. Parsing, routing, dispatch and
-response building never touch a socket, so tests drive them with a fake `Connection` (see
-`tests/test_cookbook.c: fetch`). Keep it that way.
+response building never touch a socket, so tests drive them with a fake `Connection` whose arena is a static buffer
+(see `tests/test_cookbook.c: fetch`). Keep it that way.
 
 ## Files
 | File | Responsibility |
 |---|---|
 | `app_types.h` | every struct/typedef and every compile-time limit |
-| `http_parser.c/h` | request parsing, framing (Content-Length / chunked), accessors, `status_text` |
-| `router.c/h` | route tables, `match_path`, sub-routers (`app_mount`), `app_serve_static`, `app_enable_tls` |
+| `arena.c/h` | per-connection bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`) |
+| `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text` |
+| `router.c/h` | route registration, one Patricia (segment-radix) tree per method, `app_mount`, `app_serve_static`, `app_enable_tls`, `app_free_routes` |
 | `middleware.c/h` | pipeline (`chain_next`, `chain_error`, `dispatch`), 404/405/OPTIONS defaults |
 | `response.c/h` | response head assembly, cookies, chunked streaming, file streaming |
 | `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen |
-| `event_loop.h` + `event_loop_kqueue.c` / `event_loop_epoll.c` | one API over two backends (fds, timers, signals) |
+| `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals) |
 | `cluster.c/h` | fork workers, respawn, drain |
 | `tls.c/h` | non-blocking OpenSSL; stubs when built with `NO_TLS=1` |
 | `static.c/h` | traversal-safe file serving |
 | `multipart.c/h`, `urlencoded.c/h` | form body parsers (handler-invoked, not automatic) |
-| `json/` | `json_parse` tree, `JsonWriter` (`jw_*`) emitter, tree builders (see `json/CLAUDE.md`) |
+| `vendor/picohttpparser/` | vendored HTTP/1.x request parser (MIT/Perl) |
+| `vendor/yyjson/` | vendored yyjson 0.13.0; JSON reading and writing. `cexpress.h` includes it. There is no engine JSON layer of its own |
 | `examples/cookbook.c` | tested few-shot recipes; `tests/test_cookbook.c` runs every one |
 
-## Limits (all compile-time, in `app_types.h`; excess is truncated or dropped, never overflowed)
-Routes 32 · app middleware 16 · route middleware 8 · path params 8 (value 63) · query params 16 (63) ·
-request headers 32 (value 255) · cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) ·
-path 255 (else 414) · query 255 · body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 ·
-Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 · form fields 32 · static file 50 MiB ·
-idle timeout 60 s · drain deadline 5 s.
+## Limits (all compile-time, in `app_types.h`; excess is truncated or dropped, never overflowed, except where marked)
+Routes: no fixed cap per App (each is malloc'd into a tree), 64 per Router (`MAX_ROUTER_ROUTES`), 16 distinct methods · app middleware 16 · route middleware 8 ·
+path params 8 (value 63) · query params 16 (63) · request headers 32 (value 255; **a 33rd header is a 400, not a drop**) ·
+cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
+body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 ·
+form fields 32 · static file 50 MiB · idle timeout 60 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
+worker init hooks 4 · cluster workers 128 · arena 64 KiB per connection (see below; exceeding it falls back to malloc, it is not a limit).
+
+## Memory model
+Every accepted connection is one `calloc(sizeof(Connection) + 64 KiB)`: the arena buffer sits right behind the struct
+(`connection_create`). `in_buf` is a separate 8 KiB malloc. Measured on macOS, 5,000 idle keep-alive connections on one worker took
+about 121 MB RSS, about 25 KB per connection (Linux not measured). The arena serves everything that lives for one request:
+`Request.body`, `conn->out_buf`, the file-streaming chunk buffer, chunked-response growth, and any yyjson document created
+with `arena_yyjson_alc`. Bump allocation, 8-byte aligned, no per-allocation free. When the remaining space is too small
+(not only for a single request over 64 KiB), the allocation falls back to `malloc` and is chained in a list that `arena_reset` frees.
+`flush_connection` calls `arena_reset` when a keep-alive response is fully written; `connection_close` calls `arena_destroy`.
+Consequences: nothing reached through `req` or `res` may be kept past the handler; a growing chunked response copies into a new arena block each doubling
+and leaves the old block in the arena until the request ends; a static file is read into a malloc'd buffer and copied again into the arena by `res_send_bytes`.
 
 ## Ownership (who frees what)
 | Thing | Allocated by | Freed by |
 |---|---|---|
-| `Request.body` | `parse_http_request` (always non-NULL after success) | the engine, after dispatch. Handlers never free it |
+| `Connection` + its 64 KiB arena buffer | `connection_create` (one calloc) | `connection_close` (exactly once) |
+| `conn->in_buf` | `connection_create` (+ realloc on growth) | `connection_close` |
+| Arena fallback blocks | `arena_alloc` when the buffer is full | `arena_reset` (each keep-alive response) or `arena_destroy` (close) |
+| `Request.body` | `parse_http_request`, from the arena (always non-NULL after success) | nobody: reclaimed with the arena. Handlers never free it |
 | `req_get_*` results, `MultipartPart.data` | point inside the Request / body | nobody; valid until the handler returns |
-| `conn->out_buf` | `res_*` (one malloc per response; a second send frees the first) | `flush_connection` or `connection_close` |
-| `conn->in_buf`, `Connection` | `connection_create` (+ realloc on growth) | `connection_close` (exactly once) |
+| `conn->out_buf` | `res_*`, from the arena (one allocation per response; a second send just leaves the first in the arena) | nobody: the pointer is dropped by `flush_connection` / `connection_close` |
+| yyjson doc built or read with `arena_yyjson_alc(&conn->arena)` | arena | nothing: `yyjson_*_doc_free` is a no-op for it, the arena reclaims it |
+| yyjson doc with a NULL allocator (e.g. `error_handler_json`) | libc malloc | `yyjson_mut_doc_free` / `yyjson_doc_free` |
+| `yyjson_mut_write(doc, 0, &len)` result | libc malloc, **whatever allocator the doc uses** | caller, C `free` (forgetting it leaks once per request) |
+| `Route`, `PatriciaNode` | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy` |
 | `app->connections` | `app_init` | `app_destroy` |
-| `JsonValue` tree | `json_parse`, `json_new_*` | `json_free(root)` only. `json_object_set` / `json_array_append` take ownership of `value` even on failure |
-| `json_as_string` result | inside the tree | dies with `json_free` |
-| `json_stringify` result | `json_stringify` | caller, C `free` |
-| `JsonWriter` buffer | `jw_*` | `jw_free` (always call; idempotent) |
 | `SSL`, `SSL_CTX` | `tls_connection_init`, `tls_init_app` | `tls_connection_close`, `tls_cleanup_app` |
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`app_enable_tls`, `res_send_file`, `event_loop_*`, `create_*`).
 `parse_http_request`: `0` ok, `-1` malformed, `-2` path too long (→ 414); after `-1`, `req.content_length == -2` means body too large (→ 413).
-`request_is_complete`: `1` also for invalid framing (stop reading, let the parser report it). `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
+`request_is_complete`: `1` for a complete request and also for invalid `Content-Length` / chunked+`Content-Length` framing (stop reading, let the parser report it);
+`0` while more bytes are needed, **and also (known gap, below) when the request line or headers are malformed**. `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
 `tls_connection_handshake`: `1` done, `0` in progress, `-1` fatal. `tls_connection_read/write`: bytes, `0` EOF, `-1` with `errno` (`EAGAIN` = wait).
-`json_object_set`, `json_array_append`: `1` ok, `0` failed. `JsonWriter`: failure is sticky, check `jw_ok` once at the end.
+yyjson: read functions return `NULL` on failure; `yyjson_mut_*_add_*` return `false` on failure (the cookbook and demo do not check them).
 Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `errno` for logic outside the socket layer.
 
 ## Behavior reference (non-obvious rules; the code is the spec for the rest)
 - **Routing.** Deny by default. Exact method match; no path match → 404; path matches another method → 405 + `Allow`.
+  Each method has its own Patricia tree keyed by path segments (split on `/`, empty segments ignored, so `/a//b/` = `/a/b`). At each node the
+  search tries, in this order and with backtracking: a literal child, then the `:name` / mid-pattern `*` child, then a trailing `*`.
+  So **specificity beats registration order**: `/users/me` wins over `/users/:id` even when registered second.
+  A mid-pattern `*` matches one segment and captures nothing. A trailing `*` matches one or more segments (never the bare prefix). A duplicate pattern for the same method keeps the first and warns.
   `HEAD` falls back to the same path's `GET` route (body suppressed, `Content-Length` kept). `OPTIONS` on a known path
-  → 200 + `Allow` (with `HEAD` added if `GET` exists). Explicit `app_head` / `app_options` win. Segments split on `/`,
-  empty ones ignored; `:name` captures; a middle `*` matches one segment; a trailing `*` matches one or more (not the bare prefix).
+  → 200 + `Allow` (with `HEAD` added if `GET` exists). Explicit `app_head` / `app_options` win. Path is percent-decoded before routing (so `%2F` becomes a segment break).
+  `match_path` is a standalone pattern matcher that the router itself no longer calls; it is kept for tests and does not reproduce every tree rule (it is first-match, per pattern).
 - **Middleware.** Order = registration order (app-wide, only entries whose prefix matches at a segment boundary; runs for 404s
   too) → route middleware → handler. One error handler (`app_use_error`, last wins); default is `res_status` + `res_send`.
   Handlers get no chain and cannot call `chain_next` / `chain_error`. Code after `chain_next` sees the final `res->status`.
 - **Sub-routers.** `app_mount` copies routes (prefix prepended; `/` mounts at the bare prefix) and turns `router_use`
   middleware into prefix-scoped app middleware. The Router may be a stack local. No nesting.
-- **Static.** `app_serve_static` registers `GET <prefix>/*`, `realpath`s the root once, refuses `..` (403), re-checks the
+- **Static.** `app_serve_static` registers `GET <prefix>/*`, `realpath`s the root once (a missing root registers nothing and logs it, so every request under the prefix is a 404), refuses `..` (403), re-checks the
   resolved path stays under the root after symlink resolution (403), 404 for non-files, serves `index.html` for a directory,
-  never lists. Reads the file into memory (≤ 50 MiB) and sends it with `res_send_bytes`.
-- **Request parsing.** Header names match exactly and case-insensitively at line start (never by substring). `Content-Length`
-  must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Method ≤ 7
-  chars. Path percent-decoded before routing (so `%2F` becomes a segment break). Query/headers/cookies parsed eagerly.
-  Chunked bodies: extensions ignored, trailers discarded, decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at
-  `header_len + MAX_BODY_SIZE`.
+  never lists. Reads the whole file into memory (≤ 50 MiB) and sends it with `res_send_bytes`. The root is resolved against the process's working directory.
+- **Request parsing.** picohttpparser does the request line and header block; it is strict about tokens and accepts bare `\n` line endings, and rejects HTTP versions other than 1.x. `Content-Length`
+  must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Header names are matched exactly and case-insensitively (never by substring). Method ≤ 7
+  chars. Query/headers/cookies parsed eagerly into fixed arrays. More than 32 headers → 400. Header values over 255 chars are truncated silently.
+  Chunked bodies: extensions ignored, trailers discarded, decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at `header_len + MAX_BODY_SIZE`.
 - **Buffers.** `in_buf` starts at 8 KiB; with headers complete and a body pending it is realloc'd once to the exact size
   (chunked: doubling to the cap) and shrunk back when the connection goes idle. No header terminator within 8 KiB → 431.
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
@@ -100,39 +124,49 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   and open there (runs once per serving process, after fork). `SIGPIPE` is ignored per process in `app_listen_worker`.
 - **TLS.** `app_enable_tls` (or `TLS_CERT` / `TLS_KEY` in `examples/todo_sqlite/main.c`). TLS 1.2+, non-blocking handshake driven by the loop,
   `SSL_pending` checked so pipelined bytes buffered inside OpenSSL are not stranded. `make NO_TLS=1` removes the dependency.
-- **Event loop.** `Connection.events_watched` mirrors what the kernel has registered on both backends; `watch_*` / `unwatch_*`
-  skip the syscall when the state already matches (a keep-alive response costs no extra `kevent` / `epoll_ctl`).
+- **Event loop.** `Connection.events_watched` mirrors what the loop has registered. Only the kqueue backend uses it to skip the syscall when the state already
+  matches, so a keep-alive response costs no extra `kevent` there. The epoll and io_uring backends issue a syscall on every `watch_*` / `unwatch_*`
+  (`epoll_ctl`; io_uring submits a poll-remove plus a new multishot poll), including the `unwatch_write` that `flush_connection` runs after every keep-alive response.
+  `LOOP_EVENT_ERROR` (POLLERR/POLLHUP or a negative completion) closes the connection.
 
 ## Hot-path rules (measured; do not undo)
-Per-request CPU cost of the pure path (parse, route, dispatch, response build; no sockets, one core), measured on the same
-benchmark before and after: minimal GET 1.37 → 0.39 µs, browser-shaped GET (10 headers, cookies, query) 3.9 → 0.80 µs,
-JSON POST 1.6 → 0.47 µs, 404 1.6 → 0.43 µs. End to end with `wrk` (4 workers) that was +10% on `GET /` and +110% on
-`GET /api/todos` (JSON tree → `JsonWriter`). `make bench` prints current numbers; only ratios transfer between machines.
-What made the difference, so what not to reintroduce:
+Per-request CPU cost of the pure path (parse, route, dispatch, response build; no sockets, one core; `make bench`, Apple M3 Pro,
+gcc-16 -O2, 21 Sep 2026): minimal GET 208 ns, browser-shaped GET (10 headers, cookies, query) 781 ns, JSON POST 315 ns, 404 186 ns;
+a 20-row JSON list through yyjson 659 ns. The earlier version of this file recorded 390 / 800 / 470 / 430 ns for the handwritten-parser engine on the same machine
+(no A/B rebuild of that commit was done for this update); only ratios transfer between machines. What to keep:
 - No `strtok_r` / `sscanf` / `strncpy` (zero-pads to the full size) / `strcasestr` over request bytes. Scan with lengths and `memchr`.
 - No whole-struct `memset` of `Request` (19 KB) or `Response` (16 KB). `parse_http_request` and `res_init` set scalars and
   `*_count` only; arrays are read up to their count and every slot is NUL-terminated on write.
-- `match_path` walks pattern and path in place; `req == NULL` matches without capturing (no scratch `Request` copy for 404/405).
+- Routing is one tree walk over path segments with no allocation; `req == NULL` searches without capturing (used for the 405 `Allow` list).
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
-- Emit JSON with `JsonWriter`: about 4x faster than building a tree and calling `json_stringify` (`make bench`).
-- No syscall on a path that changes nothing (`events_watched`).
-Verification tools: `make bench`, `make test` (15 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
+- Allocate per-request data from `conn->arena`, not `malloc`. Emit JSON through yyjson with `arena_yyjson_alc`.
+- No syscall on a path that changes nothing (`events_watched`; enforced on kqueue only, see Event loop).
+Verification tools: `make bench`, `make test` (14 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
 `make fuzz` (mutation fuzzer over parser/router/response), `make check-docs`. Run sanitizers and fuzz after touching
-`http_parser.c`, `router.c`, `response.c` or `json_writer.c`. The Makefile tracks header dependencies (`-MMD`).
+`http_parser.c`, `router.c`, `response.c` or `arena.c`. The Makefile tracks header dependencies (`-MMD`).
 
 ## Known gaps (verified, not fixed)
+- **A malformed request line gets no response.** `request_framing` returns `-1` with `header_len == 0` when picohttpparser rejects the
+  request (`GET /\r\n\r\n`, `HTTP/2.0`, garbage), and `request_is_complete` checks `header_len == 0` before it checks the code, so it answers
+  "need more". Observed on a live server: no reply and the socket stays open until 8 KiB arrive (431) or 60 s pass (408). Well-formed requests with bad `Content-Length`,
+  too many headers, or a too-long path are answered correctly (400 / 400 / 414). Likely fix: test `content_length < 0` before `header_len == 0` in `request_is_complete`.
+- **Path parameter names are per tree position, not per route.** Routes `/orders/:id/items` and `/orders/:oid/notes` share one parameter node named after
+  the first registration, so `req_get_param(req, "oid")` returns `NULL` (the value is under `id`). A route registered after a mid-pattern `*` at the same position
+  (`/x/*/y`, then `/x/:id/z`) captures nothing. Use the same `:name` at the same position across routes.
 - **Pipelining is dropped.** After the first request is answered, `flush_connection` sets `in_len = 0`, discarding any further
   request already in the buffer (client sees one response for two requests). Fix needs the parser to report bytes consumed,
   `memmove` of the remainder, and re-running the parse loop after each flush.
 - **Chunked request bodies are re-scanned from the start on every `recv`** (`request_is_complete` → `chunked_body_scan`):
   quadratic in the worst case up to 10 MiB, so a slow-drip client can burn CPU. Fix: keep scan position and decoded length per connection.
-- **Each accepted connection allocates an 8 KiB `in_buf`** up front (5000 idle connections ≈ 40 MiB).
-- **`Request.body` is a malloc'd copy** per request (including a 1-byte allocation for empty bodies); a zero-copy body would need NUL-termination handling.
-- Path `%2F` decodes before segmenting; queries over 255 chars, header values over 255 and params over 63 are truncated silently.
-- No HTTP/2, `Expect: 100-continue`, compression, `Range`, or WebSocket. Routes match linearly (≤ 32).
+- **Per-connection footprint is about 25 KB resident on macOS (72 KB allocated: 64 KiB arena + 8 KiB `in_buf`)**, up from about 7 KB before the arena; 10,000 idle connections are on the order of 250 MB there.
+- **`Request.body` is still a copy** (now into the arena), including a 1-byte allocation for empty bodies.
+- Header values over 255 chars, params over 63 and queries over 255 are truncated silently.
+- **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model).
+- The io_uring backend is used only as a readiness poller; sockets are still read and written with `recv` / `write`.
+- No HTTP/2, `Expect: 100-continue`, compression, `Range`, or WebSocket.
 
 ## Where to change what
 Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`. Add a parser feature → `http_parser.c/h` +
 `tests/test_http_parser.c` (or `test_http_hardening.c` for a bug regression) + a case in `tests/fuzz_parser.c` seeds. Add a route feature → `router.c/h` + `tests/test_router.c`.
 Add middleware behavior → `middleware.c` + `tests/test_middleware.c`. New public function → declare it in the header and list it in
-`API.md` (`make check-docs` enforces this). New recipe → `examples/cookbook.c` + `tests/test_cookbook.c`.
+`API.md` (`make check-docs` enforces this). New recipe → `examples/cookbook.c` + `tests/test_cookbook.c`. Anything allocated per request → the arena.

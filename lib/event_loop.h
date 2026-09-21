@@ -4,7 +4,8 @@
 #include "app_types.h"
 
 /*
- * Initializes the event loop subsystem (kqueue on BSD/macOS, epoll on Linux).
+ * Initializes the event loop subsystem (kqueue on BSD/macOS, io_uring on Linux, or epoll when built
+ * with CEXPRESS_USE_EPOLL; exactly one backend file is linked, see the Makefile).
  * Sets up signal interception for SIGINT and SIGTERM, and registers the
  * periodic idle-connection sweep timer (IDLE_SWEEP_INTERVAL_MS).
  * Returns 0 on success, -1 on failure.
@@ -20,7 +21,7 @@ void event_loop_close(App *app);
 
 /*
  * Registers interest in read readiness on the given descriptor (EVFILT_READ on
- * kqueue, EPOLLIN on epoll). udata is passed through to event notifications.
+ * kqueue, EPOLLIN on epoll, a multishot POLLIN poll on io_uring). udata is passed through to event notifications.
  * Returns 0 on success, -1 on failure.
  */
 int event_loop_watch_read(App *app, int fd, void *udata);

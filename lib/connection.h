@@ -8,7 +8,7 @@
 
 /*
  * Server lifecycle. One process runs one single-threaded, non-blocking event loop (kqueue on
- * macOS/BSD, epoll on Linux). Typical main():
+ * macOS/BSD, io_uring readiness polling on Linux; an epoll backend exists behind CEXPRESS_USE_EPOLL). Typical main():
  *   App app; app_init(&app); ...register middleware and routes...; app_listen(&app, port); app_destroy(&app);
  */
 
@@ -58,7 +58,8 @@ int app_count_connections(const App *app);
  *   IDLE_TIMEOUT_SECONDS (60) is closed (408 first if a request was half-received). A connection
  *   with a response still being written is left alone.
  * accept_connections: accepts every pending client (non-blocking, TCP_NODELAY) and registers it.
- * connection_create / connection_close: one Connection per fd, freed exactly once by connection_close.
+ * connection_create / connection_close: one Connection per fd (a single calloc that also holds the 64 KiB
+ *   per-request arena), freed exactly once by connection_close.
  */
 int set_nonblocking(int fd);
 int create_server_socket(int port);
