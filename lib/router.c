@@ -16,7 +16,11 @@ void app_init(App *app) {
     app->error_handler = NULL;
     app->worker_init_hook_count = 0;
     app->server_fd = -1;
+#if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
+    app->ring = NULL;
+#else
     app->loop_fd = -1;
+#endif
     app->timer_idle_fd = -1;
     app->timer_shutdown_fd = -1;
     app->signal_fd = -1;

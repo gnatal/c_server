@@ -3,7 +3,8 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
     CC = gcc
     CFLAGS = -Wall -Wextra -std=c11 -O2 -Ilib -D_GNU_SOURCE
-    EVENT_LOOP_SRC = lib/event_loop_epoll.c
+    LDFLAGS += -luring
+    EVENT_LOOP_SRC = lib/event_loop_io_uring.c
 else
     CC = gcc-16
     CFLAGS = -Wall -Wextra -std=c11 -O2 -Ilib

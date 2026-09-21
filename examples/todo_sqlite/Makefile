@@ -8,6 +8,9 @@ else
     CFLAGS = -Wall -Wextra -std=c11 -O2 -I../../lib
 endif
 LDFLAGS = -L../../build/lib -lcexpress
+ifeq ($(UNAME_S),Linux)
+    LDFLAGS += -luring
+endif
 
 # Copy SQLite setup from root Makefile
 SQLITE_PREFIX ?= $(shell brew --prefix sqlite3 2>/dev/null || brew --prefix sqlite 2>/dev/null || echo /opt/homebrew/opt/sqlite)

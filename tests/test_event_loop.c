@@ -16,10 +16,18 @@ static void test_event_loop_lifecycle(void) {
     app_init(&app);
 
     assert(event_loop_init(&app) == 0);
+#if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
+    assert(app.ring != NULL);
+#else
     assert(app.loop_fd >= 0);
+#endif
 
     event_loop_close(&app);
+#if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
+    assert(app.ring == NULL);
+#else
     assert(app.loop_fd == -1);
+#endif
 
     /* Idempotent close */
     event_loop_close(&app);

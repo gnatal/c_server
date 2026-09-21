@@ -117,13 +117,7 @@ static void test_cluster_http_serving_and_shutdown(void) {
         app.config.workers = 2;
         app_get(&app, "/ping", ping_handler);
 
-        /* Redirect stderr and stdout to /dev/null during test to keep test output clean */
-        FILE *devnull = fopen("/dev/null", "w");
-        if (devnull) {
-            dup2(fileno(devnull), STDOUT_FILENO);
-            dup2(fileno(devnull), STDERR_FILENO);
-            fclose(devnull);
-        }
+        /* Redirection removed for debugging */
 
         app_listen(&app, test_port);
         app_destroy(&app);
@@ -174,6 +168,10 @@ static void test_cluster_http_serving_and_shutdown(void) {
     int status = 0;
     pid_t waited = waitpid(master_pid, &status, 0);
     assert(waited == master_pid);
+    if (!WIFEXITED(status)) {
+        printf("Master process did not exit normally. WIFSIGNALED: %d, WTERMSIG: %d\n", WIFSIGNALED(status), WTERMSIG(status));
+        fflush(stdout);
+    }
     assert(WIFEXITED(status));
     assert(WEXITSTATUS(status) == 0);
 }

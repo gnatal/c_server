@@ -325,8 +325,9 @@ typedef struct {
     int server_fd;
     union {
         int kq;          /* macOS/BSD */
-        int epoll_fd;    /* Linux */
-        int loop_fd;     /* either, platform-neutral name */
+        int epoll_fd;    /* Linux (legacy/fallback) */
+        void *ring;      /* Linux io_uring (struct io_uring*) */
+        int loop_fd;     /* platform-neutral int name */
     };
     int timer_idle_fd;
     int timer_shutdown_fd;
