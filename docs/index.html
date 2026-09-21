@@ -1094,22 +1094,22 @@
           </p>
           <div class="bench-highlight-grid">
             <div class="bench-metric-card">
-              <div class="bench-metric-val" style="color: var(--primary);">209,165 <span
+              <div class="bench-metric-val" style="color: var(--primary);">214,710 <span
                   style="font-size: 1rem; font-weight: 600;">req/s</span></div>
-              <div class="bench-metric-sub"><strong>100 connections</strong> · 357.66 µs avg latency · 3.15M requests in
-                15s · 18.35 MB/s</div>
+              <div class="bench-metric-sub"><strong>100 connections</strong> · 444.91 µs avg latency · 3.24M requests in
+                15s · 18.84 MB/s</div>
             </div>
             <div class="bench-metric-card">
-              <div class="bench-metric-val" style="color: #34d399;">217,278 <span
+              <div class="bench-metric-val" style="color: #34d399;">193,064 <span
                   style="font-size: 1rem; font-weight: 600;">req/s</span></div>
-              <div class="bench-metric-sub"><strong>1,000 connections</strong> · 4.35 ms avg latency · 3.26M requests in
-                15s · 19.06 MB/s</div>
+              <div class="bench-metric-sub"><strong>1,000 connections</strong> · 5.16 ms avg latency · 2.89M requests in
+                15s · 16.94 MB/s</div>
             </div>
             <div class="bench-metric-card">
-              <div class="bench-metric-val" style="color: #a855f7;">206,036 <span
+              <div class="bench-metric-val" style="color: #a855f7;">225,061 <span
                   style="font-size: 1rem; font-weight: 600;">req/s</span></div>
-              <div class="bench-metric-sub"><strong>5,000 connections</strong> · 18.71 ms avg latency · 2.06M requests
-                in 10s · 0 crashes</div>
+              <div class="bench-metric-sub"><strong>5,000 connections</strong> · 17.25 ms avg latency · 3.38M requests
+                in 15s · 0 crashes</div>
             </div>
           </div>
         </div>
@@ -1124,9 +1124,9 @@
           <div class="bar-row">
             <div class="bar-label"><strong>⚡ CExpress (C11)</strong></div>
             <div class="bar-track">
-              <div class="bar-fill cexpress" style="width: 100%;">217,278 req/s</div>
+              <div class="bar-fill cexpress" style="width: 100%;">214,710 req/s</div>
             </div>
-            <div class="bar-val" style="color: var(--primary);">217,278 req/s</div>
+            <div class="bar-val" style="color: var(--primary);">214,710 req/s</div>
           </div>
           <div class="bar-row">
             <div class="bar-label">Rust Actix-web (4 workers)</div>
@@ -1281,55 +1281,55 @@
                 <tr>
                   <td><strong>GET /api/todos (Read)</strong></td>
                   <td>100 conns</td>
-                  <td><strong style="color: var(--accent-emerald);">59,765 req/s</strong></td>
-                  <td>1.61 ms</td>
-                  <td>3.86 ms</td>
-                  <td>148.19 MB/s</td>
+                  <td><strong style="color: var(--accent-emerald);">11,060 req/s</strong></td>
+                  <td>8.45 ms</td>
+                  <td>38.11 ms</td>
+                  <td>352.52 MB/s</td>
                   <td><span class="test-status-pill">✓ 0 locks</span></td>
                 </tr>
                 <tr>
                   <td><strong>GET /api/todos (Read)</strong></td>
                   <td>1,000 conns</td>
-                  <td><strong style="color: var(--accent-emerald);">55,063 req/s</strong></td>
-                  <td>17.98 ms</td>
-                  <td>36.96 ms</td>
-                  <td>136.53 MB/s</td>
+                  <td><strong style="color: var(--accent-emerald);">10,862 req/s</strong></td>
+                  <td>91.31 ms</td>
+                  <td>186.81 ms</td>
+                  <td>346.21 MB/s</td>
                   <td><span class="test-status-pill">✓ 0 locks</span></td>
                 </tr>
                 <tr>
                   <td><strong>GET /api/todos (Read)</strong></td>
                   <td>5,000 conns</td>
-                  <td><strong style="color: var(--accent-emerald);">53,539 req/s</strong></td>
-                  <td>83.31 ms</td>
-                  <td>183.89 ms</td>
-                  <td>132.75 MB/s</td>
+                  <td><strong style="color: var(--accent-emerald);">9,402 req/s</strong></td>
+                  <td>376.51 ms</td>
+                  <td>936.72 ms</td>
+                  <td>299.68 MB/s</td>
                   <td><span class="test-status-pill">✓ 0 locks</span></td>
                 </tr>
                 <tr>
                   <td><strong>POST /api/todos (Write)</strong></td>
                   <td>100 conns</td>
-                  <td><strong style="color: var(--accent-amber);">24,730 req/s</strong></td>
-                  <td>3.97 ms</td>
-                  <td>56.66 ms</td>
-                  <td>5.51 MB/s</td>
+                  <td><strong style="color: var(--accent-amber);">22,374 req/s</strong></td>
+                  <td>9.48 ms</td>
+                  <td>449.19 ms</td>
+                  <td>5.01 MB/s</td>
                   <td><span class="test-status-pill">✓ 0 locks</span></td>
                 </tr>
                 <tr>
                   <td><strong>POST /api/todos (Write)</strong></td>
                   <td>1,000 conns</td>
-                  <td><strong style="color: var(--accent-amber);">24,644 req/s</strong></td>
-                  <td>40.11 ms</td>
-                  <td>63.23 ms</td>
-                  <td>5.50 MB/s</td>
+                  <td><strong style="color: var(--accent-amber);">22,574 req/s</strong></td>
+                  <td>43.97 ms</td>
+                  <td>97.74 ms</td>
+                  <td>5.06 MB/s</td>
                   <td><span class="test-status-pill">✓ 0 locks</span></td>
                 </tr>
                 <tr>
                   <td><strong>POST /api/todos (Write)</strong></td>
                   <td>5,000 conns</td>
-                  <td><strong style="color: var(--accent-amber);">23,729 req/s</strong></td>
-                  <td>93.14 ms</td>
-                  <td>274.47 ms</td>
-                  <td>5.30 MB/s</td>
+                  <td><strong style="color: var(--accent-amber);">19,902 req/s</strong></td>
+                  <td>139.63 ms</td>
+                  <td>369.37 ms</td>
+                  <td>4.46 MB/s</td>
                   <td><span class="test-status-pill">✓ 0 locks</span></td>
                 </tr>
               </tbody>
@@ -1365,29 +1365,29 @@
                 <tr>
                   <td><strong>100 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">62,474 req/s</strong></td>
-                  <td>747.44 µs</td>
-                  <td>22.77 ms</td>
-                  <td>391.50 MB/s</td>
-                  <td>3.86 GB</td>
+                  <td><strong style="color: var(--primary);">55,262 req/s</strong></td>
+                  <td>1.74 ms</td>
+                  <td>10.61 ms</td>
+                  <td>346.31 MB/s</td>
+                  <td>5.11 GB</td>
                 </tr>
                 <tr>
                   <td><strong>1,000 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">60,316 req/s</strong></td>
-                  <td>16.45 ms</td>
-                  <td>32.37 ms</td>
-                  <td>377.98 MB/s</td>
-                  <td>3.70 GB</td>
+                  <td><strong style="color: var(--primary);">52,227 req/s</strong></td>
+                  <td>19.04 ms</td>
+                  <td>60.83 ms</td>
+                  <td>327.29 MB/s</td>
+                  <td>4.80 GB</td>
                 </tr>
                 <tr>
                   <td><strong>5,000 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">55,954 req/s</strong></td>
-                  <td>52.85 ms</td>
-                  <td>162.77 ms</td>
-                  <td>350.65 MB/s</td>
-                  <td>3.44 GB</td>
+                  <td><strong style="color: var(--primary);">50,635 req/s</strong></td>
+                  <td>81.94 ms</td>
+                  <td>242.00 ms</td>
+                  <td>317.31 MB/s</td>
+                  <td>4.66 GB</td>
                 </tr>
               </tbody>
             </table>
@@ -1421,10 +1421,10 @@
                 <tr>
                   <td><strong>GET /ping (Connection: close)</strong></td>
                   <td>100 conns</td>
-                  <td><strong style="color: var(--accent-purple);">16,747 conn/s</strong></td>
-                  <td>2.46 ms</td>
-                  <td>171.55 ms</td>
-                  <td>Clean accept/close lifecycle; 168k connections completed in 10s</td>
+                  <td><strong style="color: var(--accent-purple);">19,207 conn/s</strong></td>
+                  <td>2.66 ms</td>
+                  <td>35.25 ms</td>
+                  <td>Clean accept/close lifecycle; 288k connections completed in 15s</td>
                 </tr>
               </tbody>
             </table>

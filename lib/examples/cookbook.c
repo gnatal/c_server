@@ -54,7 +54,8 @@ static void send_json(Response *res, const int status, yyjson_mut_doc *doc) {
 
 /* Sends {"error": message} with `status`. */
 static void send_error(Response *res, const int status, const char *message) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, obj);
     yyjson_mut_obj_add_str(doc, obj, "error", message);
@@ -82,7 +83,8 @@ static void recipe_square(const Request *req, Response *res) {
         send_error(res, 400, "n must be an integer between -1000000 and 1000000");
         return;
     }
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, obj);
     yyjson_mut_obj_add_int(doc, obj, "n", n);
@@ -115,7 +117,8 @@ static void recipe_create_note(const Request *req, Response *res) {
         return;
     }
 
-    yyjson_doc *doc = yyjson_read(req->body, strlen(req->body), 0);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_doc *doc = yyjson_read_opts((char *)req->body, strlen(req->body), 0, &alc, NULL);
     if (doc == NULL) {
         send_error(res, 400, "invalid json");
         return;
@@ -129,7 +132,7 @@ static void recipe_create_note(const Request *req, Response *res) {
         return;
     }
 
-    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *obj = yyjson_mut_obj(mdoc);
     yyjson_mut_doc_set_root(mdoc, obj);
     yyjson_mut_obj_add_int(mdoc, obj, "id", 1);
@@ -149,7 +152,8 @@ static void recipe_numbers(const Request *req, Response *res) {
         send_error(res, 400, "count must be between 0 and 100");
         return;
     }
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     yyjson_mut_doc_set_root(doc, arr);
     for (long i = 0; i < count; i++) {
@@ -222,7 +226,8 @@ static void recipe_list_notes(const Request *req, Response *res) {
 }
 
 static void recipe_get_note(const Request *req, Response *res) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, obj);
     yyjson_mut_obj_add_str(doc, obj, "id", req_get_param(req, "id"));
@@ -305,7 +310,8 @@ static void recipe_upload(const Request *req, Response *res) {
         send_error(res, 400, "missing file part");
         return;
     }
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, obj);
     yyjson_mut_obj_add_str(doc, obj, "filename", file->filename);

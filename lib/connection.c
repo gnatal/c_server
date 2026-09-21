@@ -85,8 +85,10 @@ int create_server_socket(int port) {
     return server_fd;
 }
 
+#define ARENA_SIZE (64 * 1024)
+
 Connection *connection_create(int fd) {
-    Connection *conn = calloc(1, sizeof(Connection));
+    Connection *conn = calloc(1, sizeof(Connection) + ARENA_SIZE);
     if (conn == NULL) {
         return NULL;
     }
@@ -99,6 +101,7 @@ Connection *connection_create(int fd) {
     conn->fd = fd;
     conn->file_fd = -1;
     conn->last_activity = time(NULL);
+    arena_init(&conn->arena, (char *)(conn + 1), ARENA_SIZE);
     return conn;
 }
 
@@ -126,8 +129,8 @@ void connection_close(App *app, Connection *conn) {
     }
     free(conn->in_buf);
     conn->in_buf = NULL;
-    free(conn->out_buf);
     conn->out_buf = NULL;
+    arena_destroy(&conn->arena);
     free(conn);
 }
 
@@ -312,11 +315,13 @@ void flush_connection(App *app, Connection *conn) {
                 size_t to_read = conn->file_remaining < STREAM_CHUNK_SIZE
                                      ? conn->file_remaining
                                      : STREAM_CHUNK_SIZE;
-                free(conn->out_buf);
-                conn->out_buf = malloc(to_read);
-                if (conn->out_buf == NULL) {
-                    connection_close(app, conn);
-                    return;
+                if (conn->out_cap < to_read || conn->out_buf == NULL) {
+                    conn->out_buf = arena_alloc(&conn->arena, to_read);
+                    if (conn->out_buf == NULL) {
+                        connection_close(app, conn);
+                        return;
+                    }
+                    conn->out_cap = to_read;
                 }
                 ssize_t r = read(conn->file_fd, conn->out_buf, to_read);
                 if (r <= 0) {
@@ -340,12 +345,12 @@ void flush_connection(App *app, Connection *conn) {
     if (conn->keep_alive) {
         /* Drop write registration from a partial write above */
         event_loop_unwatch_write(app, conn->fd, conn);
-        free(conn->out_buf);
         conn->out_buf = NULL;
         conn->out_len = 0;
         conn->out_sent = 0;
         conn->out_cap = 0;
         conn->in_len = 0;
+        arena_reset(&conn->arena);
 
         /* If handle_readable grew in_buf to fit a large body (in_cap >
          * BUF_SIZE), shrink it back down now that the connection is idle -
@@ -432,11 +437,11 @@ void handle_readable(App *app, Connection *conn) {
 
         if (request_is_complete(conn->in_buf, conn->in_len)) {
             Request req;
-            const int parse_status = parse_http_request(conn->in_buf, conn->in_len, &req);
+            const int parse_status = parse_http_request(conn->in_buf, conn->in_len, &req, &conn->arena);
             if (parse_status != 0) {
                 /* -2: path too long (414). content_length == -2: body over MAX_BODY_SIZE (413),
                  * for both Content-Length and chunked framing. Anything else: 400. */
-                free(req.body); /* NULL after a failed parse */
+                /* req.body is managed by arena, no need to free */
                 reject_request(app, conn, parse_status == -2 ? 414 : (req.content_length == -2 ? 413 : 400));
                 return;
             }
@@ -448,7 +453,7 @@ void handle_readable(App *app, Connection *conn) {
             res.is_head_request = strcmp(req.method, "HEAD") == 0;
             const Route *route = match_route(app, &req);
             dispatch(app, route, &req, &res);
-            free(req.body);
+            /* req.body is managed by arena, no need to free */
 
             flush_connection(app, conn);
             return;

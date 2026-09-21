@@ -9,6 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include "cexpress.h"
+#include "arena.h"
+
+Arena test_arena;
+char test_arena_buf[64 * 1024];
+char fuzz_conn_buf[64 * 1024];
+
 static void h(const Request *r, Response *s) { (void)r; res_send(s, "x"); }
 static unsigned long long rng = 88172645463325252ULL;
 static unsigned r32(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (unsigned)(rng >> 16); }
@@ -20,6 +26,7 @@ static const char *seeds[] = {
   "PUT /files/x/y/z HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\nX-Content-Length: 9\r\n\r\n",
 };
 int main(int argc, char **argv) {
+    arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
   const long iters = argc > 1 ? atol(argv[1]) : 1000000;
   static App app; app_init(&app);
   app_get(&app, "/", h); app_get(&app, "/api/todos/:id", h); app_post(&app, "/api/todos", h);
@@ -46,16 +53,16 @@ int main(int argc, char **argv) {
     (void)request_framing(buf, len, &hl, &ch);
     if (request_is_complete(buf, len)) complete++;
     Request req;
-    if (parse_http_request(buf, len, &req) == 0) {
+    if (parse_http_request(buf, len, &req, &test_arena) == 0) {
       parsed_ok++;
       (void)req_get_header(&req, "host"); (void)req_get_query(&req, "a"); (void)req_get_cookie(&req, "a");
       (void)request_wants_close(&req);
       const Route *rt = match_route(&app, &req);
-      Connection conn; memset(&conn, 0, sizeof conn); conn.file_fd = -1; conn.keep_alive = 1;
+      Connection conn; memset(&conn, 0, sizeof conn); arena_init(&conn.arena, fuzz_conn_buf, sizeof(fuzz_conn_buf)); conn.file_fd = -1; conn.keep_alive = 1;
       Response res; res_init(&res, &conn); dispatch(&app, rt, &req, &res);
-      free(conn.out_buf);
+      arena_reset(&conn.arena);
     }
-    free(req.body);
+    arena_reset(&test_arena);
     free(buf);
   }
   printf("fuzz ok: %ld iterations, %ld parsed, %ld complete\n", iters, parsed_ok, complete);

@@ -4,7 +4,6 @@
 #include <strings.h>
 #include "http_parser.h"
 
-static void parse_headers_n(const char *block, size_t len, Request *req);
 
 /* ---- byte-level helpers (all bounded by an explicit length) ---- */
 
@@ -53,39 +52,8 @@ void url_decode(const char *src, char *dst, const size_t dst_size, const int dec
     decode_bounded(dst, dst_size, src, strlen(src), decode_plus);
 }
 
-/* Pointer to the "\r\n\r\n" ending the header block in buf[0..len), or NULL. Hops between '\n'
- * bytes with memchr (header lines are short) instead of a generic substring search. */
-static const char *find_header_end(const char *buf, const size_t len) {
-    const char *p = buf;
-    const char *end = buf + len;
-    while (p < end) {
-        const char *nl = memchr(p, '\n', (size_t)(end - p));
-        if (nl == NULL) {
-            return NULL;
-        }
-        if (nl - buf >= 3 && nl[-1] == '\r' && nl[-2] == '\n' && nl[-3] == '\r') {
-            return nl - 3;
-        }
-        p = nl + 1;
-    }
-    return NULL;
-}
 
-/* End of the header line starting at p: pointer to its "\r\n", or `end` if the
- * line is unterminated. Never reads outside [p, end). */
-static const char *find_line_end(const char *p, const char *end) {
-    while (p < end) {
-        const char *nl = memchr(p, '\n', (size_t)(end - p));
-        if (nl == NULL) {
-            return end;
-        }
-        if (nl > p && nl[-1] == '\r') {
-            return nl - 1;
-        }
-        p = nl + 1;
-    }
-    return end;
-}
+#include "vendor/picohttpparser/picohttpparser.h"
 
 /* True when the comma-separated header value contains token (case-insensitive). */
 static int list_has_token(const char *value, const char *token) {
@@ -106,19 +74,83 @@ static int list_has_token(const char *value, const char *token) {
     return 0;
 }
 
+
 /* ---- message framing (Content-Length / Transfer-Encoding) ---- */
 
-/*
- * Line-anchored scan of a header block for the two framing headers. A header
- * counts only when its *name* (text before the first ':') equals the header
- * name exactly (case-insensitive), so "X-Content-Length: 9" or a request-line
- * target containing "Content-Length:" never match. Stops at the first blank
- * line, so a raw buffer that continues into a body is safe to pass.
- *
- * Returns the Content-Length code: 0 absent-or-zero, >0 value, -1 malformed or
- * conflicting duplicates, -2 above MAX_BODY_SIZE. *has_cl_out / *chunked_out
- * report header presence.
- */
+int request_framing(const char *buf, const size_t len, size_t *header_len_out, int *chunked_out) {
+    *header_len_out = 0;
+    *chunked_out = 0;
+
+    const char *method, *path;
+    size_t method_len, path_len;
+    int minor_version;
+    struct phr_header headers[100];
+    size_t num_headers = 100;
+
+    int res = phr_parse_request(buf, len, &method, &method_len, &path, &path_len,
+                                &minor_version, headers, &num_headers, 0);
+
+    if (res == -2) return 0; // Incomplete
+    if (res == -1) return -1; // Parse error
+
+    *header_len_out = (size_t)res;
+
+    int content_length = 0;
+    int has_cl = 0;
+
+    for (size_t i = 0; i < num_headers; i++) {
+        if (headers[i].name_len == 14 && strncasecmp(headers[i].name, "Content-Length", 14) == 0) {
+            long long acc = 0;
+            const char *v = headers[i].value;
+            size_t v_len = headers[i].value_len;
+            size_t j = 0;
+            while (j < v_len && (v[j] == ' ' || v[j] == '\t')) j++;
+            if (j < v_len && v[j] == '-') {
+                has_cl = 1; content_length = -1;
+            } else if (j == v_len || v[j] < '0' || v[j] > '9') {
+                has_cl = 1; content_length = -1;
+            } else {
+                while (j < v_len && v[j] >= '0' && v[j] <= '9') {
+                    if (acc <= MAX_BODY_SIZE) acc = acc * 10 + (v[j] - '0');
+                    j++;
+                }
+                while (j < v_len && (v[j] == ' ' || v[j] == '\t')) j++;
+                int val = (j != v_len) ? -1 : (acc > MAX_BODY_SIZE ? -2 : (int)acc);
+                if (has_cl && val != content_length) content_length = -1;
+                else if (!has_cl) content_length = val;
+                has_cl = 1;
+            }
+        } else if (headers[i].name_len == 17 && strncasecmp(headers[i].name, "Transfer-Encoding", 17) == 0) {
+            const char *q = headers[i].value;
+            size_t q_len = headers[i].value_len;
+            for (size_t k = 0; k + 7 <= q_len; k++) {
+                if (strncasecmp(q + k, "chunked", 7) == 0) {
+                    *chunked_out = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (*chunked_out && has_cl) return -1;
+    return content_length;
+}
+
+
+
+
+
+
+
+
+static const char *find_line_end(const char *buf, const char *end) {
+    const char *p = memchr(buf, '\r', (size_t)(end - buf));
+    if (p != NULL && p + 1 < end && *(p + 1) == '\n') {
+        return p;
+    }
+    return end;
+}
+
 static int scan_framing(const char *block, const size_t len, int *has_cl_out, int *chunked_out) {
     const char *p = block;
     const char *end = block + len;
@@ -128,70 +160,42 @@ static int scan_framing(const char *block, const size_t len, int *has_cl_out, in
 
     while (p < end) {
         const char *le = find_line_end(p, end);
-        if (le == p) {
-            break; /* blank line: end of the header block */
-        }
+        if (le == p) break;
         const char *colon = memchr(p, ':', (size_t)(le - p));
         if (colon != NULL) {
             const size_t name_len = (size_t)(colon - p);
             const char *v = colon + 1;
-            while (v < le && is_ows(*v)) {
-                v++;
-            }
+            while (v < le && is_ows(*v)) v++;
 
             if (name_len == 14 && strncasecmp(p, "Content-Length", 14) == 0) {
                 int value = 0;
-                if (v < le && *v == '-') {
-                    value = -1;
-                } else if (v == le || *v < '0' || *v > '9') {
-                    value = -1;
-                } else {
+                if (v < le && *v == '-') value = -1;
+                else if (v == le || *v < '0' || *v > '9') value = -1;
+                else {
                     long long acc = 0;
                     while (v < le && *v >= '0' && *v <= '9') {
-                        if (acc <= MAX_BODY_SIZE) {
-                            acc = acc * 10 + (*v - '0');
-                        }
+                        if (acc <= MAX_BODY_SIZE) acc = acc * 10 + (*v - '0');
                         v++;
                     }
-                    while (v < le && is_ows(*v)) {
-                        v++;
-                    }
-                    if (v != le) {
-                        value = -1; /* trailing garbage, e.g. "5abc" or "5, 5" */
-                    } else if (acc > MAX_BODY_SIZE) {
-                        value = -2;
-                    } else {
-                        value = (int)acc;
-                    }
+                    while (v < le && is_ows(*v)) v++;
+                    if (v != le) value = -1;
+                    else if (acc > MAX_BODY_SIZE) value = -2;
+                    else value = (int)acc;
                 }
-
-                if (has_cl && value != result) {
-                    result = -1; /* conflicting duplicate Content-Length headers */
-                } else if (!has_cl) {
-                    result = value;
-                }
+                if (has_cl && value != result) result = -1;
+                else if (!has_cl) result = value;
                 has_cl = 1;
             } else if (name_len == 17 && strncasecmp(p, "Transfer-Encoding", 17) == 0) {
                 for (const char *q = v; (size_t)(le - q) >= 7; q++) {
-                    if (strncasecmp(q, "chunked", 7) == 0) {
-                        chunked = 1;
-                        break;
-                    }
+                    if (strncasecmp(q, "chunked", 7) == 0) { chunked = 1; break; }
                 }
             }
         }
-        if (le >= end) {
-            break;
-        }
+        if (le >= end) break;
         p = le + 2;
     }
-
-    if (has_cl_out != NULL) {
-        *has_cl_out = has_cl;
-    }
-    if (chunked_out != NULL) {
-        *chunked_out = chunked;
-    }
+    if (has_cl_out != NULL) *has_cl_out = has_cl;
+    if (chunked_out != NULL) *chunked_out = chunked;
     return result;
 }
 
@@ -205,77 +209,36 @@ int request_has_chunked_encoding(const char *header_block) {
     return chunked;
 }
 
-int request_framing(const char *buf, const size_t len, size_t *header_len_out, int *chunked_out) {
-    *header_len_out = 0;
-    *chunked_out = 0;
 
-    const char *terminator = find_header_end(buf, len);
-    if (terminator == NULL) {
-        return 0;
-    }
-    *header_len_out = (size_t)(terminator + 4 - buf);
 
-    const char *first_line_end = memchr(buf, '\r', (size_t)(terminator - buf));
-    const char *block = first_line_end != NULL ? first_line_end + 2 : terminator;
-    if (block > terminator) {
-        block = terminator; /* zero header lines: the request line's CRLF starts the terminator */
+int request_wants_close(const Request *req) {
+    const char *connection = req_get_header(req, "Connection");
+    if (connection != NULL) {
+        if (list_has_token(connection, "close")) return 1;
+        if (list_has_token(connection, "keep-alive")) return 0;
     }
-
-    int has_cl = 0;
-    const int content_length = scan_framing(block, (size_t)(terminator - block), &has_cl, chunked_out);
-    if (*chunked_out && has_cl) {
-        return -1; /* RFC 7230 3.3.3: request-smuggling shape, rejected by parse_http_request */
-    }
-    return content_length;
+    return strcmp(req->version, "HTTP/1.1") != 0;
 }
+
 
 int request_is_complete(const char *buf, const size_t len) {
     size_t header_len;
     int chunked;
     const int content_length = request_framing(buf, len, &header_len, &chunked);
-    if (header_len == 0) {
-        return 0;
-    }
-    if (content_length < 0) {
-        return 1; /* stop buffering; parse_http_request turns this into 400/413 */
-    }
+    if (header_len == 0) return 0;
+    if (content_length < 0) return 1;
 
     const size_t body_have = len - header_len;
     if (chunked) {
         size_t decoded_len;
-        /* 1 = complete, -1/-2 = rejected: all stop buffering. Only 0 means "need more". */
         return chunked_body_scan(buf + header_len, body_have, MAX_BODY_SIZE, &decoded_len) != 0;
     }
     return body_have >= (size_t)content_length;
 }
 
-int request_wants_close(const Request *req) {
-    const char *connection = req_get_header(req, "Connection");
-    if (connection != NULL) {
-        if (list_has_token(connection, "close")) {
-            return 1;
-        }
-        if (list_has_token(connection, "keep-alive")) {
-            return 0;
-        }
-    }
-    return strcmp(req->version, "HTTP/1.1") != 0;
-}
-
 /* ---- request parsing ---- */
 
-/* Skips spaces from p (bounded by end), returns the first non-space. */
-static const char *skip_spaces(const char *p, const char *end) {
-    while (p < end && *p == ' ') {
-        p++;
-    }
-    return p;
-}
-
-int parse_http_request(const char *raw, const size_t raw_len, Request *req) {
-    /* Initialize only what accessors read. The arrays behind the *_count fields
-     * are never read past their count and every slot is NUL-terminated when
-     * written, so zeroing the whole ~19 KB struct per request is unnecessary. */
+int parse_http_request(const char *raw, const size_t raw_len, Request *req, Arena *arena) {
     req->method[0] = '\0';
     req->path[0] = '\0';
     req->query[0] = '\0';
@@ -287,176 +250,99 @@ int parse_http_request(const char *raw, const size_t raw_len, Request *req) {
     req->content_length = 0;
     req->body = NULL;
 
-    const char *header_end = find_header_end(raw, raw_len);
-    if (header_end == NULL) {
-        return -1;
-    }
-    const char *line_end = find_line_end(raw, header_end + 2);
-    if (line_end >= header_end + 2) {
-        return -1; /* no CRLF-terminated request line */
-    }
+    const char *method, *path;
+    size_t method_len, path_len;
+    int minor_version;
+    struct phr_header headers[MAX_HEADERS];
+    size_t num_headers = MAX_HEADERS;
 
-    /* Request line: METHOD SP target [SP version] */
-    const char *p = raw;
-    const char *sp = memchr(p, ' ', (size_t)(line_end - p));
-    if (sp == NULL || sp == p || (size_t)(sp - p) >= sizeof(req->method)) {
-        return -1; /* no method, or a method token that would not fit (was silently truncated) */
-    }
-    copy_bounded(req->method, sizeof(req->method), p, (size_t)(sp - p));
+    int res = phr_parse_request(raw, raw_len, &method, &method_len, &path, &path_len,
+                                &minor_version, headers, &num_headers, 0);
 
-    const char *target = skip_spaces(sp, line_end);
-    const char *target_end = memchr(target, ' ', (size_t)(line_end - target));
-    if (target_end == NULL) {
-        target_end = line_end;
-    }
-    if (target_end == target) {
-        return -1;
-    }
+    if (res <= 0) return -1;
 
-    const char *version = skip_spaces(target_end, line_end);
-    const char *version_end = memchr(version, ' ', (size_t)(line_end - version));
-    if (version_end == NULL) {
-        version_end = line_end;
-    }
-    copy_bounded(req->version, sizeof(req->version), version, (size_t)(version_end - version));
+    if (method_len >= sizeof(req->method)) return -1;
 
-    const char *qmark = memchr(target, '?', (size_t)(target_end - target));
-    const char *path_end = qmark != NULL ? qmark : target_end;
-    if ((size_t)(path_end - target) >= sizeof(req->path)) {
-        return -2; /* -> 414 URI Too Long: never silently truncate into a different path */
-    }
-    copy_bounded(req->path, sizeof(req->path), target, (size_t)(path_end - target));
+    copy_bounded(req->method, sizeof(req->method), method, method_len);
+    snprintf(req->version, sizeof(req->version), "HTTP/1.%d", minor_version);
+
+    const char *qmark = memchr(path, '?', path_len);
+    size_t p_len = qmark ? (size_t)(qmark - path) : path_len;
+    if (p_len >= sizeof(req->path)) return -2;
+    
+    copy_bounded(req->path, sizeof(req->path), path, p_len);
     url_decode(req->path, req->path, sizeof(req->path), 0);
-    if (qmark != NULL) {
-        copy_bounded(req->query, sizeof(req->query), qmark + 1, (size_t)(target_end - qmark - 1));
+    
+    if (qmark) {
+        size_t q_len = path_len - p_len - 1;
+        copy_bounded(req->query, sizeof(req->query), qmark + 1, q_len);
     }
     parse_query_string(req->query, req);
 
-    /* Header block: after the request line's CRLF, up to the blank line. */
-    const char *header_start = line_end + 2;
-    if (header_start > header_end) {
-        header_start = header_end; /* zero header lines: request-line CRLF is the start of "\r\n\r\n" */
+    for (size_t i = 0; i < num_headers; i++) {
+        if (req->header_count < MAX_HEADERS) {
+            copy_bounded(req->header_names[req->header_count], sizeof(req->header_names[0]), headers[i].name, headers[i].name_len);
+            copy_bounded(req->header_values[req->header_count], sizeof(req->header_values[0]), headers[i].value, headers[i].value_len);
+            req->header_count++;
+        }
     }
-    const size_t header_block_len = (size_t)(header_end - header_start);
-    parse_headers_n(header_start, header_block_len, req);
     parse_cookies(req_get_header(req, "Cookie"), req);
 
-    const char *body_start = header_end + 4;
-    const size_t available = raw_len - (size_t)(body_start - raw);
+    size_t header_len = (size_t)res;
+    const char *body_start = raw + header_len;
+    const size_t available = raw_len - header_len;
 
-    int has_cl = 0;
     int chunked = 0;
-    const int cl = scan_framing(header_start, header_block_len, &has_cl, &chunked);
+    int content_length = request_framing(raw, raw_len, &header_len, &chunked);
+    
+    if (content_length < 0) {
+        req->content_length = content_length;
+        return -1;
+    }
 
     if (chunked) {
-        if (has_cl) {
-            return -1; /* RFC 7230 3.3.3: ambiguous framing, reject rather than guess */
-        }
         size_t decoded_len = 0;
-        const int scan = chunked_body_scan(body_start, available, MAX_BODY_SIZE, &decoded_len);
+        int scan = chunked_body_scan(body_start, available, MAX_BODY_SIZE, &decoded_len);
         if (scan == -2) {
-            req->content_length = -2; /* connection.c maps -2 to 413 for both framings */
+            req->content_length = -2;
             return -1;
         }
-        if (scan != 1) {
-            return -1;
-        }
-        req->body = malloc(decoded_len + 1);
-        if (req->body == NULL) {
-            return -1;
-        }
-        const size_t written = chunked_body_decode(body_start, available, req->body);
+        if (scan != 1) return -1;
+        req->body = arena_alloc(arena, decoded_len + 1);
+        if (!req->body) return -1;
+        size_t written = chunked_body_decode(body_start, available, req->body);
         req->body[written] = '\0';
         req->content_length = (int)written;
         return 0;
     }
-
-    req->content_length = cl;
-    if (cl < 0) {
-        return -1;
-    }
-
-    /* Copy exactly content_length bytes (a pipelined next request may follow in
-     * `raw`). Sized off raw_len, never strlen: the body may hold NUL bytes. */
-    size_t body_len = (size_t)cl;
-    if (body_len > available) {
-        body_len = available;
-    }
-    req->body = malloc(body_len + 1);
-    if (req->body == NULL) {
-        return -1;
-    }
+    
+    req->content_length = content_length;
+    
+    size_t body_len = (size_t)content_length;
+    if (body_len > available) body_len = available;
+    req->body = arena_alloc(arena, body_len + 1);
+    if (!req->body) return -1;
     memcpy(req->body, body_start, body_len);
     req->body[body_len] = '\0';
     return 0;
 }
 
-void parse_query_string(const char *query, Request *req) {
-    req->query_count = 0;
-    const char *p = query;
-    while (*p != '\0' && req->query_count < MAX_QUERY_PARAMS) {
-        const char *amp = strchr(p, '&');
-        const size_t pair_len = amp != NULL ? (size_t)(amp - p) : strlen(p);
-        if (pair_len > 0) {
-            const char *eq = memchr(p, '=', pair_len);
-            const size_t name_len = eq != NULL ? (size_t)(eq - p) : pair_len;
-            const char *value = eq != NULL ? eq + 1 : p + pair_len;
-            const size_t value_len = eq != NULL ? pair_len - name_len - 1 : 0;
-
-            decode_bounded(req->query_names[req->query_count], sizeof(req->query_names[0]), p, name_len, 1);
-            decode_bounded(req->query_values[req->query_count], sizeof(req->query_values[0]), value, value_len, 1);
-            req->query_count++;
-        }
-        if (amp == NULL) {
-            break;
-        }
-        p = amp + 1;
-    }
-}
-
-const char *req_get_query(const Request *req, const char *name) {
-    for (int i = 0; i < req->query_count; i++) {
-        if (strcmp(req->query_names[i], name) == 0) {
-            return req->query_values[i];
-        }
-    }
-    return NULL;
-}
-
-static void parse_headers_n(const char *block, const size_t len, Request *req) {
+void parse_headers(const char *header_block, Request *req) {
+    struct phr_header headers[MAX_HEADERS];
+    size_t num_headers = MAX_HEADERS;
+    int res = phr_parse_headers(header_block, strlen(header_block), headers, &num_headers, 0);
+    if (res == -1) return;
+    
     req->header_count = 0;
-    const char *p = block;
-    const char *end = block + len;
-
-    while (p < end && req->header_count < MAX_HEADERS) {
-        const char *le = find_line_end(p, end);
-        const char *colon = memchr(p, ':', (size_t)(le - p));
-        if (colon != NULL) {
-            const char *value = colon + 1;
-            while (value < le && is_ows(*value)) {
-                value++;
-            }
-            const char *value_end = le;
-            while (value_end > value && is_ows(value_end[-1])) {
-                value_end--;
-            }
-            copy_bounded(req->header_names[req->header_count], sizeof(req->header_names[0]), p,
-                         (size_t)(colon - p));
-            copy_bounded(req->header_values[req->header_count], sizeof(req->header_values[0]), value,
-                         (size_t)(value_end - value));
+    for (size_t i = 0; i < num_headers; i++) {
+        if (req->header_count < MAX_HEADERS) {
+            copy_bounded(req->header_names[req->header_count], sizeof(req->header_names[0]), headers[i].name, headers[i].name_len);
+            copy_bounded(req->header_values[req->header_count], sizeof(req->header_values[0]), headers[i].value, headers[i].value_len);
             req->header_count++;
         }
-        /* A line with no ':' is malformed and skipped. */
-        if (le >= end) {
-            break;
-        }
-        p = le + 2;
     }
 }
 
-void parse_headers(const char *header_block, Request *req) {
-    parse_headers_n(header_block, strlen(header_block), req);
-}
 
 const char *req_get_header(const Request *req, const char *name) {
     for (int i = 0; i < req->header_count; i++) {
@@ -538,6 +424,7 @@ const char *status_text(const int status) {
     }
 }
 
+
 /* ---- chunked request bodies ---- */
 
 /* Pointer to the "\r" of the first CRLF in buf[0..len), or NULL. Length-bounded:
@@ -553,7 +440,12 @@ static const char *find_crlf(const char *buf, const size_t len) {
 
 /* "\r\n\r\n" ending a chunked body's trailer-part; found from the last-chunk line's own start. */
 static const char *find_double_crlf(const char *buf, const size_t len) {
-    return find_header_end(buf, len);
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n') {
+            return buf + i;
+        }
+    }
+    return NULL;
 }
 
 int chunked_body_scan(const char *body_start, const size_t available, const size_t max_decoded_len,
@@ -650,4 +542,35 @@ size_t chunked_body_decode(const char *body_start, const size_t available, char 
     }
 
     return out_len;
+}
+void parse_query_string(const char *query, Request *req) {
+    req->query_count = 0;
+    const char *p = query;
+    while (*p != '\0' && req->query_count < MAX_QUERY_PARAMS) {
+        const char *amp = strchr(p, '&');
+        const size_t pair_len = amp != NULL ? (size_t)(amp - p) : strlen(p);
+        if (pair_len > 0) {
+            const char *eq = memchr(p, '=', pair_len);
+            const size_t name_len = eq != NULL ? (size_t)(eq - p) : pair_len;
+            const char *value = eq != NULL ? eq + 1 : p + pair_len;
+            const size_t value_len = eq != NULL ? pair_len - name_len - 1 : 0;
+
+            decode_bounded(req->query_names[req->query_count], sizeof(req->query_names[0]), p, name_len, 1);
+            decode_bounded(req->query_values[req->query_count], sizeof(req->query_values[0]), value, value_len, 1);
+            req->query_count++;
+        }
+        if (amp == NULL) {
+            break;
+        }
+        p = amp + 1;
+    }
+}
+
+const char *req_get_query(const Request *req, const char *name) {
+    for (int i = 0; i < req->query_count; i++) {
+        if (strcmp(req->query_names[i], name) == 0) {
+            return req->query_values[i];
+        }
+    }
+    return NULL;
 }

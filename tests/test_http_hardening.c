@@ -10,6 +10,10 @@
 #include <string.h>
 #include "app_types.h"
 #include "http_parser.h"
+#include "arena.h"
+
+Arena test_arena;
+char test_arena_buf[64 * 1024];
 
 static void test_framing_is_line_anchored(void) {
     /* Regression: Content-Length used to be found by substring search, so a header whose name merely
@@ -36,9 +40,9 @@ static void test_framing_is_line_anchored(void) {
     assert(request_is_complete(in_body, strlen(in_body)) == 1);
 
     Request req;
-    assert(parse_http_request(x_header, strlen(x_header), &req) == 0);
+    assert(parse_http_request(x_header, strlen(x_header), &req, &test_arena) == 0);
     assert(req.content_length == 0);
-    free(req.body);
+    arena_reset(&test_arena);
 }
 
 static void test_content_length_is_strict(void) {
@@ -66,7 +70,7 @@ static void test_content_length_is_strict(void) {
     assert(chunked == 1);
     assert(request_is_complete(both, strlen(both)) == 1);
     Request req;
-    assert(parse_http_request(both, strlen(both), &req) == -1);
+    assert(parse_http_request(both, strlen(both), &req, &test_arena) == -1);
     assert(req.body == NULL);
 }
 
@@ -97,19 +101,19 @@ static void test_wants_close_header_forms(void) {
     strncpy(req.version, "HTTP/1.1", sizeof(req.version) - 1);
 
     /* Regression: "Connection:close" (no space) used to be missed by a substring search. */
-    parse_headers("Connection:close", &req);
+    parse_headers("Connection:close\r\n", &req);
     assert(request_wants_close(&req) == 1);
-    parse_headers("connection: CLOSE", &req);
+    parse_headers("connection: CLOSE\r\n", &req);
     assert(request_wants_close(&req) == 1);
-    parse_headers("Connection: keep-alive, Upgrade", &req);
+    parse_headers("Connection: keep-alive, Upgrade\r\n", &req);
     assert(request_wants_close(&req) == 0);
-    parse_headers("Connection: upgrade, close", &req);
+    parse_headers("Connection: upgrade, close\r\n", &req);
     assert(request_wants_close(&req) == 1);
     /* Only a real Connection header counts, not one quoted inside another header's value. */
-    parse_headers("X-Debug: Connection: close", &req);
+    parse_headers("X-Debug: Connection: close\r\n", &req);
     assert(request_wants_close(&req) == 0);
     /* Token match, not substring: "closed" is not "close". */
-    parse_headers("Connection: closed-form", &req);
+    parse_headers("Connection: closed-form\r\n", &req);
     assert(request_wants_close(&req) == 0);
 }
 
@@ -118,38 +122,36 @@ static void test_request_line_limits(void) {
     /* Regression: a method token longer than req->method used to be silently truncated to its first
      * 7 characters, with the leftover characters then mis-read as the path. */
     const char *long_method = "GETTTTTTTTTT /a HTTP/1.1\r\n\r\n";
-    assert(parse_http_request(long_method, strlen(long_method), &req) == -1);
+    assert(parse_http_request(long_method, strlen(long_method), &req, &test_arena) == -1);
     assert(req.body == NULL);
 
     const char *seven = "OPTIONS /a HTTP/1.1\r\n\r\n";
-    assert(parse_http_request(seven, strlen(seven), &req) == 0);
+    assert(parse_http_request(seven, strlen(seven), &req, &test_arena) == 0);
     assert(strcmp(req.method, "OPTIONS") == 0);
-    free(req.body);
+    arena_reset(&test_arena);
 
     const char *eight = "OPTIONSS /a HTTP/1.1\r\n\r\n";
-    assert(parse_http_request(eight, strlen(eight), &req) == -1);
+    assert(parse_http_request(eight, strlen(eight), &req, &test_arena) == -1);
 
     const char *no_target = "GET\r\n\r\n";
-    assert(parse_http_request(no_target, strlen(no_target), &req) == -1);
+    assert(parse_http_request(no_target, strlen(no_target), &req, &test_arena) == -1);
     const char *leading_space = " GET /a HTTP/1.1\r\n\r\n";
-    assert(parse_http_request(leading_space, strlen(leading_space), &req) == -1);
+    assert(parse_http_request(leading_space, strlen(leading_space), &req, &test_arena) == -1);
 
-    /* Version is optional (HTTP/0.9-style): parses, and request_wants_close then closes. */
+    /* Version is required by picohttpparser. */
     const char *no_version = "GET /a\r\n\r\n";
-    assert(parse_http_request(no_version, strlen(no_version), &req) == 0);
-    assert(strcmp(req.version, "") == 0);
-    assert(request_wants_close(&req) == 1);
-    free(req.body);
+    assert(parse_http_request(no_version, strlen(no_version), &req, &test_arena) == -1);
+    arena_reset(&test_arena);
 
     /* An oversized query is truncated to fit req->query, never overflowed. */
     char long_query[1200];
     int n = snprintf(long_query, sizeof(long_query), "GET /a?");
     for (int i = 0; i < 900; i++) long_query[n++] = 'q';
     n += snprintf(long_query + n, sizeof(long_query) - (size_t)n, " HTTP/1.1\r\n\r\n");
-    assert(parse_http_request(long_query, (size_t)n, &req) == 0);
+    assert(parse_http_request(long_query, (size_t)n, &req, &test_arena) == 0);
     assert(strlen(req.query) == sizeof(req.query) - 1);
     assert(req.query_count == 1);
-    free(req.body);
+    arena_reset(&test_arena);
 }
 
 /* parse_http_request initializes only what accessors read. Parse into a struct full of garbage
@@ -158,7 +160,7 @@ static void test_parse_does_not_depend_on_zeroed_request(void) {
     Request req;
     memset(&req, 0xA5, sizeof(req));
     const char *raw = "GET /plain HTTP/1.1\r\n\r\n";
-    assert(parse_http_request(raw, strlen(raw), &req) == 0);
+    assert(parse_http_request(raw, strlen(raw), &req, &test_arena) == 0);
     assert(strcmp(req.method, "GET") == 0);
     assert(strcmp(req.path, "/plain") == 0);
     assert(strcmp(req.query, "") == 0);
@@ -168,11 +170,11 @@ static void test_parse_does_not_depend_on_zeroed_request(void) {
     assert(req_get_query(&req, "q") == NULL);
     assert(req_get_header(&req, "Host") == NULL);
     assert(req_get_cookie(&req, "a") == NULL);
-    free(req.body);
+    arena_reset(&test_arena);
 
     memset(&req, 0xA5, sizeof(req));
     const char *bad = "GET\r\n\r\n";
-    assert(parse_http_request(bad, strlen(bad), &req) == -1);
+    assert(parse_http_request(bad, strlen(bad), &req, &test_arena) == -1);
     assert(req.body == NULL);
     assert(req.content_length == 0);
 }
@@ -182,7 +184,7 @@ static void test_header_value_whitespace_and_limits(void) {
     memset(&req, 0, sizeof(req));
 
     /* Optional whitespace (spaces and tabs) around the value is trimmed on both sides. */
-    parse_headers("A:   spaced   \r\nB:\ttabbed\t\r\nC:x y  z", &req);
+    parse_headers("A:   spaced   \r\nB:\ttabbed\t\r\nC:x y  z\r\n", &req);
     assert(strcmp(req_get_header(&req, "A"), "spaced") == 0);
     assert(strcmp(req_get_header(&req, "B"), "tabbed") == 0);
     assert(strcmp(req_get_header(&req, "C"), "x y  z") == 0);
@@ -193,6 +195,8 @@ static void test_header_value_whitespace_and_limits(void) {
     for (int i = 0; i < 100; i++) big[n++] = 'N';
     n += snprintf(big + n, sizeof(big) - (size_t)n, ": ");
     for (int i = 0; i < 400; i++) big[n++] = 'v';
+    big[n++] = '\r';
+    big[n++] = '\n';
     big[n] = '\0';
     parse_headers(big, &req);
     assert(req.header_count == 1);
@@ -228,6 +232,7 @@ static void test_percent_decoding_at_boundaries(void) {
 }
 
 int main(void) {
+    arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_framing_is_line_anchored();
     test_content_length_is_strict();
     test_request_framing();

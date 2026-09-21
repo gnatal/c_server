@@ -6,15 +6,20 @@
 #include "app_types.h"
 #include "response.h"
 
+#include "arena.h"
+
 static Connection *make_conn(void) {
     Connection *conn = calloc(1, sizeof(Connection));
+    arena_init(&conn->arena, malloc(64 * 1024), 64 * 1024);
     conn->keep_alive = 1;
     conn->file_fd = -1;
     return conn;
 }
 
 static void free_conn(Connection *conn) {
-    free(conn->out_buf);
+    void *buf = conn->arena.buf;
+    arena_reset(&conn->arena);
+    free(buf);
     free(conn);
 }
 

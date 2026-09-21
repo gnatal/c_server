@@ -3,6 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "cexpress.h"
+#include "arena.h"
+
+Arena test_arena;
+char test_arena_buf[64 * 1024];
+
 
 static void handler_ping(const Request *req, Response *res) {
     (void)req;
@@ -13,24 +18,26 @@ static void handler_ping(const Request *req, Response *res) {
 static char *fetch(App *app, const char *raw) {
     Connection conn;
     memset(&conn, 0, sizeof(conn));
+    arena_init(&conn.arena, test_arena_buf, sizeof(test_arena_buf));
     conn.file_fd = -1;
     conn.keep_alive = 1;
 
     Request req;
-    assert(parse_http_request(raw, strlen(raw), &req) == 0);
+    assert(parse_http_request(raw, strlen(raw), &req, &test_arena) == 0);
     Response res;
     res_init(&res, &conn);
     res.is_head_request = strcmp(req.method, "HEAD") == 0;
     dispatch(app, match_route(app, &req), &req, &res);
-    free(req.body);
+    arena_reset(&test_arena);
 
     char *out = malloc(conn.out_len + 1);
     memcpy(out, conn.out_buf, conn.out_len + 1); /* out_buf is NUL-terminated */
-    free(conn.out_buf);
+    arena_reset(&conn.arena);
     return out;
 }
 
 int main(void) {
+    arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     static App app;
     app_init(&app);
     app_get(&app, "/ping", handler_ping);
@@ -46,9 +53,9 @@ int main(void) {
     conn.file_fd = -1;
     Request req;
     const char *close_req = "GET /ping HTTP/1.1\r\nConnection: close\r\n\r\n";
-    assert(parse_http_request(close_req, strlen(close_req), &req) == 0);
+    assert(parse_http_request(close_req, strlen(close_req), &req, &test_arena) == 0);
     assert(request_wants_close(&req) == 1);
-    free(req.body);
+    arena_reset(&test_arena);
 
     /* HEAD: same headers, no body. */
     resp = fetch(&app, "HEAD /ping HTTP/1.1\r\n\r\n");

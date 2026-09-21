@@ -1,143 +1,215 @@
 ==> Building release binary
 ==> Starting server (WORKERS=4, QUIET=1, TODO_DB_PATH=stress_todos.db, memory tracking: /usr/bin/time -l)
+CExpress cluster master (PID 56893) starting 4 workers on port 8080
+Listening on port 8080
 ==> Waiting for server to come up
 ==> Seeding 20 todos
-==> Idle memory after startup + seeding: 11.9 MB total across 5 processes
+==> Idle memory after startup + seeding: 11.6 MB total across 5 processes
+
+=== GET /ping (keep-alive)  threads=8 conns=100 ===
+Running 15s test @ http://127.0.0.1:8080/ping
+  8 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   432.26us  160.15us   7.32ms   94.15%
+    Req/Sec    27.31k     2.33k   30.23k    79.88%
+  3281903 requests in 15.10s, 287.95MB read
+Requests/sec: 217342.40
+Transfer/sec:     19.07MB
+Peak server memory: 11.6 MB total across 5 processes (largest single process: 2.9 MB)
+
+=== GET /ping (keep-alive)  threads=8 conns=1000 ===
+Running 15s test @ http://127.0.0.1:8080/ping
+  8 threads and 1000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.93ms    1.08ms  36.05ms   96.21%
+    Req/Sec    25.48k     2.00k   27.88k    88.25%
+  3042701 requests in 15.01s, 266.96MB read
+Requests/sec: 202729.96
+Transfer/sec:     17.79MB
+Peak server memory: 11.6 MB total across 5 processes (largest single process: 2.9 MB)
+
+=== GET /ping (keep-alive)  threads=8 conns=5000 ===
+Running 15s test @ http://127.0.0.1:8080/ping
+  8 threads and 5000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    21.81ms   16.53ms 347.18ms   98.29%
+    Req/Sec    23.50k     3.37k   27.46k    86.73%
+  2760126 requests in 15.06s, 242.17MB read
+  Socket errors: connect 0, read 1624, write 0, timeout 0
+Requests/sec: 183304.07
+Transfer/sec:     16.08MB
+Peak server memory: 11.6 MB total across 5 processes (largest single process: 2.9 MB)
+
+=== GET /ping (conn: close) threads=8 conns=100 ===
+Running 15s test @ http://127.0.0.1:8080/ping
+  8 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.94ms   15.27ms 370.57ms   98.06%
+    Req/Sec     4.03k     1.46k    8.16k    83.66%
+  228968 requests in 15.10s, 19.00MB read
+  Socket errors: connect 96, read 0, write 0, timeout 0
+Requests/sec:  15168.20
+Transfer/sec:      1.26MB
+Peak server memory: 7.2 MB total across 5 processes (largest single process: 2.0 MB)
+
+=== GET /ping (conn: close) threads=8 conns=1000 ===
+Running 15s test @ http://127.0.0.1:8080/ping
+  8 threads and 1000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     0.00us    0.00us   0.00us     nan%
+    Req/Sec     0.00      0.00     0.00       nan%
+  0 requests in 15.09s, 0.00B read
+  Socket errors: connect 1000, read 0, write 0, timeout 0
+Requests/sec:      0.00
+Transfer/sec:       0.00B
+Peak server memory: 7.2 MB total across 5 processes (largest single process: 2.0 MB)
+
+=== GET /ping (conn: close) threads=8 conns=5000 ===
+Running 15s test @ http://127.0.0.1:8080/ping
+  8 threads and 5000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.05ms    6.90ms 173.91ms   98.60%
+    Req/Sec     2.90k     1.67k    5.91k    60.82%
+  255084 requests in 15.09s, 21.16MB read
+  Socket errors: connect 4378, read 0, write 0, timeout 0
+Requests/sec:  16903.33
+Transfer/sec:      1.40MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 === GET / (Todo UI)         threads=8 conns=100 ===
 Running 15s test @ http://127.0.0.1:8080/
   8 threads and 100 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.64ms  247.89us   7.64ms   95.49%
-    Req/Sec     7.36k   669.24    18.87k    94.43%
-  880854 requests in 15.10s, 5.39GB read
-Requests/sec:  58336.14
-Transfer/sec:    365.57MB
-Peak server memory: 12.8 MB total across 5 processes (largest single process: 3.3 MB)
+    Latency     1.64ms  292.12us   6.82ms   87.17%
+    Req/Sec     6.99k     1.46k   53.34k    96.42%
+  835663 requests in 15.10s, 5.11GB read
+Requests/sec:  55340.31
+Transfer/sec:    346.80MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 === GET /api/todos (read)   threads=8 conns=100 ===
 Running 15s test @ http://127.0.0.1:8080/api/todos
   8 threads and 100 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     3.50ms  351.26us   9.18ms   92.60%
-    Req/Sec     3.44k   622.99    24.78k    99.92%
-  411527 requests in 15.10s, 1.00GB read
-Requests/sec:  27249.96
-Transfer/sec:     67.57MB
-Peak server memory: 13.0 MB total across 5 processes (largest single process: 3.5 MB)
+    Latency     1.65ms  597.88us  25.11ms   98.59%
+    Req/Sec     7.33k   440.36    11.91k    91.04%
+  879248 requests in 15.10s, 2.33GB read
+Requests/sec:  58217.43
+Transfer/sec:    157.79MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 === GET / (Todo UI)         threads=8 conns=1000 ===
 Running 15s test @ http://127.0.0.1:8080/
   8 threads and 1000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    17.15ms    2.15ms  53.08ms   96.12%
-    Req/Sec     7.28k   412.35     9.21k    93.00%
-  869733 requests in 15.01s, 5.32GB read
-Requests/sec:  57952.66
-Transfer/sec:    363.17MB
-Peak server memory: 20.2 MB total across 5 processes (largest single process: 10.7 MB)
+    Latency    18.24ms    1.79ms  40.84ms   96.04%
+    Req/Sec     6.83k   294.24     8.90k    86.17%
+  816042 requests in 15.01s, 4.99GB read
+Requests/sec:  54366.01
+Transfer/sec:    340.69MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 === GET /api/todos (read)   threads=8 conns=1000 ===
 Running 15s test @ http://127.0.0.1:8080/api/todos
   8 threads and 1000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    36.85ms    2.56ms  70.72ms   92.23%
-    Req/Sec     3.39k   169.45     4.03k    75.00%
-  405390 requests in 15.02s, 0.98GB read
-Requests/sec:  26989.12
-Transfer/sec:     66.92MB
-Peak server memory: 16.8 MB total across 5 processes (largest single process: 10.4 MB)
+    Latency    17.66ms    1.55ms  39.18ms   95.96%
+    Req/Sec     7.08k   308.56     8.34k    91.67%
+  845817 requests in 15.01s, 2.24GB read
+Requests/sec:  56352.05
+Transfer/sec:    152.73MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 === GET / (Todo UI)         threads=8 conns=5000 ===
 Running 15s test @ http://127.0.0.1:8080/
   8 threads and 5000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    61.40ms   13.55ms 153.07ms   62.44%
-    Req/Sec     6.87k   391.89     8.42k    79.75%
-  820173 requests in 15.05s, 5.02GB read
-  Socket errors: connect 0, read 1997, write 0, timeout 0
-Requests/sec:  54503.14
-Transfer/sec:    341.55MB
-Peak server memory: 43.1 MB total across 5 processes (largest single process: 36.7 MB)
+    Latency    57.81ms   15.33ms 153.49ms   73.11%
+    Req/Sec     6.72k   358.78     8.90k    82.83%
+  801790 requests in 15.04s, 4.91GB read
+  Socket errors: connect 0, read 2337, write 0, timeout 0
+Requests/sec:  53313.93
+Transfer/sec:    334.10MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 === GET /api/todos (read)   threads=8 conns=5000 ===
 Running 15s test @ http://127.0.0.1:8080/api/todos
   8 threads and 5000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   171.77ms   33.94ms 378.32ms   86.65%
-    Req/Sec     3.22k   235.56     3.73k    82.83%
-  384793 requests in 15.05s, 0.93GB read
-Requests/sec:  25575.03
-Transfer/sec:     63.41MB
-Peak server memory: 48.8 MB total across 5 processes (largest single process: 42.4 MB)
+    Latency    88.53ms   30.57ms 488.20ms   92.15%
+    Req/Sec     6.68k     0.98k    8.05k    86.82%
+  787677 requests in 15.04s, 2.08GB read
+Requests/sec:  52365.13
+Transfer/sec:    141.93MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 === POST /api/todos (write) threads=8 conns=100 ===
 Running 15s test @ http://127.0.0.1:8080/api/todos
   8 threads and 100 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     5.02ms    8.67ms 157.99ms   99.09%
-    Req/Sec     2.80k   197.90     4.34k    98.66%
-  333263 requests in 15.02s, 74.27MB read
-Requests/sec:  22182.84
-Transfer/sec:      4.94MB
-Peak server memory: 51.5 MB total across 5 processes (largest single process: 45.0 MB)
+    Latency     4.27ms    2.26ms  63.33ms   97.37%
+    Req/Sec     2.90k   437.66    10.61k    92.60%
+  347198 requests in 15.10s, 77.37MB read
+Requests/sec:  22986.16
+Transfer/sec:      5.12MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 === POST /api/todos (write) threads=8 conns=1000 ===
 Running 15s test @ http://127.0.0.1:8080/api/todos
   8 threads and 1000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    44.87ms    3.78ms  86.28ms   95.86%
-    Req/Sec     2.79k   180.47     3.58k    86.25%
-  333123 requests in 15.03s, 74.34MB read
-Requests/sec:  22162.16
-Transfer/sec:      4.95MB
-Peak server memory: 51.5 MB total across 5 processes (largest single process: 45.0 MB)
+    Latency    43.17ms    6.40ms 121.00ms   95.59%
+    Req/Sec     2.89k   266.34     3.99k    91.00%
+  345467 requests in 15.02s, 77.09MB read
+Requests/sec:  22996.04
+Transfer/sec:      5.13MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 === POST /api/todos (write) threads=8 conns=5000 ===
 Running 15s test @ http://127.0.0.1:8080/api/todos
   8 threads and 5000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   131.01ms   31.28ms 351.44ms   78.00%
-    Req/Sec     2.72k   236.16     3.22k    79.67%
-  325224 requests in 15.05s, 72.58MB read
-  Socket errors: connect 0, read 2386, write 0, timeout 0
-Requests/sec:  21614.68
-Transfer/sec:      4.82MB
-Peak server memory: 44.2 MB total across 5 processes (largest single process: 37.8 MB)
+    Latency   135.25ms   36.69ms 420.28ms   77.54%
+    Req/Sec     2.79k   268.83     3.44k    81.42%
+  332873 requests in 15.04s, 74.31MB read
+  Socket errors: connect 0, read 2393, write 0, timeout 0
+Requests/sec:  22129.31
+Transfer/sec:      4.94MB
+Peak server memory: 7.1 MB total across 5 processes (largest single process: 2.0 MB)
 
 ==> Done. Stopping server
-CExpress cluster master (PID 46828) starting 4 workers on port 8080
-
-Received signal 15, draining connections...
-CExpress cluster master (PID 46828) starting 4 workers on port 8080
-
-Received signal 15, draining connections...
-CExpress cluster master (PID 46828) starting 4 workers on port 8080
-
-Received signal 15, draining connections...
-CExpress cluster master (PID 46828) starting 4 workers on port 8080
-Listening on port 8080
-
-Received signal 15, draining connections...
-CExpress cluster master (PID 46828) starting 4 workers on port 8080
 
 Master received signal 15, draining 4 workers...
+
+Received signal 15, draining connections...
+
+
+Received signal 15, draining connections...
+Received signal 15, draining connections...
+
+Received signal 15, draining connections...
 All workers terminated cleanly. Master exiting.
 
 ================ Memory summary ================
-Idle (after startup + seeding):  11.9 MB total across 5 processes
-After all benchmarks (pre-stop): 44.2 MB total across 5 processes
+Idle (after startup + seeding):  11.6 MB total across 5 processes
+After all benchmarks (pre-stop): 7.1 MB total across 5 processes
 
 Peak per benchmark (sum of master + workers, sampled every 250ms):
-GET / (Todo UI)         threads=8 conns=100              12.8 MB total        3.3 MB largest process
-GET /api/todos (read)   threads=8 conns=100              13.0 MB total        3.5 MB largest process
-GET / (Todo UI)         threads=8 conns=1000             20.2 MB total       10.7 MB largest process
-GET /api/todos (read)   threads=8 conns=1000             16.8 MB total       10.4 MB largest process
-GET / (Todo UI)         threads=8 conns=5000             43.1 MB total       36.7 MB largest process
-GET /api/todos (read)   threads=8 conns=5000             48.8 MB total       42.4 MB largest process
-POST /api/todos (write) threads=8 conns=100              51.5 MB total       45.0 MB largest process
-POST /api/todos (write) threads=8 conns=1000             51.5 MB total       45.0 MB largest process
-POST /api/todos (write) threads=8 conns=5000             44.2 MB total       37.8 MB largest process
+GET /ping (keep-alive)  threads=8 conns=100              11.6 MB total        2.9 MB largest process
+GET /ping (keep-alive)  threads=8 conns=1000             11.6 MB total        2.9 MB largest process
+GET /ping (keep-alive)  threads=8 conns=5000             11.6 MB total        2.9 MB largest process
+GET /ping (conn: close) threads=8 conns=100               7.2 MB total        2.0 MB largest process
+GET /ping (conn: close) threads=8 conns=1000              7.2 MB total        2.0 MB largest process
+GET /ping (conn: close) threads=8 conns=5000              7.1 MB total        2.0 MB largest process
+GET / (Todo UI)         threads=8 conns=100               7.1 MB total        2.0 MB largest process
+GET /api/todos (read)   threads=8 conns=100               7.1 MB total        2.0 MB largest process
+GET / (Todo UI)         threads=8 conns=1000              7.1 MB total        2.0 MB largest process
+GET /api/todos (read)   threads=8 conns=1000              7.1 MB total        2.0 MB largest process
+GET / (Todo UI)         threads=8 conns=5000              7.1 MB total        2.0 MB largest process
+GET /api/todos (read)   threads=8 conns=5000              7.1 MB total        2.0 MB largest process
+POST /api/todos (write) threads=8 conns=100               7.1 MB total        2.0 MB largest process
+POST /api/todos (write) threads=8 conns=1000              7.1 MB total        2.0 MB largest process
+POST /api/todos (write) threads=8 conns=5000              7.1 MB total        2.0 MB largest process
 
 Note: summed RSS counts pages shared between processes (the binary, libc,
 SQLite, copy-on-write pages from the fork) once per process, so the total
@@ -149,23 +221,24 @@ In cluster mode, 'maximum resident set size' (bytes) is the largest single
 process, and user/sys CPU time is summed across the master and every reaped
 worker. 'instructions retired', 'cycles elapsed' and 'peak memory footprint'
 cover the master process only - do not quote them as whole-server figures.
-      135.94 real        59.88 user        60.83 sys
-            47218688  maximum resident set size
+app_serve_static: root directory "public" does not exist, not registered
+      230.25 real         0.01 user         0.03 sys
+             3014656  maximum resident set size
                    0  average shared memory size
                    0  average unshared data size
                    0  average unshared stack size
-                5144  page reclaims
-                  15  page faults
+                1174  page reclaims
+                  10  page faults
                    0  swaps
                    0  block input operations
                    0  block output operations
-             7356369  messages sent
-             4780248  messages received
-                   5  signals received
-             1040867  voluntary context switches
-               68979  involuntary context switches
-            75351595  instructions retired
-            67986452  cycles elapsed
+                   0  messages sent
+                   0  messages received
+                   4  signals received
+                   8  voluntary context switches
+                5742  involuntary context switches
+           101222171  instructions retired
+           109763723  cycles elapsed
              1294624  peak memory footprint
 
 Worker crashes during run: 0

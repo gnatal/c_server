@@ -9,6 +9,12 @@
 #include <string.h>
 #include <time.h>
 #include "cexpress.h"
+#include "arena.h"
+#include "vendor/yyjson/yyjson.h"
+
+Arena test_arena;
+char test_arena_buf[64 * 1024];
+
 
 static void handler_ok(const Request *req, Response *res) { (void)req; res_json(res, "{\"ok\":true}"); }
 static void mw_pass(const Request *req, Response *res, MiddlewareChain *chain) { (void)req; (void)res; chain_next(chain); }
@@ -37,20 +43,20 @@ static void one_request(const App *app_const, const char *raw, const size_t len,
     App *app = (App *)app_const;
     Request req;
     req.body = NULL;
-    if (request_is_complete(raw, len) && parse_http_request(raw, len, &req) == 0) {
+    if (request_is_complete(raw, len) && parse_http_request(raw, len, &req, &test_arena) == 0) {
         Response res;
         res_init(&res, conn);
         conn->keep_alive = !request_wants_close(&req);
         dispatch(app, match_route(app, &req), &req, &res);
     }
-    free(req.body);
-    free(conn->out_buf);
-    conn->out_buf = NULL;
+    arena_reset(&test_arena);
+    arena_reset(&conn->arena);
 }
 
 static void run(const char *label, App *app, const char *raw, const int iterations) {
     Connection conn;
     memset(&conn, 0, sizeof(conn));
+    arena_init(&conn.arena, test_arena_buf, sizeof(test_arena_buf));
     conn.file_fd = -1;
     const size_t len = strlen(raw);
     for (int i = 0; i < iterations / 10; i++) one_request(app, raw, len, &conn);
@@ -63,35 +69,27 @@ static void run(const char *label, App *app, const char *raw, const int iteratio
 typedef struct { long long id; const char *title; int done; } Row;
 
 static void emit_rows(const Row *rows, const int count) {
-    JsonWriter w;
-    jw_init(&w);
-    jw_array_begin(&w);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, arr);
+    
     for (int i = 0; i < count; i++) {
-        jw_object_begin(&w);
-        jw_key(&w, "id");    jw_int(&w, rows[i].id);
-        jw_key(&w, "title"); jw_string(&w, rows[i].title);
-        jw_key(&w, "done");  jw_bool(&w, rows[i].done);
-        jw_object_end(&w);
+        yyjson_mut_val *obj = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, obj, "id", rows[i].id);
+        yyjson_mut_obj_add_str(doc, obj, "title", rows[i].title);
+        yyjson_mut_obj_add_bool(doc, obj, "done", rows[i].done);
+        yyjson_mut_arr_append(arr, obj);
     }
-    jw_array_end(&w);
-    jw_free(&w);
+    
+    char *out = yyjson_mut_write(doc, 0, NULL);
+    free(out);
+    yyjson_mut_doc_free(doc);
 }
 
-static void emit_rows_tree(const Row *rows, const int count) {
-    JsonValue *array = json_new_array();
-    for (int i = 0; i < count; i++) {
-        JsonValue *object = json_new_object();
-        json_object_set(object, "id", json_new_number((double)rows[i].id));
-        json_object_set(object, "title", json_new_string(rows[i].title));
-        json_object_set(object, "done", json_new_bool(rows[i].done));
-        json_array_append(array, object);
-    }
-    char *out = json_stringify(array);
-    free(out);
-    json_free(array);
-}
+
 
 int main(void) {
+    arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     static App app;
     app_init(&app);
     app_use(&app, mw_pass);
@@ -120,11 +118,7 @@ int main(void) {
     double start = now_ns();
     for (int i = 0; i < m; i++) emit_rows(rows, 20);
     const double writer_ns = (now_ns() - start) / m;
-    start = now_ns();
-    for (int i = 0; i < m; i++) emit_rows_tree(rows, 20);
-    const double tree_ns = (now_ns() - start) / m;
-    printf("\nJSON, 20-row list:\n  JsonWriter %8.0f ns\n  tree+stringify %4.0f ns  (%.1fx slower)\n",
-           writer_ns, tree_ns, tree_ns / writer_ns);
+    printf("\nJSON, 20-row list:\n  yyjson %8.0f ns\n", writer_ns);
 
     printf("\nsizeof(Request)=%zu sizeof(Response)=%zu sizeof(Connection)=%zu\n",
            sizeof(Request), sizeof(Response), sizeof(Connection));

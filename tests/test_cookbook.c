@@ -3,6 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "cexpress.h"
+#include "arena.h"
+
+Arena test_arena;
+char test_arena_buf[64 * 1024];
+
 #include "examples/cookbook.h"
 
 /*
@@ -13,12 +18,13 @@
 static char *fetch(App *app, const char *raw, const size_t raw_len) {
     Connection conn;
     memset(&conn, 0, sizeof(conn));
+    arena_init(&conn.arena, test_arena_buf, sizeof(test_arena_buf));
     conn.file_fd = -1;
     conn.keep_alive = 1;
 
     Request req;
-    if (parse_http_request(raw, raw_len, &req) != 0) {
-        free(req.body);
+    if (parse_http_request(raw, raw_len, &req, &test_arena) != 0) {
+        arena_reset(&test_arena);
         char *failed = malloc(12);
         memcpy(failed, "PARSE_ERROR", 12);
         return failed;
@@ -27,12 +33,12 @@ static char *fetch(App *app, const char *raw, const size_t raw_len) {
     res_init(&res, &conn);
     res.is_head_request = strcmp(req.method, "HEAD") == 0;
     dispatch(app, match_route(app, &req), &req, &res);
-    free(req.body);
+    arena_reset(&test_arena);
 
     char *out = malloc(conn.out_len + 1);
     memcpy(out, conn.out_buf, conn.out_len);
     out[conn.out_len] = '\0';
-    free(conn.out_buf);
+    arena_reset(&conn.arena);
     return out;
 }
 
@@ -235,6 +241,7 @@ static void test_worker_hook_recipe(App *app) {
 }
 
 int main(void) {
+    arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     static App app; /* App is ~48 KB */
     app_init(&app);
     cookbook_register(&app);

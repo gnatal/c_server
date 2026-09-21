@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <time.h>
 #include <limits.h>
+#include "arena.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -144,6 +145,8 @@ typedef struct Connection {
     TlsState tls_state;
     int tls_want_read;
     int tls_want_write;
+
+    Arena arena;            /* Per-connection arena allocator (64KB default) */
 } Connection;
 
 typedef enum {

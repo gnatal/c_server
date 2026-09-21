@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "app_types.h"
 #include "event_loop.h"
+#include "arena.h"
 
 /*
  * Server lifecycle. One process runs one single-threaded, non-blocking event loop (kqueue on

@@ -25,7 +25,7 @@
  *   Limits (excess is dropped or truncated, never overflowed): method 7 chars (longer -> -1),
  *   query 255, MAX_QUERY_PARAMS, MAX_HEADERS (name 63, value 255), MAX_COOKIES.
  */
-int parse_http_request(const char *raw, size_t raw_len, Request *req);
+int parse_http_request(const char *raw, size_t raw_len, Request *req, Arena *arena);
 
 /*
  * request_framing: locate the header block and decide how the body is framed.

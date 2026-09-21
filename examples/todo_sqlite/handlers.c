@@ -11,7 +11,8 @@
 
 /* Sends {"error": message} with `status`. JsonWriter escapes the message. */
 static void send_error(Response *res, int status, const char *message) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, obj);
     yyjson_mut_obj_add_str(doc, obj, "error", message);
@@ -66,7 +67,8 @@ static yyjson_mut_val *write_todo(yyjson_mut_doc *doc, const Todo *todo) {
 }
 
 static void send_todo_json(Response *res, int status, const Todo *todo) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_doc_set_root(doc, write_todo(doc, todo));
     res_status(res, status);
     size_t len;
@@ -111,7 +113,8 @@ void handler_list_todos(const Request *req, Response *res) {
         return;
     }
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     yyjson_mut_doc_set_root(doc, arr);
     for (int i = 0; i < list.count; i++) {
@@ -154,7 +157,8 @@ void handler_create_todo(const Request *req, Response *res) {
         return;
     }
 
-    yyjson_doc *doc = yyjson_read(req->body, strlen(req->body), 0);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_doc *doc = yyjson_read_opts((char *)req->body, strlen(req->body), 0, &alc, NULL);
     if (doc == NULL) {
         send_error(res, 400, "invalid json");
         return;
@@ -189,7 +193,8 @@ void handler_replace_todo(const Request *req, Response *res) {
         return;
     }
 
-    yyjson_doc *doc = yyjson_read(req->body, strlen(req->body), 0);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_doc *doc = yyjson_read_opts((char *)req->body, strlen(req->body), 0, &alc, NULL);
     if (doc == NULL) {
         send_error(res, 400, "invalid json");
         return;
@@ -230,7 +235,8 @@ void handler_patch_todo(const Request *req, Response *res) {
         return;
     }
 
-    yyjson_doc *doc = yyjson_read(req->body, strlen(req->body), 0);
+    yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
+    yyjson_doc *doc = yyjson_read_opts((char *)req->body, strlen(req->body), 0, &alc, NULL);
     if (doc == NULL) {
         send_error(res, 400, "invalid json");
         return;
