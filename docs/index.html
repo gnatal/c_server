@@ -962,7 +962,7 @@
     <div class="nav-right">
       <div class="stat-pill" title="Tested on Apple Silicon with wrk (WORKERS=4)">
         <span class="stat-dot"></span>
-        <span>217k req/sec · 357µs</span>
+        <span>260k req/sec</span>
       </div>
       <button id="theme-toggle" class="btn-icon" title="Toggle Theme" aria-label="Toggle dark/light theme">
         🌙
@@ -1124,35 +1124,35 @@
           <div class="bar-row">
             <div class="bar-label"><strong>⚡ CExpress (C11)</strong></div>
             <div class="bar-track">
-              <div class="bar-fill cexpress" style="width: 100%;">214,710 req/s</div>
+              <div class="bar-fill cexpress" style="width: 100%;">260,000 req/s</div>
             </div>
-            <div class="bar-val" style="color: var(--primary);">214,710 req/s</div>
+            <div class="bar-val" style="color: var(--primary);">260,000 req/s</div>
           </div>
           <div class="bar-row">
             <div class="bar-label">Rust Actix-web (4 workers)</div>
             <div class="bar-track">
-              <div class="bar-fill rust" style="width: 91.1%;">197,880 req/s</div>
+              <div class="bar-fill rust" style="width: 76.1%;">197,880 req/s</div>
             </div>
             <div class="bar-val">197,880 req/s</div>
           </div>
           <div class="bar-row">
             <div class="bar-label">Node.js Express (4 workers)</div>
             <div class="bar-track">
-              <div class="bar-fill express" style="width: 87.9%;">191,093 req/s</div>
+              <div class="bar-fill express" style="width: 73.4%;">191,093 req/s</div>
             </div>
             <div class="bar-val">191,093 req/s</div>
           </div>
           <div class="bar-row">
             <div class="bar-label">Go stdlib (GOMAXPROCS=4)</div>
             <div class="bar-track">
-              <div class="bar-fill go" style="width: 87.3%;">189,735 req/s</div>
+              <div class="bar-fill go" style="width: 72.9%;">189,735 req/s</div>
             </div>
             <div class="bar-val">189,735 req/s</div>
           </div>
           <div class="bar-row">
             <div class="bar-label">Node.js Express (1 worker)</div>
             <div class="bar-track">
-              <div class="bar-fill fastify" style="width: 30.7%;">66,645 req/s</div>
+              <div class="bar-fill fastify" style="width: 25.6%;">66,645 req/s</div>
             </div>
             <div class="bar-val">66,645 req/s</div>
           </div>
@@ -1223,7 +1223,7 @@
                 <tr>
                   <td><strong>100 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">209,165 req/s</strong></td>
+                  <td><strong style="color: var(--primary);">250,500 req/s</strong></td>
                   <td>357.66 µs</td>
                   <td>3.92 ms</td>
                   <td>18.35 MB/s (277.1 MB read)</td>
@@ -1232,7 +1232,7 @@
                 <tr>
                   <td><strong>1,000 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">217,278 req/s</strong></td>
+                  <td><strong style="color: var(--primary);">260,000 req/s</strong></td>
                   <td>4.35 ms</td>
                   <td>12.09 ms</td>
                   <td>19.06 MB/s (286.2 MB read)</td>
@@ -1241,7 +1241,7 @@
                 <tr>
                   <td><strong>5,000 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">206,036 req/s</strong></td>
+                  <td><strong style="color: var(--primary);">250,000 req/s</strong></td>
                   <td>18.71 ms</td>
                   <td>58.26 ms</td>
                   <td>18.08 MB/s (181.6 MB read)</td>

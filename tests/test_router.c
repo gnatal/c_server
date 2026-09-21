@@ -218,18 +218,20 @@ static void test_match_route_allowed_methods(void) {
 static void test_app_add_route_overflow(void) {
     App app;
     app_init(&app);
-    assert(app.route_count == 0);
 
-    for (int i = 0; i < MAX_ROUTES; i++) {
+    /* MAX_ROUTES limit was removed, so we can register many routes */
+    for (int i = 0; i < 100; i++) {
         char path[32];
         snprintf(path, sizeof(path), "/route%d", i);
         app_get(&app, path, dummy_handler_a);
     }
-    assert(app.route_count == MAX_ROUTES);
+    
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/route99", sizeof(req.path) - 1);
+    assert(match_route(&app, &req) != NULL);
 
-    /* Exceeding MAX_ROUTES should be rejected safely */
-    app_get(&app, "/overflow", dummy_handler_a);
-    assert(app.route_count == MAX_ROUTES);
     cleanup_app(&app);
 }
 
@@ -240,15 +242,23 @@ static void test_app_get_mw_stores_route_middleware(void) {
     Middleware mws[] = { dummy_mw_a, dummy_mw_b };
     app_get_mw(&app, "/protected", dummy_handler_a, mws, 2);
 
-    assert(app.route_count == 1);
-    const Route *route = &app.routes[0];
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/protected", sizeof(req.path) - 1);
+    const Route *route = match_route(&app, &req);
+
+    assert(route != NULL);
     assert(route->middleware_count == 2);
     assert(route->middlewares[0] == dummy_mw_a);
     assert(route->middlewares[1] == dummy_mw_b);
 
     /* app_get (no middleware) still yields a route with zero middleware. */
     app_get(&app, "/open", dummy_handler_a);
-    assert(app.routes[1].middleware_count == 0);
+    strncpy(req.path, "/open", sizeof(req.path) - 1);
+    route = match_route(&app, &req);
+    assert(route != NULL);
+    assert(route->middleware_count == 0);
     cleanup_app(&app);
 }
 
@@ -259,9 +269,15 @@ static void test_app_post_mw_stores_route_middleware(void) {
     Middleware mws[] = { dummy_mw_a };
     app_post_mw(&app, "/protected", dummy_handler_b, mws, 1);
 
-    assert(app.route_count == 1);
-    assert(app.routes[0].middleware_count == 1);
-    assert(app.routes[0].middlewares[0] == dummy_mw_a);
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "POST", sizeof(req.method) - 1);
+    strncpy(req.path, "/protected", sizeof(req.path) - 1);
+    const Route *route = match_route(&app, &req);
+
+    assert(route != NULL);
+    assert(route->middleware_count == 1);
+    assert(route->middlewares[0] == dummy_mw_a);
     cleanup_app(&app);
 }
 
@@ -276,8 +292,14 @@ static void test_app_add_route_mw_truncates_overflow(void) {
 
     app_add_route_mw(&app, "GET", "/many", dummy_handler_a, mws, MAX_ROUTE_MIDDLEWARES + 2);
 
-    assert(app.route_count == 1);
-    assert(app.routes[0].middleware_count == MAX_ROUTE_MIDDLEWARES);
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/many", sizeof(req.path) - 1);
+    const Route *route = match_route(&app, &req);
+
+    assert(route != NULL);
+    assert(route->middleware_count == MAX_ROUTE_MIDDLEWARES);
     cleanup_app(&app);
 }
 
@@ -288,11 +310,6 @@ static void test_app_put_patch_delete_register_correct_methods(void) {
     app_put(&app, "/users/:id", dummy_handler_a);
     app_patch(&app, "/users/:id", dummy_handler_a);
     app_delete(&app, "/users/:id", dummy_handler_a);
-
-    assert(app.route_count == 3);
-    assert(strcmp(app.routes[0].method, "PUT") == 0);
-    assert(strcmp(app.routes[1].method, "PATCH") == 0);
-    assert(strcmp(app.routes[2].method, "DELETE") == 0);
 
     Request req;
     memset(&req, 0, sizeof(req));
@@ -320,10 +337,17 @@ static void test_app_put_patch_delete_mw_store_route_middleware(void) {
     app_patch_mw(&app, "/users/:id", dummy_handler_a, mws, 1);
     app_delete_mw(&app, "/users/:id", dummy_handler_a, mws, 1);
 
-    assert(app.route_count == 3);
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.path, "/users/1", sizeof(req.path) - 1);
+
+    const char *methods[] = {"PUT", "PATCH", "DELETE"};
     for (int i = 0; i < 3; i++) {
-        assert(app.routes[i].middleware_count == 1);
-        assert(app.routes[i].middlewares[0] == dummy_mw_a);
+        strncpy(req.method, methods[i], sizeof(req.method) - 1);
+        const Route *r = match_route(&app, &req);
+        assert(r != NULL);
+        assert(r->middleware_count == 1);
+        assert(r->middlewares[0] == dummy_mw_a);
     }
     cleanup_app(&app);
 }
@@ -352,8 +376,14 @@ static void test_router_put_patch_delete_register_correct_methods(void) {
     App app;
     app_init(&app);
     app_mount(&app, "/api", &router);
-    assert(app.route_count == 6);
-    assert(strcmp(app.routes[0].path, "/api/users/:id") == 0);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "PUT", sizeof(req.method) - 1);
+    strncpy(req.path, "/api/users/1", sizeof(req.path) - 1);
+    const Route *r = match_route(&app, &req);
+    assert(r != NULL && strcmp(r->method, "PUT") == 0);
+
     cleanup_app(&app);
 }
 
@@ -368,20 +398,20 @@ static void test_app_mount_prefixes_router_routes(void) {
 
     app_mount(&app, "/api", &router);
 
-    assert(app.route_count == 2);
-    assert(strcmp(app.routes[0].path, "/api/users") == 0);
-    assert(app.routes[0].handler == dummy_handler_a);
-    /* A router route registered at "/" mounts at the prefix itself, not
-     * "/api/" - so it matches GET /api, not GET /api/. */
-    assert(strcmp(app.routes[1].path, "/api") == 0);
-    assert(app.routes[1].handler == dummy_handler_b);
-
     Request req;
     memset(&req, 0, sizeof(req));
     strncpy(req.method, "GET", sizeof(req.method) - 1);
     strncpy(req.path, "/api/users", sizeof(req.path) - 1);
     const Route *matched = match_route(&app, &req);
     assert(matched != NULL && matched->handler == dummy_handler_a);
+
+    /* A router route registered at "/" mounts at the prefix itself, not
+     * "/api/" - so it matches GET /api, not GET /api/. */
+    strncpy(req.path, "/api", sizeof(req.path) - 1);
+    matched = match_route(&app, &req);
+    assert(matched != NULL && matched->handler == dummy_handler_b);
+
+
 
     memset(&req, 0, sizeof(req));
     strncpy(req.method, "GET", sizeof(req.method) - 1);
@@ -401,10 +431,14 @@ static void test_app_mount_carries_route_middleware(void) {
 
     app_mount(&app, "/api", &router);
 
-    assert(app.route_count == 1);
-    assert(strcmp(app.routes[0].path, "/api/protected") == 0);
-    assert(app.routes[0].middleware_count == 1);
-    assert(app.routes[0].middlewares[0] == dummy_mw_a);
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/api/protected", sizeof(req.path) - 1);
+    const Route *r = match_route(&app, &req);
+    assert(r != NULL);
+    assert(r->middleware_count == 1);
+    assert(r->middlewares[0] == dummy_mw_a);
     cleanup_app(&app);
 }
 
@@ -434,8 +468,12 @@ static void test_app_mount_strips_trailing_slash_from_prefix(void) {
 
     app_mount(&app, "/api/", &router);
 
-    assert(app.route_count == 1);
-    assert(strcmp(app.routes[0].path, "/api/users") == 0);
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/api/users", sizeof(req.path) - 1);
+    const Route *r = match_route(&app, &req);
+    assert(r != NULL);
     cleanup_app(&app);
 }
 
@@ -450,8 +488,12 @@ static void test_app_mount_root_prefix_is_unscoped(void) {
 
     app_mount(&app, "/", &router);
 
-    assert(app.route_count == 1);
-    assert(strcmp(app.routes[0].path, "/users") == 0);
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/users", sizeof(req.path) - 1);
+    const Route *r = match_route(&app, &req);
+    assert(r != NULL);
     assert(app.middleware_count == 1);
     assert(app.middlewares[0].prefix[0] == '\0');
     cleanup_app(&app);
@@ -461,19 +503,18 @@ static void test_app_mount_respects_max_routes(void) {
     App app;
     app_init(&app);
 
-    for (int i = 0; i < MAX_ROUTES; i++) {
-        char path[32];
-        snprintf(path, sizeof(path), "/route%d", i);
-        app_get(&app, path, dummy_handler_a);
-    }
-    assert(app.route_count == MAX_ROUTES);
-
     Router router;
     router_init(&router);
-    router_get(&router, "/overflow", dummy_handler_b);
+    for (int i = 0; i < MAX_ROUTER_ROUTES; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/route%d", i);
+        router_get(&router, path, dummy_handler_a);
+    }
+    assert(router.route_count == MAX_ROUTER_ROUTES);
+    router_get(&router, "/overflow", dummy_handler_b); // rejected safely
+    assert(router.route_count == MAX_ROUTER_ROUTES);
 
     app_mount(&app, "/api", &router);
-    assert(app.route_count == MAX_ROUTES);
     cleanup_app(&app);
 }
 
@@ -484,16 +525,21 @@ static void test_app_head_options_register_correct_methods(void) {
     app_head(&app, "/users/:id", dummy_handler_a);
     app_options(&app, "/users/:id", dummy_handler_a);
 
-    assert(app.route_count == 2);
-    assert(strcmp(app.routes[0].method, "HEAD") == 0);
-    assert(strcmp(app.routes[1].method, "OPTIONS") == 0);
-
     Middleware mws[] = { dummy_mw_a };
     app_head_mw(&app, "/protected", dummy_handler_b, mws, 1);
     app_options_mw(&app, "/protected", dummy_handler_b, mws, 1);
-    assert(app.route_count == 4);
-    assert(app.routes[2].middleware_count == 1 && app.routes[2].middlewares[0] == dummy_mw_a);
-    assert(app.routes[3].middleware_count == 1 && app.routes[3].middlewares[0] == dummy_mw_a);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.path, "/protected", sizeof(req.path) - 1);
+    
+    strncpy(req.method, "HEAD", sizeof(req.method) - 1);
+    const Route *r = match_route(&app, &req);
+    assert(r != NULL && r->middleware_count == 1 && r->middlewares[0] == dummy_mw_a);
+    
+    strncpy(req.method, "OPTIONS", sizeof(req.method) - 1);
+    r = match_route(&app, &req);
+    assert(r != NULL && r->middleware_count == 1 && r->middlewares[0] == dummy_mw_a);
     cleanup_app(&app);
 }
 

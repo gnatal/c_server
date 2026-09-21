@@ -16,7 +16,7 @@
  *                     the bare prefix ("/files") does not match
  * First registered match wins. HEAD falls back to the GET route for the same path unless an explicit
  * HEAD route exists. OPTIONS on a known path answers 200 + Allow without an explicit route.
- * Limits: MAX_ROUTES (32) per App/Router, MAX_ROUTE_MIDDLEWARES (8) per route; excess is dropped with
+ * Limits: dynamically allocated routes per App, MAX_ROUTER_ROUTES (64) per Router, MAX_ROUTE_MIDDLEWARES (8) per route; excess is dropped with
  * a stderr warning, not overflowed. Strings are copied, the caller's buffers need not outlive the call.
  */
 
@@ -107,5 +107,8 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir);
 /* Enables HTTPS with PEM files (TLS 1.2+). Returns 0, or -1 on bad arguments / path >= PATH_MAX.
  * The context is created per worker process at app_listen. */
 int app_enable_tls(App *app, const char *cert_file, const char *key_file);
+
+/* Frees dynamically allocated route tree memory. Called by app_destroy. */
+void app_free_routes(App *app);
 
 #endif /* ROUTER_H */

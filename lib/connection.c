@@ -145,6 +145,7 @@ void app_destroy(App *app) {
             }
         }
     }
+    app_free_routes(app);
     event_loop_close(app);
     if (app->server_fd >= 0) {
         close(app->server_fd);

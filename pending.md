@@ -169,14 +169,11 @@ To push CExpress from its current simplicity-first design to advanced, state-of-
    - **Current**: Custom byte-by-byte parser (`lib/http_parser.c`) using `memchr`.
    - **Upgrade**: Integrate [picohttpparser](https://github.com/h2o/picohttpparser). It uses SIMD (AVX2/SSE4) to parse HTTP headers extremely quickly, serving as the backbone for some of the world's fastest web servers.
 
-4. **Upgrade the Router to a Radix Trie**
+4. **Upgrade the Router to a Patricia Tree**
    - **Current**: Route matching is likely linear O(N) iterating over registered routes in `lib/router.c`.
-   - **Upgrade**: Implement a Radix Trie (Prefix Tree) similar to Go's `httprouter` or Fastify. This makes route matching O(k) (where k is path length), maintaining high performance even with thousands of routes.
+   - **Upgrade**: Implement a Patricia Tree (radix tree variant) for route matching. This makes route matching highly performante even with thousands of routes.
 
 5. **Adopt `io_uring` (Linux Only)**
    - **Current**: Uses `kqueue` (macOS) and `epoll` (Linux) via multi-process workers.
    - **Upgrade**: Replace `epoll` with Linux's `io_uring` to perform asynchronous I/O that bypasses standard syscall overhead, allowing massive concurrency with zero user-kernel context switches.
 
-6. **Non-Blocking Database Drivers / Thread Pool**
-   - **Current**: SQLite operations (e.g., in the demo) block the worker process entirely.
-   - **Upgrade**: Use async/non-blocking drivers for databases (like `libpq` for PostgreSQL) within the event loop, or implement a `libuv`-style thread pool for strictly blocking I/O (like SQLite or file reads) so the main event loop never stalls.

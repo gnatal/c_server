@@ -11,7 +11,7 @@ void app_init(App *app) {
     app->config.tls_cert_file[0] = '\0';
     app->config.tls_key_file[0] = '\0';
     app->ssl_ctx = NULL;
-    app->route_count = 0;
+    app->method_tree_count = 0;
     app->middleware_count = 0;
     app->error_handler = NULL;
     app->worker_init_hook_count = 0;
@@ -65,17 +65,39 @@ static void fill_route(Route *route, const char *method, const char *path, Handl
     route->middleware_count = middleware_count;
 }
 
+static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route);
+
+static void app_insert_route_struct(App *app, Route *route) {
+    MethodTree *mt = NULL;
+    for (int i = 0; i < app->method_tree_count; i++) {
+        if (strcmp(app->method_trees[i].method, route->method) == 0) {
+            mt = &app->method_trees[i];
+            break;
+        }
+    }
+    if (!mt) {
+        if (app->method_tree_count >= 16) {
+            fprintf(stderr, "app_add_route: max method trees exceeded\n");
+            free(route);
+            return;
+        }
+        mt = &app->method_trees[app->method_tree_count++];
+        strncpy(mt->method, route->method, sizeof(mt->method) - 1);
+        mt->method[sizeof(mt->method) - 1] = '\0';
+        mt->tree = NULL;
+    }
+    tree_insert(&mt->tree, route->path, route);
+}
+
 void app_add_route(App *app, const char *method, const char *path, Handler handler) {
     app_add_route_mw(app, method, path, handler, NULL, 0);
 }
 
 void app_add_route_mw(App *app, const char *method, const char *path, Handler handler,
                        const Middleware *middlewares, int middleware_count) {
-    if (app->route_count >= MAX_ROUTES) {
-        fprintf(stderr, "app_add_route: MAX_ROUTES exceeded\n");
-        return;
-    }
-    fill_route(&app->routes[app->route_count++], method, path, handler, middlewares, middleware_count);
+    Route *route = malloc(sizeof(Route));
+    fill_route(route, method, path, handler, middlewares, middleware_count);
+    app_insert_route_struct(app, route);
 }
 
 void app_get(App *app, const char *path, Handler handler) {
@@ -152,8 +174,8 @@ void router_add_route(Router *router, const char *method, const char *path, Hand
 
 void router_add_route_mw(Router *router, const char *method, const char *path, Handler handler,
                           const Middleware *middlewares, int middleware_count) {
-    if (router->route_count >= MAX_ROUTES) {
-        fprintf(stderr, "router_add_route: MAX_ROUTES exceeded\n");
+    if (router->route_count >= MAX_ROUTER_ROUTES) {
+        fprintf(stderr, "router_add_route: MAX_ROUTER_ROUTES exceeded\n");
         return;
     }
     fill_route(&router->routes[router->route_count++], method, path, handler, middlewares, middleware_count);
@@ -280,17 +302,6 @@ void app_mount(App *app, const char *prefix, const Router *router) {
 }
 
 void app_serve_static(App *app, const char *prefix, const char *root_dir) {
-    if (app->route_count >= MAX_ROUTES) {
-        fprintf(stderr, "app_serve_static: MAX_ROUTES exceeded\n");
-        return;
-    }
-
-    /* Canonicalize root_dir once, at registration time, rather than per
-     * request - static_serve_file (lib/static.c) compares every resolved
-     * request path against this canonical root to catch a symlink inside
-     * root_dir escaping it (realpath also requires the path to already
-     * exist, which doubles as a deny-by-default check: refuse to register a
-     * mount pointing at a directory that isn't there). */
     char canonical_root[PATH_MAX];
     if (realpath(root_dir, canonical_root) == NULL) {
         fprintf(stderr, "app_serve_static: root directory \"%s\" does not exist, not registered\n", root_dir);
@@ -300,14 +311,10 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
     char normalized_prefix[128];
     normalize_mount_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
 
-    /* Always a trailing-wildcard pattern (see match_path, "Behavior reference, Routing",
-     * lib/CLAUDE.md) so this mount answers everything under the prefix - a
-     * request for the prefix itself, with nothing after it, simply doesn't
-     * match (same as any other trailing "*" route) and falls through to the
-     * app's ordinary 404/405 handling. */
-    Route *route = &app->routes[app->route_count++];
     char pattern[256];
     snprintf(pattern, sizeof(pattern), "%s/*", normalized_prefix);
+    
+    Route *route = malloc(sizeof(Route));
     fill_route(route, "GET", pattern, NULL, NULL, 0);
 
     size_t root_len = strlen(canonical_root);
@@ -316,6 +323,8 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
     }
     memcpy(route->static_root, canonical_root, root_len);
     route->static_root[root_len] = '\0';
+    
+    app_insert_route_struct(app, route);
 }
 
 /* Advances *cursor past '/' separators and returns the next path segment
@@ -388,70 +397,215 @@ int match_path(const char *pattern, const char *path, Request *req) {
     return pattern_seg == NULL && path_seg == NULL;
 }
 
-const Route *match_route(const App *app, Request *req) {
-    for (int i = 0; i < app->route_count; i++) {
-        const Route *route = &app->routes[i];
-        if (strcmp(route->method, req->method) != 0) {
-            continue;
+static PatriciaNode *create_patricia_node(const char *prefix, size_t prefix_len, NodeType type) {
+    PatriciaNode *n = calloc(1, sizeof(PatriciaNode));
+    if (prefix_len > 0) {
+        n->prefix = malloc(prefix_len + 1);
+        memcpy(n->prefix, prefix, prefix_len);
+        n->prefix[prefix_len] = '\0';
+        n->prefix_len = (int)prefix_len;
+    }
+    n->type = type;
+    return n;
+}
+
+static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route) {
+    if (*root_ptr == NULL) {
+        *root_ptr = create_patricia_node("", 0, NODE_STATIC);
+    }
+    
+    PatriciaNode *current = *root_ptr;
+    const char *cursor = path;
+    size_t seg_len;
+    const char *seg = next_segment(&cursor, &seg_len);
+    
+    while (seg != NULL) {
+        NodeType type = NODE_STATIC;
+        if (seg_len == 1 && seg[0] == '*') {
+            const char *lookahead = cursor;
+            size_t next_len;
+            if (next_segment(&lookahead, &next_len) == NULL) {
+                type = NODE_CATCH_ALL;
+            } else {
+                type = NODE_PARAM;
+            }
+        } else if (seg[0] == ':') {
+            type = NODE_PARAM;
         }
-        if (match_path(route->path, req->path, req)) {
-            return route;
+        
+        PatriciaNode *next_node = NULL;
+        
+        if (type == NODE_STATIC) {
+            for (int i = 0; i < current->child_count; i++) {
+                if (current->children[i]->prefix_len == (int)seg_len &&
+                    memcmp(current->children[i]->prefix, seg, seg_len) == 0) {
+                    next_node = current->children[i];
+                    break;
+                }
+            }
+            if (!next_node) {
+                if (current->child_count >= current->child_cap) {
+                    current->child_cap = current->child_cap == 0 ? 4 : current->child_cap * 2;
+                    current->children = realloc(current->children, current->child_cap * sizeof(PatriciaNode *));
+                }
+                next_node = create_patricia_node(seg, seg_len, NODE_STATIC);
+                current->children[current->child_count++] = next_node;
+            }
+        } else if (type == NODE_PARAM) {
+            if (!current->param_child) {
+                if (seg[0] == ':') {
+                    current->param_child = create_patricia_node(seg + 1, seg_len - 1, NODE_PARAM);
+                } else {
+                    current->param_child = create_patricia_node("*", 1, NODE_PARAM);
+                }
+            }
+            next_node = current->param_child;
+        } else if (type == NODE_CATCH_ALL) {
+            if (!current->catch_all_child) {
+                current->catch_all_child = create_patricia_node("*", 1, NODE_CATCH_ALL);
+            }
+            next_node = current->catch_all_child;
+        }
+        
+        current = next_node;
+        seg = next_segment(&cursor, &seg_len);
+    }
+    
+    if (!current->route) {
+        current->route = route;
+    } else {
+        fprintf(stderr, "Warning: Route %s already registered, ignoring duplicate\n", path);
+        free(route);
+    }
+}
+
+static const Route *tree_search_recursive(PatriciaNode *node, const char *cursor, const char *seg, size_t seg_len, Request *req) {
+    if (seg == NULL) {
+        return node->route;
+    }
+    
+    for (int i = 0; i < node->child_count; i++) {
+        PatriciaNode *child = node->children[i];
+        if (child->prefix_len == (int)seg_len && memcmp(child->prefix, seg, seg_len) == 0) {
+            const char *next_cursor = cursor;
+            size_t next_seg_len;
+            const char *next_seg = next_segment(&next_cursor, &next_seg_len);
+            const Route *res = tree_search_recursive(child, next_cursor, next_seg, next_seg_len, req);
+            if (res) return res;
         }
     }
-
-    /* Auto-HEAD-from-GET: only reached when no explicit HEAD route matched
-     * above. HTTP requires a HEAD response to look like the equivalent GET
-     * response minus the body (RFC 7231 4.3.2) - falling back to the GET
-     * route here means its handler runs normally (building a body as usual),
-     * and Response.is_head_request (set by handle_readable, connection.c)
-     * is what actually keeps that body off the wire (response.c). */
-    if (strcmp(req->method, "HEAD") == 0) {
-        for (int i = 0; i < app->route_count; i++) {
-            const Route *route = &app->routes[i];
-            if (strcmp(route->method, "GET") != 0) {
-                continue;
-            }
-            if (match_path(route->path, req->path, req)) {
-                return route;
-            }
+    
+    if (node->param_child) {
+        int saved_param_count = req ? req->param_count : 0;
+        if (req && req->param_count < MAX_PARAMS && node->param_child->prefix_len > 0 && node->param_child->prefix[0] != '*') {
+            const size_t name_len = node->param_child->prefix_len;
+            const size_t name_cap = sizeof(req->param_names[0]) - 1;
+            const size_t value_cap = sizeof(req->param_values[0]) - 1;
+            const size_t name_copy = name_len < name_cap ? name_len : name_cap;
+            const size_t value_copy = seg_len < value_cap ? seg_len : value_cap;
+            
+            char *name_slot = req->param_names[req->param_count];
+            char *value_slot = req->param_values[req->param_count];
+            memcpy(name_slot, node->param_child->prefix, name_copy);
+            name_slot[name_copy] = '\0';
+            memcpy(value_slot, seg, value_copy);
+            value_slot[value_copy] = '\0';
+            req->param_count++;
         }
+        
+        const char *next_cursor = cursor;
+        size_t next_seg_len;
+        const char *next_seg = next_segment(&next_cursor, &next_seg_len);
+        const Route *res = tree_search_recursive(node->param_child, next_cursor, next_seg, next_seg_len, req);
+        if (res) return res;
+        
+        if (req) req->param_count = saved_param_count;
     }
-
+    
+    if (node->catch_all_child) {
+        return node->catch_all_child->route;
+    }
+    
     return NULL;
 }
 
-int match_route_allowed_methods(const App *app, const Request *req, char *allowed, size_t allowed_size) {
-    char seen[MAX_ROUTES][8];
-    int seen_count = 0;
-    allowed[0] = '\0';
+static const Route *tree_search(PatriciaNode *node, const char *path, Request *req) {
+    if (!node) return NULL;
+    const char *cursor = path;
+    size_t seg_len;
+    const char *seg = next_segment(&cursor, &seg_len);
+    return tree_search_recursive(node, cursor, seg, seg_len, req);
+}
 
-    for (int i = 0; i < app->route_count; i++) {
-        const Route *route = &app->routes[i];
-        if (!match_path(route->path, req->path, NULL)) {
-            continue;
+const Route *match_route(const App *app, Request *req) {
+    if (req != NULL) {
+        req->param_count = 0;
+    }
+    
+    for (int i = 0; i < app->method_tree_count; i++) {
+        if (strcmp(app->method_trees[i].method, req->method) == 0) {
+            const Route *route = tree_search(app->method_trees[i].tree, req->path, req);
+            if (route) return route;
+            break;
         }
-
-        int already_seen = 0;
-        for (int j = 0; j < seen_count; j++) {
-            if (strcmp(seen[j], route->method) == 0) {
-                already_seen = 1;
+    }
+    
+    if (strcmp(req->method, "HEAD") == 0) {
+        if (req != NULL) {
+            req->param_count = 0;
+        }
+        for (int i = 0; i < app->method_tree_count; i++) {
+            if (strcmp(app->method_trees[i].method, "GET") == 0) {
+                const Route *route = tree_search(app->method_trees[i].tree, req->path, req);
+                if (route) return route;
                 break;
             }
         }
-        if (already_seen) {
-            continue;
-        }
-        strncpy(seen[seen_count], route->method, sizeof(seen[0]) - 1);
-        seen[seen_count][sizeof(seen[0]) - 1] = '\0';
-        seen_count++;
-
-        if (allowed[0] != '\0') {
-            strncat(allowed, ", ", allowed_size - strlen(allowed) - 1);
-        }
-        strncat(allowed, route->method, allowed_size - strlen(allowed) - 1);
     }
+    
+    return NULL;
+}
 
+static int tree_has_match(PatriciaNode *node, const char *path) {
+    return tree_search(node, path, NULL) != NULL;
+}
+
+int match_route_allowed_methods(const App *app, const Request *req, char *allowed, size_t allowed_size) {
+    int seen_count = 0;
+    allowed[0] = '\0';
+    
+    for (int i = 0; i < app->method_tree_count; i++) {
+        if (tree_has_match(app->method_trees[i].tree, req->path)) {
+            if (allowed[0] != '\0') {
+                strncat(allowed, ", ", allowed_size - strlen(allowed) - 1);
+            }
+            strncat(allowed, app->method_trees[i].method, allowed_size - strlen(allowed) - 1);
+            seen_count++;
+        }
+    }
+    
     return seen_count;
+}
+
+void free_patricia_tree(PatriciaNode *node) {
+    if (!node) return;
+    for (int i = 0; i < node->child_count; i++) {
+        free_patricia_tree(node->children[i]);
+    }
+    if (node->children) free(node->children);
+    if (node->param_child) free_patricia_tree(node->param_child);
+    if (node->catch_all_child) free_patricia_tree(node->catch_all_child);
+    if (node->prefix) free(node->prefix);
+    if (node->route) free(node->route);
+    free(node);
+}
+
+void app_free_routes(App *app) {
+    for (int i = 0; i < app->method_tree_count; i++) {
+        free_patricia_tree(app->method_trees[i].tree);
+        app->method_trees[i].tree = NULL;
+    }
+    app->method_tree_count = 0;
 }
 
 const char *req_get_param(const Request *req, const char *name) {

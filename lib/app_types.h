@@ -17,7 +17,7 @@
 #endif
 
 /* ---- limits ---- */
-#define MAX_ROUTES 32                 /* per App and per Router */
+#define MAX_ROUTER_ROUTES 64          /* per Router (sub-router staging limit) */
 #define MAX_MIDDLEWARES 16            /* app-wide and per Router */
 #define MAX_ROUTE_MIDDLEWARES 8       /* per route */
 #define MAX_PARAMS 8                  /* path params per request (name/value 63 chars) */
@@ -253,9 +253,32 @@ typedef struct {
     char static_root[PATH_MAX];   /* "" for an ordinary route; canonical directory for app_serve_static mounts */
 } Route;
 
+typedef enum {
+    NODE_STATIC,
+    NODE_PARAM,
+    NODE_CATCH_ALL
+} NodeType;
+
+typedef struct PatriciaNode {
+    char *prefix;
+    int prefix_len;
+    NodeType type;
+    Route *route;     /* Pointer to the route data. malloc'd when inserted. NULL if internal node. */
+    struct PatriciaNode **children;
+    int child_count;
+    int child_cap;
+    struct PatriciaNode *param_child;
+    struct PatriciaNode *catch_all_child;
+} PatriciaNode;
+
+typedef struct {
+    char method[8];
+    PatriciaNode *tree;
+} MethodTree;
+
 /* A standalone route table, copied into an App by app_mount. It has no life at dispatch time. */
 typedef struct {
-    Route routes[MAX_ROUTES];
+    Route routes[MAX_ROUTER_ROUTES];
     int route_count;
     Middleware middlewares[MAX_MIDDLEWARES];
     int middleware_count;
@@ -294,8 +317,8 @@ typedef struct {
 /* The whole server. ~48 KB: declare it static or on main's stack. Create with app_init, end with app_destroy. */
 typedef struct {
     ServerConfig config;
-    Route routes[MAX_ROUTES];
-    int route_count;
+    MethodTree method_trees[16];
+    int method_tree_count;
     MiddlewareEntry middlewares[MAX_MIDDLEWARES];
     int middleware_count;
     ErrorHandler error_handler;
