@@ -16,7 +16,8 @@ A process runs one single-threaded, non-blocking event loop: kqueue on macOS/BSD
 (readiness only: multishot `POLL_ADD` on each fd, then ordinary `recv`/`write`; needs liburing and a kernel with
 multishot poll, 5.13+). An epoll backend (`event_loop_epoll.c`) is kept for `-DCEXPRESS_USE_EPOLL`; the Makefile does not select it
 on Linux, and on macOS it is only built for `make test_epoll` through epoll-shim. `workers != 1` forks N such processes sharing
-the port via `SO_REUSEPORT`; a master respawns any that die. Handlers run synchronously on the loop: a blocking call (DB,
+the port via `SO_REUSEPORT`; a master respawns any that die, with backoff and a restart budget (S7, see "Behavior
+reference, Workers and fork"). Handlers run synchronously on the loop: a blocking call (DB,
 sleep) stalls that whole worker, so scale with workers, not threads. State is per process; there is no shared memory.
 If `event_loop_init` fails (for example io_uring is blocked by the runtime), `app_listen_worker` prints the error and exits; there is no runtime fallback to epoll.
 
@@ -44,7 +45,7 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | `response.c/h` | response head assembly, cookies, chunked streaming, file streaming |
 | `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen |
 | `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals) |
-| `cluster.c/h` | fork workers, respawn, drain |
+| `cluster.c/h` | fork workers, respawn (with backoff and a restart budget, S7), drain |
 | `static.c/h` | traversal-safe file serving, with an in-memory cache of recently served files (P1) |
 | `multipart.c/h`, `urlencoded.c/h` | form body parsers (handler-invoked, not automatic) |
 | `vendor/picohttpparser/` | vendored HTTP/1.x request parser (MIT/Perl) |
@@ -209,6 +210,21 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   SIGTERM, waits 6 s, then SIGKILLs.
 - **Workers and fork.** Never open a database or socket in `main()` before `app_listen`; register `app_on_worker_start`
   and open there (runs once per serving process, after fork). `SIGPIPE` is ignored per process in `app_listen_worker`.
+  **Respawn (S7).** Before forking anyone, `cluster_listen` calls `create_server_socket(port)` once itself and closes
+  the fd - this is purely a validation call: `create_server_socket` already `perror`s and `exit()`s (S12: still
+  unfixed there) on a bind/listen failure, so a fatal, permanent misconfiguration (the port already taken, permission
+  denied on a privileged port, ...) now stops the master with one clear message instead of forking `workers_count`
+  children that would all fail the exact same way - MEASURED (`improvements.md`, S7) 10,594 respawns and 31,788 log
+  lines in about 4 seconds with `WORKERS=2` and the port already taken. A worker that exits abnormally *after*
+  startup (a real crash, not a bind failure) is respawned with exponential backoff per slot (100 ms, doubling, capped
+  at 30 s) instead of instantly; if a slot fails more than `CLUSTER_RESTART_BUDGET` (5) times within
+  `CLUSTER_RESTART_WINDOW_MS` (60 s) - a sliding window, not a lifetime count, so an occasional unrelated crash over a
+  long-running server's life doesn't eventually trip it - the master gives up on the whole cluster, drains whatever
+  workers are still up the same way a SIGTERM would, and `exit()`s non-zero itself (same S12 caveat: no error code
+  returned to `app_listen`/`main()`). Both mechanisms are implementation details of `cluster.c` (the constants above
+  are file-local, not in `app_types.h`, same convention as `connection.c`'s `ARENA_SIZE`) and share one accounting
+  helper, `record_worker_failure`, so a `fork()` failure while trying to (re)spawn a slot counts against the same
+  budget as an abnormal exit rather than looping unbounded on its own.
 - **Event loop.** `Connection.events_watched` mirrors what the loop has registered. Only the kqueue backend uses it to skip the syscall when the state already
   matches, so a keep-alive response costs no extra `kevent` there. The epoll and io_uring backends issue a syscall on every `watch_*` / `unwatch_*`
   (`epoll_ctl`; io_uring submits a poll-remove plus a new multishot poll), including the `unwatch_write` that `flush_connection` runs after every keep-alive response.

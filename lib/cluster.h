@@ -29,11 +29,15 @@ int cluster_worker_id(void);
 /*
  * Starts the multi-process cluster supervisor:
  * - If num_workers <= 1: runs app_listen_worker directly in the current process.
- * - If num_workers > 1: forks num_workers child processes, each opening its own
- *   independent SO_REUSEPORT listening socket and event loop.
+ * - If num_workers > 1: verifies the port is bindable once (create_server_socket, which exits with a
+ *   clear error on failure - S7/S12) before forking anyone, then forks num_workers child processes,
+ *   each opening its own independent SO_REUSEPORT listening socket and event loop.
  * - The master supervisor intercepts SIGINT/SIGTERM, forwards termination signals
- *   to workers, reaps child processes (waitpid) preventing zombies, and automatically
- *   respawns any worker that terminates unexpectedly during normal operation.
+ *   to workers, reaps child processes (waitpid) preventing zombies, and respawns any worker that
+ *   terminates unexpectedly during normal operation - with exponential backoff per slot, and a
+ *   restart budget: a slot that keeps failing beyond the budget makes the whole master drain and
+ *   exit(EXIT_FAILURE) instead of forking forever (S7; see lib/CLAUDE.md, "Behavior reference,
+ *   Workers and fork" for the exact numbers).
  */
 void cluster_listen(App *app, int port, int num_workers);
 

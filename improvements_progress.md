@@ -731,6 +731,132 @@ silently assumed away.
 
 ---
 
+## S7 · A failing worker is respawned instantly, forever
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+`cluster_listen` (`lib/cluster.c`) used to respawn any worker that exited abnormally immediately, with no
+delay and no limit — MEASURED (`improvements.md`, S7) 10,594 respawns and 31,788 log lines in about 4
+seconds with `WORKERS=2` against a port already taken. Both halves of `improvements.md`'s fix were
+implemented, not just one:
+
+- **Preflight bind check (the "Better:" fix).** `cluster_listen` now calls `create_server_socket(port)`
+  once itself, before forking anyone, and immediately closes the returned fd - a pure validation call.
+  `create_server_socket` already `perror`s and `exit()`s (S12: still unfixed there - a real error-code
+  path is a larger, separate change this fix does not attempt) on any bind/listen failure, so this one
+  call turns the exact MEASURED scenario (every one of `workers_count` children failing the identical
+  `bind()` and getting respawned instantly) into a single clear message and one process exit, before a
+  single `fork()` happens. This directly targets the *fatal, permanent misconfiguration* case (wrong
+  port, permission denied on a privileged port, ...), which no amount of backoff can ever fix.
+- **Exponential backoff + a restart budget (the base fix), for a worker that starts fine and later
+  crashes at runtime** — the case the preflight check above does not cover. New per-slot state
+  (`ClusterWorkerSlot.pending_respawn` / `backoff_until_ms` / `consecutive_failures` / `window_start_ms`)
+  and a new helper, `record_worker_failure`, shared by three call sites (an abnormal exit reaped by the
+  supervision loop's `waitpid`, a `fork()` failure while respawning a previously-failed slot, and a
+  `fork()` failure in the very first spawn loop — this last one was a pre-existing, separate gap where a
+  slot whose initial fork failed was simply abandoned forever with no accounting or retry at all; folding
+  it into the same mechanism was a small, essentially free extension once the helper existed, not a
+  deliberate independent fix):
+  - **Backoff**: 100 ms (`CLUSTER_RESTART_BACKOFF_INITIAL_MS`) doubling per consecutive failure, capped
+    at 30 s (`CLUSTER_RESTART_BACKOFF_MAX_MS`) — `improvements.md`'s own suggested numbers.
+  - **Budget**: more than `CLUSTER_RESTART_BUDGET` (5) failures within a **sliding**
+    `CLUSTER_RESTART_WINDOW_MS` (60 s) window — not a lifetime count, so an occasional, unrelated crash
+    over a long-running server's life doesn't eventually trip a budget that was really meant to catch a
+    *loop*. The window resets whenever a failure falls outside it (`now - window_start_ms >
+    CLUSTER_RESTART_WINDOW_MS`), same "reset on staleness" idea as S1/S4's own deadline fields.
+  - **Non-blocking scheduling**: the master's supervision loop still polls every ~50 ms
+    (`waitpid(WNOHANG)` + a short `nanosleep` when idle, unchanged); a new pass each iteration checks
+    every `pending_respawn` slot against `monotonic_ms() >= backoff_until_ms` and respawns exactly those
+    that are due. A single blocking `nanosleep` for the backoff duration was deliberately rejected as a
+    design (considered and discarded, not just not implemented): it would serialize concurrent slot
+    failures against each other and make the master unresponsive to SIGINT/SIGTERM for up to 30 s.
+  - **When the budget is exhausted**, the affected slot's `record_worker_failure` call returns 1; the
+    supervision loop treats that exactly like an external SIGTERM to itself (`g_shutdown_signo = SIGTERM`
+    if not already set) and falls into the *same* pre-existing drain sequence (forward SIGTERM to
+    remaining active workers, wait up to 6 s, SIGKILL if needed) rather than a separate code path, then
+    calls `exit(EXIT_FAILURE)` at the very end - `cluster_listen` is `void` with no way to hand a failure
+    back to `app_listen`/`main()`, so this is the same "library calls `exit()` for a fatal condition"
+    convention `create_server_socket` and `event_loop_init` already use (S12, again not attempted here).
+- **Incidental fix, found while writing the tests below**: `spawn_worker` now `fflush(stdout)` /
+  `fflush(stderr)` right before `fork()`. `printf` to a pipe (not a tty) is fully buffered, not
+  line-buffered; without this, an unflushed line in the master (e.g. the "starting N workers" banner) got
+  duplicated once per subsequent child's own `exit()`-time flush, since `fork()` copies the buffer
+  contents as-is. Harmless before this fix (each slot only ever forked once, immediately, so there was
+  nothing subsequent to duplicate into), but S7's own respawn loop forks the same slot repeatedly in quick
+  succession, which made the pre-existing duplication newly visible and newly relevant - exactly the kind
+  of log noise a crash-loop fix should not be adding back in a different form.
+
+**Deliberately scoped down**, matching the S1–S6 precedent of narrowing rather than silently doing less
+than advertised:
+- **S12 (making `create_server_socket`/`event_loop_init` return error codes instead of calling `exit()`)
+  is explicitly out of scope** — `improvements.md`'s own S7 entry names it as the more thorough version of
+  this fix and lists it separately with its own ID. The preflight check above reuses `create_server_socket`
+  precisely because it already does the right thing (print one clear message, stop), not because this fix
+  changed how it fails.
+- **The restart budget's numbers (5 failures / 60 s window, 100 ms–30 s backoff) are fixed compile-time
+  constants** (`cluster.c`-local `#define`s, not `ServerConfig` fields, not `app_types.h` - same
+  convention as `connection.c`'s `ARENA_SIZE`), not configurable per application. `improvements.md` only
+  asked for "for example" values; no attempt was made to expose them, since nothing in this codebase's
+  existing cluster API took a tuning knob for anything like this either.
+- **A per-slot budget, not a whole-cluster one**: two different slots each get their own independent
+  5-failures-per-60s allowance. A pathological scenario where every slot fails exactly 5 times and no more
+  (staying just under each individual budget) while the cluster is effectively never fully healthy is a
+  known accepted limitation of a per-slot design, not something this fix attempts to close - matching
+  `improvements.md`'s own fix description ("Exponential backoff **per slot**").
+
+**Tests and results.**
+
+- Unit tests added to `tests/test_cluster.c` (registered in `main`), both driving a real forked master
+  process end to end rather than poking internal state (the new fields are `cluster.c`-local, not exposed
+  through `cluster.h`):
+  - `test_cluster_master_exits_fast_when_port_is_taken` — occupies the target port on `INADDR_ANY`
+    (matching `create_server_socket`'s own bind address exactly; an address mismatch, e.g. loopback-only
+    vs. wildcard, can coexist on some stacks without `SO_REUSEPORT` and would have silently defeated the
+    test) without `SO_REUSEPORT`, then forks a real master with `workers = 2` against that port and
+    asserts it exits non-zero in under 2 seconds - reproducing the exact MEASURED scenario
+    (`improvements.md`) and asserting the fix's actual guarantee (fast, single failure) rather than just
+    "eventually fails".
+  - `test_cluster_master_exits_after_restart_budget_exceeded` — registers an `app_on_worker_start` hook
+    that calls `exit(7)` immediately (a worker that can never come up, deterministically and as fast as
+    possible, before any socket work), forks a real master with `workers = 2`, and asserts it eventually
+    exits with status 1 - exercising the full backoff-then-give-up path for real (the test genuinely waits
+    through the 100/200/400/800/1600 ms schedule, not a mocked clock), confirmed by manual runs showing
+    the expected failure-count/backoff-ms log lines in order before the final "giving up" message.
+- `make test`: all 13 suites pass (test_cluster: 2 new cases). Needed a real hung-process debugging pass
+  during development: the first version of `test_cluster_master_exits_fast_when_port_is_taken` bound its
+  blocker socket to `INADDR_LOOPBACK` while `create_server_socket` binds `INADDR_ANY` — on this machine
+  the two bindings didn't conflict, so the preflight check correctly found the port free, the master
+  proceeded to spawn two real, HTTP-serving workers, and the test hung forever waiting for a fast failure
+  that was never going to happen. Fixed by matching `INADDR_ANY` exactly (see Tests above); left as a
+  cautionary note here since it is the kind of test bug that produces a false sense of coverage rather
+  than an outright failure.
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan (the two
+  pre-existing `-Wformat-truncation` warnings in `tests/test_http_parser.c`, confirmed via `git stash` to
+  predate this change, are unrelated).
+- `make fuzz` (300,000 iterations): clean (40,522 parsed, 43,650 complete) - `cluster.c` is not on the
+  fuzzed parser/router/response path, included for completeness after touching the tree.
+- `make check-docs`: passes (121 engine functions covered - `cluster_listen`'s signature and name are
+  unchanged, only its doc comment; `record_worker_failure` and `monotonic_ms` are `static`, not part of
+  the public surface `API.md`/`check-docs` track).
+- Compiled `lib/cluster.c` directly with the project's `-Wall -Wextra -std=c11 -O2` flags: no new
+  warnings.
+- Manual verification of the exact log shape (run directly, outside the test harness, to read the timing
+  by eye): `WORKERS=2` against an already-bound port now prints exactly one `bind: Address already in
+  use` line and exits, instead of thousands of respawn lines; a worker forced to `exit(7)` on every
+  attempt (the same hook the automated test uses) prints `failure 1/5` through `failure 5/5` with the
+  correct doubling backoff (100/200/400/800/1600 ms) before the sixth attempt prints "worker 0 failed 6
+  times within 60s, giving up - shutting down", drains, and the master process exits with status 1.
+
+**Status:** Fixed for both the fatal-misconfiguration case (preflight check; the exact MEASURED problem)
+and the general crash-loop case (backoff + per-slot restart budget). S12 (returning error codes instead of
+`exit()`ing from `create_server_socket`/`event_loop_init`, and by extension from this fix's own fatal
+`cluster_listen` exit) remains open, per `improvements.md`'s own scoping of S7 versus S12 - not a gap this
+work introduced, the other half of a two-part fix `improvements.md` itself splits into two IDs.
+
+---
+
 ## TLS removal · not an `improvements.md` item — an architectural decision, not a fix
 
 **Date completed.** 2026-09-22.

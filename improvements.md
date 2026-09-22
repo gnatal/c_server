@@ -28,7 +28,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | S4 | ~~A declared `Content-Length` reserves 10 MiB per connection at once~~ | Security / Memory | Med | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (+3,000 MB virtual for 300 conns) |
 | S5 | ~~Header values over 255 chars are silently truncated (JWTs break)~~ | Security / Correctness | Med | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED |
 | S6 | ~~`%00` in a path truncates it~~ | Security | Med | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (`style.css%00.png` → 200) |
-| S7 | Failing workers are respawned with no backoff | Reliability | High | S | Stops a fork/log storm | MEASURED (10,594 respawns in 4 s) |
+| S7 | ~~Failing workers are respawned with no backoff~~ | Reliability | High | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (10,594 respawns in 4 s) |
 | S8 | Malformed request line gets no response | Security / Correctness | Med | S | Frees the connection at once instead of after 8 KiB or 60 s+ | MEASURED |
 | S9 | Demo ships a default API key | Security | Med | S | Removes a known-credential default | Code reading |
 | S10 | ~~TLS hardening gaps (renegotiation, handshake deadline)~~ | Security | Low | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | ESTIMATED |
@@ -127,7 +127,10 @@ record.
 **Fix.** After decoding the path (and query names/values, cookie values), reject an embedded NUL with `400`. It is one `memchr` over data already in cache.
 **Probable gain.** Removes a well-known bypass primitive for a few nanoseconds per request.
 
-### S7 · A failing worker is respawned instantly, forever
+### S7 · ~~A failing worker is respawned instantly, forever~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** `cluster_listen` (`lib/cluster.c:158-166`) respawns any worker that exits abnormally (non-zero code or signal) with no delay or limit. `create_server_socket` calls `exit(EXIT_FAILURE)` on a bind error (`connection.c:74-76`), and an `event_loop_init` failure exits the worker (`connection.c:548-551`).
 **Measured.** With the port already taken, `WORKERS=2` produced **10,594 respawn messages and 31,788 log lines in about 4 seconds** (~2,600 forks per second).
 **Fix.** Exponential backoff per slot (for example 100 ms doubling to 30 s) plus a restart budget (N failures in M seconds); when exhausted, stop and exit the master with a non-zero status. Better: have the master create/verify the listen socket (or run a startup handshake through a pipe) before forking, so a fatal configuration error stops the whole server once. Make `create_server_socket` return an error instead of calling `exit()` (S12).
