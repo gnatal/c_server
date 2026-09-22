@@ -640,15 +640,16 @@ static void test_close_idle_connections_skips_pending_write(void) {
     Connection *conn;
     setup_test_connection(&app, fds, &conn);
 
-    /* Simulate a write still in flight (e.g. a slow reader on the response
-     * side) - this is a different axis than the read-side idle timeout and
-     * must not be torn down by close_idle_connections. */
+    /* Simulate a write still in flight that is actively making progress (e.g. a slow but real
+     * reader on the response side) - this is a different axis than the read-side idle timeout, and
+     * must not be torn down by close_idle_connections as long as last_write_progress is recent (S2). */
     conn->out_buf = malloc(4);
     assert(conn->out_buf != NULL);
     memcpy(conn->out_buf, "ping", 4);
     conn->out_len = 4;
     conn->out_sent = 0;
     conn->last_activity = time(NULL) - IDLE_TIMEOUT_SECONDS - 1;
+    conn->last_write_progress = time(NULL);
 
     close_idle_connections(&app);
 
@@ -656,6 +657,33 @@ static void test_close_idle_connections_skips_pending_write(void) {
 
     teardown_test_connection(&app, fds, conn);
 }
+
+/* S2: a client that requests a response and then stops reading (never a byte accepted onto the
+ * socket) used to be exempted from close_idle_connections entirely ("slow readers are not this
+ * timeout's job"), pinning the fd, arena and out_buf forever. last_write_progress bounds that. */
+static void test_close_idle_connections_write_stall_closes_connection(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    int client_fd = fds[0];
+
+    conn->out_buf = malloc(4);
+    assert(conn->out_buf != NULL);
+    memcpy(conn->out_buf, "ping", 4);
+    conn->out_len = 4;
+    conn->out_sent = 0;
+    conn->last_write_progress = time(NULL) - WRITE_TIMEOUT_SECONDS - 1;
+
+    close_idle_connections(&app);
+
+    assert(app.connections[client_fd] == NULL); /* reclaimed: nothing more to say to a reader that stopped reading */
+
+    close(fds[1]);
+    app_destroy(&app);
+}
+
 
 /* S1: a client that sends one byte every few seconds keeps refreshing last_activity forever, so the
  * old idle-only check (last_activity vs IDLE_TIMEOUT_SECONDS) never fires. request_started does not
@@ -936,6 +964,43 @@ static void test_handle_readable_during_shutdown_forces_connection_close(void) {
     app_destroy(&app);
 }
 
+/* S2, end to end through the real flush_connection path (not a manually poked field): a response
+ * larger than the socketpair's kernel buffers, with nobody ever reading the peer end, forces a real
+ * EAGAIN partway through and proves flush_connection itself arms last_write_progress. Backdating it
+ * past WRITE_TIMEOUT_SECONDS and re-running the sweep must then reclaim the stuck connection -
+ * exactly the "client stopped reading" case improvements.md flagged as untested. */
+static void test_flush_connection_write_stall_reclaimed_by_close_idle_connections(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    const size_t body_len = 8 * 1024 * 1024; /* comfortably larger than any default socket buffer */
+    char *body = malloc(body_len);
+    assert(body != NULL);
+    memset(body, 'x', body_len);
+    conn->out_buf = body;
+    conn->out_len = body_len;
+    conn->out_sent = 0;
+    conn->keep_alive = 1;
+
+    flush_connection(&app, conn);
+
+    assert(app.connections[fds[0]] == conn);  /* still open: partial write in flight */
+    assert(conn->out_sent < conn->out_len);   /* proves a real EAGAIN was hit, not a full drain */
+    assert(conn->last_write_progress != 0);
+
+    /* Peer never reads: simulate the stall running past the deadline. */
+    conn->last_write_progress = time(NULL) - WRITE_TIMEOUT_SECONDS - 1;
+    close_idle_connections(&app);
+
+    assert(app.connections[fds[0]] == NULL);
+
+    close(fds[1]);
+    app_destroy(&app);
+    free(body);
+}
+
 static void test_app_stop_drains_and_flushes_pending_write(void) {
     App app;
     int fds[2];
@@ -1035,6 +1100,8 @@ int main(void) {
     test_close_idle_connections_408s_stalled_partial_request();
     test_close_idle_connections_leaves_recent_activity_alone();
     test_close_idle_connections_skips_pending_write();
+    test_close_idle_connections_write_stall_closes_connection();
+    test_flush_connection_write_stall_reclaimed_by_close_idle_connections();
     test_close_idle_connections_header_deadline_closes_slow_drip();
     test_close_idle_connections_header_deadline_leaves_fresh_partial_request_alone();
     test_close_idle_connections_body_deadline_allows_slow_body_within_window();

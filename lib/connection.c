@@ -292,6 +292,13 @@ void flush_connection(App *app, Connection *conn) {
     size_t bytes_written_this_flush = 0;
     const size_t max_flush_bytes = 4 * STREAM_CHUNK_SIZE;
 
+    if (conn->last_write_progress == 0) {
+        /* First time flush_connection runs for this response: start the S2 stall clock now, even
+         * before the first byte actually goes out (a response that gets EAGAIN on every attempt is
+         * exactly the "made no progress" case the deadline exists for). */
+        conn->last_write_progress = time(NULL);
+    }
+
     while (1) {
         while (conn->out_sent < conn->out_len) {
             ssize_t n = conn_write(app, conn, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
@@ -305,6 +312,7 @@ void flush_connection(App *app, Connection *conn) {
             }
             conn->out_sent += (size_t)n;
             conn->last_activity = time(NULL);
+            conn->last_write_progress = conn->last_activity; /* S2: only advances on actual bytes written */
             bytes_written_this_flush += (size_t)n;
         }
 
@@ -356,6 +364,7 @@ void flush_connection(App *app, Connection *conn) {
         conn->out_cap = 0;
         conn->in_len = 0;
         conn->request_started = 0; /* back to idle between requests: only IDLE_TIMEOUT_SECONDS applies (S1) */
+        conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying (S2) */
         arena_reset(&conn->arena);
 
         /* If handle_readable grew in_buf to fit a large body (in_cap >
@@ -499,10 +508,16 @@ void close_idle_connections(App *app) {
             continue;
         }
 
-        /* A write still in flight is a slow-reader-on-the-response problem,
-         * not the slow-sender-of-a-request problem this timeout targets -
-         * leave it for flush_connection()/EVFILT_WRITE to keep draining. */
+        /* A write still in flight is a slow-reader-on-the-response problem, not the
+         * slow-sender-of-a-request problem the checks below target, so it is bounded separately here
+         * (S2): a pending response that hasn't accepted a single byte onto the socket in
+         * WRITE_TIMEOUT_SECONDS is a client that stopped reading, not a slow one - close it rather
+         * than hold the fd, arena and out_buf forever. Still-progressing writes (however slowly) are
+         * left for flush_connection()/EVFILT_WRITE to keep draining. */
         if (conn->out_buf != NULL || conn->file_fd >= 0) {
+            if (now - conn->last_write_progress >= WRITE_TIMEOUT_SECONDS) {
+                connection_close(app, conn); /* a response is already mid-flight: nothing left to say */
+            }
             continue;
         }
 

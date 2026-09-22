@@ -98,3 +98,73 @@ slow throughput than 30 s allows for 10 MiB.
 **Status:** Fixed. `REQUEST_HEADER_TIMEOUT_SECONDS` / `REQUEST_BODY_TIMEOUT_SECONDS` are compile-time
 constants in `lib/app_types.h`, consistent with this repo's existing "limits are constants, not
 runtime knobs" convention — not exposed as `ServerConfig` fields.
+
+---
+
+## S2 · A client that stops reading holds its connection forever
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+`close_idle_connections` used to skip any connection with a response pending (`out_buf != NULL` or
+`file_fd >= 0`) unconditionally — a client that requested a large response and then simply stopped
+reading kept its fd, arena and full output buffer forever, with no mechanism to reclaim it. Added a
+third clock, alongside S1's `request_started`, that specifically measures write *progress* rather than
+write *activity*.
+
+- `lib/app_types.h`: added `Connection.last_write_progress` (a `time_t`, zero-initialized by the
+  existing `calloc`) and `WRITE_TIMEOUT_SECONDS` (30).
+- `lib/connection.c`:
+  - `flush_connection` arms `last_write_progress = time(NULL)` the first time it runs for a given
+    response (even before any byte is actually written — a response that gets `EAGAIN` on every
+    attempt is exactly the "made no progress" case this exists for), and advances it to `time(NULL)`
+    only when a `write()`/`SSL_write()` call actually accepts bytes (`n > 0`). Getting `EAGAIN` does
+    **not** advance it — that's what makes it measure stall time instead of merely "response still
+    pending," and lets a response that's still slowly draining survive indefinitely (each accepted
+    byte resets the clock) while one making zero progress at all gets caught.
+  - The keep-alive branch resets `last_write_progress` back to `0` once a response is fully queued,
+    same lifecycle as `request_started`.
+  - `close_idle_connections`'s pending-write branch, which previously just `continue`d
+    unconditionally, now closes the connection first if `now - last_write_progress >=
+    WRITE_TIMEOUT_SECONDS` (with a comment: nothing left to say — the response was already mid-flight,
+    so there's no 408-equivalent to send, just a reclaim).
+- No `lib/tls.c` changes needed: `flush_connection` calls `conn_write`, which already dispatches to
+  `tls_connection_write` for TLS connections, so the same clock covers both transports without
+  touching the TLS module.
+
+**Tests and results.**
+
+- Unit tests added to `tests/test_connection.c` (registered in `main`):
+  - Updated `test_close_idle_connections_skips_pending_write` to set `last_write_progress` to "now"
+    (previously it only asserted pending writes were exempt outright; now it asserts a write that's
+    actively progressing survives).
+  - `test_close_idle_connections_write_stall_closes_connection` — a pending write with
+    `last_write_progress` backdated past `WRITE_TIMEOUT_SECONDS` is reclaimed with nothing sent back.
+  - `test_flush_connection_write_stall_reclaimed_by_close_idle_connections` — the strongest of the
+    three: goes through the *real* `flush_connection` path (not a manually poked field) with an 8 MiB
+    response over a `socketpair(2)` whose peer end is never read. `flush_connection` genuinely hits
+    `EAGAIN` partway through (asserted via `conn->out_sent < conn->out_len`, proving this isn't a
+    synthetic setup) and arms `last_write_progress` on its own. Backdating that timestamp and
+    re-running the sweep then reclaims the connection — this is the exact "needs a response larger
+    than the socket buffers" scenario `improvements.md` flagged as untested for S2, now covered.
+- `make test`: all 14 suites pass (17 connection-suite cases now, up from 14).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 14 suites pass clean under ASan + UBSan, including
+  the 8 MiB-buffer test (the buffer is `malloc`'d directly rather than arena-owned, matching the
+  pre-existing convention in this file's other manual `out_buf` fixtures, and is explicitly `free`'d
+  after `app_destroy`).
+- Compiled `lib/connection.c` directly with the project's `-Wall -Wextra -std=c11 -O2` flags: no new
+  warnings.
+- Live end-to-end reproduction was attempted against the demo server (a 20 MiB file under
+  `/static/bigfile.bin`, a client connecting with a pinned small `SO_RCVBUF` and never calling `recv`
+  for 35 s) but was **inconclusive**: macOS loopback auto-tunes socket buffer capacity well past what
+  a request under `app_serve_static`'s `MAX_STATIC_FILE_SIZE` (50 MiB) cap can exhaust — the full
+  20 MiB round-tripped in under a second regardless of the pinned receive-buffer hint, so the server
+  never actually saw backpressure. This matches `improvements.md`'s own S2 entry, which was marked
+  "Not tested (needs a response larger than the socket buffers)" for the identical reason. The
+  `socketpair`-based unit test above is the authoritative verification here: Unix-domain socketpairs
+  have much smaller, non-auto-tuned buffers, so an 8 MiB unread response reliably forces a real
+  `EAGAIN`, unlike TCP loopback.
+
+**Status:** Fixed. `WRITE_TIMEOUT_SECONDS` is a compile-time constant in `lib/app_types.h`, same
+convention as S1's deadlines.

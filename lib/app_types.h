@@ -48,6 +48,10 @@
                                              * alone cannot (last_activity resets on every byte, however sparse) */
 #define REQUEST_BODY_TIMEOUT_SECONDS 30    /* deadline from the same first byte to a fully framed body once headers
                                              * are complete; same slow-drip rationale, sized for MAX_BODY_SIZE */
+#define WRITE_TIMEOUT_SECONDS 30      /* a pending response that hasn't accepted a single byte onto the socket for
+                                        * this long is closed: a slow reader is fine, one making zero progress at
+                                        * all is a client that stopped reading and would otherwise pin the
+                                        * connection (fd, arena, out_buf) forever */
 #define IDLE_SWEEP_INTERVAL_MS 1000   /* how often idle connections are checked */
 #define SHUTDOWN_TIMEOUT_SECONDS 5    /* graceful-drain deadline before force close */
 #define INITIAL_CONNECTION_TABLE_CAP 1024 /* App.connections slots at start; doubles on demand (bounded by RLIMIT_NOFILE) */
@@ -151,6 +155,14 @@ typedef struct Connection {
     size_t out_len;
     size_t out_sent;
     size_t out_cap;
+
+    /* Non-zero while a response is pending (out_buf != NULL or file_fd >= 0): set by flush_connection
+     * the first time it runs for this response, and advanced only when a write() / SSL_write() actually
+     * accepts bytes onto the socket - never merely because flush_connection ran. Lets
+     * close_idle_connections bound "made no progress at all" separately from "still slowly draining"
+     * (WRITE_TIMEOUT_SECONDS), closing a client that stopped reading instead of holding the connection,
+     * its arena and out_buf forever. Reset to 0 once a keep-alive response is fully queued. */
+    time_t last_write_progress;
 
     /* File streaming (res_send_file): >= 0 while flush_connection streams file_remaining bytes from disk. */
     int file_fd;

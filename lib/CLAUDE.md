@@ -51,7 +51,7 @@ path params 8 (value 63) · query params 16 (63) · request headers 32 (value 25
 cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
 body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 ·
 form fields 32 · static file 50 MiB · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
-drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
+pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
 worker init hooks 4 · cluster workers 128 · arena 64 KiB per connection (see below; exceeding it falls back to malloc, it is not a limit).
 
 ## Memory model
@@ -117,7 +117,8 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length` and `Connection` are engine-owned.
   `CookieOptions` zero value = session cookie; `max_age > 0` seconds, `< 0` expire now.
 - **Timeouts.** `last_activity` advances on received bytes only. Sweep every second; ≥ 60 s silent → close (408 first if a
-  request was half-received). A connection with a response pending is never timed out (slow readers are not this timeout's job).
+  request was half-received). A connection with a response pending (`out_buf != NULL` or `file_fd >= 0`) is exempt from
+  this particular check — that axis is bounded separately, below.
   A second, independent clock, `Connection.request_started`, bounds a request's *total* time regardless of how often a byte
   arrives (a client sending one byte every few seconds keeps `last_activity` fresh forever, so the check above alone never
   fires): armed at the first byte of a request (`handle_readable`) or at the start of a TLS handshake (`tls_connection_init`,
@@ -129,6 +130,13 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   generous `REQUEST_BODY_TIMEOUT_SECONDS` once they are complete and only the body is pending; either expiring closes with
   408 (or a bare close if nothing was received yet, e.g. a stalled handshake). A connection idle *between* requests
   (`request_started == 0`) is governed only by the first, `last_activity`-based check.
+  A third clock, `Connection.last_write_progress`, bounds a *pending response* that is making no progress at all: armed by
+  `flush_connection` the first time it runs for a given response, and advanced only when `write()`/`SSL_write()` actually
+  accepts bytes (not merely because `flush_connection` ran — an `EAGAIN` alone doesn't count as progress), reset to 0 once a
+  keep-alive response is fully queued. The sweep closes (no response, nothing left to say) any connection with a response
+  still pending whose `last_write_progress` is `≥ WRITE_TIMEOUT_SECONDS` old — a client that stopped reading, as opposed to
+  one still slowly draining a large response (which keeps advancing the clock and is left alone, however long that takes in
+  total).
 - **Shutdown.** SIGINT/SIGTERM (kqueue `EVFILT_SIGNAL` / `signalfd`, no async handlers) → `app_stop`: stop accepting, close idle
   connections, in-flight ones get `Connection: close`, 5 s deadline; a second signal exits at once. Cluster master forwards
   SIGTERM, waits 6 s, then SIGKILLs.
