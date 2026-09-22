@@ -33,6 +33,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+DEMO_DIR="examples/todo_sqlite"
+
 PORT="${PORT:-8080}"
 WORKERS="${WORKERS:-4}"
 THREADS="${THREADS:-8}"
@@ -64,12 +66,21 @@ PEAK_FILE="$(mktemp -t cexpress_peak.XXXXXX)"
 echo "==> Building release binary"
 make demo -s
 
-rm -f "$DB_PATH" "${DB_PATH}-shm" "${DB_PATH}-wal"
+rm -f "$DEMO_DIR/$DB_PATH" "$DEMO_DIR/${DB_PATH}-shm" "$DEMO_DIR/${DB_PATH}-wal"
 
 echo "==> Starting server (WORKERS=$WORKERS, QUIET=1, TODO_DB_PATH=$DB_PATH, memory tracking: $([ ${#TIME_CMD[@]} -gt 0 ] && echo "${TIME_CMD[*]}" || echo off))"
+# Started from DEMO_DIR (not the repo root): the demo resolves public/ and its default
+# TODO_DB_PATH relative to its own working directory, so from the repo root app_serve_static
+# finds no public/ to register and GET / (and the whole "read" phase's UI check) 404s.
+# `exec` inside the subshell replaces it with the server (or time(1)) directly, so SERVER_PID
+# below is still that process's PID, not an intermediate shell - same assumption the
+# time(1)-vs-master PID resolution right after this relies on.
 # stderr (server warnings + the time(1) report) goes to $SERVER_LOG, printed at the end.
-QUIET=1 WORKERS="$WORKERS" PORT="$PORT" TODO_DB_PATH="$DB_PATH" API_KEY="$API_KEY" \
-    ${TIME_CMD[@]+"${TIME_CMD[@]}"} ./examples/todo_sqlite/cexpress_demo 2>"$SERVER_LOG" &
+(
+    cd "$DEMO_DIR"
+    QUIET=1 WORKERS="$WORKERS" PORT="$PORT" TODO_DB_PATH="$DB_PATH" API_KEY="$API_KEY" \
+        exec ${TIME_CMD[@]+"${TIME_CMD[@]}"} ./cexpress_demo
+) 2>"$SERVER_LOG" &
 SERVER_PID=$!
 
 # Under time(1), $SERVER_PID is time itself - the real server master is its child.
@@ -97,7 +108,7 @@ stop_server() {
 
 cleanup() {
     stop_server
-    rm -f "$DB_PATH" "${DB_PATH}-shm" "${DB_PATH}-wal" "$SERVER_LOG" "$PEAK_FILE"
+    rm -f "$DEMO_DIR/$DB_PATH" "$DEMO_DIR/${DB_PATH}-shm" "$DEMO_DIR/${DB_PATH}-wal" "$SERVER_LOG" "$PEAK_FILE"
 }
 trap cleanup EXIT
 

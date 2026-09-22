@@ -13,9 +13,25 @@ Utility and load-testing scripts used to benchmark latency, throughput, and memo
 - `check_docs.sh` (`make check-docs`): fails when a `lib/*.h` engine header declares a public function that `lib/API.md` never mentions, or when `lib/API.md` names a `name(` that no engine header or the vendored yyjson header declares. The yyjson API is not required to be listed (it has hundreds of functions); only the subset named in `API.md` is checked for typos. Keeps the LLM-facing API index from drifting.
 - `export_framework.sh` (`make export DEST=...`): copies `lib/` into another directory together with a standalone Makefile and README (see `../importing.md`). The generated Makefile lists the current sources (arena, yyjson, picohttpparser, the per-OS event loop) and links `-luring` on Linux. TLS is out of scope for this library (terminate it at a gateway/reverse proxy in front); the exported Makefile has no OpenSSL detection.
 
-## Known problems with `stress_test.sh` (as of 2026-09-21; recorded, not fixed)
-- **It starts the demo from the repository root.** The demo resolves `public/` and the default `todos.db` against its working directory, so from the root `app_serve_static` logs `root directory "public" does not exist, not registered` and `GET /` answers `404` with a 9-byte body. The `GET / (Todo UI)` rows in `stress_tests/full_run_output.txt` therefore measure a 404, not the 6,481-byte page. Run the server from `examples/todo_sqlite/` (as the manual commands below do) for a real Todo-UI number.
-- **The memory rows from that run are not credible.** They report 7-12 MB total across 5 processes during the 5,000-connection phases; a direct measurement (below) puts one worker with 5,000 idle connections at about 121 MB RSS. The `time -l` footer also shows 0.01 s user CPU for a 230 s run. The cause was not investigated (the sampler and the `time`/`pgrep -P` PID resolution are the places to look).
+## Known problems with `stress_test.sh`
+- **Fixed 2026-09-22: it used to start the demo from the repository root.** The demo resolves `public/` and the
+  default `todos.db` against its working directory, so from the root `app_serve_static` logged `root directory
+  "public" does not exist, not registered` and `GET /` answered `404` with a 9-byte body - the `GET / (Todo UI)`
+  rows in `stress_tests/full_run_output.txt` (captured 2026-09-21, before this fix) measure that 404, not the
+  6,481-byte page. Fix: the script still builds and does its own `cd` from the repository root (the Makefile paths
+  are root-relative), but now launches the server itself from a `DEMO_DIR="examples/todo_sqlite"` subshell
+  (`cd "$DEMO_DIR"; VAR=... exec ... ./cexpress_demo` - note the env-var assignments must precede `exec`, not
+  follow it as an argument to it, which silently fails with "exec: QUIET=1: not found" since `exec` has no such
+  option). `DB_PATH`'s pre-start and cleanup `rm -f` calls were updated to `$DEMO_DIR/$DB_PATH` to match, since the
+  scratch database now lives there too, not at the repository root. Verified: `PHASES=read DURATION=2s CONNS=10
+  MEASURE_MEMORY=0 ./scripts/stress_test.sh` now reports `GET / (Todo UI)` transferring ~6.27 KB/request
+  (850.83 MB / 135,773 requests), matching the real page size; `MEASURE_MEMORY=1` (the `time(1)`-wrapped,
+  `pgrep -P`-based master-PID resolution path) was also re-verified working end to end after the subshell change.
+- **The memory rows from the 2026-09-21 run are not credible** (separate, still-open problem - not touched by the
+  fix above). They report 7-12 MB total across 5 processes during the 5,000-connection phases; a direct measurement
+  (below) puts one worker with 5,000 idle connections at about 121 MB RSS. The `time -l` footer also shows 0.01 s
+  user CPU for a 230 s run. The cause was not investigated (the sampler and the `time`/`pgrep -P` PID resolution are
+  the places to look).
 
 ## Memory tracking (`stress_test.sh`, on by default, `MEASURE_MEMORY=0` to disable)
 Two independent measurements, because neither alone is accurate for a forked cluster:
