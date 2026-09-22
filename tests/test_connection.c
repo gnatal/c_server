@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
+#include <netinet/in.h>
 #include "app_types.h"
 #include "event_loop.h"
 #include "connection.h"
@@ -47,6 +49,52 @@ static void teardown_test_connection(App *app, int fds[2], Connection *conn) {
     (void)conn;
     close(fds[1]);
     app_destroy(app);
+}
+
+/* S3 tests need real accept_connections() behavior (accept() itself, EMFILE, the listen backlog),
+ * which socketpair(2) can't exercise - a real loopback TCP listener is required instead. Binds an
+ * ephemeral port (port 0) and initializes the event loop, since accept_connections calls
+ * event_loop_watch_read for any connection it doesn't reject. */
+static void setup_test_server(App *app) {
+    app_init(app);
+    assert(event_loop_init(app) == 0);
+    app->server_fd = create_server_socket(0);
+    assert(app->server_fd >= 0);
+}
+
+/* A blocking client connect to setup_test_server's app - blocking so the call doesn't return until
+ * the client's side of the loopback three-way handshake is done. That does not, it turns out,
+ * guarantee the connection is already sitting in the listen backlog: under load (observed
+ * occasionally with ASan) accept() can still see nothing for a few milliseconds after connect()
+ * returns, so callers should drive accept_connections through drain_accept_connections below rather
+ * than a single bare call. */
+static int connect_loopback_client(const App *app) {
+    struct sockaddr_in bound;
+    socklen_t bound_len = sizeof(bound);
+    assert(getsockname(app->server_fd, (struct sockaddr *)&bound, &bound_len) == 0);
+
+    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(client_fd >= 0);
+
+    struct sockaddr_in target;
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    target.sin_port = bound.sin_port;
+    assert(connect(client_fd, (struct sockaddr *)&target, sizeof(target)) == 0);
+    return client_fd;
+}
+
+/* Calls accept_connections repeatedly with short pauses instead of once, to absorb the rare
+ * connect()-returned-but-not-yet-in-the-backlog race described above. Each retry beyond the first is
+ * normally a no-op (accept() immediately returns EAGAIN, so accept_connections returns at once) - the
+ * pauses only add real time on the rare run that needed them. */
+static void drain_accept_connections(App *app) {
+    for (int attempt = 0; attempt < 10; attempt++) {
+        accept_connections(app);
+        struct timespec pause = {0, 5 * 1000 * 1000}; /* 5ms */
+        nanosleep(&pause, NULL);
+    }
 }
 
 static void test_set_nonblocking_and_create(void) {
@@ -1079,6 +1127,134 @@ static void test_res_send_file_streams_to_socket(void) {
     app_destroy(&app);
 }
 
+/* S3: accept_connections used to accept without limit, bounded only by RLIMIT_NOFILE - a flood of
+ * connections had no graceful degradation, just an eventual, silent EMFILE. max_connections caps
+ * concurrently open connections per worker; past it, accept_connections still accept()s (it has to,
+ * to answer at all) but sends 503 + Connection: close and closes immediately, without registering a
+ * Connection or touching the event loop. */
+static void test_accept_connections_enforces_max_connections(void) {
+    App app;
+    setup_test_server(&app);
+    app.config.max_connections = 2;
+
+    int clients[3];
+    for (int i = 0; i < 3; i++) {
+        clients[i] = connect_loopback_client(&app);
+    }
+
+    drain_accept_connections(&app);
+
+    assert(app_count_connections(&app) == 2);
+    assert(app.open_connections == 2);
+
+    /* The third client gets an explicit 503, not a silent drop or a hung connection. */
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(clients[2], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 503 Service Unavailable") != NULL);
+    assert(strstr(resp, "Connection: close") != NULL);
+
+    for (int i = 0; i < 3; i++) {
+        close(clients[i]);
+    }
+    app_destroy(&app);
+}
+
+/* max_connections == 0 is a deliberate opt-out (uncapped, the pre-S3 default): the accept path must
+ * not treat "unset" as "zero capacity". */
+static void test_accept_connections_max_connections_zero_is_unlimited(void) {
+    App app;
+    setup_test_server(&app);
+    app.config.max_connections = 0;
+
+    int clients[5];
+    for (int i = 0; i < 5; i++) {
+        clients[i] = connect_loopback_client(&app);
+    }
+
+    drain_accept_connections(&app);
+
+    assert(app_count_connections(&app) == 5);
+    assert(app.open_connections == 5);
+
+    for (int i = 0; i < 5; i++) {
+        close(clients[i]);
+    }
+    app_destroy(&app);
+}
+
+/*
+ * S3, EMFILE recovery. Simulates the process being genuinely out of file descriptors (not just past
+ * the configured max_connections) by lowering RLIMIT_NOFILE to exactly the number of descriptors
+ * currently in use, so the very next fd allocation - accept()'s own - is guaranteed to fail with
+ * EMFILE.
+ *
+ * MEASURED on this machine (macOS): accept() does not leave the completed connection in the listen
+ * backlog for a retry when it fails this way - it dequeues and destroys it before failing to
+ * allocate an fd, so the connecting client sees its connection closed (observed: a clean EOF, no
+ * data) rather than an HTTP 503. A prior version of this fix tried to recover that same connection
+ * (close the spare fd, retry accept(), answer 503) and found that retry reliably returns EAGAIN
+ * instead - proof the connection was already gone, not evidence of a bug in the retry. So this test
+ * does not assert a 503 for the connection that triggered EMFILE; it asserts what the fix actually
+ * delivers: freeing the spare fd lets the *next* accept() succeed (accept_connections is not
+ * permanently stuck at the limit), and connection_close opportunistically re-arms the spare fd once
+ * anything closes.
+ */
+static void test_accept_connections_emfile_frees_a_slot_and_recovers(void) {
+    App app;
+    setup_test_server(&app);
+    assert(app.spare_fd >= 0); /* reserved by app_init; the mechanism under test needs it armed */
+
+    int doomed_client = connect_loopback_client(&app);
+
+    struct rlimit original;
+    assert(getrlimit(RLIMIT_NOFILE, &original) == 0);
+
+    /* probe's fd number equals the count of descriptors already in use (fds are handed out
+     * lowest-first): pin the limit there so the very next fd allocation fails with EMFILE, without
+     * guessing at an absolute descriptor count that varies by environment. */
+    int probe = open("/dev/null", O_RDONLY);
+    assert(probe >= 0);
+    close(probe);
+    struct rlimit tight = original;
+    tight.rlim_cur = (rlim_t)probe;
+    assert(setrlimit(RLIMIT_NOFILE, &tight) == 0);
+
+    drain_accept_connections(&app); /* hits EMFILE: spare_fd is sacrificed, doomed_client's connection is lost */
+
+    assert(setrlimit(RLIMIT_NOFILE, &original) == 0); /* restore before anything else can fail the test */
+
+    assert(app_count_connections(&app) == 0);
+    assert(app.spare_fd < 0); /* consumed, not yet re-armed - nothing has closed to trigger that */
+
+    char resp[16];
+    ssize_t n = read(doomed_client, resp, sizeof(resp));
+    assert(n <= 0); /* closed, not a live connection waiting for a request */
+    close(doomed_client);
+
+    /* The real point of the fix: a *later* connection, once descriptors are no longer scarce, is
+     * accepted normally - the worker recovered instead of staying stuck refusing everything. */
+    int later_client = connect_loopback_client(&app);
+    drain_accept_connections(&app);
+    assert(app_count_connections(&app) == 1);
+
+    /* Closing it frees a descriptor; connection_close should opportunistically re-arm the spare. */
+    Connection *conn = NULL;
+    for (int fd = 0; fd < app.connections_cap; fd++) {
+        if (app.connections[fd] != NULL) {
+            conn = app.connections[fd];
+            break;
+        }
+    }
+    assert(conn != NULL);
+    connection_close(&app, conn);
+    assert(app.spare_fd >= 0);
+
+    close(later_client);
+    app_destroy(&app);
+}
+
 int main(void) {
     test_set_nonblocking_and_create();
     test_handle_readable_round_trip_success();
@@ -1113,6 +1289,9 @@ int main(void) {
     test_handle_readable_during_shutdown_forces_connection_close();
     test_app_stop_drains_and_flushes_pending_write();
     test_res_send_file_streams_to_socket();
+    test_accept_connections_enforces_max_connections();
+    test_accept_connections_max_connections_zero_is_unlimited();
+    test_accept_connections_emfile_frees_a_slot_and_recovers();
 
     printf("all connection tests passed\n");
     return 0;

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include "router.h"
 #include "middleware.h"
 
@@ -10,7 +11,12 @@ void app_init(App *app) {
     app->config.tls_enabled = 0;
     app->config.tls_cert_file[0] = '\0';
     app->config.tls_key_file[0] = '\0';
+    app->config.max_connections = DEFAULT_MAX_CONNECTIONS;
     app->ssl_ctx = NULL;
+    app->open_connections = 0;
+    /* Best effort (S3): a failed open just means EMFILE gets the pre-existing silent behavior -
+     * see App.spare_fd. */
+    app->spare_fd = open("/dev/null", O_RDONLY);
     app->method_tree_count = 0;
     app->middleware_count = 0;
     app->error_handler = NULL;

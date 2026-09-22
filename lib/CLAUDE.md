@@ -52,7 +52,8 @@ cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 2
 body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 ·
 form fields 32 · static file 50 MiB · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
 pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
-worker init hooks 4 · cluster workers 128 · arena 64 KiB per connection (see below; exceeding it falls back to malloc, it is not a limit).
+worker init hooks 4 · cluster workers 128 · arena 64 KiB per connection (see below; exceeding it falls back to malloc, it is not a limit) ·
+max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped).
 
 ## Memory model
 Every accepted connection is one `calloc(sizeof(Connection) + 64 KiB)`: the arena buffer sits right behind the struct
@@ -80,6 +81,7 @@ and leaves the old block in the arena until the request ends; a static file is r
 | `Route`, `PatriciaNode` | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy` |
 | `app->connections` | `app_init` | `app_destroy` |
 | `SSL`, `SSL_CTX` | `tls_connection_init`, `tls_init_app` | `tls_connection_close`, `tls_cleanup_app` |
+| `app->spare_fd` (S3, one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`app_enable_tls`, `res_send_file`, `event_loop_*`, `create_*`).
@@ -116,6 +118,23 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length` and `Connection` are engine-owned.
   `CookieOptions` zero value = session cookie; `max_age > 0` seconds, `< 0` expire now.
+- **Overload (S3).** `accept_connections` sheds load on two independent axes, both O(1), checked before
+  `ensure_connection_capacity`/`connection_create` so an already-overloaded worker doesn't pay for either. (1)
+  `App.open_connections` (a running count, `++` in `accept_connections`, `--` in `connection_close` - not
+  `app_count_connections`, an O(n) rescan used only at shutdown) checked against `ServerConfig.max_connections`
+  (`0` = uncapped): past it, the fd is still `accept()`ed (has to be, to answer at all) but gets a hand-built 503 +
+  `Connection: close` and is closed immediately - no `Connection`, arena or event-loop registration. Skips the
+  plaintext write for a TLS listener (`app->ssl_ctx != NULL`): the client there expects a handshake, not HTTP, so
+  writing anything would just be protocol garbage. (2) `App.spare_fd`, one descriptor opened at `app_init` and held
+  in reserve: on `accept()` failing with `EMFILE`/`ENFILE` (the process is out of descriptors, not just over
+  `max_connections`), it's closed to free one slot and `accept_connections` retries. MEASURED (macOS/BSD): the
+  connection that triggered *that* failure is already gone by then - the kernel dequeues and destroys it rather
+  than leaving it in the backlog for the retry to recover, so there is no 503 for it specifically. What the freed
+  slot does deliver is recovery: the *next* `accept()` (now or on a later call) succeeds instead of the worker
+  staying stuck at the limit indefinitely. `spare_fd` stays consumed (`-1`) until `connection_close` opportunistically
+  reopens it the moment anything closes (the cheapest point to retry, rather than waiting for the next accept batch).
+  Unrelated to either: `create_server_socket`'s `listen()` backlog is `max(BACKLOG, SOMAXCONN)`, not the bare
+  `BACKLOG` constant.
 - **Timeouts.** `last_activity` advances on received bytes only. Sweep every second; ≥ 60 s silent → close (408 first if a
   request was half-received). A connection with a response pending (`out_buf != NULL` or `file_fd >= 0`) is exempt from
   this particular check — that axis is bounded separately, below.

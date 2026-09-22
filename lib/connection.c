@@ -75,7 +75,12 @@ int create_server_socket(int port) {
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, BACKLOG) < 0) {
+    /* S3: take whichever is larger - BACKLOG is a floor, not a cap. No-op on a system whose
+     * SOMAXCONN is already <= BACKLOG (e.g. macOS, where kern.ipc.somaxconn is 128, same as
+     * BACKLOG); on a Linux whose SOMAXCONN is raised, this actually widens the pending-accept
+     * queue instead of the kernel silently dropping SYNs past 128. */
+    const int backlog = BACKLOG > SOMAXCONN ? BACKLOG : SOMAXCONN;
+    if (listen(server_fd, backlog) < 0) {
         perror("listen");
         exit(EXIT_FAILURE);
     }
@@ -118,6 +123,14 @@ void connection_close(App *app, Connection *conn) {
         if (app->connections != NULL && conn->fd >= 0 && conn->fd < app->connections_cap) {
             app->connections[conn->fd] = NULL;
         }
+        app->open_connections--; /* paired with accept_connections' ++ (S3) */
+        if (app->spare_fd < 0) {
+            /* Opportunistic re-arm (S3): this connection closing just freed a descriptor, the
+             * cheapest possible moment to try reclaiming the reserve - waiting for the next
+             * accept_connections call could be a long time if the listen socket is the thing
+             * that's starved. Best effort: still -1 on failure, tried again next close. */
+            app->spare_fd = open("/dev/null", O_RDONLY);
+        }
     }
 
     if (conn->file_fd >= 0) {
@@ -154,6 +167,10 @@ void app_destroy(App *app) {
     if (app->server_fd >= 0) {
         close(app->server_fd);
         app->server_fd = -1;
+    }
+    if (app->spare_fd >= 0) {
+        close(app->spare_fd);
+        app->spare_fd = -1;
     }
     tls_cleanup_app(app);
     free(app->connections);
@@ -242,20 +259,76 @@ static int ensure_connection_capacity(App *app, int fd) {
     return 0;
 }
 
+/*
+ * S3 overload shedding: writes a minimal, hand-built 503 (no Connection/arena/Response - this
+ * happens before any of that would normally exist) to a freshly accepted fd, then closes it.
+ * Best-effort and one nonblocking attempt only: a client that won't read even this gets no more
+ * consideration than one that was never told anything, which is fine - the point is to answer
+ * politely when possible, not to guarantee delivery under overload (that would need to hold and
+ * retry the write, defeating the purpose of shedding cheaply). For a TLS listener the client
+ * expects a TLS handshake, not plaintext HTTP, so writing this would just look like protocol
+ * garbage instead of a 503 - skip straight to closing there.
+ */
+static void reject_overloaded_connection(int client_fd, int is_tls) {
+    if (!is_tls) {
+        const char *body = status_text(503);
+        char head[160];
+        int head_len = snprintf(head, sizeof(head),
+                                 "HTTP/1.1 503 %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
+                                 "Connection: close\r\n\r\n",
+                                 body, strlen(body));
+        set_nonblocking(client_fd);
+        if (head_len > 0 && (size_t)head_len < sizeof(head)) {
+            ssize_t n = write(client_fd, head, (size_t)head_len);
+            if (n == head_len) {
+                write(client_fd, body, strlen(body));
+            }
+        }
+    }
+    close(client_fd);
+}
+
 void accept_connections(App *app) {
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(app->server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
+            /* Out of descriptors process- or system-wide: without a free slot, accept() keeps
+             * failing this way forever (nothing here releases one on its own), silently starving
+             * every future connection - the pre-S3 behavior. MEASURED (macOS/BSD): the connection
+             * that triggered *this* failure is already gone by the time we see the error - accept()
+             * dequeues it off the listen backlog and destroys it when it can't allocate an fd,
+             * rather than leaving it there for a retry, so there is nobody left here to answer with
+             * a 503 (not verified on Linux; a kernel that instead leaves it queued would make a
+             * retry-accept recover it, which is harmless to also attempt, but this codebase doesn't
+             * rely on that). What the spare fd can still do is free up exactly one slot so the
+             * *next* accept() call - for whatever connection comes after this one, now or on a later
+             * call to accept_connections - succeeds instead of the worker staying stuck at the limit
+             * indefinitely. connection_close re-arms the spare fd opportunistically once anything
+             * closes. */
+            if ((errno == EMFILE || errno == ENFILE) && app->spare_fd >= 0) {
+                close(app->spare_fd);
+                app->spare_fd = -1;
+                continue;
+            }
             break;
         }
 
-        /* fd is bounded only by the process's own RLIMIT_NOFILE (accept()
-         * itself starts failing with EMFILE once that's hit) - no fixed
-         * ceiling here, just grow the table to fit. A failed grow (genuine
-         * OOM) rejects just this one connection, without affecting any
-         * already-open ones. */
+        /* S3: shed load past the configured cap instead of accumulating connections (and their
+         * arenas) without bound. Checked before ensure_connection_capacity/connection_create so an
+         * overloaded server doesn't pay for either. open_connections is O(1) (see App.open_connections)
+         * - this runs once per accepted connection, including every one we're about to reject, so it
+         * must not become the O(n) scan it's replacing. */
+        if (app->config.max_connections > 0 && app->open_connections >= app->config.max_connections) {
+            reject_overloaded_connection(client_fd, app->ssl_ctx != NULL);
+            continue;
+        }
+
+        /* Past the cap above, fd is bounded only by the process's own RLIMIT_NOFILE (accept()
+         * itself starts failing with EMFILE once that's hit, handled above) - no fixed ceiling
+         * here, just grow the table to fit. A failed grow (genuine OOM) rejects just this one
+         * connection, without affecting any already-open ones. */
         if (ensure_connection_capacity(app, client_fd) != 0) {
             close(client_fd);
             continue;
@@ -271,6 +344,7 @@ void accept_connections(App *app) {
             continue;
         }
         app->connections[client_fd] = conn;
+        app->open_connections++; /* paired with connection_close's -- (S3) */
 
         if (app->ssl_ctx != NULL) {
             if (tls_connection_init(app, conn) != 0) {

@@ -168,3 +168,117 @@ write *activity*.
 
 **Status:** Fixed. `WRITE_TIMEOUT_SECONDS` is a compile-time constant in `lib/app_types.h`, same
 convention as S1's deadlines.
+
+---
+
+## S3 · No connection limit, no overload behavior
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+`accept_connections` used to be bounded only by `RLIMIT_NOFILE`: past it, `accept()` starts failing
+and the worker just stops accepting, with no cap of its own and no way to tell a client the server is
+full. Two independent mechanisms were added, matching `improvements.md`'s fix list items (1) and (2);
+(3) (an optional per-IP cap) was deliberately skipped to keep this an S-effort fix — noted below.
+
+- `lib/app_types.h`: added `ServerConfig.max_connections` (default `DEFAULT_MAX_CONNECTIONS` = 10,000,
+  applied by `app_init`; `0` is a deliberate opt-out, uncapped) and two `App` fields:
+  `open_connections` (a running count) and `spare_fd` (one reserved descriptor).
+- `lib/router.c`: `app_init` sets `config.max_connections` to the default and opens `spare_fd`
+  (`open("/dev/null", O_RDONLY)`; best-effort, `-1` on failure just means the EMFILE mechanism below
+  degrades to the pre-S3 behavior rather than the whole server failing to start).
+- `lib/connection.c`:
+  - **The cap.** `accept_connections` checks `open_connections >= max_connections` right after a
+    successful `accept()`, before `ensure_connection_capacity`/`connection_create` — so an overloaded
+    worker doesn't pay for either. Past the cap, a new `reject_overloaded_connection` helper writes a
+    hand-built `503 Service Unavailable` + `Connection: close` (no `Connection`/arena/`Response` — none
+    of that machinery exists yet at this point) in one best-effort nonblocking write, then closes the
+    fd. It skips the plaintext write entirely when `app->ssl_ctx != NULL`: a TLS listener's client
+    expects a handshake, not HTTP text, so writing anything would just look like protocol garbage
+    instead of a 503.
+  - `open_connections` is a running counter (`++` in `accept_connections`, `--` in `connection_close`),
+    not a rescan of `app->connections` — the existing `app_count_connections` (O(n)) was deliberately
+    left alone (still used at shutdown) rather than reused here, since calling an O(n) scan once per
+    *accepted* connection would turn a connection flood into the same O(n)-per-connection problem this
+    check exists to prevent.
+  - **The EMFILE fallback.** On `accept()` failing with `EMFILE`/`ENFILE`, `spare_fd` is closed (freeing
+    one descriptor) and `accept_connections` retries. See the MEASURED finding below — this needed a
+    full redesign partway through once real testing showed the naive version didn't work.
+  - `create_server_socket`'s `listen()` call now uses `max(BACKLOG, SOMAXCONN)` instead of the bare
+    `BACKLOG` (128) constant — a no-op on macOS (`SOMAXCONN` is also 128 there) but widens the pending-
+    accept queue on a Linux whose `SOMAXCONN` is raised, per `improvements.md`'s note.
+  - `app_destroy` closes `spare_fd`.
+
+**MEASURED finding that changed the design.** The first implementation of the EMFILE fallback followed
+`improvements.md`'s fix literally: on `EMFILE`, close `spare_fd`, retry `accept()` for *that* connection,
+answer it with a 503, then reopen `spare_fd`. Testing it against a real tightened `RLIMIT_NOFILE`
+showed the retry reliably returned `EAGAIN`, not the connection — on this machine (macOS), `accept()`
+does not leave a completed connection in the listen backlog for a retry when it fails to allocate an
+fd for it; it dequeues and destroys that connection as part of failing, rather than leaving it queued.
+So there is nobody left to send a 503 to by the time the failure is observed. (Not verified on Linux;
+a kernel that instead leaves it queued would make the retry harmless and possibly even recover it, but
+nothing here relies on that.) The fix was redesigned around what's actually achievable: `spare_fd` is
+freed and *not* immediately reopened, so the *next* `accept()` call — for whatever connection comes
+after the lost one, now or on a later call to `accept_connections` — succeeds instead of the worker
+staying stuck at the limit indefinitely. `connection_close` opportunistically re-arms `spare_fd` the
+moment anything closes, rather than waiting for another `accept_connections` call that might not come
+for a while if the listen socket itself is the thing that's starved.
+
+Deliberately *not* done: (3) a per-IP cap (explicitly "optional" in `improvements.md`'s fix list) —
+`max_connections` and the `EMFILE` fallback address the memory-bound and total-fd-exhaustion cases;
+a single misbehaving IP hogging a large fraction of the cap is a real but separate problem, left for
+later. Also not done: making `max_connections` a per-IP-aware or dynamically adjustable value, or
+exposing it as an env var in the `examples/todo_sqlite` demo (it's set directly on `app.config`, the
+same pattern already used for `port`/`workers`/etc. in application code).
+
+**Tests and results.**
+
+- Unit tests added to `tests/test_connection.c` (registered in `main`), needing a real loopback TCP
+  listener rather than `socketpair(2)` (new helpers `setup_test_server`, `connect_loopback_client`,
+  `drain_accept_connections`):
+  - `test_accept_connections_enforces_max_connections` — 3 real concurrent client connections against
+    `max_connections = 2`: the first two are accepted, the third gets an explicit 503 body with
+    `Connection: close`.
+  - `test_accept_connections_max_connections_zero_is_unlimited` — 5 concurrent connections against
+    `max_connections = 0` all succeed (the opt-out sentinel isn't mistaken for "cap of zero").
+  - `test_accept_connections_emfile_frees_a_slot_and_recovers` — pins `RLIMIT_NOFILE` (via `getrlimit`/
+    `setrlimit`, restored before any assertion can bail the test binary) to exactly the descriptor count
+    already in use, forcing a real `EMFILE` from `accept()`. Matching the MEASURED finding above, it does
+    **not** assert a 503 for the connection that triggered the failure (asserts only that it's closed,
+    `n <= 0`); it asserts the actual guarantee: a later connection is accepted normally once the retry
+    frees a slot, and `connection_close` re-arms `spare_fd`.
+  - `drain_accept_connections` retries `accept_connections` a few times with short pauses rather than
+    calling it once: a rare race (a `connect()` that has returned client-side but isn't yet visible to
+    the server's `accept()`) surfaced intermittently under the ASan build during development — a 15%
+    failure rate across 20 runs — and was fixed by this retry rather than by loosening any assertion.
+    Confirmed clean over 30 consecutive ASan runs afterward.
+- `make test`: all 14 suites pass, plain and stress-run repeatedly (15 runs).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 14 suites pass clean under ASan + UBSan; the new
+  EMFILE test specifically stress-run 30 times with zero failures after the `drain_accept_connections`
+  fix (see above).
+- Compiled `lib/connection.c` and `lib/router.c` directly with the project's `-Wall -Wextra -std=c11
+  -O2` flags: no new warnings (the pre-existing `router.c` warnings on `next_seg_len`/`seg_len`/
+  `strncpy` are unrelated to this change and were present before it).
+- Live end-to-end verification against a minimal standalone server (not the `examples/todo_sqlite`
+  demo, to avoid adding a `MAX_CONNECTIONS` env var to it for a one-off test) built against the real
+  library with `app.config.max_connections = 5`: 15 concurrent clients produced exactly 5 `200 OK`
+  responses and 9 explicit `503 Service Unavailable` responses (one client saw a connection reset, a
+  benign client-side race with the server closing right after writing); a liveness check immediately
+  afterward still returned `200 OK`, confirming the server both degrades gracefully under the cap and
+  stays fully responsive once the flood subsides.
+- Live end-to-end reproduction of the exact scenario `improvements.md` measured for this item
+  (`ulimit -n 40`, then ~100 concurrent clients, against `examples/todo_sqlite`'s demo) confirmed the
+  same shape reported there — the first ~32 connections got a real response and the rest got no data
+  at the TCP level (consistent with the MEASURED macOS `accept()`/`EMFILE` finding above: those
+  connections' completed handshakes are destroyed by the kernel before the server can answer them) —
+  and additionally confirmed a liveness check immediately after the flood still got `200 OK`, i.e. the
+  worker was not left permanently stuck the way `improvements.md` described ("stayed idle... never
+  told anyone it was full").
+
+**Status:** Fixed, with one caveat carried forward rather than hidden: the `EMFILE` fallback cannot
+deliver a 503 for the specific connection that exhausts the descriptor table on the kernels tested here
+(MEASURED, macOS) — only the `max_connections` cap (checked well before the OS limit, by default at
+10,000) delivers the clean "accept, answer 503, close" behavior `improvements.md` asked for. Anyone
+relying on graceful 503s under true fd exhaustion, rather than under the configured cap, should treat
+that as a known limitation, not a guarantee.

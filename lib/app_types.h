@@ -34,8 +34,9 @@
 #define MAX_BOUNDARY_LEN 71           /* RFC 2046: 70 chars + NUL */
 #define MAX_CHUNK_SIZE_LINE_LEN 64    /* a chunk-size line longer than this is malformed */
 #define MAX_EVENTS 64                 /* events fetched per event-loop poll */
-#define BACKLOG 128
+#define BACKLOG 128                   /* listen() backlog floor; create_server_socket takes max(BACKLOG, SOMAXCONN) */
 #define DEFAULT_PORT 8080
+#define DEFAULT_MAX_CONNECTIONS 10000 /* ServerConfig.max_connections default, applied by app_init (see below) */
 
 #define BUF_SIZE 8192                 /* connection input buffer start size; also the request-header limit (431 beyond) */
 #define MAX_BODY_SIZE (10 * 1024 * 1024)        /* request body (Content-Length or decoded chunked) and streamed response buffer; 413 beyond */
@@ -342,6 +343,14 @@ typedef struct {
     int tls_enabled;
     char tls_cert_file[PATH_MAX];
     char tls_key_file[PATH_MAX];
+
+    /* Per-worker cap on concurrently open connections (accepted but not yet closed; includes an
+     * in-progress TLS handshake). Beyond it, accept_connections (connection.c) still accept()s the
+     * fd - it has to, to say anything at all - but answers 503 + Connection: close immediately and
+     * closes it, without allocating a Connection or touching the event loop. app_init sets
+     * DEFAULT_MAX_CONNECTIONS; set to 0 to opt out (uncapped, bounded only by RLIMIT_NOFILE, the
+     * pre-S3 behavior). */
+    int max_connections;
 } ServerConfig;
 
 /* The whole server. About 4.6 KB on macOS (PATH_MAX 1024) and more on Linux (two PATH_MAX TLS paths), routes live on the heap:
@@ -370,6 +379,25 @@ typedef struct {
      * grown by doubling in accept_connections, freed by app_destroy. */
     Connection **connections;
     int connections_cap;
+
+    /* Running count of open connections (accepted, not yet connection_close'd), kept in step with
+     * accept_connections (++) and connection_close (--) so the S3 max_connections check in
+     * accept_connections is O(1) instead of rescanning `connections` on every accept - which would
+     * turn a connection flood into the same O(n) hot-path problem this check exists to guard
+     * against. Precise only across that accept/close pairing (the only one production code uses);
+     * app_count_connections (a full rescan, called rarely - only at shutdown) remains the
+     * authoritative count for anything that walks `connections` directly, e.g. a test harness that
+     * pokes it by hand. */
+    int open_connections;
+
+    /* One fd (opened once, up front) held in reserve and not otherwise used: on EMFILE/ENFILE from
+     * accept() (connection.c: accept_connections), closing it frees exactly one descriptor, just
+     * enough to accept the connection that couldn't otherwise be accepted, answer 503, and close it
+     * again - the alternative is accept() failing forever with no way to even say the server is
+     * full, since every syscall including a rejection's accept() needs a free descriptor. -1 if the
+     * initial open failed (degrades to the pre-S3 silent behavior on EMFILE, same as before this
+     * field existed). Opened by app_init, closed by app_destroy. */
+    int spare_fd;
 
     WorkerInitHook worker_init_hooks[MAX_WORKER_INIT_HOOKS];
     int worker_init_hook_count;
