@@ -21,8 +21,8 @@ static volatile sig_atomic_t g_shutdown_signo = 0;
  * delay instead of instantly, and after CLUSTER_RESTART_BUDGET failures within
  * CLUSTER_RESTART_WINDOW_MS the master gives up on the whole cluster rather than forking forever -
  * MEASURED (improvements.md, S7) 10,594 respawns and 31,788 log lines in about 4 seconds with
- * WORKERS=2 and the port already taken. Implementation-only constants (never exposed through
- * cluster.h), same convention as connection.c's local ARENA_SIZE.
+ * WORKERS=2 and the port already taken. Implementation-only constants, never exposed through
+ * cluster.h.
  */
 #define CLUSTER_RESTART_BACKOFF_INITIAL_MS 100  /* delay before the 1st respawn attempt after a failure */
 #define CLUSTER_RESTART_BACKOFF_MAX_MS 30000    /* backoff doubles per consecutive failure, capped here */

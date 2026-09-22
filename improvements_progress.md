@@ -1305,3 +1305,154 @@ the CPU win, and the array itself was never the size problem headers were). `siz
 9,792 bytes, well short of `improvements.md`'s "~1–2 KB" speculation but still a 77.5% reduction — the
 remaining bulk is cookie/query/param storage, unchanged fixed-size arrays out of this entry's scope, not a
 shortfall in the header-view work itself.
+
+---
+
+## M1 · A 64 KiB arena is allocated for every connection
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+`connection_create` used to `calloc(sizeof(Connection) + 64 KiB)` per accepted socket and `arena_init` the
+trailing 64 KiB as that connection's own arena — MEASURED (`improvements.md`, M1) 24,950 B RSS per idle
+keep-alive connection, of which the arena accounted for ~16.5 KB. `improvements.md`'s own fix list named the
+real hazard directly: moving to one arena per *worker* only works if two things also change — a still-pending
+response's unsent tail has to be copied out of the shared arena before it can safely be reused by another
+connection, and file-streaming chunk buffers have to stop living in it entirely. Both were implemented, not
+just the headline "one arena, not many" change.
+
+- **`App.arena` (`lib/app_types.h`), new field — the one arena for the whole worker process.** `app_init`
+  (`lib/router.c`) `malloc`s its `ARENA_SIZE` (64 KiB, moved here from a `connection.c`-local `#define` since
+  `connection_create` no longer needs it at all) buffer and calls `arena_init` once, the same failure
+  convention as the pre-existing `app->connections` calloc ("the server can't run without this either" -
+  `perror` + `exit(EXIT_FAILURE)`). Allocated before `app_listen`/cluster fork, so every worker process gets
+  its own private copy via ordinary `fork()` copy-on-write once it starts writing to it - no different from
+  how the rest of `App` already crosses the fork, and unlike a live socket or DB handle (which the existing
+  "open DB connections in `app_on_worker_start`, not `main()`" convention is about), a not-yet-written memory
+  buffer has no per-process identity to corrupt by being shared before the copy triggers.
+- **`Connection.arena` is now `Arena *arena`** (was an embedded `Arena`), set once, at `connection_create`
+  (which now takes an `App *` parameter to reach it: `conn->arena = &app->arena`), and never reassigned.
+  `connection_create` itself shrank to a plain `calloc(sizeof(Connection))` - no more trailing 64 KiB, no more
+  `arena_init` call of its own. Every internal `&conn->arena` became `conn->arena` (already a pointer):
+  `parse_http_request_from_head`'s call in `handle_readable`, and `arena_alloc(&conn->arena, ...)` in
+  `response.c`'s `send_with_content_type`/`append_to_out_buf`. The public, documented pattern
+  `arena_yyjson_alc(&res->conn->arena)` (`lib/API.md`, `lib/examples/cookbook.c`, `examples/todo_sqlite/handlers.c`
+  - 12 call sites total) became `arena_yyjson_alc(res->conn->arena)` (drop the `&`) - a mechanical, mostly
+  one-character fix at each site, not a design change to any of those functions, and exactly what
+  `improvements.md`'s own M1 entry anticipated ("`Connection.arena` can stay as a pointer to the shared arena
+  so `res->conn->arena` ... keeps working").
+- **The actual hazard: copying out a still-unsent response before the shared arena can be reused
+  (`lib/connection.c`: `flush_connection`).** With one arena per connection, a response that couldn't be
+  fully written in one `write()` call (a big body, a slow client, a small socket buffer) just sat in that
+  connection's own arena until the next writable event drained it - nobody else could disturb it. With one
+  arena per *worker*, that stops being true: the very next connection's dispatch would call `arena_reset`
+  after its own turn, and a bump allocator's reset doesn't clear memory, it just lets the next allocation
+  overwrite it - exactly what a still-pending `out_buf` from a different, unfinished response would sit on
+  top of. New field `Connection.out_buf_owned` (0 by default, matching `calloc`'s zero-init - "nothing owned
+  yet") tracks this: `flush_connection`'s inner write loop, on `EAGAIN`, now checks whether the current
+  `out_buf` is still arena-resident (`!out_buf_owned && out_buf != file_buf` - see below) and if so, `malloc`s
+  a buffer exactly the size of the unsent remainder, `memcpy`s it out, repoints `out_buf` at the copy, and
+  sets `out_buf_owned = 1` *before* returning control to the event loop. A response that never hits `EAGAIN`
+  (the common case - it drains in one shot) never pays for this at all. The owned copy is `free`'d once fully
+  drained (a new check right after the outer response loop, before the keep-alive/close branch) or in
+  `connection_close`, on whichever exit path gets there first - never both, since the check flips
+  `out_buf_owned` back to 0 the moment it fires.
+- **File streaming stops using the arena at all (`Connection.file_buf`, new field).** `res_send_file`'s
+  chunk-by-chunk body (up to `STREAM_CHUNK_SIZE`, 16 KiB, per `flush_connection` iteration, `read()` from
+  `file_fd`) used to `arena_alloc` its chunk buffer fresh each turn - the same hazard as above, just certain
+  to happen instead of only possible, since a large file always spans multiple event-loop turns. `file_buf`
+  is `malloc`'d once (lazily, on the first chunk) and reused for every subsequent chunk of that one streamed
+  response, `free`'d when streaming ends (the pre-existing "`file_remaining == 0`" branch) or in
+  `connection_close` if a still-streaming connection closes some other way (a write error, a `read()`
+  failure). `out_buf` points at `file_buf` while streaming - never `out_buf_owned` (that flag means "a
+  `malloc`'d tail-copy needing the generic free," which `file_buf` is not: it has its own dedicated lifecycle
+  and would be a double-free if the generic path also tried to free it - `connection_close` and the
+  post-response-loop cleanup both check `out_buf == file_buf` first, before checking `out_buf_owned`, to keep
+  the two paths from colliding when both are non-NULL at once).
+- **The shared arena is reset by the caller that just used it, not by `flush_connection` itself
+  (`handle_readable`, `reject_request`).** `flush_connection` is called from three places: after a fresh
+  dispatch (`handle_readable`), after building an error response (`reject_request`, itself called from
+  several sites - body-limit 413, parse-failure 400/413/414, buffer-full 431, grow-failure 413/500, and
+  `close_idle_connections`' 408s), and from the event loop's own write-readiness dispatch (a `flush_connection`
+  call with no dispatch alongside it, just continuing an earlier partial drain). Only the first two just
+  finished *using* the shared arena for this request; the third is purely continuing to drain a buffer that,
+  thanks to the copy-out/`file_buf` mechanisms above, is already guaranteed not to be arena-resident by the
+  time it runs. So `arena_reset(&app->arena)` moved out of `flush_connection`'s old keep-alive branch and
+  into `handle_readable` (right after its own `flush_connection` call) and `reject_request` (same), both
+  using `app`, never `conn` - `conn` may already be a dangling pointer by then (a non-keep-alive response, or
+  a hard write error, both close it inside `flush_connection`), while `app` is always still valid.
+
+**Deliberately scoped down**, matching the S1–P3 precedent of narrowing rather than silently doing less than
+advertised:
+- **M2 (the 8 KiB `in_buf` per idle connection) was not attempted**, despite `improvements.md`'s own
+  dependency note suggesting M1 and M2 "change how `Connection.arena` and `in_buf` are owned (do them
+  together)." `in_buf` has a materially different lifetime problem (it needs to survive across several
+  `recv()`s for one request, not just across one dispatch-and-flush cycle) that a shared-per-worker treatment
+  doesn't solve the same way arena did - genuinely a separate design, left for its own entry.
+- **`ARENA_SIZE` (64 KiB) is unchanged.** The per-request working-set assumption behind that number doesn't
+  change just because the arena is now shared instead of duplicated - it still only ever holds one request's
+  data at a time (reset immediately after), the same as before.
+- **No attempt to shrink `App.arena` below 64 KiB or make it configurable.** Out of scope; a different,
+  unasked-for change.
+
+**Tests and results.**
+
+- Unit test added to `tests/test_connection.c` (registered in `main`):
+  `test_flush_connection_file_stream_survives_another_connections_dispatch` - the direct regression test for
+  M1's own stated risk. Streams a file well over `STREAM_CHUNK_SIZE * 4` (`max_flush_bytes`, the
+  fairness-yield threshold inside `flush_connection`) to one connection over a `socketpair(2)`, and between
+  every yield, runs a completely ordinary, unrelated dispatch-and-flush cycle for a *second* connection on
+  the *same* `App` (so it shares `app.arena`) - reproducing the exact "another connection's turn happens
+  between this one's turns" sequence the real event loop produces, including that second connection's own
+  `arena_reset`. The streamed file's content is a non-repeating hash-of-index pattern (not a short cycle that
+  could coincidentally survive corruption undetected), asserted byte-for-byte equal at the end. Also asserts
+  `interleaved > 0` (that the fairness-yield genuinely fired at least once), so a future change to
+  `STREAM_CHUNK_SIZE`/`max_flush_bytes` that made the file "too small to matter" would fail loudly here
+  instead of silently stopping to exercise M1 at all.
+- `make test`: all 13 suites pass.
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan - meaningful here
+  specifically because this fix replaced "everything lives in one arena until reset" with three different
+  manual `malloc`/`free` lifecycles (`out_buf_owned`'s tail-copy, `file_buf`, and the pre-existing arena
+  fallback blocks) that all have to interact correctly without a double-free or a leak; a sanitizer run is
+  exactly the right tool for that risk profile, and it found nothing across the new test above plus every
+  pre-existing streaming/partial-write test in the suite (`test_res_send_file_streams_to_socket`,
+  `test_flush_connection_write_stall_reclaimed_by_close_idle_connections`, the S2 8 MiB-buffer test, and
+  others).
+- `make fuzz FUZZ_ITERS=500000`: clean (67,357 parsed, 72,558 complete) - `fuzz_parser.c` doesn't link
+  `connection.c` (no socket layer), but does exercise `response.c`'s changed `arena_alloc(conn->arena, ...)`
+  call sites and the `out_buf_owned` resets on every successful parse through `dispatch()`.
+- `make check-docs`: passes (124 engine functions covered - no signatures in the public surface changed
+  other than `arena_yyjson_alc`'s *usage* at call sites, not its own signature).
+- Compiled `lib/connection.c`, `lib/response.c`, `lib/router.c` with the project's `-Wall -Wextra -std=c11
+  -O2` flags: no new warnings.
+- `make bench`: `sizeof(Connection)` 152 → 144 bytes (the embedded `Arena` struct's several fields replaced
+  by one pointer, offset by the two new fields, `out_buf_owned` and `file_buf`); per-request CPU numbers
+  unchanged within ordinary run-to-run noise (minimal GET ~150-170 ns, browser-shaped GET ~375-420 ns), as
+  expected - the arena mechanics themselves (bump-allocate, reset once per request) didn't change, only
+  *which* arena and *when* it's reset.
+- **Live reproduction of the exact MEASURED scenario from `improvements.md`** (5,000 idle keep-alive
+  connections held open by a script, `ps` RSS delta, `examples/todo_sqlite`'s demo, single worker): baseline
+  2,624 KB RSS, 43,760 KB with 5,000 connections held - **8.23 KB per connection**, matching
+  `improvements.md`'s own "8,415 B" reference point (its `ARENA_SIZE 0` simulation of exactly this fix) to
+  within 2%, and a **−67% reduction** from the ~25 KB/connection this same document measured before the fix.
+  Total overhead for 5,000 connections: ~41 MB, matching the PROJECTED "~43 MB" almost exactly. Verified the
+  server stayed fully responsive throughout - `GET /ping` and an authenticated `GET /api/todos` both still
+  returned 200 while all 5,000 connections were held open.
+- **Live correctness check under real concurrent load** (not just the unit test's simulated interleaving):
+  wrote a 5 MB file of random bytes into the demo's `public/` directory (over the static-file cache's 256 KiB
+  per-entry cap, so `app_serve_static` serves it via the whole-file-in-memory `res_send_bytes` path, an
+  arena-resident `out_buf` too large to write in one `write()` call on any real socket), downloaded it over
+  `curl` while a concurrent shell loop fired 200 back-to-back `GET /ping` requests at the same worker, and
+  confirmed the downloaded file's SHA-256 matched the original exactly - the same shared-arena-survives-
+  interleaving property the unit test proves, now confirmed against the real event loop, real sockets, and
+  real OS scheduling instead of a hand-driven loop. Temporary file removed after the check; not committed.
+- Live cluster sanity check: `WORKERS=2`, five sequential `GET /ping` requests and one authenticated `GET
+  /api/todos`, all 200 - confirming `App.arena`'s pre-fork `malloc` (in `app_init`, before `app_listen`'s
+  cluster fork) works correctly across `fork()`'s copy-on-write semantics for each worker process
+  independently, not just in the single-worker case the rest of this verification used.
+
+**Status:** Fixed for the measured problem (one arena per worker instead of one per connection) and for both
+follow-on risks `improvements.md`'s own fix list named (partial-write copy-out, file-streaming buffers) -
+neither was left as a known gap. M2 (`in_buf`) remains open, per the scoping above - a related but distinct
+change, not a shortfall in this entry's own scope.

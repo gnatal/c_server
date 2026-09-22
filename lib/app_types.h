@@ -50,6 +50,8 @@
 #define DEFAULT_PORT 8080
 #define DEFAULT_MAX_CONNECTIONS 10000 /* ServerConfig.max_connections default, applied by app_init (see below) */
 
+#define ARENA_SIZE (64 * 1024)        /* App.arena's fixed buffer (M1): one shared per-worker bump allocator, not one
+                                        * per connection; reset once per request, falls back to malloc beyond this */
 #define BUF_SIZE 8192                 /* connection input buffer start size; also the request-header limit (431 beyond) */
 #define MAX_BODY_SIZE (10 * 1024 * 1024)        /* request body (Content-Length or decoded chunked) and streamed response buffer; 413 beyond */
 #define MAX_STATIC_FILE_SIZE (50 * 1024 * 1024) /* static_serve_file refuses larger files with 500 */
@@ -211,14 +213,22 @@ typedef struct Connection {
     size_t in_cap;
     size_t in_len;
 
-    /* Output: one response built by res_send / res_json / res_write into memory from `arena` (not malloc'd
-     * and never freed individually: flush_connection drops the pointer and resets the arena when a keep-alive
-     * response is done, connection_close destroys the arena). out_buf != NULL means a response is pending. For responses
-     * built by the response layer, out_buf[out_len] == '\0' (not sent). */
+    /* Output: one response built by res_send / res_json / res_write into memory from `arena` (M1: a
+     * pointer to the single shared per-worker arena, not a per-connection one - see `arena` below).
+     * out_buf != NULL means a response is pending. For responses built by the response layer,
+     * out_buf[out_len] == '\0' (not sent).
+     * Ownership (M1): normally arena-resident (freed implicitly by the next arena_reset, same as
+     * before) - `out_buf_owned` is 0. If a response can't be fully written in one `flush_connection`
+     * call (EAGAIN), the unsent tail is copied into a connection-owned `malloc`'d buffer before
+     * `flush_connection` returns, since the shared arena would otherwise be reset and reused by
+     * another connection before this one's write finishes; `out_buf_owned` becomes 1 and that copy
+     * is `free`'d once fully drained or on close. File streaming never touches `out_buf_owned` - see
+     * `file_buf` below. */
     char *out_buf;
     size_t out_len;
     size_t out_sent;
     size_t out_cap;
+    int out_buf_owned;
 
     /* Non-zero while a response is pending (out_buf != NULL or file_fd >= 0): set by flush_connection
      * the first time it runs for this response, and advanced only when a write() actually accepts
@@ -228,14 +238,29 @@ typedef struct Connection {
      * its arena and out_buf forever. Reset to 0 once a keep-alive response is fully queued. */
     time_t last_write_progress;
 
-    /* File streaming (res_send_file): >= 0 while flush_connection streams file_remaining bytes from disk. */
+    /* File streaming (res_send_file): >= 0 while flush_connection streams file_remaining bytes from disk.
+     * `file_buf` (M1) is a lazily malloc'd, connection-owned STREAM_CHUNK_SIZE buffer flush_connection
+     * reads each chunk into and reuses across turns (`out_buf` points at it while streaming) - never the
+     * shared arena, since a large file spans many event-loop turns during which other connections would
+     * otherwise reuse and overwrite it. Freed when streaming ends (success or error) or on connection_close. */
     int file_fd;
     size_t file_remaining;
+    char *file_buf;
 
     int events_watched;     /* EVENT_READ | EVENT_WRITE currently registered with the event loop */
 
-    Arena arena;            /* Per-request bump allocator: a 64 KiB buffer allocated in the same calloc as this struct
-                             * (connection_create), plus malloc'd fallback blocks. Reset after each keep-alive response. */
+    /* Per-request bump allocator (M1): a pointer to the single arena shared by every connection this
+     * worker process serves (`App.arena`), not one embedded per connection - set once, at
+     * connection_create, and never reassigned. Safe because the event loop is single-threaded and
+     * non-blocking: at most one connection's handler code runs at a time, and control returns to the
+     * event loop (where the next connection's turn may begin) only after that connection's response has
+     * either been fully queued or had its still-pending tail copied out to a connection-owned buffer
+     * (`out_buf_owned` above) - so nothing any connection still needs is ever left in the shared arena
+     * when another connection's turn starts. `arena_reset` runs once per dispatch cycle, in the two
+     * places that just finished one (`reject_request`, `handle_readable`'s post-dispatch flush) - not
+     * inside `flush_connection` itself, since it also runs on a later, unrelated write-readiness turn
+     * where nothing needs resetting again. */
+    Arena *arena;
 } Connection;
 
 typedef enum {
@@ -473,6 +498,14 @@ typedef struct {
     int worker_init_hook_count;
 
     int is_shutting_down;  /* set by app_stop: no new connections, responses carry Connection: close */
+
+    /* Per-request bump allocator, shared by every connection this worker process serves (M1) - not one
+     * per connection. `app_init` mallocs its ARENA_SIZE (64 KiB) buffer and calls arena_init; every
+     * `Connection.arena` this process creates is simply `&app->arena`. Safe under the single-threaded,
+     * non-blocking event loop model (see `Connection.arena`'s own comment for why); freed by
+     * `app_destroy` (`arena_destroy` plus a `free` of the buffer itself, the same "test/owner frees what
+     * it mallocs" convention arena.h documents for a hand-built Arena). */
+    Arena arena;
 } App;
 
 #endif /* APP_TYPES_H */

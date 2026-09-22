@@ -58,9 +58,11 @@ int main(int argc, char **argv) {
       (void)req_get_header(&req, "host"); (void)req_get_query(&req, "a"); (void)req_get_cookie(&req, "a");
       (void)request_wants_close(&req);
       const Route *rt = match_route(&app, &req);
-      Connection conn; memset(&conn, 0, sizeof conn); arena_init(&conn.arena, fuzz_conn_buf, sizeof(fuzz_conn_buf)); conn.file_fd = -1; conn.keep_alive = 1;
+      Connection conn; memset(&conn, 0, sizeof conn);
+      Arena conn_arena; arena_init(&conn_arena, fuzz_conn_buf, sizeof(fuzz_conn_buf)); conn.arena = &conn_arena;
+      conn.file_fd = -1; conn.keep_alive = 1;
       Response res; res_init(&res, &conn); dispatch(&app, rt, &req, &res);
-      arena_reset(&conn.arena);
+      arena_reset(conn.arena);
     }
     arena_reset(&test_arena);
     free(buf);

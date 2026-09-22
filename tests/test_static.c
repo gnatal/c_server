@@ -80,16 +80,21 @@ static void test_mime_type_defaults_to_octet_stream(void) {
 
 static Connection *make_conn(void) {
     Connection *conn = calloc(1, sizeof(Connection));
-    arena_init(&conn->arena, malloc(64 * 1024), 64 * 1024);
+    /* M1: Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
+     * now, not one embedded per connection - malloc a standalone Arena for this fixture to point at. */
+    Arena *arena = malloc(sizeof(Arena));
+    arena_init(arena, malloc(64 * 1024), 64 * 1024);
+    conn->arena = arena;
     conn->keep_alive = 1;
     conn->file_fd = -1;
     return conn;
 }
 
 static void free_conn(Connection *conn) {
-    void *buf = conn->arena.buf;
-    arena_reset(&conn->arena);
+    void *buf = conn->arena->buf;
+    arena_reset(conn->arena);
     free(buf);
+    free(conn->arena);
     free(conn);
 }
 

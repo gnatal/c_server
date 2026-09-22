@@ -45,7 +45,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | P9 | HTTP pipelining is dropped | Performance / Correctness | | M | Large for pipelining clients | ESTIMATED |
 | P10 | `accept` path uses 4 syscalls plus setup | Performance | | S | Fewer syscalls per new connection on Linux | ESTIMATED |
 | P11 | SQLite commits fsync on every write (Linux) | Performance (demo) | | S | Order-of-magnitude on write rate | ESTIMATED |
-| M1 | 64 KiB arena per connection | Memory | | M | **−66%** per idle connection (25 → 8.4 KB) | MEASURED |
+| M1 | ~~64 KiB arena per connection~~ | Memory | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - MEASURED 8.2 KB per idle connection, matching the projected 8.4 KB | MEASURED |
 | M2 | 8 KiB input buffer per idle connection | Memory | | M | Idle connection to <1 KB (with M1) | ESTIMATED |
 | M3 | ~~TLS connections keep large SSL buffers~~ | Memory | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
 | M4 | Request bodies are copied twice | Memory | | M | Peak upload memory halved | PROJECTED |
@@ -294,7 +294,10 @@ Kept for historical record.
 
 ## 5. Memory
 
-### M1 · A 64 KiB arena is allocated for every connection
+### M1 · ~~A 64 KiB arena is allocated for every connection~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** `connection_create` (`connection.c:90-106`) allocates `sizeof(Connection) + 64 KiB` for every accepted socket, even though a request runs to completion inside one event-loop turn (nothing about the arena has to outlive it except a partially-written response).
 **Measured.** 5,000 idle keep-alive connections on one worker: **24,950 B per connection** with the arena; **8,415 B** with the arena buffer set to zero (everything then falls back to `malloc`), so the arena accounts for ~16.5 KB (−66%) of each connection. 121 MB → 43 MB for 5,000 connections.
 **Fix.** One arena per **worker** (reset after each request), not per connection. `Connection.arena` can stay as a pointer to the shared arena so `res->conn->arena` (used in the cookbook and demo) keeps working. When a response is only partly written (`EAGAIN`), copy the unsent tail into a connection-owned buffer, and free it when drained; file-streaming chunk buffers become per-connection and lazy.

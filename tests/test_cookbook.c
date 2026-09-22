@@ -18,7 +18,11 @@ char test_arena_buf[64 * 1024];
 static char *fetch(App *app, const char *raw, const size_t raw_len) {
     Connection conn;
     memset(&conn, 0, sizeof(conn));
-    arena_init(&conn.arena, test_arena_buf, sizeof(test_arena_buf));
+    /* M1: Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
+     * now, not one embedded per connection - point it at its own local Arena, same buffer as before. */
+    Arena conn_arena;
+    arena_init(&conn_arena, test_arena_buf, sizeof(test_arena_buf));
+    conn.arena = &conn_arena;
     conn.file_fd = -1;
     conn.keep_alive = 1;
 
@@ -38,7 +42,7 @@ static char *fetch(App *app, const char *raw, const size_t raw_len) {
     char *out = malloc(conn.out_len + 1);
     memcpy(out, conn.out_buf, conn.out_len);
     out[conn.out_len] = '\0';
-    arena_reset(&conn.arena);
+    arena_reset(conn.arena);
     return out;
 }
 

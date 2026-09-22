@@ -83,10 +83,8 @@ int create_server_socket(int port) {
     return server_fd;
 }
 
-#define ARENA_SIZE (64 * 1024)
-
-Connection *connection_create(int fd) {
-    Connection *conn = calloc(1, sizeof(Connection) + ARENA_SIZE);
+Connection *connection_create(App *app, int fd) {
+    Connection *conn = calloc(1, sizeof(Connection));
     if (conn == NULL) {
         return NULL;
     }
@@ -102,7 +100,7 @@ Connection *connection_create(int fd) {
     /* request_started stays 0 (calloc) until a request actually starts arriving: a freshly accepted,
      * otherwise-silent connection is bounded by IDLE_TIMEOUT_SECONDS below, same as before (S1 targets
      * a request that is under way but moving too slowly, not one that never starts). */
-    arena_init(&conn->arena, (char *)(conn + 1), ARENA_SIZE);
+    conn->arena = &app->arena; /* M1: shared per-worker arena, not one allocated per connection */
     return conn;
 }
 
@@ -129,6 +127,19 @@ void connection_close(App *app, Connection *conn) {
         close(conn->file_fd);
         conn->file_fd = -1;
     }
+    /* M1: file_buf and a still-owned malloc'd out_buf tail-copy are connection-owned, unlike the
+     * (shared, App-owned) arena a normal out_buf lives in - free them here regardless of which exit
+     * path got the connection closed (a hard write/read error mid-response, not just the ordinary
+     * "response fully sent, not keeping this connection alive" case). out_buf can equal file_buf
+     * (streaming's out_buf just points at it) - free it once, via file_buf, never both. */
+    if (conn->out_buf == conn->file_buf) {
+        conn->out_buf = NULL;
+    } else if (conn->out_buf_owned) {
+        free(conn->out_buf);
+        conn->out_buf = NULL;
+    }
+    free(conn->file_buf);
+    conn->file_buf = NULL;
 
     if (conn->fd >= 0) {
         close(conn->fd);
@@ -137,7 +148,6 @@ void connection_close(App *app, Connection *conn) {
     free(conn->in_buf);
     conn->in_buf = NULL;
     conn->out_buf = NULL;
-    arena_destroy(&conn->arena);
     free(conn);
 }
 
@@ -162,6 +172,11 @@ void app_destroy(App *app) {
         close(app->spare_fd);
         app->spare_fd = -1;
     }
+    /* M1: the one shared arena every Connection.arena pointed at. Every connection above was already
+     * closed (connection_close no longer touches app->arena itself), so nothing still references it. */
+    arena_destroy(&app->arena);
+    free(app->arena.buf);
+    app->arena.buf = NULL;
     free(app->connections);
     app->connections = NULL;
     app->connections_cap = 0;
@@ -323,7 +338,7 @@ void accept_connections(App *app) {
         const int nodelay = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        Connection *conn = connection_create(client_fd);
+        Connection *conn = connection_create(app, client_fd);
         if (conn == NULL) {
             close(client_fd);
             continue;
@@ -351,6 +366,25 @@ void flush_connection(App *app, Connection *conn) {
             ssize_t n = conn_write(conn, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* M1: out_buf is shared-arena-resident unless it's already a connection-owned
+                     * copy (out_buf_owned) or the file-streaming chunk buffer (out_buf == file_buf,
+                     * never arena to begin with - see file_buf's own comment). Returning to the event
+                     * loop now would let another connection's dispatch reset and reuse the shared
+                     * arena before this response finishes draining, so copy what's left out first. */
+                    if (!conn->out_buf_owned && conn->out_buf != conn->file_buf) {
+                        size_t remaining = conn->out_len - conn->out_sent;
+                        char *tail = malloc(remaining);
+                        if (tail == NULL) {
+                            connection_close(app, conn);
+                            return;
+                        }
+                        memcpy(tail, conn->out_buf + conn->out_sent, remaining);
+                        conn->out_buf = tail;
+                        conn->out_len = remaining;
+                        conn->out_sent = 0;
+                        conn->out_cap = remaining;
+                        conn->out_buf_owned = 1;
+                    }
                     event_loop_watch_write(app, conn->fd, conn);
                     return;
                 }
@@ -375,14 +409,24 @@ void flush_connection(App *app, Connection *conn) {
                 size_t to_read = conn->file_remaining < STREAM_CHUNK_SIZE
                                      ? conn->file_remaining
                                      : STREAM_CHUNK_SIZE;
-                if (conn->out_cap < to_read || conn->out_buf == NULL) {
-                    conn->out_buf = arena_alloc(&conn->arena, to_read);
-                    if (conn->out_buf == NULL) {
+                /* M1: a connection-owned buffer, malloc'd once and reused chunk to chunk - never the
+                 * shared arena, since a large file spans many event-loop turns during which other
+                 * connections would otherwise reuse and overwrite it (see Connection.file_buf). A
+                 * still-owned malloc'd tail-copy from the response head (above) is done with once we
+                 * get here (the inner loop just fully drained it) and isn't file_buf, so free it now
+                 * rather than leak it when out_buf moves on to file_buf below. */
+                if (conn->out_buf_owned) {
+                    free(conn->out_buf);
+                    conn->out_buf_owned = 0;
+                }
+                if (conn->file_buf == NULL) {
+                    conn->file_buf = malloc(STREAM_CHUNK_SIZE);
+                    if (conn->file_buf == NULL) {
                         connection_close(app, conn);
                         return;
                     }
-                    conn->out_cap = to_read;
                 }
+                conn->out_buf = conn->file_buf;
                 ssize_t r = read(conn->file_fd, conn->out_buf, to_read);
                 if (r <= 0) {
                     connection_close(app, conn);
@@ -390,16 +434,29 @@ void flush_connection(App *app, Connection *conn) {
                 }
                 conn->out_len = (size_t)r;
                 conn->out_sent = 0;
-                conn->out_cap = to_read;
+                conn->out_cap = STREAM_CHUNK_SIZE;
                 conn->file_remaining -= (size_t)r;
                 continue;
             } else {
                 close(conn->file_fd);
                 conn->file_fd = -1;
+                free(conn->file_buf);
+                conn->file_buf = NULL;
+                conn->out_buf = NULL;
+                conn->out_cap = 0;
             }
         }
 
         break;
+    }
+
+    /* Whatever is left in out_buf now has been fully drained (the inner loop only exits via that, or
+     * the streaming branch above, which never leaves it non-NULL and un-freed). A connection-owned
+     * tail-copy (M1) needs freeing here; an arena-resident buffer does not (the caller - handle_readable
+     * or reject_request - resets the shared arena once this whole dispatch-and-flush cycle is done). */
+    if (conn->out_buf_owned) {
+        free(conn->out_buf);
+        conn->out_buf_owned = 0;
     }
 
     if (conn->keep_alive) {
@@ -413,7 +470,6 @@ void flush_connection(App *app, Connection *conn) {
         conn->request_started = 0; /* back to idle between requests: only IDLE_TIMEOUT_SECONDS applies (S1) */
         conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying (S2) */
         conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check (S4) */
-        arena_reset(&conn->arena);
 
         /* If handle_readable grew in_buf to fit a large body (in_cap >
          * BUF_SIZE), shrink it back down now that the connection is idle -
@@ -441,6 +497,10 @@ static void reject_request(App *app, Connection *conn, const int status) {
     res_status(&res, status);
     res_send(&res, status_text(status));
     flush_connection(app, conn);
+    /* M1: conn may already be freed (flush_connection always closes here, keep_alive is forced off
+     * above) - reset the shared arena through app, never conn, once this dispatch-and-flush cycle
+     * that just used it is over. */
+    arena_reset(&app->arena);
 }
 
 /*
@@ -549,7 +609,7 @@ void handle_readable(App *app, Connection *conn) {
 
         if (request_head_is_complete(&head, conn->in_buf, conn->in_len)) {
             Request req;
-            const int parse_status = parse_http_request_from_head(conn->in_buf, conn->in_len, &head, &req, &conn->arena);
+            const int parse_status = parse_http_request_from_head(conn->in_buf, conn->in_len, &head, &req, conn->arena);
             if (parse_status != 0) {
                 /* -2: path too long (414). -3 (S5) is retired (P3): req->headers holds views now, so
                  * there is no fixed-size copy left to overflow - parse_http_request_from_head never
@@ -576,6 +636,12 @@ void handle_readable(App *app, Connection *conn) {
             /* req.body is managed by arena, no need to free */
 
             flush_connection(app, conn);
+            /* M1: conn may already be freed by flush_connection (a non-keep-alive response, or a
+             * hard write error) - reset the shared arena through app, never conn, once this
+             * dispatch-and-flush cycle that just used it is over (flush_connection has already
+             * copied out anywhere it returned early with a still-pending response, so nothing any
+             * connection still needs is left in it). */
+            arena_reset(&app->arena);
             return;
         }
     }

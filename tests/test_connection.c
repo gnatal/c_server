@@ -44,7 +44,7 @@ static void setup_test_connection(App *app, int fds[2], Connection **conn) {
     assert(set_nonblocking(fds[0]) == 0);
     assert(set_nonblocking(fds[1]) == 0);
 
-    *conn = connection_create(fds[0]);
+    *conn = connection_create(app, fds[0]);
     assert(*conn != NULL);
     app->connections[fds[0]] = *conn;
     assert(event_loop_watch_read(app, fds[0], *conn) == 0);
@@ -114,7 +114,12 @@ static void test_set_nonblocking_and_create(void) {
     int flags = fcntl(p[0], F_GETFL, 0);
     assert(flags & O_NONBLOCK);
 
-    Connection *c = connection_create(p[0]);
+    /* M1: connection_create points its arena at App.arena now, so it needs one in scope even for a
+     * connection this test never registers into app.connections (app_destroy below won't touch it). */
+    App app;
+    app_init(&app);
+
+    Connection *c = connection_create(&app, p[0]);
     assert(c != NULL);
     assert(c->fd == p[0]);
     assert(c->in_buf != NULL);
@@ -127,6 +132,7 @@ static void test_set_nonblocking_and_create(void) {
     free(c);
     close(p[0]);
     close(p[1]);
+    app_destroy(&app);
 }
 
 static void test_handle_readable_round_trip_success(void) {
@@ -1102,8 +1108,8 @@ static void test_app_count_connections(void) {
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds1) == 0);
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds2) == 0);
 
-    Connection *c1 = connection_create(fds1[0]);
-    Connection *c2 = connection_create(fds2[0]);
+    Connection *c1 = connection_create(&app, fds1[0]);
+    Connection *c2 = connection_create(&app, fds2[0]);
     assert(c1 != NULL && c2 != NULL);
 
     app.connections[fds1[0]] = c1;
@@ -1137,8 +1143,8 @@ static void test_app_stop_idempotency_and_closing_idle(void) {
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds_idle) == 0);
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds_busy) == 0);
 
-    Connection *c_idle = connection_create(fds_idle[0]);
-    Connection *c_busy = connection_create(fds_busy[0]);
+    Connection *c_idle = connection_create(&app, fds_idle[0]);
+    Connection *c_busy = connection_create(&app, fds_busy[0]);
     assert(c_idle != NULL && c_busy != NULL);
 
     app.connections[fds_idle[0]] = c_idle;
@@ -1318,6 +1324,128 @@ static void test_res_send_file_streams_to_socket(void) {
     app_destroy(&app);
 }
 
+/* Finds "\r\n\r\n" in a buffer that isn't NUL-terminated (or safe to strstr - the M1 test below streams
+ * binary content that legitimately contains NUL bytes) and returns a pointer just past it, or NULL. */
+static const char *skip_response_head(const char *buf, size_t len) {
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            return buf + i + 4;
+        }
+    }
+    return NULL;
+}
+
+/* M1 regression: Connection.arena became a pointer to one Arena shared by every connection a worker
+ * serves, instead of one embedded per connection - the risk improvements.md called out for this fix
+ * is exactly the scenario built here. A file well over STREAM_CHUNK_SIZE is streamed to conn1 over a
+ * socketpair (small enough buffers that flush_connection's own 4*STREAM_CHUNK_SIZE fairness-yield
+ * forces several separate calls, each returning control to "the event loop" - this test's own driving
+ * loop - well before the file finishes). Between every one of those calls, conn2 runs a completely
+ * ordinary dispatch-and-flush cycle of its own on the SAME app, which builds its response from and
+ * then resets the shared arena, exactly what happens for real between two connections' turns on one
+ * worker. If conn1's streamed chunks lived in that arena (the pre-fix design), conn2's activity would
+ * corrupt or truncate them; because they live in Connection.file_buf instead - connection-owned,
+ * lazily malloc'd, never arena-resident - the full file must still arrive at the client byte for byte. */
+static void test_flush_connection_file_stream_survives_another_connections_dispatch(void) {
+    App app;
+    app_init(&app);
+    assert(event_loop_init(&app) == 0);
+    app_get(&app, "/ping", ping_handler);
+
+    int fds1[2], fds2[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds1) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds2) == 0);
+    assert(set_nonblocking(fds1[0]) == 0);
+    assert(set_nonblocking(fds1[1]) == 0);
+    assert(set_nonblocking(fds2[0]) == 0);
+    assert(set_nonblocking(fds2[1]) == 0);
+
+    Connection *conn1 = connection_create(&app, fds1[0]);
+    Connection *conn2 = connection_create(&app, fds2[0]);
+    assert(conn1 != NULL && conn2 != NULL);
+    app.connections[fds1[0]] = conn1;
+    app.connections[fds2[0]] = conn2;
+    conn1->keep_alive = 0; /* closes on its own once fully sent: doubles as this test's exit condition */
+    conn2->keep_alive = 1;
+
+    char tmp_path[] = "/tmp/cexpress_m1_stream_test_XXXXXX";
+    int tmp_fd = mkstemp(tmp_path);
+    assert(tmp_fd >= 0);
+    /* Several times STREAM_CHUNK_SIZE and max_flush_bytes (4x that), so the fairness-yield inside
+     * flush_connection fires repeatedly - one interleaving opportunity per yield below. A non-repeating
+     * byte pattern (not a short cycle aligned with the 16 KiB chunk size) so a duplicated, dropped or
+     * corrupted chunk is detectable rather than masked by a value that looks the same everywhere. */
+    const size_t file_len = STREAM_CHUNK_SIZE * 30 + 777;
+    char *expected = malloc(file_len);
+    assert(expected != NULL);
+    for (size_t i = 0; i < file_len; i++) {
+        expected[i] = (char)((i * 2654435761u) >> 24); /* Knuth multiplicative hash of the index */
+    }
+    assert(write(tmp_fd, expected, file_len) == (ssize_t)file_len);
+    close(tmp_fd);
+
+    Response res1;
+    memset(&res1, 0, sizeof(res1));
+    res1.conn = conn1;
+    assert(res_send_file(&res1, "application/octet-stream", tmp_path) == 0);
+    assert(conn1->file_fd >= 0);
+
+    char *received = malloc(file_len + 4096);
+    assert(received != NULL);
+    size_t received_len = 0;
+    int rounds = 0;
+    int interleaved = 0;
+    while (app.connections[fds1[0]] != NULL) {
+        assert(rounds++ < 10000); /* generous cap: fail loudly instead of hanging if something regresses */
+
+        flush_connection(&app, conn1);
+
+        char chunk[4096];
+        ssize_t n;
+        while ((n = read(fds1[1], chunk, sizeof(chunk))) > 0) {
+            assert(received_len + (size_t)n <= file_len + 4096);
+            memcpy(received + received_len, chunk, (size_t)n);
+            received_len += (size_t)n;
+        }
+        if (app.connections[fds1[0]] == NULL) {
+            break; /* conn1 fully sent and closed itself (keep_alive was 0) */
+        }
+
+        /* Interleave conn2's own, unrelated dispatch-and-flush cycle on the same app - the exact
+         * "another connection's turn happens between this one's yields" sequence handle_readable
+         * produces for real, reusing the identical shared-arena reset it performs after its own
+         * flush_connection call. */
+        Request req2;
+        const char *raw2 = "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert(parse_http_request(raw2, strlen(raw2), &req2, &app.arena) == 0);
+        Response res2;
+        res_init(&res2, conn2);
+        dispatch(&app, match_route(&app, &req2), &req2, &res2);
+        flush_connection(&app, conn2);
+        arena_reset(&app.arena);
+        interleaved++;
+        char discard[256];
+        while (read(fds2[1], discard, sizeof(discard)) > 0) { }
+    }
+    assert(app.connections[fds1[0]] == NULL);
+    /* If this is 0, the file was too small (or max_flush_bytes/STREAM_CHUNK_SIZE changed) for the
+     * fairness-yield to ever fire, and the test below would pass without exercising M1 at all. */
+    assert(interleaved > 0);
+
+    const char *body = skip_response_head(received, received_len);
+    assert(body != NULL);
+    size_t body_len = received_len - (size_t)(body - received);
+    assert(body_len == file_len);
+    assert(memcmp(body, expected, file_len) == 0);
+
+    free(expected);
+    free(received);
+    unlink(tmp_path);
+    close(fds1[1]);
+    close(fds2[1]);
+    app_destroy(&app);
+}
+
 /* S3: accept_connections used to accept without limit, bounded only by RLIMIT_NOFILE - a flood of
  * connections had no graceful degradation, just an eventual, silent EMFILE. max_connections caps
  * concurrently open connections per worker; past it, accept_connections still accept()s (it has to,
@@ -1485,6 +1613,7 @@ int main(void) {
     test_handle_readable_during_shutdown_forces_connection_close();
     test_app_stop_drains_and_flushes_pending_write();
     test_res_send_file_streams_to_socket();
+    test_flush_connection_file_stream_survives_another_connections_dispatch();
     test_accept_connections_enforces_max_connections();
     test_accept_connections_max_connections_zero_is_unlimited();
     test_accept_connections_emfile_frees_a_slot_and_recovers();

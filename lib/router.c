@@ -40,6 +40,16 @@ void app_init(App *app) {
         exit(EXIT_FAILURE);
     }
     app->connections_cap = INITIAL_CONNECTION_TABLE_CAP;
+
+    /* M1: one shared arena for the whole worker process (every Connection.arena it creates just points
+     * here), not one per connection - see app_types.h's App.arena and Connection.arena comments. Same
+     * failure convention as the calloc above: the server can't run without this either. */
+    char *arena_buf = malloc(ARENA_SIZE);
+    if (arena_buf == NULL) {
+        perror("app_init: malloc (arena)");
+        exit(EXIT_FAILURE);
+    }
+    arena_init(&app->arena, arena_buf, ARENA_SIZE);
 }
 
 /* Shared fill logic for one route slot, used by both app_add_route_mw and

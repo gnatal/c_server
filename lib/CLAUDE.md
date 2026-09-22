@@ -23,7 +23,7 @@ If `event_loop_init` fails (for example io_uring is blocked by the runtime), `ap
 
 Per request (`connection.c: handle_readable`):
 1. `recv` into `conn->in_buf`, then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below (P2) - the body-limit check (S4), `request_head_is_complete` (a chunked scan when the body is chunked), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request before P2).
-2. `parse_http_request_from_head(in_buf, in_len, &head, &req, &conn->arena)` → `Request` on the stack (copies method/path/query into its fixed arrays; headers are stored as VIEWS into `in_buf`, not copies, and the body is copied into the connection arena - P3). Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request`/`request_is_complete`/`request_framing` remain as thin, unchanged-behavior wrappers over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
+2. `parse_http_request_from_head(in_buf, in_len, &head, &req, conn->arena)` → `Request` on the stack (copies method/path/query into its fixed arrays; headers are stored as VIEWS into `in_buf`, not copies, and the body is copied into the shared arena - P3, M1). Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request`/`request_is_complete`/`request_framing` remain as thin, unchanged-behavior wrappers over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
 4. `match_route` (per-method Patricia tree, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
@@ -38,7 +38,7 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | File | Responsibility |
 |---|---|
 | `app_types.h` | every struct/typedef and every compile-time limit |
-| `arena.c/h` | per-connection bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`) |
+| `arena.c/h` | bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`); one shared per worker process (M1, `App.arena`), not one per connection |
 | `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text`. One `parse_request_head` pass feeds the body-limit check, completeness check and full parse (P2); `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers kept for existing callers. Headers are stored as views into the input buffer and cookies are split lazily, on first access (P3) |
 | `router.c/h` | route registration, one Patricia (segment-radix) tree per method, `app_mount`, `app_serve_static`, `app_free_routes` |
 | `middleware.c/h` | pipeline (`chain_next`, `chain_error`, `dispatch`), 404/405/OPTIONS defaults |
@@ -63,31 +63,48 @@ form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB e
 (`STATIC_CACHE_*`, `static.c`; a file over the per-entry cap is served but never cached; see "Static" below - P1) ·
 idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
 pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
-worker init hooks 4 · cluster workers 128 · arena 64 KiB per connection (see below; exceeding it falls back to malloc, it is not a limit) ·
+worker init hooks 4 · cluster workers 128 · arena 64 KiB, one per worker process, not per connection (M1; see below; exceeding it falls back to malloc, it is not a limit) ·
 max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped) ·
 body limit prefixes 16 (`MAX_BODY_LIMITS`; `App.body_limits`, set at runtime by `app_use_body_limit`, unlike the other limits here - see "Body limits (S4)" below).
 
 ## Memory model
-Every accepted connection is one `calloc(sizeof(Connection) + 64 KiB)`: the arena buffer sits right behind the struct
-(`connection_create`). `in_buf` is a separate 8 KiB malloc. Measured on macOS, 5,000 idle keep-alive connections on one worker took
-about 121 MB RSS, about 25 KB per connection (Linux not measured). The arena serves everything that lives for one request:
-`Request.body`, `conn->out_buf`, the file-streaming chunk buffer, chunked-response growth, and any yyjson document created
-with `arena_yyjson_alc`. Bump allocation, 8-byte aligned, no per-allocation free. When the remaining space is too small
-(not only for a single request over 64 KiB), the allocation falls back to `malloc` and is chained in a list that `arena_reset` frees.
-`flush_connection` calls `arena_reset` when a keep-alive response is fully written; `connection_close` calls `arena_destroy`.
-Consequences: nothing reached through `req` or `res` may be kept past the handler; a growing chunked response copies into a new arena block each doubling
-and leaves the old block in the arena until the request ends; a static file is read into a malloc'd buffer and copied again into the arena by `res_send_bytes`.
+**One arena per worker process, not per connection (M1).** `app_init` mallocs a single 64 KiB buffer and calls
+`arena_init` once into `App.arena`; `connection_create` just points `Connection.arena` at it
+(`conn->arena = &app->arena`) rather than allocating one of its own. Every accepted connection is now just
+`calloc(sizeof(Connection))` plus a separate 8 KiB `malloc` for `in_buf`. This is safe under the single-threaded,
+non-blocking event loop model: at most one connection's handler code runs at a time, and `handle_readable`/
+`reject_request` reset the shared arena (`arena_reset(&app->arena)`, through `app`, not `conn` - `conn` may already
+be freed by then) exactly once, right after each dispatch-and-flush cycle they run - by which point
+`flush_connection` has already copied any still-unsent response tail out to a connection-owned buffer if it
+couldn't fully drain in that same cycle (see `Connection.out_buf_owned`), so nothing any connection still needs
+is ever left in the shared arena when another connection's turn begins. File streaming (`res_send_file`) never
+touches the shared arena at all: each chunk is read into `Connection.file_buf`, a connection-owned buffer
+malloc'd lazily on first use and reused turn to turn, precisely because a large file spans many event-loop turns
+during which other connections' dispatches would otherwise reuse and overwrite an arena-resident chunk buffer.
+Measured on macOS, 5,000 idle keep-alive connections on one worker now take about 8.2 KB RSS per connection (about
+44 MB total for 5,000), down from about 25 KB per connection (about 121 MB) before this fix (Linux not measured).
+The arena serves everything that lives for one request: `Request.body`, the initial `conn->out_buf` build (`res_*`),
+chunked-response growth, and any yyjson document created with `arena_yyjson_alc`. Bump allocation, 8-byte aligned,
+no per-allocation free. When the remaining space is too small (not only for a single request over 64 KiB), the
+allocation falls back to `malloc` and is chained in a list that `arena_reset` frees. Consequences: nothing reached
+through `req` or `res` may be kept past the handler; a growing chunked response copies into a new arena block each
+doubling and leaves the old block in the arena until the request ends; a static file is read into a malloc'd buffer
+and copied again into the arena by `res_send_bytes` (unlike `res_send_file`, which never copies the body into the
+arena at all - see above).
 
 ## Ownership (who frees what)
 | Thing | Allocated by | Freed by |
 |---|---|---|
-| `Connection` + its 64 KiB arena buffer | `connection_create` (one calloc) | `connection_close` (exactly once) |
+| `App.arena`'s 64 KiB buffer (M1: one per worker process, not one per connection) | `app_init` (one malloc) | `app_destroy` (`arena_destroy` for fallback blocks, then a plain `free` of the buffer itself - `arena_destroy` never frees `buf`, same convention as a test's hand-built Arena) |
+| `Connection` | `connection_create` (one calloc; no arena buffer behind it any more) | `connection_close` (exactly once) |
 | `conn->in_buf` | `connection_create` (+ realloc on growth) | `connection_close` |
-| Arena fallback blocks | `arena_alloc` when the buffer is full | `arena_reset` (each keep-alive response) or `arena_destroy` (close) |
+| `conn->arena` | not allocated - always `&app->arena`, set once at `connection_create` | nobody frees it through `conn`; `app_destroy` frees the one underlying `App.arena` after every connection is already closed |
+| `conn->file_buf` (M1: a connection-owned file-streaming chunk buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
+| Arena fallback blocks | `arena_alloc` when the buffer is full | `arena_reset` (each dispatch-and-flush cycle, in `handle_readable`/`reject_request`) or `arena_destroy` (`app_destroy`) |
 | `Request.body` | `parse_http_request`, from the arena (always non-NULL after success) | nobody: reclaimed with the arena. Handlers never free it |
 | `req_get_*` results, `MultipartPart.data` | point inside the Request / body | nobody; valid until the handler returns |
-| `conn->out_buf` | `res_*`, from the arena (one allocation per response; a second send just leaves the first in the arena) | nobody: the pointer is dropped by `flush_connection` / `connection_close` |
-| yyjson doc built or read with `arena_yyjson_alc(&conn->arena)` | arena | nothing: `yyjson_*_doc_free` is a no-op for it, the arena reclaims it |
+| `conn->out_buf` | `res_*`, from the shared arena (one allocation per response; a second send just leaves the first in the arena) - **or** a connection-owned `malloc`'d copy of an unsent tail (M1: `conn->out_buf_owned`, made by `flush_connection` when a response can't be fully written in one call, since the shared arena would otherwise be reused by another connection before the write finishes) | the arena copy: nobody, reclaimed by the next `arena_reset`. The owned copy: `flush_connection` once fully drained, or `connection_close` on any error/close path - never both (see `Connection.out_buf_owned`) |
+| yyjson doc built or read with `arena_yyjson_alc(res->conn->arena)` (a pointer already - no `&`, M1) | arena | nothing: `yyjson_*_doc_free` is a no-op for it, the arena reclaims it |
 | yyjson doc with a NULL allocator (e.g. `error_handler_json`) | libc malloc | `yyjson_mut_doc_free` / `yyjson_doc_free` |
 | `yyjson_mut_write(doc, 0, &len)` result | libc malloc, **whatever allocator the doc uses** | caller, C `free` (forgetting it leaks once per request) |
 | `Route`, `PatriciaNode` | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy` |
@@ -310,7 +327,7 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
   `memmove` of the remainder, and re-running the parse loop after each flush.
 - **Chunked request bodies are re-scanned from the start on every `recv`** (`request_is_complete` → `chunked_body_scan`):
   quadratic in the worst case up to 10 MiB, so a slow-drip client can burn CPU. Fix: keep scan position and decoded length per connection.
-- **Per-connection footprint is about 25 KB resident on macOS (72 KB allocated: 64 KiB arena + 8 KiB `in_buf`)**, up from about 7 KB before the arena; 10,000 idle connections are on the order of 250 MB there.
+- **Per-connection footprint is about 8.2 KB resident on macOS** (M1 fixed the dominant 64 KiB-per-connection arena share of this - see Memory model; 10,000 idle connections are on the order of 84 MB now, down from about 250 MB before). `in_buf` (8 KiB, `BUF_SIZE`) remains per connection; shrinking that too is M2, still open.
 - **`Request.body` is still a copy** (now into the arena), including a 1-byte allocation for empty bodies.
 - Path/query params over 63 chars and queries over 255 chars are truncated silently. So are individual cookie values
   over 255 chars after the `Cookie` header is split (`parse_cookies` → `cookie_values[MAX_COOKIES][256]`) - the raw

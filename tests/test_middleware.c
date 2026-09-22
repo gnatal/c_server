@@ -11,16 +11,22 @@
 
 static Connection *make_conn(void) {
     Connection *conn = calloc(1, sizeof(Connection));
-    arena_init(&conn->arena, malloc(64 * 1024), 64 * 1024);
+    /* M1: Connection.arena is now a pointer to a shared per-worker Arena (App.arena in the real
+     * engine) rather than one embedded per connection - this fixture mallocs its own standalone
+     * Arena to point at, same as it always mallocked its own 64 KiB buffer. */
+    Arena *arena = malloc(sizeof(Arena));
+    arena_init(arena, malloc(64 * 1024), 64 * 1024);
+    conn->arena = arena;
     conn->keep_alive = 1;
     conn->file_fd = -1;
     return conn;
 }
 
 static void free_conn(Connection *conn) {
-    void *buf = conn->arena.buf;
-    arena_reset(&conn->arena);
+    void *buf = conn->arena->buf;
+    arena_reset(conn->arena);
     free(buf);
+    free(conn->arena);
     free(conn);
 }
 

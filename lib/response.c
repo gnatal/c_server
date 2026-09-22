@@ -216,9 +216,12 @@ static void send_with_content_type(Response *res, const char *content_type, cons
     /* A second res_send/res_json in the same request replaces the first response (last wins);
      * the earlier buffer is simply left in the arena to be freed at request end. */
 
-    /* Ownership: managed by the connection's arena. Freed exactly once, by flush_connection() when a
-     * keep-alive response finishes or by connection_close() on any error/close path. */
-    conn->out_buf = arena_alloc(&conn->arena, head_len + sent_body_len + 1);
+    /* Ownership: managed by the shared per-worker arena (M1), not a per-connection one - reclaimed by
+     * arena_reset once this request's dispatch-and-flush cycle ends (handle_readable/reject_request),
+     * unless flush_connection has to copy an unsent tail out to a connection-owned buffer first (see
+     * Connection.out_buf_owned) because the response couldn't be fully written in one go. */
+    conn->out_buf = arena_alloc(conn->arena, head_len + sent_body_len + 1);
+    conn->out_buf_owned = 0; /* a fresh arena allocation is never a connection-owned tail-copy */
     if (conn->out_buf == NULL) {
         conn->out_cap = 0;
         abort_response(conn);
@@ -358,7 +361,7 @@ static int append_to_out_buf(Connection *conn, const void *data, size_t len) {
         while (new_cap < conn->out_len + len + 1) {
             new_cap *= 2;
         }
-        char *grown = arena_alloc(&conn->arena, new_cap);
+        char *grown = arena_alloc(conn->arena, new_cap);
         if (grown == NULL) {
             return -1;
         }
@@ -366,6 +369,7 @@ static int append_to_out_buf(Connection *conn, const void *data, size_t len) {
             memcpy(grown, conn->out_buf, conn->out_len);
         }
         conn->out_buf = grown;
+        conn->out_buf_owned = 0; /* a fresh arena allocation is never a connection-owned tail-copy */
         conn->out_cap = new_cap;
     }
     memcpy(conn->out_buf + conn->out_len, data, len);

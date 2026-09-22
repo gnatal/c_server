@@ -59,12 +59,13 @@ int app_count_connections(const App *app);
  *   IDLE_TIMEOUT_SECONDS (60) is closed (408 first if a request was half-received). A connection
  *   with a response still being written is left alone.
  * accept_connections: accepts every pending client (non-blocking, TCP_NODELAY) and registers it.
- * connection_create / connection_close: one Connection per fd (a single calloc that also holds the 64 KiB
- *   per-request arena), freed exactly once by connection_close.
+ * connection_create / connection_close: one Connection per fd, freed exactly once by connection_close.
+ *   connection_create points its arena at the App's single shared per-worker arena (M1) rather than
+ *   allocating one of its own.
  */
 int set_nonblocking(int fd);
 int create_server_socket(int port);
-Connection *connection_create(int fd);
+Connection *connection_create(App *app, int fd);
 void connection_close(App *app, Connection *conn);
 void accept_connections(App *app);
 void flush_connection(App *app, Connection *conn);
