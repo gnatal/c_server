@@ -49,8 +49,8 @@ int main(int argc, char **argv) {
       }
     }
     char *exact = malloc(len ? len : 1); memcpy(exact, buf, len); free(buf); buf = exact;  /* no NUL, no slack */
-    size_t hl; int ch;
-    (void)request_framing(buf, len, &hl, &ch);
+    size_t hl; int ch; const char *fpath; size_t fpath_len;
+    (void)request_framing(buf, len, &hl, &ch, &fpath, &fpath_len);
     if (request_is_complete(buf, len)) complete++;
     Request req;
     if (parse_http_request(buf, len, &req, &test_arena) == 0) {

@@ -19,6 +19,7 @@ void app_init(App *app) {
     app->spare_fd = open("/dev/null", O_RDONLY);
     app->method_tree_count = 0;
     app->middleware_count = 0;
+    app->body_limit_count = 0;
     app->error_handler = NULL;
     app->worker_init_hook_count = 0;
     app->server_fd = -1;
@@ -333,8 +334,60 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
     }
     memcpy(route->static_root, canonical_root, root_len);
     route->static_root[root_len] = '\0';
-    
+
     app_insert_route_struct(app, route);
+}
+
+/* Same "prefix matches path at a segment boundary" rule as chain_next's app-wide middleware match
+ * (middleware.c: middleware_prefix_matches) - kept as its own small copy here rather than shared,
+ * since app_body_limit_for_path is looked up directly (no Request yet to hand a shared helper) while
+ * middleware_prefix_matches works off one, and the two moved independently is not worth a coupling. */
+static int body_limit_prefix_matches(const char *prefix, const char *path) {
+    if (prefix[0] == '\0' || (prefix[0] == '/' && prefix[1] == '\0')) {
+        return 1;
+    }
+    const size_t prefix_len = strlen(prefix);
+    if (strncmp(path, prefix, prefix_len) != 0) {
+        return 0;
+    }
+    const char next = path[prefix_len];
+    return next == '\0' || next == '/';
+}
+
+void app_use_body_limit(App *app, const char *prefix, size_t max_bytes) {
+    if (app->body_limit_count >= MAX_BODY_LIMITS) {
+        fprintf(stderr, "app_use_body_limit: MAX_BODY_LIMITS exceeded\n");
+        return;
+    }
+    if (prefix == NULL) {
+        prefix = "";
+    }
+    if (max_bytes > MAX_BODY_SIZE) {
+        fprintf(stderr, "app_use_body_limit: %zu exceeds MAX_BODY_SIZE, clamped to %d\n",
+                max_bytes, MAX_BODY_SIZE);
+        max_bytes = MAX_BODY_SIZE;
+    }
+    BodyLimitEntry *entry = &app->body_limits[app->body_limit_count++];
+    strncpy(entry->prefix, prefix, sizeof(entry->prefix) - 1);
+    entry->prefix[sizeof(entry->prefix) - 1] = '\0';
+    entry->max_bytes = max_bytes;
+}
+
+size_t app_body_limit_for_path(const App *app, const char *path) {
+    size_t best_len = 0;
+    size_t limit = MAX_BODY_SIZE;
+    for (int i = 0; i < app->body_limit_count; i++) {
+        const BodyLimitEntry *entry = &app->body_limits[i];
+        if (!body_limit_prefix_matches(entry->prefix, path)) {
+            continue;
+        }
+        const size_t entry_len = strlen(entry->prefix);
+        if (entry_len >= best_len) {
+            best_len = entry_len;
+            limit = entry->max_bytes;
+        }
+    }
+    return limit;
 }
 
 /* Advances *cursor past '/' separators and returns the next path segment

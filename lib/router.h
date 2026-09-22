@@ -107,6 +107,24 @@ void app_mount(App *app, const char *prefix, const Router *router);
  */
 void app_serve_static(App *app, const char *prefix, const char *root_dir);
 
+/*
+ * Per-route/prefix request body cap (S4). A declared Content-Length above `max_bytes` for a request
+ * whose path falls under `prefix` (same segment-boundary rule as app_use_prefix: "" or "/" matches
+ * everything) is rejected with 413 as soon as headers are complete, before the body is buffered -
+ * tighter than waiting for the global MAX_BODY_SIZE (10 MiB) cap, and without reserving memory
+ * proportional to what the client merely claims it will send. `max_bytes` is clamped down to
+ * MAX_BODY_SIZE if given a larger value (it can only tighten the global cap, never loosen it); NULL
+ * or "" for prefix matches every path. The most specific (longest) matching prefix wins, independent
+ * of registration order. Only Content-Length bodies are covered; chunked bodies remain governed by
+ * the global MAX_BODY_SIZE raw-wire cap only. Limit: MAX_BODY_LIMITS (16) prefixes; excess is
+ * dropped with a stderr warning.
+ */
+void app_use_body_limit(App *app, const char *prefix, size_t max_bytes);
+
+/* The effective body-size cap for `path`: the longest app_use_body_limit prefix that matches it, or
+ * MAX_BODY_SIZE if none do. Exposed for the engine (connection.c) and tests. */
+size_t app_body_limit_for_path(const App *app, const char *path);
+
 /* Enables HTTPS with PEM files (TLS 1.2+). Returns 0, or -1 on bad arguments / path >= PATH_MAX.
  * The context is created per worker process at app_listen. */
 int app_enable_tls(App *app, const char *cert_file, const char *key_file);

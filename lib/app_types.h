@@ -19,6 +19,7 @@
 /* ---- limits ---- */
 #define MAX_ROUTER_ROUTES 64          /* per Router (sub-router staging limit) */
 #define MAX_MIDDLEWARES 16            /* app-wide and per Router */
+#define MAX_BODY_LIMITS 16            /* app_use_body_limit prefixes (S4); excess dropped with a stderr warning */
 #define MAX_ROUTE_MIDDLEWARES 8       /* per route */
 #define MAX_PARAMS 8                  /* path params per request (name/value 63 chars) */
 #define MAX_QUERY_PARAMS 16           /* name/value 63 chars, percent- and '+'-decoded */
@@ -142,8 +143,18 @@ typedef struct Connection {
      * silent): only IDLE_TIMEOUT_SECONDS applies then, same as before this field existed. */
     time_t request_started;
 
-    /* Input: malloc'd at BUF_SIZE, realloc'd up to header_len + MAX_BODY_SIZE + 1 to fit a declared
-     * body, shrunk back to BUF_SIZE when the connection goes idle. in_buf[in_len] is always '\0'. */
+    /* Set once per request the first time its headers are found complete (any outcome: within
+     * limit, over it, or framing not yet knowable) so handle_readable's per-route body-limit check
+     * (S4, app_use_body_limit) runs request_framing at most once per request instead of on every
+     * read while a body is still arriving. Cleared with request_started when a keep-alive response
+     * is fully queued (flush_connection) so the next request on the same connection is rechecked. */
+    int body_limit_checked;
+
+    /* Input: malloc'd at BUF_SIZE, grown by doubling (like the chunked path) up to header_len +
+     * content_length + 1 to fit a declared body - never reallocated straight to the full declared
+     * size in one step (S4: a client that declares a large Content-Length and sends little of it no
+     * longer costs a reservation proportional to what it claims, only to what actually arrived).
+     * Shrunk back to BUF_SIZE when the connection goes idle. in_buf[in_len] is always '\0'. */
     char *in_buf;
     size_t in_cap;
     size_t in_len;
@@ -275,6 +286,16 @@ typedef struct {
     char prefix[128];
 } MiddlewareEntry;
 
+/* app_use_body_limit slot (S4): a declared Content-Length over max_bytes for a request whose path
+ * falls under prefix (same segment-boundary rule as MiddlewareEntry) is rejected with 413 as soon as
+ * headers are complete, before any body buffering. max_bytes is clamped to MAX_BODY_SIZE at
+ * registration (it can only tighten the global cap, never loosen it). Chunked bodies are unaffected:
+ * they stay governed by the global MAX_BODY_SIZE raw-wire cap only. */
+typedef struct {
+    char prefix[128];
+    size_t max_bytes;
+} BodyLimitEntry;
+
 typedef struct {
     char method[8];
     char path[256];               /* pattern, e.g. "/users/:id" */
@@ -361,6 +382,13 @@ typedef struct {
     int method_tree_count;
     MiddlewareEntry middlewares[MAX_MIDDLEWARES];
     int middleware_count;
+
+    /* app_use_body_limit registrations (S4), checked by connection.c before a declared Content-Length
+     * body is buffered. Unrelated to `middlewares` above: looked up directly by path prefix, not run
+     * as part of the middleware chain (it has to be checked before a Request even exists). */
+    BodyLimitEntry body_limits[MAX_BODY_LIMITS];
+    int body_limit_count;
+
     ErrorHandler error_handler;
     int server_fd;
     union {

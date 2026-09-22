@@ -33,11 +33,16 @@ int parse_http_request(const char *raw, size_t raw_len, Request *req, Arena *are
  * request_framing: locate the header block and decide how the body is framed.
  *   *header_len_out = bytes up to and including "\r\n\r\n", or 0 if headers are incomplete.
  *   *chunked_out    = 1 for "Transfer-Encoding: chunked".
+ *   *path_out / *path_len_out (both optional, pass NULL to skip) = the raw (not percent-decoded)
+ *     request-target and its length, pointing into `buf`; valid only when the return value's
+ *     caller can confirm *header_len_out > 0 (undefined content otherwise). Used by connection.c's
+ *     S4 body-limit lookup to find a route/prefix before the body itself has to be parsed.
  *   Returns the Content-Length code: 0 absent/zero, >0 value, -1 malformed / conflicting
  *   duplicates / chunked+Content-Length, -2 above MAX_BODY_SIZE.
  * Header names match exactly (case-insensitive) at line start: "X-Content-Length" never matches.
  */
-int request_framing(const char *buf, size_t len, size_t *header_len_out, int *chunked_out);
+int request_framing(const char *buf, size_t len, size_t *header_len_out, int *chunked_out,
+                    const char **path_out, size_t *path_len_out);
 
 /*
  * request_is_complete: 1 when buf[0..len) holds a full request (headers + framed body), or

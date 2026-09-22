@@ -282,3 +282,132 @@ deliver a 503 for the specific connection that exhausts the descriptor table on 
 10,000) delivers the clean "accept, answer 503, close" behavior `improvements.md` asked for. Anyone
 relying on graceful 503s under true fd exhaustion, rather than under the configured cap, should treat
 that as a known limitation, not a guarantee.
+
+---
+
+## S4 · A declared `Content-Length` reserves 10 MiB per connection immediately
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+`improvements.md`'s fix had two parts — grow the input buffer geometrically as bytes actually arrive
+(as chunked already did), and add a way to reject an oversized declared body earlier than the global
+10 MiB cap, per route/prefix. Both were implemented.
+
+- **Geometric growth for `Content-Length` (`lib/connection.c`: `grow_in_buf`).** Previously, once
+  `in_buf` filled and headers were complete, a declared `Content-Length` reallocated `in_buf` in one
+  step straight to `header_len + content_length + 1` — trusting the client's declared size regardless
+  of how many body bytes had actually shown up. Rewrote that branch to mirror the chunked branch
+  already next to it: double `in_cap` each time (capped at the same target size) instead of jumping
+  straight there, so the reservation grows in step with data genuinely received. A client that
+  declares a 10 MiB body and stalls after 9 KB now costs a few doublings from `BUF_SIZE` (8 KiB), not
+  a single ~10 MiB allocation. Added a defensive early-return (`if (conn->in_cap >= target) return 1`)
+  mirroring chunked's analogous cap-hit guard, for the case where a prior growth step already reached
+  the target exactly.
+- **Per-route/prefix body limits (`lib/router.c`/`.h`, `lib/app_types.h`).** New `app_use_body_limit(App
+  *, prefix, max_bytes)`, matching `app_use_prefix`'s segment-boundary prefix semantics (its own small
+  `body_limit_prefix_matches` static, not shared with `middleware.c`'s copy — the lookup runs before a
+  `Request` exists, so there's nothing to hand a `Request`-shaped helper). Registrations go into
+  `App.body_limits[MAX_BODY_LIMITS]` (16 slots, excess dropped with a stderr warning, same convention
+  as `app_use_prefix`/`MAX_MIDDLEWARES`); `max_bytes` above `MAX_BODY_SIZE` is clamped down with a
+  warning — a route can only *tighten* the global cap, never loosen it, so nothing here can be used to
+  accept more than `MAX_BODY_SIZE` ever could. `app_body_limit_for_path` returns the *longest* matching
+  prefix's limit (specificity beats registration order, same rule routing itself uses), or
+  `MAX_BODY_SIZE` if nothing matches — so an app that never calls `app_use_body_limit` sees no behavior
+  change at all.
+- **Early rejection (`lib/connection.c`: `reject_if_over_body_limit`, called from `handle_readable`
+  right after every `recv`, before `request_is_complete`).** This is the part that needed
+  `request_framing` to expose the request path: added optional `path_out`/`path_len_out` parameters
+  (`lib/http_parser.h`/`.c`; `NULL` skips them, and every pre-existing caller — `request_is_complete`,
+  `parse_http_request`, `close_idle_connections`'s sweep-time framing check, the buffer-full-branch
+  check in `handle_readable` — was updated to pass `NULL, NULL` and is otherwise unchanged). As soon as
+  headers are complete, `reject_if_over_body_limit` looks up the effective limit for the request's raw
+  (not percent-decoded) path and, if the declared `Content-Length` exceeds it, sends 413 immediately —
+  before `grow_in_buf` ever runs, before a single body byte is buffered. A new `Connection.body_limit_checked`
+  flag (zero-initialized by the existing `calloc`, cleared alongside `request_started`/`last_write_progress`
+  in `flush_connection`'s keep-alive branch) makes this run at most once per request rather than once per
+  `recv` while a body is still trickling in.
+
+**Deliberately scoped down**, matching the S1–S3 precedent of narrowing rather than silently doing
+less than advertised:
+- **`app_use_body_limit` covers `Content-Length` only, not chunked.** Threading a per-route limit into
+  `chunked_body_scan`/`grow_in_buf`'s chunked branch would mean changing `request_is_complete` and
+  `parse_http_request`'s signatures (both take only `buf`/`len`, by design — "HTTP parsing functions
+  should be pure ... take `const char*` buffers", `CLAUDE.md`) to also take an app-supplied limit,
+  which ripples into every caller in `tests/` and `tests/fuzz_parser.c`. `improvements.md`'s own
+  MEASURED problem statement for S4 is specifically about `Content-Length`'s one-shot reservation;
+  chunked's raw-wire cap was already doubling-and-capped before this fix, so it doesn't share the
+  measured problem. Chunked bodies remain governed by the single global `MAX_BODY_SIZE` only,
+  regardless of `app_use_body_limit` registrations for their path.
+- **Path matching for body limits uses the raw (non-percent-decoded) request-target**, not the decoded
+  `req->path` that route matching and app-wide middleware use — there is no parsed `Request` yet at
+  the point this check has to run (that's the whole reason it exists: to reject before the body,
+  and therefore before a full parse, happens). A prefix containing percent-encoded characters
+  (`%2F` etc.) will not match the way it would against a decoded path. Not expected to matter in
+  practice (`app_use_body_limit` prefixes are written by the application, like `app_use_prefix`'s
+  already are, and are realistically plain ASCII paths), but noted rather than silently assumed away.
+- `MAX_BODY_LIMITS` (16) is a fixed array, like `MAX_MIDDLEWARES`, not a dynamically grown list — an
+  app registering more than 16 prefixes needs to consolidate, or the doc's own "excess is dropped, not
+  overflowed" convention (`CLAUDE.md`, "Limits") applies.
+
+**Tests and results.**
+
+- Unit tests added to `tests/test_router.c` (registered in `main`): `test_body_limit_defaults_to_max_body_size`
+  (no registrations → `MAX_BODY_SIZE` everywhere), `test_body_limit_prefix_scoping` (segment-boundary match:
+  `/api/uploads` matches itself and `/api/uploads/avatar`, not `/api/uploadsx`), `test_body_limit_longest_prefix_wins`
+  (registered broad-then-narrow, deliberately out of specificity order — narrower still wins, mirroring
+  routing's own "specificity beats registration order"), `test_body_limit_unscoped_prefix_applies_everywhere`
+  (`""` and `NULL` both behave as unscoped), `test_body_limit_clamped_to_max_body_size` (a limit requested
+  above `MAX_BODY_SIZE` is clamped down, confirmed via the return value, not just the stderr warning),
+  `test_body_limit_overflow_is_dropped` (the 17th registration is dropped, `body_limit_count` stays at
+  `MAX_BODY_LIMITS`).
+- Unit tests added to `tests/test_http_hardening.c`: `test_request_framing_path_out` — a complete request
+  returns the exact raw path and length pointing into the caller's own buffer; an incomplete request
+  (`header_len == 0`) doesn't crash when `path_out`/`path_len_out` are requested but unavailable. Every
+  pre-existing `request_framing` call site in this file (4 call sites) updated to pass `NULL, NULL`.
+- Unit tests added to `tests/test_connection.c` (registered in `main`):
+  - `test_handle_readable_content_length_grows_geometrically` — a 5 MiB declared body fed in 4 KiB
+    writes (matching the existing large-body test's pattern, since a nonblocking `socketpair` fd can't
+    be counted on to accept a large write in one call without a drain in between); the first time
+    `conn->in_cap` grows past `BUF_SIZE` (only a few KB genuinely received so far), it asserts `in_cap`
+    is nowhere close to the 5 MiB declared (`< declared_len / 4`) — the exact behavior the old one-shot
+    realloc violated. The request is then completed normally to a 200, confirming the geometric growth
+    doesn't break large legitimate bodies, just how gradually they're paid for.
+  - `test_handle_readable_route_body_limit_413` — a route under an `app_use_body_limit`-covered prefix
+    with a declared `Content-Length` over that limit (but comfortably under the global `MAX_BODY_SIZE`,
+    so this is specifically exercising the new per-route path, not the pre-existing global one) gets
+    413 immediately and the connection is closed.
+  - `test_handle_readable_route_body_limit_allows_within_limit` — same route and limit, a body within
+    it completes normally to a 200 with the correct byte count, confirming the check doesn't
+    false-positive on ordinary requests.
+- `make test`: all 14 suites pass (test_router: 6 new cases; test_http_hardening: 1 new case, plus 4
+  existing `request_framing` call sites updated; test_connection: 3 new cases).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 14 suites pass clean under ASan + UBSan.
+- `make fuzz` (200,000 iterations): clean. `fuzz_parser.c`'s `request_framing` call updated to exercise
+  the new `path_out`/`path_len_out` params (previously fuzzed with `NULL, NULL`) rather than leave the
+  new code path outside the fuzzer's reach.
+- `make check-docs`: passes (130 engine functions covered) — `app_use_body_limit` and
+  `app_body_limit_for_path` documented in `lib/API.md`, `request_framing`'s entry updated for the two
+  new optional parameters.
+- Compiled `lib/connection.c`, `lib/router.c`, `lib/http_parser.c` directly with the project's
+  `-Wall -Wextra -std=c11 -O2` flags: no new warnings (the pre-existing `router.c` warnings on
+  `next_seg_len`/`seg_len`/`strncpy` predate this change, noted in `lib/CLAUDE.md`, "Hot-path rules").
+  Fixed one warning of our own making (`-Wcomment`: a doc-comment line containing `/*path_len_out`
+  triggered "'/*' within comment").
+- Live end-to-end reproduction against a minimal standalone server built with the real library
+  (`app_use_body_limit(&app, "/limited", 1024)`): a raw-socket request declaring `Content-Length: 2000`
+  against `/limited` got `413 Payload Too Large` in under 0.1 ms — before any body bytes were sent —
+  while the same 2000-byte body against an unlimited route (`/upload`) completed normally with `200 OK`.
+- **Live reproduction of the exact MEASURED scenario from `improvements.md`** (300 connections, each
+  declaring a 10 MiB `Content-Length` and sending 9 KB of body): `improvements.md` reported **+3,000 MB
+  virtual** for this. After the fix, `ps -o vsz` on the same standalone server showed **0 measurable VSZ
+  growth** (435,304,880 KB before and after — identical), with RSS growing by ~9.5 MB (proportional to
+  the ~9 KB × 300 connections actually sent, consistent with each connection's `in_buf` doubling only as
+  far as needed to hold what arrived, not the declared 10 MiB).
+
+**Status:** Fixed for the measured problem (`Content-Length` reservation now proportional to data
+received, not declared) and for the "reject early" half of the fix (per-route/prefix limits, checked
+before any buffering). Chunked bodies and non-ASCII-prefix matching are explicitly out of scope, per
+the narrowing above — not gaps introduced by this work, but existing global behavior this change did
+not touch.

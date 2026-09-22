@@ -77,7 +77,8 @@ static int list_has_token(const char *value, const char *token) {
 
 /* ---- message framing (Content-Length / Transfer-Encoding) ---- */
 
-int request_framing(const char *buf, const size_t len, size_t *header_len_out, int *chunked_out) {
+int request_framing(const char *buf, const size_t len, size_t *header_len_out, int *chunked_out,
+                    const char **path_out, size_t *path_len_out) {
     *header_len_out = 0;
     *chunked_out = 0;
 
@@ -94,6 +95,8 @@ int request_framing(const char *buf, const size_t len, size_t *header_len_out, i
     if (res == -1) return -1; // Parse error
 
     *header_len_out = (size_t)res;
+    if (path_out != NULL) *path_out = path;
+    if (path_len_out != NULL) *path_len_out = path_len;
 
     int content_length = 0;
     int has_cl = 0;
@@ -224,7 +227,7 @@ int request_wants_close(const Request *req) {
 int request_is_complete(const char *buf, const size_t len) {
     size_t header_len;
     int chunked;
-    const int content_length = request_framing(buf, len, &header_len, &chunked);
+    const int content_length = request_framing(buf, len, &header_len, &chunked, NULL, NULL);
     if (header_len == 0) return 0;
     if (content_length < 0) return 1;
 
@@ -293,7 +296,7 @@ int parse_http_request(const char *raw, const size_t raw_len, Request *req, Aren
     const size_t available = raw_len - header_len;
 
     int chunked = 0;
-    int content_length = request_framing(raw, raw_len, &header_len, &chunked);
+    int content_length = request_framing(raw, raw_len, &header_len, &chunked, NULL, NULL);
     
     if (content_length < 0) {
         req->content_length = content_length;

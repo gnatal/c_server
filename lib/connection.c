@@ -439,6 +439,7 @@ void flush_connection(App *app, Connection *conn) {
         conn->in_len = 0;
         conn->request_started = 0; /* back to idle between requests: only IDLE_TIMEOUT_SECONDS applies (S1) */
         conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying (S2) */
+        conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check (S4) */
         arena_reset(&conn->arena);
 
         /* If handle_readable grew in_buf to fit a large body (in_cap >
@@ -477,11 +478,15 @@ static void reject_request(App *app, Connection *conn, const int status) {
 /*
  * in_buf is full with headers complete: grow it to fit the body. Returns 1 grown (keep reading),
  * 0 realloc failed (-> 500), -1 chunked raw-size cap hit (-> 413).
- * Content-Length: one realloc straight to header_len + content_length + 1 (size is known).
- * Chunked: doubling, capped at header_len + MAX_BODY_SIZE on the RAW wire size, so a client
- * cannot inflate memory past that by sending tiny chunks ("1\r\nX\r\n" = 6 raw bytes per byte).
+ * Both Content-Length and chunked grow the same way (S4): doubling, capped at the known target size
+ * (header_len + content_length + 1, or header_len + MAX_BODY_SIZE for chunked's raw wire size) - never
+ * one realloc straight to the full size a client merely *declared*. A client that sends a 10 MiB
+ * Content-Length and then only a few KB of body costs a reservation proportional to what actually
+ * arrived (doubling from BUF_SIZE), not the declared 10 MiB up front; the full target is only reached
+ * once that much has genuinely been received (and buffered) across repeated calls here.
  * A Content-Length above MAX_BODY_SIZE never gets here: request_is_complete already stopped
- * buffering and parse_http_request answered 413.
+ * buffering and parse_http_request answered 413. A route-specific limit below MAX_BODY_SIZE
+ * (app_use_body_limit) is enforced earlier still, in handle_readable, before this is ever called.
  */
 static int grow_in_buf(Connection *conn, const size_t header_len, const int chunked, const int content_length) {
     size_t needed;
@@ -492,7 +497,11 @@ static int grow_in_buf(Connection *conn, const size_t header_len, const int chun
         }
         needed = conn->in_cap * 2 > raw_cap ? raw_cap : conn->in_cap * 2;
     } else if (content_length >= 0) {
-        needed = header_len + (size_t)content_length + 1;
+        const size_t target = header_len + (size_t)content_length + 1;
+        if (conn->in_cap >= target) {
+            return 1; /* already large enough (request_is_complete will pick this up next read) */
+        }
+        needed = conn->in_cap * 2 > target ? target : conn->in_cap * 2;
     } else {
         return 0;
     }
@@ -503,6 +512,42 @@ static int grow_in_buf(Connection *conn, const size_t header_len, const int chun
     conn->in_buf = grown;
     conn->in_cap = needed;
     return 1;
+}
+
+/*
+ * S4: as soon as a request's headers are complete, reject a declared Content-Length that exceeds
+ * the effective app_use_body_limit for its path with 413 - before any body buffering happens, not
+ * just before in_buf is grown to fit it. Runs at most once per request (conn->body_limit_checked).
+ * Only Content-Length is covered: chunked bodies stay governed by the global MAX_BODY_SIZE raw-wire
+ * cap in grow_in_buf/chunked_body_scan (see app_use_body_limit's header comment for why).
+ * Returns 1 if the request was rejected (caller must not touch conn again), 0 otherwise.
+ */
+static int reject_if_over_body_limit(App *app, Connection *conn) {
+    if (conn->body_limit_checked) {
+        return 0;
+    }
+    size_t header_len;
+    int chunked;
+    const char *path;
+    size_t path_len;
+    const int content_length = request_framing(conn->in_buf, conn->in_len, &header_len, &chunked,
+                                               &path, &path_len);
+    if (header_len == 0) {
+        return 0; /* headers still incomplete: nothing to check yet, try again next read */
+    }
+    conn->body_limit_checked = 1;
+    if (chunked || content_length < 0) {
+        return 0; /* not this check's job: chunked, absent, or already malformed/oversized globally */
+    }
+    char path_buf[256];
+    const size_t n = path_len < sizeof(path_buf) - 1 ? path_len : sizeof(path_buf) - 1;
+    memcpy(path_buf, path, n);
+    path_buf[n] = '\0';
+    if ((size_t)content_length > app_body_limit_for_path(app, path_buf)) {
+        reject_request(app, conn, 413);
+        return 1;
+    }
+    return 0;
 }
 
 void handle_readable(App *app, Connection *conn) {
@@ -528,6 +573,10 @@ void handle_readable(App *app, Connection *conn) {
         conn->in_len += (size_t)n;
         conn->in_buf[conn->in_len] = '\0';
         conn->last_activity = time(NULL);
+
+        if (reject_if_over_body_limit(app, conn)) {
+            return;
+        }
 
         if (request_is_complete(conn->in_buf, conn->in_len)) {
             Request req;
@@ -560,7 +609,7 @@ void handle_readable(App *app, Connection *conn) {
          * a body larger than the buffer, so grow (never masks an oversized-header attack). */
         size_t header_len;
         int chunked;
-        const int content_length = request_framing(conn->in_buf, conn->in_len, &header_len, &chunked);
+        const int content_length = request_framing(conn->in_buf, conn->in_len, &header_len, &chunked, NULL, NULL);
         if (header_len == 0) {
             reject_request(app, conn, 431);
             return;
@@ -604,7 +653,7 @@ void close_idle_connections(App *app) {
             size_t header_len = 0;
             int chunked = 0;
             if (conn->in_len > 0) {
-                request_framing(conn->in_buf, conn->in_len, &header_len, &chunked);
+                request_framing(conn->in_buf, conn->in_len, &header_len, &chunked, NULL, NULL);
             }
             const int headers_complete = header_len > 0;
             const time_t deadline = headers_complete ? REQUEST_BODY_TIMEOUT_SECONDS : REQUEST_HEADER_TIMEOUT_SECONDS;

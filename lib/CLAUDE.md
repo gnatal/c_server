@@ -53,7 +53,8 @@ body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 
 form fields 32 · static file 50 MiB · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
 pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
 worker init hooks 4 · cluster workers 128 · arena 64 KiB per connection (see below; exceeding it falls back to malloc, it is not a limit) ·
-max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped).
+max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped) ·
+body limit prefixes 16 (`MAX_BODY_LIMITS`; `App.body_limits`, set at runtime by `app_use_body_limit`, unlike the other limits here - see "Body limits (S4)" below).
 
 ## Memory model
 Every accepted connection is one `calloc(sizeof(Connection) + 64 KiB)`: the arena buffer sits right behind the struct
@@ -113,8 +114,11 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Header names are matched exactly and case-insensitively (never by substring). Method ≤ 7
   chars. Query/headers/cookies parsed eagerly into fixed arrays. More than 32 headers → 400. Header values over 255 chars are truncated silently.
   Chunked bodies: extensions ignored, trailers discarded, decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at `header_len + MAX_BODY_SIZE`.
-- **Buffers.** `in_buf` starts at 8 KiB; with headers complete and a body pending it is realloc'd once to the exact size
-  (chunked: doubling to the cap) and shrunk back when the connection goes idle. No header terminator within 8 KiB → 431.
+- **Buffers.** `in_buf` starts at 8 KiB; with headers complete and a body pending it grows by doubling, capped at the
+  known target size (S4: `Content-Length` and chunked both work this way now - `Content-Length` used to realloc straight
+  to `header_len + content_length + 1` in one step, reserving virtual memory proportional to what the client merely
+  *declared* rather than what it had actually sent), and shrunk back when the connection goes idle. No header
+  terminator within 8 KiB → 431.
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length` and `Connection` are engine-owned.
   `CookieOptions` zero value = session cookie; `max_age > 0` seconds, `< 0` expire now.
@@ -135,6 +139,17 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   reopens it the moment anything closes (the cheapest point to retry, rather than waiting for the next accept batch).
   Unrelated to either: `create_server_socket`'s `listen()` backlog is `max(BACKLOG, SOMAXCONN)`, not the bare
   `BACKLOG` constant.
+- **Body limits (S4).** `app_use_body_limit(app, prefix, max_bytes)` (`router.c`) registers a `BodyLimitEntry` in
+  `App.body_limits` (same segment-boundary prefix match as app-wide middleware; `max_bytes` clamped down to
+  `MAX_BODY_SIZE`, never loosened past it). `connection.c`'s `reject_if_over_body_limit`, called from
+  `handle_readable` right after every `recv` (before `request_is_complete`), runs `request_framing` once per
+  request (`Connection.body_limit_checked` guards repeat calls, cleared with `request_started` in
+  `flush_connection`'s keep-alive branch) and, as soon as headers are complete, compares a declared
+  `Content-Length` against `app_body_limit_for_path` (longest matching prefix wins, independent of registration
+  order; `MAX_BODY_SIZE` if nothing matches) - over it is 413, sent before a single body byte is buffered or
+  `in_buf` is grown. Only `Content-Length` is covered; chunked bodies stay governed by the global `MAX_BODY_SIZE`
+  raw-wire cap in `grow_in_buf`/`chunked_body_scan` only (a deliberate scope decision, not a gap: chunked's raw-cap
+  doubling was already proportional to bytes received, which is what S4 was chiefly about for `Content-Length`).
 - **Timeouts.** `last_activity` advances on received bytes only. Sweep every second; ≥ 60 s silent → close (408 first if a
   request was half-received). A connection with a response pending (`out_buf != NULL` or `file_fd >= 0`) is exempt from
   this particular check — that axis is bounded separately, below.

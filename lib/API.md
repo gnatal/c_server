@@ -28,6 +28,7 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `router_add_route(Router *, method, path, Handler)`, `router_add_route_mw(...)` — generic forms.
 - `app_mount(App *, prefix, const Router *)` — copy a router's routes and middleware into the app under a prefix.
 - `app_serve_static(App *, prefix, root_dir)` — serve files from a directory (traversal-safe; the root is resolved against the working directory).
+- `app_use_body_limit(App *, prefix, max_bytes)` — reject a declared `Content-Length` over `max_bytes` for paths under `prefix` with 413, before buffering the body (clamped to `MAX_BODY_SIZE`; chunked bodies unaffected). `app_body_limit_for_path(const App *, path)` — the effective cap for a path (engine/tests).
 - `match_route(const App *, Request *)`, `match_path(pattern, path, Request *)`, `match_route_allowed_methods(...)` — matching (engine/tests).
 - `app_free_routes(App *)` — free the route trees (engine: `app_destroy` calls it).
 - Path rules that surprise: a literal segment beats `:name` beats `*` regardless of registration order; use the same `:name` at the same position in every route (`lib/CLAUDE.md`, "Known gaps").
@@ -74,7 +75,7 @@ serialize once, `free` the string.
 - `multipart_parse_boundary(content_type, out, out_size)` → 1/0, `parse_multipart_body(body, len, boundary, MultipartForm *)` → part count or -1, `multipart_get_part(form, name)`.
 
 ## Parser internals (`http_parser.h`) — engine and tests
-- `parse_http_request(raw, raw_len, Request *, Arena *)`, `request_is_complete(buf, len)`, `request_framing(buf, len, &header_len, &chunked)`, `request_wants_close(req)`.
+- `parse_http_request(raw, raw_len, Request *, Arena *)`, `request_is_complete(buf, len)`, `request_framing(buf, len, &header_len, &chunked, &path, &path_len)` (`path`/`path_len` out params optional, pass `NULL`), `request_wants_close(req)`.
 - `extract_content_length(block)`, `request_has_chunked_encoding(block)`, `chunked_body_scan(...)`, `chunked_body_decode(...)`.
 - `parse_query_string(query, req)`, `parse_headers(block, req)`, `parse_cookies(value, req)`, `status_text(code)`.
 

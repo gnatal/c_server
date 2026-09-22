@@ -66,7 +66,7 @@ static void test_content_length_is_strict(void) {
     const char *both = "POST /a HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
     size_t header_len;
     int chunked;
-    assert(request_framing(both, strlen(both), &header_len, &chunked) == -1);
+    assert(request_framing(both, strlen(both), &header_len, &chunked, NULL, NULL) == -1);
     assert(chunked == 1);
     assert(request_is_complete(both, strlen(both)) == 1);
     Request req;
@@ -79,20 +79,41 @@ static void test_request_framing(void) {
     int chunked = 99;
 
     const char *partial = "POST /a HTTP/1.1\r\nContent-Length: 3\r\n";
-    assert(request_framing(partial, strlen(partial), &header_len, &chunked) == 0);
+    assert(request_framing(partial, strlen(partial), &header_len, &chunked, NULL, NULL) == 0);
     assert(header_len == 0 && chunked == 0);
 
     const char *complete = "POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
-    assert(request_framing(complete, strlen(complete), &header_len, &chunked) == 3);
+    assert(request_framing(complete, strlen(complete), &header_len, &chunked, NULL, NULL) == 3);
     assert(header_len == strlen(complete) - 3 && chunked == 0);
 
     const char *no_headers = "GET / HTTP/1.1\r\n\r\n";
-    assert(request_framing(no_headers, strlen(no_headers), &header_len, &chunked) == 0);
+    assert(request_framing(no_headers, strlen(no_headers), &header_len, &chunked, NULL, NULL) == 0);
     assert(header_len == strlen(no_headers));
 
     const char *te = "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
-    assert(request_framing(te, strlen(te), &header_len, &chunked) == 0);
+    assert(request_framing(te, strlen(te), &header_len, &chunked, NULL, NULL) == 0);
     assert(chunked == 1 && header_len == strlen(te));
+}
+
+/* request_framing's optional path_out/path_len_out (S4: app_use_body_limit needs the request path
+ * before a Request struct exists). NULL for either stays valid (every other caller above passes
+ * NULL, NULL); when given, they point into the caller's own buffer, not a copy. */
+static void test_request_framing_path_out(void) {
+    size_t header_len;
+    int chunked;
+    const char *path;
+    size_t path_len;
+
+    const char *req_line = "POST /api/uploads/avatar HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    assert(request_framing(req_line, strlen(req_line), &header_len, &chunked, &path, &path_len) == 3);
+    assert(path_len == strlen("/api/uploads/avatar"));
+    assert(memcmp(path, "/api/uploads/avatar", path_len) == 0);
+
+    /* Headers incomplete: header_len == 0, path_out must not be trusted (not asserted here, just
+     * confirmed request_framing doesn't crash when path_out is requested but unavailable). */
+    const char *partial = "POST /a HTTP/1.1\r\nContent-Length: 3\r\n";
+    assert(request_framing(partial, strlen(partial), &header_len, &chunked, &path, &path_len) == 0);
+    assert(header_len == 0);
 }
 
 static void test_wants_close_header_forms(void) {
@@ -236,6 +257,7 @@ int main(void) {
     test_framing_is_line_anchored();
     test_content_length_is_strict();
     test_request_framing();
+    test_request_framing_path_out();
     test_wants_close_header_forms();
     test_request_line_limits();
     test_parse_does_not_depend_on_zeroed_request();

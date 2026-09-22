@@ -375,6 +375,125 @@ static void test_handle_readable_body_too_large_413(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+/* S4: a declared Content-Length is no longer reserved in one shot (in_cap jumping straight to
+ * header_len + content_length + 1) - in_buf grows by doubling as bytes actually arrive, the same
+ * strategy the chunked path already used. Regression for the MEASURED problem in improvements.md
+ * (300 connections each declaring a 10 MiB body and sending 9 KB cost +3,000 MB of virtual memory). */
+static void test_handle_readable_content_length_grows_geometrically(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_post(&app, "/upload", echo_len_handler);
+
+    const int declared_len = 5 * 1024 * 1024; /* 5 MiB declared, well under MAX_BODY_SIZE */
+    char head[128];
+    snprintf(head, sizeof(head), "POST /upload HTTP/1.1\r\nContent-Length: %d\r\n\r\n", declared_len);
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    handle_readable(&app, conn);
+    assert(conn->in_cap == BUF_SIZE); /* headers alone: no growth yet */
+
+    char *body = malloc((size_t)declared_len);
+    assert(body != NULL);
+    memset(body, 'x', (size_t)declared_len);
+
+    /* Small writes with a drain (handle_readable) after each, like
+     * test_handle_readable_large_body_grows_buffer: a nonblocking socketpair fd can't be counted on
+     * to accept a large write in one go without the reader draining in between. */
+    size_t sent = 0;
+    int checked_growth_stays_small = 0;
+    while (sent < (size_t)declared_len) {
+        size_t left = (size_t)declared_len - sent;
+        size_t piece = left < 4096 ? left : 4096;
+        ssize_t n = write(fds[1], body + sent, piece);
+        assert(n > 0);
+        sent += (size_t)n;
+        handle_readable(&app, conn);
+
+        /* The first time in_buf grows past its starting capacity, it must not have jumped anywhere
+         * near the full declared size - the old behavior reallocated straight to
+         * header_len + declared_len + 1 (>5 MiB) on this very first growth; the fix grows by
+         * doubling, so at this point (only a few KB actually received) in_cap should still be a
+         * small multiple of BUF_SIZE, nowhere close to what the client merely *claimed* it would
+         * send. Checked once, right after the first growth, then left alone as further real growth
+         * toward the (genuinely arriving) body is expected and fine. */
+        if (!checked_growth_stays_small && conn->in_cap > BUF_SIZE) {
+            assert(conn->in_cap < (size_t)declared_len / 4);
+            checked_growth_stays_small = 1;
+        }
+    }
+    assert(checked_growth_stays_small); /* the body is large enough that growth must have happened */
+    free(body);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+/* S4: app_use_body_limit rejects a declared Content-Length over a route's configured limit with 413
+ * as soon as headers are complete, before any body byte is buffered - conn->in_cap must never grow
+ * past BUF_SIZE for a request rejected this way. */
+static void test_handle_readable_route_body_limit_413(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_post(&app, "/api/uploads/avatar", echo_len_handler);
+    app_use_body_limit(&app, "/api/uploads", 1024);
+
+    int client_fd = fds[0];
+    char req_line[160];
+    snprintf(req_line, sizeof(req_line),
+             "POST /api/uploads/avatar HTTP/1.1\r\nContent-Length: %d\r\n\r\n", 2048);
+    assert(write(fds[1], req_line, strlen(req_line)) == (ssize_t)strlen(req_line));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 413 Payload Too Large") != NULL);
+    assert(app.connections[client_fd] == NULL); /* rejected and closed */
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+/* Sibling of the above: a body within the configured route limit is unaffected - same request shape,
+ * declared length now under the 1024-byte cap instead of over it. */
+static void test_handle_readable_route_body_limit_allows_within_limit(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_post(&app, "/api/uploads/avatar", echo_len_handler);
+    app_use_body_limit(&app, "/api/uploads", 1024);
+
+    const int body_len = 100;
+    char body[100];
+    memset(body, 'z', sizeof(body));
+    char head[160];
+    snprintf(head, sizeof(head), "POST /api/uploads/avatar HTTP/1.1\r\nContent-Length: %d\r\n\r\n", body_len);
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    assert(write(fds[1], body, sizeof(body)) == (ssize_t)sizeof(body));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(resp, "received 100 bytes") != NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_chunked_round_trip(void) {
     App app;
     int fds[2];
@@ -1265,6 +1384,9 @@ int main(void) {
     test_handle_readable_header_overflow_431();
     test_handle_readable_large_body_grows_buffer();
     test_handle_readable_body_too_large_413();
+    test_handle_readable_content_length_grows_geometrically();
+    test_handle_readable_route_body_limit_413();
+    test_handle_readable_route_body_limit_allows_within_limit();
     test_handle_readable_chunked_round_trip();
     test_handle_readable_chunked_grows_buffer();
     test_handle_readable_chunked_too_large_413();

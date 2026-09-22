@@ -668,6 +668,79 @@ static void test_allowed_methods_does_not_touch_request(void) {
     cleanup_app(&app); /* app_init's table; app_destroy lives in connection.c, not linked here */
 }
 
+/* S4: app_use_body_limit / app_body_limit_for_path. */
+static void test_body_limit_defaults_to_max_body_size(void) {
+    App app;
+    app_init(&app);
+    assert(app_body_limit_for_path(&app, "/anything") == MAX_BODY_SIZE);
+    assert(app_body_limit_for_path(&app, "/") == MAX_BODY_SIZE);
+    cleanup_app(&app);
+}
+
+static void test_body_limit_prefix_scoping(void) {
+    App app;
+    app_init(&app);
+    app_use_body_limit(&app, "/api/uploads", 1024);
+
+    assert(app_body_limit_for_path(&app, "/api/uploads") == 1024);        /* exact match */
+    assert(app_body_limit_for_path(&app, "/api/uploads/avatar") == 1024); /* segment boundary */
+    assert(app_body_limit_for_path(&app, "/api/uploadsx") != 1024);       /* not a real prefix match */
+    assert(app_body_limit_for_path(&app, "/api/uploadsx") == MAX_BODY_SIZE);
+    assert(app_body_limit_for_path(&app, "/api/other") == MAX_BODY_SIZE); /* outside the prefix */
+    cleanup_app(&app);
+}
+
+static void test_body_limit_longest_prefix_wins(void) {
+    App app;
+    app_init(&app);
+    /* Registered broad-then-narrow, deliberately out of specificity order, like route matching's
+     * "specificity beats registration order" rule (lib/CLAUDE.md). */
+    app_use_body_limit(&app, "/api", 5 * 1024 * 1024);
+    app_use_body_limit(&app, "/api/uploads", 1024);
+
+    assert(app_body_limit_for_path(&app, "/api/other") == 5 * 1024 * 1024);
+    assert(app_body_limit_for_path(&app, "/api/uploads/avatar") == 1024);
+    cleanup_app(&app);
+}
+
+static void test_body_limit_unscoped_prefix_applies_everywhere(void) {
+    App app;
+    app_init(&app);
+    app_use_body_limit(&app, "", 2048);
+    assert(app_body_limit_for_path(&app, "/x") == 2048);
+    assert(app_body_limit_for_path(&app, "/") == 2048);
+
+    App app2;
+    app_init(&app2);
+    app_use_body_limit(&app2, NULL, 4096); /* NULL prefix behaves like "" */
+    assert(app_body_limit_for_path(&app2, "/y") == 4096);
+    cleanup_app(&app);
+    cleanup_app(&app2);
+}
+
+static void test_body_limit_clamped_to_max_body_size(void) {
+    App app;
+    app_init(&app);
+    app_use_body_limit(&app, "/big", (size_t)MAX_BODY_SIZE * 4);
+    assert(app_body_limit_for_path(&app, "/big") == MAX_BODY_SIZE); /* never loosens the global cap */
+    cleanup_app(&app);
+}
+
+static void test_body_limit_overflow_is_dropped(void) {
+    App app;
+    app_init(&app);
+    for (int i = 0; i < MAX_BODY_LIMITS; i++) {
+        char prefix[32];
+        snprintf(prefix, sizeof(prefix), "/p%d", i);
+        app_use_body_limit(&app, prefix, 100);
+    }
+    assert(app.body_limit_count == MAX_BODY_LIMITS);
+    app_use_body_limit(&app, "/overflow", 200); /* dropped with a stderr warning, not overflowed */
+    assert(app.body_limit_count == MAX_BODY_LIMITS);
+    assert(app_body_limit_for_path(&app, "/overflow") == MAX_BODY_SIZE);
+    cleanup_app(&app);
+}
+
 int main(void) {
     test_match_path_without_request_captures_nothing();
     test_match_path_segments_and_truncation();
@@ -695,6 +768,12 @@ int main(void) {
     test_router_head_options_register_correct_methods();
     test_match_route_head_falls_back_to_get();
     test_match_route_explicit_head_wins_over_get_fallback();
+    test_body_limit_defaults_to_max_body_size();
+    test_body_limit_prefix_scoping();
+    test_body_limit_longest_prefix_wins();
+    test_body_limit_unscoped_prefix_applies_everywhere();
+    test_body_limit_clamped_to_max_body_size();
+    test_body_limit_overflow_is_dropped();
 
     printf("all router tests passed\n");
     return 0;
