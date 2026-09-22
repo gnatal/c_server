@@ -441,6 +441,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 ├── tradeoffs.md          # Arena, yyjson, picohttpparser, Patricia router, io_uring: costs and measurements
 ├── todo.md               # Cheat sheet for running the demo (not a task list)
 ├── finds.md              # Point-in-time review notes on the docs (2026-09-21)
+├── improvements.md       # Prioritized list of speed, security and memory fixes, with measured or estimated gains
 ├── CLAUDE.md             # Project standards, coding guidelines, and workflow rules (AGENTS.md is a symlink to it)
 ├── docs/                 # index.html: static documentation and benchmark site
 ├── lib/                  # Reusable CExpress engine (builds to build/lib/libcexpress.a)

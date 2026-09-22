@@ -602,6 +602,10 @@ static void test_close_idle_connections_408s_stalled_partial_request(void) {
     assert(conn->in_len > 0);
 
     conn->last_activity = time(NULL) - IDLE_TIMEOUT_SECONDS - 1;
+    /* handle_readable already started the S1 request_started clock; back it up past
+     * IDLE_TIMEOUT_SECONDS too so this exercises the pre-existing "quiet past IDLE_TIMEOUT_SECONDS"
+     * shape (bigger than either S1 deadline) rather than the new, tighter one. */
+    conn->request_started = time(NULL) - IDLE_TIMEOUT_SECONDS - 1;
     close_idle_connections(&app);
 
     char resp[256];
@@ -651,6 +655,117 @@ static void test_close_idle_connections_skips_pending_write(void) {
     assert(app.connections[fds[0]] == conn);
 
     teardown_test_connection(&app, fds, conn);
+}
+
+/* S1: a client that sends one byte every few seconds keeps refreshing last_activity forever, so the
+ * old idle-only check (last_activity vs IDLE_TIMEOUT_SECONDS) never fires. request_started does not
+ * reset on each byte, so it bounds total time-to-complete-headers regardless. */
+static void test_close_idle_connections_header_deadline_closes_slow_drip(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    int client_fd = fds[0];
+
+    const char *partial = "GET /p";
+    assert(write(fds[1], partial, strlen(partial)) == (ssize_t)strlen(partial));
+    handle_readable(&app, conn); /* starts conn->request_started */
+    assert(conn->in_len > 0);
+
+    /* A byte "just" arrived (last_activity is fresh - the slow-drip trick), but the request has
+     * actually been dribbling in for longer than the header deadline allows. */
+    conn->last_activity = time(NULL);
+    conn->request_started = time(NULL) - REQUEST_HEADER_TIMEOUT_SECONDS - 1;
+
+    close_idle_connections(&app);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 408 Request Timeout") != NULL);
+    assert(app.connections[client_fd] == NULL);
+
+    close(fds[1]);
+    app_destroy(&app);
+}
+
+/* A partial request still within the header deadline must be left alone, even though it would have
+ * tripped the old, much longer IDLE_TIMEOUT_SECONDS-only sweep eventually. */
+static void test_close_idle_connections_header_deadline_leaves_fresh_partial_request_alone(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    const char *partial = "GET /p";
+    assert(write(fds[1], partial, strlen(partial)) == (ssize_t)strlen(partial));
+    handle_readable(&app, conn);
+    assert(conn->in_len > 0);
+    assert(conn->request_started != 0);
+
+    close_idle_connections(&app);
+
+    assert(app.connections[fds[0]] == conn);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+/* Once headers are complete, a still-pending body gets the more generous body deadline instead of the
+ * tight header deadline - a slow but legitimate upload should not be cut off at the header threshold. */
+static void test_close_idle_connections_body_deadline_allows_slow_body_within_window(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_post(&app, "/upload", echo_len_handler);
+
+    const char *head = "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n";
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    handle_readable(&app, conn); /* headers complete, body still pending */
+    assert(conn->in_len > 0);
+
+    /* Past the header deadline but still inside the body deadline - must survive. */
+    conn->request_started = time(NULL) - REQUEST_HEADER_TIMEOUT_SECONDS - 1;
+
+    close_idle_connections(&app);
+
+    assert(app.connections[fds[0]] == conn);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+/* A body that never finishes arriving still has to give up eventually: past the (longer) body
+ * deadline, close_idle_connections must reject it rather than hold it forever. */
+static void test_close_idle_connections_body_deadline_closes_stalled_body(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    int client_fd = fds[0];
+    app_post(&app, "/upload", echo_len_handler);
+
+    const char *head = "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n";
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    handle_readable(&app, conn);
+    assert(conn->in_len > 0);
+
+    conn->request_started = time(NULL) - REQUEST_BODY_TIMEOUT_SECONDS - 1;
+
+    close_idle_connections(&app);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 408 Request Timeout") != NULL);
+    assert(app.connections[client_fd] == NULL);
+
+    close(fds[1]);
+    app_destroy(&app);
 }
 
 static void test_handle_readable_head_request_omits_body(void) {
@@ -920,6 +1035,10 @@ int main(void) {
     test_close_idle_connections_408s_stalled_partial_request();
     test_close_idle_connections_leaves_recent_activity_alone();
     test_close_idle_connections_skips_pending_write();
+    test_close_idle_connections_header_deadline_closes_slow_drip();
+    test_close_idle_connections_header_deadline_leaves_fresh_partial_request_alone();
+    test_close_idle_connections_body_deadline_allows_slow_body_within_window();
+    test_close_idle_connections_body_deadline_closes_stalled_body();
     test_handle_readable_head_request_omits_body();
     test_handle_readable_auto_options_response();
     test_app_count_connections();

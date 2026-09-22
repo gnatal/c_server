@@ -101,6 +101,10 @@ Connection *connection_create(int fd) {
     conn->fd = fd;
     conn->file_fd = -1;
     conn->last_activity = time(NULL);
+    /* request_started stays 0 (calloc) until a request actually starts arriving, or (tls_connection_init)
+     * a TLS handshake begins: a freshly accepted, otherwise-silent connection is bounded by
+     * IDLE_TIMEOUT_SECONDS below, same as before (S1 targets a request/handshake that is under way but
+     * moving too slowly, not one that never starts). */
     arena_init(&conn->arena, (char *)(conn + 1), ARENA_SIZE);
     return conn;
 }
@@ -351,6 +355,7 @@ void flush_connection(App *app, Connection *conn) {
         conn->out_sent = 0;
         conn->out_cap = 0;
         conn->in_len = 0;
+        conn->request_started = 0; /* back to idle between requests: only IDLE_TIMEOUT_SECONDS applies (S1) */
         arena_reset(&conn->arena);
 
         /* If handle_readable grew in_buf to fit a large body (in_cap >
@@ -418,6 +423,11 @@ static int grow_in_buf(Connection *conn, const size_t header_len, const int chun
 }
 
 void handle_readable(App *app, Connection *conn) {
+    if (conn->request_started == 0) {
+        /* First byte of a fresh request after an idle keep-alive gap: (re)start the deadline clock (S1). */
+        conn->request_started = time(NULL);
+    }
+
     while (conn->in_len < conn->in_cap - 1) {
         ssize_t n = conn_read(app, conn, conn->in_buf + conn->in_len, conn->in_cap - 1 - conn->in_len);
         if (n < 0) {
@@ -493,6 +503,30 @@ void close_idle_connections(App *app) {
          * not the slow-sender-of-a-request problem this timeout targets -
          * leave it for flush_connection()/EVFILT_WRITE to keep draining. */
         if (conn->out_buf != NULL || conn->file_fd >= 0) {
+            continue;
+        }
+
+        /* A request (or TLS handshake) in flight is bounded by request_started, independent of how
+         * often a byte arrives - closes the slow-drip case (one byte every N < 60s) that never goes
+         * "idle" under last_activity alone (S1). Headers incomplete: header deadline; headers already
+         * complete (body still pending): the more generous body deadline. request_framing is cheap and
+         * this only runs once per sweep second per connection, not on the per-byte hot path. */
+        if (conn->request_started != 0) {
+            size_t header_len = 0;
+            int chunked = 0;
+            if (conn->in_len > 0) {
+                request_framing(conn->in_buf, conn->in_len, &header_len, &chunked);
+            }
+            const int headers_complete = header_len > 0;
+            const time_t deadline = headers_complete ? REQUEST_BODY_TIMEOUT_SECONDS : REQUEST_HEADER_TIMEOUT_SECONDS;
+            if (now - conn->request_started < deadline) {
+                continue;
+            }
+            if (conn->in_len > 0) {
+                reject_request(app, conn, 408);
+            } else {
+                connection_close(app, conn); /* nothing received yet (e.g. stalled TLS handshake): no 408 to send */
+            }
             continue;
         }
 

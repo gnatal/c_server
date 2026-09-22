@@ -120,6 +120,10 @@ int tls_connection_init(App *app, Connection *conn) {
     conn->tls_state = TLS_STATE_HANDSHAKE;
     conn->tls_want_read = 0;
     conn->tls_want_write = 0;
+    /* Starts the S1 deadline clock for the handshake itself (close_idle_connections,
+     * REQUEST_HEADER_TIMEOUT_SECONDS); tls_connection_handshake restarts it on success for the header
+     * wait that follows. */
+    conn->request_started = time(NULL);
     return 0;
 }
 
@@ -134,6 +138,9 @@ int tls_connection_handshake(App *app, Connection *conn) {
         conn->tls_state = TLS_STATE_CONNECTED;
         conn->tls_want_read = 0;
         conn->tls_want_write = 0;
+        /* Restart the request deadline clock (S1) from here rather than from accept, so a handshake
+         * that took a while doesn't eat into the header deadline for the request that follows it. */
+        conn->request_started = time(NULL);
         event_loop_unwatch_write(app, conn->fd, conn);
         event_loop_watch_read(app, conn->fd, conn);
         return 1;

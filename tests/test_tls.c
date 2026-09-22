@@ -418,6 +418,37 @@ static void test_tls_bad_client_handshake_rejected(void) {
     app_destroy(&app);
 }
 
+/* S1: a client that opens the TCP connection and never completes (or never starts) the TLS handshake
+ * used to be bound only by IDLE_TIMEOUT_SECONDS (60s) via last_activity, refreshed by accept alone -
+ * effectively never advancing since nothing is ever received. request_started (armed by
+ * tls_connection_init) gives the handshake its own, tighter deadline. */
+static void test_tls_handshake_deadline_closes_stalled_handshake(void) {
+    App app;
+    app_init(&app);
+    assert(app_enable_tls(&app, TEST_CERT_FILE, TEST_KEY_FILE) == 0);
+    assert(tls_init_app(&app) == 0);
+    assert(event_loop_init(&app) == 0);
+
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    assert(set_nonblocking(fds[0]) == 0);
+    assert(set_nonblocking(fds[1]) == 0);
+
+    Connection *conn = connection_create(fds[0]);
+    assert(conn != NULL);
+    app.connections[fds[0]] = conn;
+    assert(tls_connection_init(&app, conn) == 0); /* arms conn->request_started, no ClientHello sent */
+    assert(conn->request_started != 0);
+
+    conn->request_started = time(NULL) - REQUEST_HEADER_TIMEOUT_SECONDS - 1;
+    close_idle_connections(&app);
+
+    assert(app.connections[fds[0]] == NULL); /* nothing to send mid-handshake: just reclaimed */
+
+    close(fds[1]);
+    app_destroy(&app);
+}
+
 static void test_tls_clean_shutdown(void) {
     App app;
     int fds[2];
@@ -452,6 +483,7 @@ int main(void) {
     test_tls_partial_write_large_response();
     test_tls_chunked_streaming_response();
     test_tls_bad_client_handshake_rejected();
+    test_tls_handshake_deadline_closes_stalled_handshake();
     test_tls_clean_shutdown();
 #endif
 

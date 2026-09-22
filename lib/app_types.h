@@ -42,6 +42,12 @@
 #define MAX_STATIC_FILE_SIZE (50 * 1024 * 1024) /* static_serve_file refuses larger files with 500 */
 #define STREAM_CHUNK_SIZE (16 * 1024)           /* res_send_file reads this much per write; 4 chunks per event-loop turn */
 #define IDLE_TIMEOUT_SECONDS 60       /* no bytes received for this long: close (408 if mid-request) */
+#define REQUEST_HEADER_TIMEOUT_SECONDS 10  /* deadline from the first byte of a request (or the start of a TLS
+                                             * handshake) to a complete header block, regardless of how often the
+                                             * client sends a byte: closes slow-drip connections IDLE_TIMEOUT_SECONDS
+                                             * alone cannot (last_activity resets on every byte, however sparse) */
+#define REQUEST_BODY_TIMEOUT_SECONDS 30    /* deadline from the same first byte to a fully framed body once headers
+                                             * are complete; same slow-drip rationale, sized for MAX_BODY_SIZE */
 #define IDLE_SWEEP_INTERVAL_MS 1000   /* how often idle connections are checked */
 #define SHUTDOWN_TIMEOUT_SECONDS 5    /* graceful-drain deadline before force close */
 #define INITIAL_CONNECTION_TABLE_CAP 1024 /* App.connections slots at start; doubles on demand (bounded by RLIMIT_NOFILE) */
@@ -121,6 +127,15 @@ typedef struct Connection {
     int keep_alive;
 
     time_t last_activity;   /* last successful recv (or accept); writes do not refresh it */
+
+    /* Non-zero while a request (or, pre-handshake, the TLS handshake) is in flight: set on the first
+     * byte of a request (handle_readable) or at the start of a TLS handshake (tls_connection_init,
+     * restarted on handshake success), cleared once a keep-alive response is fully queued. Unlike
+     * last_activity it is never refreshed by a byte arriving, so close_idle_connections can bound total
+     * request time even for a client that dribbles one byte at a time (see REQUEST_HEADER_TIMEOUT_SECONDS /
+     * REQUEST_BODY_TIMEOUT_SECONDS). Zero means "idle between requests" (or freshly accepted and still
+     * silent): only IDLE_TIMEOUT_SECONDS applies then, same as before this field existed. */
+    time_t request_started;
 
     /* Input: malloc'd at BUF_SIZE, realloc'd up to header_len + MAX_BODY_SIZE + 1 to fit a declared
      * body, shrunk back to BUF_SIZE when the connection goes idle. in_buf[in_len] is always '\0'. */
