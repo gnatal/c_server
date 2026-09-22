@@ -40,17 +40,6 @@ int main(void) {
     mw_authenticate_set_key(api_key_env);
   }
 
-  const char *cert_env = getenv("TLS_CERT");
-  const char *key_env = getenv("TLS_KEY");
-  if (cert_env != NULL && key_env != NULL) {
-    if (app_enable_tls(&app, cert_env, key_env) != 0) {
-      fprintf(stderr, "Failed to configure TLS with cert '%s' and key '%s'\n", cert_env, key_env);
-      return 1;
-    }
-  } else if (cert_env != NULL || key_env != NULL) {
-    fprintf(stderr, "Warning: Both TLS_CERT and TLS_KEY must be set to enable TLS/HTTPS\n");
-  }
-
   /* SQLite-backed Todo storage: db_open validates TODO_DB_PATH and runs the
    * schema migration once, in this (pre-fork) process, then closes again -
    * app_on_worker_start registers db_worker_init to open this app's actual,

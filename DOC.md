@@ -55,19 +55,19 @@ CExpress provides a single umbrella header:
 #include "cexpress.h"
 ```
 
-This includes all core subsystems: routing, response helpers, middleware chains, HTTP parser, static files, multipart, URL-encoded forms, the per-connection arena, TLS, and the vendored yyjson JSON library.
+This includes all core subsystems: routing, response helpers, middleware chains, HTTP parser, static files, multipart, URL-encoded forms, the per-connection arena, and the vendored yyjson JSON library. There is no TLS: this engine is plaintext HTTP/1.1 only, and TLS termination belongs at a gateway or reverse proxy in front of it.
 
 ### Compiling & Linking
-Build the library once with `make` in the CExpress checkout (it produces `build/lib/libcexpress.a`), then compile your application files and link against it. Also link OpenSSL when the library was built with TLS (the default when OpenSSL is found) and, on Linux, liburing:
+Build the library once with `make` in the CExpress checkout (it produces `build/lib/libcexpress.a`), then compile your application files and link against it. On Linux, also link liburing:
 
 ```bash
-# macOS (Homebrew gcc; adjust the OpenSSL prefix to your machine)
+# macOS (Homebrew gcc)
 gcc-16 -Wall -Wextra -std=c11 -O2 -Ipath/to/cexpress/lib -o my_app main.c \
-    path/to/cexpress/build/lib/libcexpress.a -L/opt/homebrew/opt/openssl@3/lib -lssl -lcrypto
+    path/to/cexpress/build/lib/libcexpress.a
 
 # Linux
 gcc -Wall -Wextra -std=c11 -O2 -D_GNU_SOURCE -Ipath/to/cexpress/lib -o my_app main.c \
-    path/to/cexpress/build/lib/libcexpress.a -lssl -lcrypto -luring
+    path/to/cexpress/build/lib/libcexpress.a -luring
 ```
 
 [`importing.md`](importing.md) has a complete, tested Makefile that does this for you.
@@ -549,9 +549,8 @@ The complete list, one line per function, is [`lib/API.md`](lib/API.md) (kept in
 |---|---|---|
 | `app_init(App *app)` | `router.h` | Initializes an application instance and connection table. |
 | `app_listen(App *app, int port)` | `connection.h` | Starts the server (delegates to cluster if `config.workers != 1`). |
-| `app_destroy(App *app)` | `connection.h` | Releases connections, routes, event loop descriptors, and TLS state. |
+| `app_destroy(App *app)` | `connection.h` | Releases connections, routes, and event loop descriptors. |
 | `app_on_worker_start(App *app, hook)` | `connection.h` | Registers a callback run once per worker process, after any fork. |
-| `app_enable_tls(App *app, cert, key)` | `router.h` | Enables HTTPS with PEM files (TLS 1.2+). |
 | `app_get(...)` / `app_post(...)` / `app_put(...)` / `app_patch(...)` / `app_delete(...)` | `router.h` | Registers verb routes (`app_head`, `app_options` override the automatic answers). |
 | `app_get_mw(...)` etc. | `router.h` | Same, with per-route middleware. |
 | `router_init(Router *)`, `router_get(...)` etc., `router_use(...)` | `router.h` | Builds a sub-router. |

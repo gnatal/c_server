@@ -186,8 +186,9 @@ static-file demo, still reachable via the generic `/static` mount above.
   (bounded between 1 and 65535) with fallback to `DEFAULT_PORT` (8080), stored in `app.config.port`.
 - API authentication secret is configured via `API_KEY` environment variable in `main.c`
   or dynamically via `mw_authenticate_set_key`.
-- `WORKERS` (`N`, or `auto` = one per CPU core), `QUIET=1` (no access log) and `TLS_CERT` + `TLS_KEY` (both required to
-  serve HTTPS) are read in `main.c` too.
+- `WORKERS` (`N`, or `auto` = one per CPU core) and `QUIET=1` (no access log) are read in `main.c` too. There is no
+  TLS: the engine is plaintext HTTP/1.1 only (`lib/CLAUDE.md`); serve HTTPS from a gateway or reverse proxy in front
+  of this demo, not from the demo itself.
 - SQLite database path is configured via `TODO_DB_PATH` (default `"todos.db"`,
   relative to the server's working directory) — see "Persistence layer" above
   for why it's read once in `main.c` and handed to `db_open`/stashed for

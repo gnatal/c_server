@@ -527,3 +527,93 @@ than advertised:
 the live request path (`parse_http_request`); `parse_headers` (test-only component parser), individual
 post-split cookie values, and path/query param values remain truncating, per the scoping above — not
 newly introduced gaps, pre-existing behavior this entry's effort budget did not extend to.
+
+---
+
+## TLS removal · not an `improvements.md` item — an architectural decision, not a fix
+
+**Date completed.** 2026-09-22.
+
+**Why.** This engine's job is parsing and serving HTTP/1.1 on a plaintext socket. TLS termination is a
+separate, well-understood concern that belongs at a gateway or reverse proxy in front of it (nginx, a
+cloud load balancer, a sidecar), not compiled into a library whose header comment says it parses
+HTTP/1.1. Keeping an OpenSSL-based non-blocking TLS state machine (handshake driving, buffer release,
+renegotiation/handshake-deadline hardening — S10, never done) coupled into `Connection`'s lifecycle,
+`accept_connections`, `flush_connection` and the main event loop added a second protocol's worth of
+state to every connection-handling path for a feature real deployments almost always terminate
+upstream anyway. Removing it deletes an entire dependency (OpenSSL/LibreSSL headers and libs, `-lssl
+-lcrypto`, the `NO_TLS=1`/`CEXPRESS_HAS_TLS` build-time branch) and an entire class of future TLS CVEs
+this codebase would otherwise have to track and patch.
+
+**How it was completed.**
+
+- **Deleted outright:** `lib/tls.c`, `lib/tls.h`, `tests/test_tls.c`, `tests/certs/{server.crt,server.key}`.
+- **`lib/app_types.h`:** removed the `TlsState` enum, `Connection.ssl`/`tls_state`/`tls_want_read`/
+  `tls_want_write`, `ServerConfig.tls_enabled`/`tls_cert_file`/`tls_key_file`, and `App.ssl_ctx`.
+- **`lib/connection.c`:** `conn_read`/`conn_write` dropped their `SSL*` branch and now call `recv`/`write`
+  directly (and dropped their now-unused `App *` parameter). `accept_connections` no longer branches into
+  `tls_connection_init`/`tls_connection_handshake` after accept — every accepted fd goes straight to
+  `event_loop_watch_read`. `reject_overloaded_connection` (S3) dropped its `is_tls` parameter and always
+  writes the 503 body now (previously skipped it for a TLS listener, since a TLS client expects a
+  handshake, not HTTP text — moot with no TLS listener possible). `flush_connection` no longer checks
+  `tls_has_pending` after a keep-alive response completes. `app_listen_worker` no longer calls
+  `tls_init_app`, no longer prints "(HTTPS / TLS)", no longer branches on `TLS_STATE_HANDSHAKE` per event,
+  and — the direct fix for the now-moot P5 — no longer runs the per-poll-batch scan over the entire
+  `connections` table checking `tls_has_pending` on every TLS connection (that scan existed only because
+  OpenSSL can buffer decrypted bytes internally that a bare `recv` on the fd would never see; with no
+  OpenSSL, there is no hidden buffer to poll for). `close_idle_connections`'s comments describing a
+  "TLS handshake in flight" were updated to describe a request in flight only (the S1 deadline mechanism
+  itself, `request_started`/`REQUEST_HEADER_TIMEOUT_SECONDS`/`REQUEST_BODY_TIMEOUT_SECONDS`, is unchanged
+  and still covers plaintext slow-drip clients exactly as before — only the TLS-handshake half of what it
+  used to also cover is gone, because there is no handshake anymore).
+- **`lib/router.c`/`lib/router.h`:** removed `app_enable_tls` entirely and its `app_init` field
+  initialization.
+- **`lib/cexpress.h`:** dropped `#include "tls.h"`.
+- **Root `Makefile`:** removed the entire OpenSSL auto-detection block (`OPENSSL_CFLAGS`/
+  `OPENSSL_LDFLAGS`/`CEXPRESS_HAS_TLS`/`NO_TLS`), `lib/tls.c` from `LIB_SRCS`, `TLS_TEST_BIN` and every
+  `lib/tls.o` dependency from every test-binary target (including the epoll-shim targets), and the
+  `./$(TLS_TEST_BIN)` line from the `test` target. `make test` now runs 13 suites, down from 14.
+- **`examples/todo_sqlite/main.c`:** removed the `TLS_CERT`/`TLS_KEY` env-var block that called
+  `app_enable_tls`. **`examples/todo_sqlite/Makefile`:** removed its own OpenSSL detection block.
+- **`Dockerfile`:** dropped `openssl-dev`/`openssl-libs-static` from the builder stage and `libssl3`/
+  `libcrypto3` from the runtime stage.
+- **`scripts/export_framework.sh`:** the generated standalone Makefile it writes for `make export`
+  dropped its OpenSSL detection and `lib/tls.c`; its generated README no longer tells consumers to link
+  `-lssl -lcrypto`.
+- **Docs:** `lib/CLAUDE.md` (added a "No TLS" note up top explaining the rationale, removed `tls.c/h` from
+  the files table, the `SSL`/`SSL_CTX` ownership row, the TLS return-convention line, the TLS bullet under
+  "Behavior reference", and every TLS aside in the S1/S2/S3 timeout/overload descriptions), `lib/API.md`
+  (removed `app_enable_tls` and the TLS internals line; added a one-line "no TLS" note — `make check-docs`
+  enforces this file matches the headers, so it would have failed otherwise), `tests/CLAUDE.md`
+  (14 → 13 suites, removed the `test_tls.c` entry), `README.md`, `DOC.md`, `importing.md` (dependency
+  tables, the consumer Makefile template, the compile/link examples, the file tree, the checklist),
+  `examples/todo_sqlite/CLAUDE.md`, `scripts/CLAUDE.md`. `finds.md` and `stress_tests/stress_test_report.md`
+  were deliberately left untouched: they are point-in-time snapshots (like `improvements.md`'s own dated
+  measurements), not living documentation, so they still correctly describe what was true when they were
+  written.
+- **`improvements.md`:** marked S10 (TLS hardening gaps), P5 (whole-connection-table TLS scan) and M3
+  (TLS SSL buffer release) as REMOVED in both the summary table and their detail sections, with a pointer
+  to this entry, rather than deleting them — the measurements are still accurate historical record of a
+  problem that existed in code that no longer does.
+
+**Tests and results.**
+
+- `make test`: all 13 suites pass (down from 14 — `test_tls` is gone).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan.
+- `make fuzz FUZZ_ITERS=200000`: clean (26,972 parsed, 29,122 complete).
+- `make check-docs`: passes (120 engine functions covered, down from 130 in the S4 entry above by the 10
+  functions removed: 9 `tls_*` plus `app_enable_tls`).
+- `make demo`: builds clean with no OpenSSL flags in the compile/link command (verified by inspecting the
+  actual `gcc-16` invocation Make printed).
+- Live end-to-end verification: started the demo (`QUIET=1 PORT=18099 ./cexpress_demo`) and confirmed
+  `GET /ping` and `GET /api/todos` both answer normally over plain HTTP — no TLS listener, no handshake,
+  nothing changed about ordinary plaintext request handling.
+- Compiled every touched file with the project's `-Wall -Wextra -std=c11 -O2` flags via the normal build:
+  no new warnings.
+
+**Deliberately not done:** no compatibility shim, no `NO_TLS`-style flag kept as a no-op, no deprecated
+wrapper around `app_enable_tls` that errors at runtime — the function and every trace of it are gone, per
+this codebase's own standing guidance to avoid backwards-compatibility hacks for something being
+deliberately removed, not renamed.
+
+**Status:** Done. TLS is not a feature of this engine; terminate it at a gateway or reverse proxy.

@@ -15,8 +15,8 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `app_listen(App *, int port)` — run until SIGINT/SIGTERM (cluster if `config.workers` != 1).
 - `app_destroy(App *)` — free everything `app_init` and route registration allocated; call after `app_listen` returns.
 - `app_on_worker_start(App *, WorkerInitHook)` — run a hook once per serving process, after fork (open DB handles here).
-- `app_enable_tls(App *, cert_pem, key_pem)` — enable HTTPS; `0` ok, `-1` bad args.
 - `app_listen_worker(App *, int port)`, `app_listen_cluster(App *, int port, int workers)`, `app_stop(App *)`, `app_count_connections(const App *)` — lower-level lifecycle.
+- No TLS: this engine is plaintext HTTP/1.1 only. Terminate TLS at a gateway or reverse proxy in front of it.
 
 ## Routes (`router.h`)
 - `app_get` / `app_post` / `app_put` / `app_patch` / `app_delete` / `app_head` / `app_options` `(App *, path, Handler)` — register a route.
@@ -83,5 +83,4 @@ serialize once, `free` the string.
 - Connections (`connection.h`): `set_nonblocking`, `create_server_socket`, `connection_create`, `connection_close`, `accept_connections`, `handle_readable`, `flush_connection`, `close_idle_connections`.
 - Event loop (`event_loop.h`; kqueue on macOS/BSD, io_uring on Linux, epoll behind `CEXPRESS_USE_EPOLL`): `event_loop_init`, `event_loop_close`, `event_loop_watch_read`, `event_loop_unwatch_read`, `event_loop_watch_write`, `event_loop_unwatch_write`, `event_loop_unwatch_all`, `event_loop_arm_shutdown_timer`, `event_loop_poll`.
 - Cluster (`cluster.h`): `cluster_listen`, `cluster_resolve_worker_count`, `cluster_is_worker`, `cluster_worker_id`.
-- TLS (`tls.h`): `tls_is_available`, `tls_init_app`, `tls_cleanup_app`, `tls_connection_init`, `tls_connection_handshake`, `tls_connection_read`, `tls_connection_write`, `tls_connection_close`, `tls_has_pending`.
 - Static files (`static.h`): `static_serve_file`, `static_resolve_relative_path`, `static_mime_type`.

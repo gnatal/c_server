@@ -47,10 +47,10 @@
 #define MAX_STATIC_FILE_SIZE (50 * 1024 * 1024) /* static_serve_file refuses larger files with 500 */
 #define STREAM_CHUNK_SIZE (16 * 1024)           /* res_send_file reads this much per write; 4 chunks per event-loop turn */
 #define IDLE_TIMEOUT_SECONDS 60       /* no bytes received for this long: close (408 if mid-request) */
-#define REQUEST_HEADER_TIMEOUT_SECONDS 10  /* deadline from the first byte of a request (or the start of a TLS
-                                             * handshake) to a complete header block, regardless of how often the
-                                             * client sends a byte: closes slow-drip connections IDLE_TIMEOUT_SECONDS
-                                             * alone cannot (last_activity resets on every byte, however sparse) */
+#define REQUEST_HEADER_TIMEOUT_SECONDS 10  /* deadline from the first byte of a request to a complete header
+                                             * block, regardless of how often the client sends a byte: closes
+                                             * slow-drip connections IDLE_TIMEOUT_SECONDS alone cannot
+                                             * (last_activity resets on every byte, however sparse) */
 #define REQUEST_BODY_TIMEOUT_SECONDS 30    /* deadline from the same first byte to a fully framed body once headers
                                              * are complete; same slow-drip rationale, sized for MAX_BODY_SIZE */
 #define WRITE_TIMEOUT_SECONDS 30      /* a pending response that hasn't accepted a single byte onto the socket for
@@ -123,13 +123,6 @@ typedef struct {
 
 /* ---- connection and event loop ---- */
 
-typedef enum {
-    TLS_STATE_NONE = 0,
-    TLS_STATE_HANDSHAKE,
-    TLS_STATE_CONNECTED,
-    TLS_STATE_CLOSING
-} TlsState;
-
 /* Per-connection state, one per accepted fd, owned by App.connections[fd]. Freed only by connection_close. */
 typedef struct Connection {
     int fd;
@@ -137,13 +130,12 @@ typedef struct Connection {
 
     time_t last_activity;   /* last successful recv (or accept); writes do not refresh it */
 
-    /* Non-zero while a request (or, pre-handshake, the TLS handshake) is in flight: set on the first
-     * byte of a request (handle_readable) or at the start of a TLS handshake (tls_connection_init,
-     * restarted on handshake success), cleared once a keep-alive response is fully queued. Unlike
-     * last_activity it is never refreshed by a byte arriving, so close_idle_connections can bound total
-     * request time even for a client that dribbles one byte at a time (see REQUEST_HEADER_TIMEOUT_SECONDS /
-     * REQUEST_BODY_TIMEOUT_SECONDS). Zero means "idle between requests" (or freshly accepted and still
-     * silent): only IDLE_TIMEOUT_SECONDS applies then, same as before this field existed. */
+    /* Non-zero while a request is in flight: set on the first byte of a request (handle_readable),
+     * cleared once a keep-alive response is fully queued. Unlike last_activity it is never refreshed
+     * by a byte arriving, so close_idle_connections can bound total request time even for a client
+     * that dribbles one byte at a time (see REQUEST_HEADER_TIMEOUT_SECONDS / REQUEST_BODY_TIMEOUT_SECONDS).
+     * Zero means "idle between requests" (or freshly accepted and still silent): only
+     * IDLE_TIMEOUT_SECONDS applies then, same as before this field existed. */
     time_t request_started;
 
     /* Set once per request the first time its headers are found complete (any outcome: within
@@ -172,8 +164,8 @@ typedef struct Connection {
     size_t out_cap;
 
     /* Non-zero while a response is pending (out_buf != NULL or file_fd >= 0): set by flush_connection
-     * the first time it runs for this response, and advanced only when a write() / SSL_write() actually
-     * accepts bytes onto the socket - never merely because flush_connection ran. Lets
+     * the first time it runs for this response, and advanced only when a write() actually accepts
+     * bytes onto the socket - never merely because flush_connection ran. Lets
      * close_idle_connections bound "made no progress at all" separately from "still slowly draining"
      * (WRITE_TIMEOUT_SECONDS), closing a client that stopped reading instead of holding the connection,
      * its arena and out_buf forever. Reset to 0 once a keep-alive response is fully queued. */
@@ -184,11 +176,6 @@ typedef struct Connection {
     size_t file_remaining;
 
     int events_watched;     /* EVENT_READ | EVENT_WRITE currently registered with the event loop */
-
-    void *ssl;              /* SSL* when TLS is active, else NULL */
-    TlsState tls_state;
-    int tls_want_read;
-    int tls_want_write;
 
     Arena arena;            /* Per-request bump allocator: a 64 KiB buffer allocated in the same calloc as this struct
                              * (connection_create), plus malloc'd fallback blocks. Reset after each keep-alive response. */
@@ -364,21 +351,18 @@ struct MiddlewareChain {
 typedef struct {
     int port;
     int workers;        /* 1 = single process (default); > 1 = cluster; 0 = one worker per CPU core */
-    int tls_enabled;
-    char tls_cert_file[PATH_MAX];
-    char tls_key_file[PATH_MAX];
 
-    /* Per-worker cap on concurrently open connections (accepted but not yet closed; includes an
-     * in-progress TLS handshake). Beyond it, accept_connections (connection.c) still accept()s the
-     * fd - it has to, to say anything at all - but answers 503 + Connection: close immediately and
-     * closes it, without allocating a Connection or touching the event loop. app_init sets
-     * DEFAULT_MAX_CONNECTIONS; set to 0 to opt out (uncapped, bounded only by RLIMIT_NOFILE, the
-     * pre-S3 behavior). */
+    /* Per-worker cap on concurrently open connections (accepted but not yet closed). Beyond it,
+     * accept_connections (connection.c) still accept()s the fd - it has to, to say anything at all -
+     * but answers 503 + Connection: close immediately and closes it, without allocating a Connection
+     * or touching the event loop. app_init sets DEFAULT_MAX_CONNECTIONS; set to 0 to opt out
+     * (uncapped, bounded only by RLIMIT_NOFILE, the pre-S3 behavior). */
     int max_connections;
 } ServerConfig;
 
-/* The whole server. About 4.6 KB on macOS (PATH_MAX 1024) and more on Linux (two PATH_MAX TLS paths), routes live on the heap:
- * a local or static App is fine. A Router is much larger (64 routes, about 88 KB on macOS): make it static if it is big. Create with app_init, end with app_destroy. */
+/* The whole server. About 4.6 KB on macOS, routes live on the heap: a local or static App is fine. A
+ * Router is much larger (64 routes, about 88 KB on macOS): make it static if it is big. Create with
+ * app_init, end with app_destroy. */
 typedef struct {
     ServerConfig config;
     MethodTree method_trees[16];
@@ -403,8 +387,6 @@ typedef struct {
     int timer_idle_fd;
     int timer_shutdown_fd;
     int signal_fd;
-
-    void *ssl_ctx;       /* SSL_CTX* once TLS is initialized, else NULL */
 
     /* Indexed directly by fd: the Connection* for an open fd, else NULL. Heap-allocated by app_init,
      * grown by doubling in accept_connections, freed by app_destroy. */

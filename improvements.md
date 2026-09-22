@@ -31,14 +31,14 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | S7 | Failing workers are respawned with no backoff | Reliability | High | S | Stops a fork/log storm | MEASURED (10,594 respawns in 4 s) |
 | S8 | Malformed request line gets no response | Security / Correctness | Med | S | Frees the connection at once instead of after 8 KiB or 60 s+ | MEASURED |
 | S9 | Demo ships a default API key | Security | Med | S | Removes a known-credential default | Code reading |
-| S10 | TLS hardening gaps (renegotiation, handshake deadline) | Security | Low | S | Hardening | ESTIMATED |
+| S10 | ~~TLS hardening gaps (renegotiation, handshake deadline)~~ | Security | Low | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | ESTIMATED |
 | S11 | Bare `\n` and substring `chunked` accepted (smuggling ambiguity) | Security | Low | S | Removes proxy desync ambiguity | Code reading + MEASURED (bare LF) |
 | S12 | Startup allocations and `exit()` calls in library code | Reliability | Low | S | Errors reach the application | Code reading |
 | P1 | Static and file responses go through slow paths | Performance | | M | **3.8×** small files; `/static` up to ~6.6× | MEASURED |
 | P2 | Request headers are parsed three times | Performance | | M | ~300 ns of 781 ns pure path (browser-shaped); ~40 of 208 ns (minimal) | PROJECTED from MEASURED parts |
 | P3 | Headers are copied into fixed 19 KB `Request` arrays | Performance / Memory | | L | A further ~200 ns (browser-shaped); fixes S5 | PROJECTED |
 | P4 | epoll and io_uring issue a syscall on every interest change | Performance | | S | ~5–25% per keep-alive request on Linux | ESTIMATED |
-| P5 | With TLS on, every loop iteration scans the whole connection table | Performance | | S | **+25%** at 3,000 idle TLS conns; grows with connection count | MEASURED |
+| P5 | ~~With TLS on, every loop iteration scans the whole connection table~~ | Performance | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
 | P6 | SQLite statements are re-prepared on every call | Performance (demo) | | S | 41% off a list query, 61% off get-by-id | MEASURED |
 | P7 | Router child lookup is a linear scan | Performance | | S | 8.4 µs → ~0.1 µs at 5,000 sibling routes | MEASURED (problem) / PROJECTED (fix) |
 | P8 | Chunked bodies are re-scanned from the start on every `recv` | Performance / Security | Med | M | Removes a ~75 s CPU amplification | MEASURED rate, extrapolated |
@@ -47,7 +47,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | P11 | SQLite commits fsync on every write (Linux) | Performance (demo) | | S | Order-of-magnitude on write rate | ESTIMATED |
 | M1 | 64 KiB arena per connection | Memory | | M | **−66%** per idle connection (25 → 8.4 KB) | MEASURED |
 | M2 | 8 KiB input buffer per idle connection | Memory | | M | Idle connection to <1 KB (with M1) | ESTIMATED |
-| M3 | TLS connections keep large SSL buffers | Memory | | S | **−41%** per TLS connection (81 → 48 KB) | MEASURED |
+| M3 | ~~TLS connections keep large SSL buffers~~ | Memory | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
 | M4 | Request bodies are copied twice | Memory | | M | Peak upload memory halved | PROJECTED |
 | M5 | "Streaming" responses are fully buffered | Memory / Feature | | L | Bounded memory; enables SSE and large streams | Code reading |
 | M6 | `Route` embeds a `PATH_MAX` buffer | Memory | | S | ~4 KB per route on Linux | Code reading |
@@ -124,7 +124,11 @@ Dependencies to respect: M1 and M2 change how `Connection.arena` and `in_buf` ar
 **Fix.** Refuse to start (or generate a random key and print it once) unless `API_KEY` is set or a `--insecure-demo` flag is given; resolve the key once at startup; compare the scheme case-insensitively; add a per-IP failed-auth limit.
 **Probable gain.** Removes a well-known credential from anything deployed from the demo. (`getenv` per request costs tens of ns; irrelevant for speed.)
 
-### S10 · TLS hardening gaps
+### S10 · ~~TLS hardening gaps~~ (REMOVED 2026-09-22)
+**TLS was removed from the engine entirely on 2026-09-22** — see `improvements_progress.md` for the removal record
+and `lib/CLAUDE.md`'s "No TLS" note for the rationale (TLS termination belongs at a gateway/reverse proxy in front
+of an HTTP/1.1 parsing library, not inside it). This entry is kept for historical record; it no longer applies.
+
 **Problem.** `tls_init_app` (`lib/tls.c:43-59`) sets a TLS 1.2 floor and server cipher preference, which is good, but does not set `SSL_OP_NO_RENEGOTIATION` (client-initiated renegotiation on TLS 1.2 is a known CPU-exhaustion vector), has no handshake deadline (S1), and leaves session-ticket and cipher-list policy at library defaults.
 **Fix.** Add `SSL_OP_NO_RENEGOTIATION`, decide ticket policy (`SSL_OP_NO_TICKET` or rotate keys across workers, since each worker has its own context), and expose an optional cipher/curve configuration.
 **Probable gain.** Hardening; not exercised here (ESTIMATED). Also note that with several workers each has an independent session cache, so resumption only works if tickets share a key.
@@ -183,7 +187,12 @@ Dependencies to respect: M1 and M2 change how `Connection.arena` and `in_buf` ar
 **Fix.** Add the same early-out as kqueue: in `unwatch_write`, return immediately if `!(events_watched & EVENT_WRITE)`; in `watch_read`, if already watching. For io_uring, prefer `IORING_POLL_UPDATE_EVENTS` (or leave the read poll armed and add write polls only when needed) over remove+add.
 **Probable gain.** **ESTIMATED** 5–15% per keep-alive request on epoll (one of three syscalls removed) and 10–25% on io_uring (two SQEs plus a submit removed); to be confirmed with a Linux benchmark (not run here).
 
-### P5 · With TLS on, every loop iteration scans the whole connection table
+### P5 · ~~With TLS on, every loop iteration scans the whole connection table~~ (REMOVED 2026-09-22)
+**TLS was removed from the engine entirely on 2026-09-22** — see `improvements_progress.md`. Removing TLS also
+removed the `tls_has_pending` scan this entry is about, as a side effect rather than a targeted fix: there is no
+longer a hidden per-connection buffer (OpenSSL's) that the event loop needs to poll separately from the socket.
+Kept for historical record.
+
 **Problem.** After each `event_loop_poll` batch, `app_listen_worker` loops over `fd = 0 … connections_cap` checking `tls_has_pending` (`connection.c:643-651`). Cost is proportional to the table size (which only grows) and each non-NULL slot is dereferenced, so it costs cache misses per idle connection, per batch.
 **Measured** (1 worker, TLS, `wrk -c50` on `/ping`):
 
@@ -259,7 +268,9 @@ Dependencies to respect: M1 and M2 change how `Connection.arena` and `in_buf` ar
 **Fix.** Read into a per-worker scratch buffer (16–64 KiB). If the request is complete after the read, parse it in place and never touch a per-connection buffer; only when a request is incomplete, copy the received bytes into a connection-owned buffer (allocated then, freed when the request completes).
 **Probable gain.** **ESTIMATED**: together with M1 an idle connection needs only the `Connection` struct (152 B) plus its table slot, roughly **<1 KB** instead of 25 KB, so 100,000 idle connections fit in ~100 MB of application memory (kernel socket buffers are separate and not in RSS). Cost: one extra copy for requests that span several reads.
 
-### M3 · TLS connections keep large SSL buffers
+### M3 · ~~TLS connections keep large SSL buffers~~ (REMOVED 2026-09-22)
+**TLS was removed from the engine entirely on 2026-09-22** — see `improvements_progress.md`. Kept for historical record.
+
 **Problem.** `tls_init_app` sets `SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER` (`tls.c:59`) but not `SSL_MODE_RELEASE_BUFFERS`, so each `SSL` object holds its read/write buffers even while idle.
 **Measured** (3,000 idle keep-alive TLS connections, each after one request): **81,230 B per connection** baseline vs **48,332 B** with `SSL_MODE_RELEASE_BUFFERS` (−33 KB, −40%). Throughput with 3,000 idle connections: 181k → 177k req/s (−3%, within run-to-run noise).
 **Fix.** Add `SSL_MODE_RELEASE_BUFFERS` to `SSL_CTX_set_mode`. One token.
@@ -325,7 +336,7 @@ Dependencies to respect: M1 and M2 change how `Connection.arena` and `in_buf` ar
 | T4 | `scripts/stress_test.sh` starts the demo from the repo root (its `GET /` measures a 404) and its memory sampler disagrees with direct measurement | `cd examples/todo_sqlite` before launching; verify the sampler against `ps` |
 | T5 | No Linux run of any test, benchmark or io_uring code path in this environment | Add a CI job on Linux (build + `make test` + sanitizers + a `wrk` smoke run); every ESTIMATED tag above needs it |
 | T6 | Read errors at 5,000 connections (hundreds to a couple thousand per run) are unexplained | Run the same `wrk -c5000` against a trivial known-good server (a 30-line kqueue echo, or nginx) on the same machine: if it shows the same errors, it is the OS or `wrk`, not CExpress; otherwise log `errno` at every `connection_close` caused by `LOOP_EVENT_ERROR` to see which condition drops connections. Also raise `BACKLOG` and compare |
-| T7 | `make bench` has no static-file, JSON-list-through-response, TLS or many-routes case | Add the P1/P5/P7 experiments as benchmark cases so future changes are measured |
+| T7 | `make bench` has no static-file, JSON-list-through-response, or many-routes case | Add the P1/P7 experiments as benchmark cases so future changes are measured |
 
 ---
 

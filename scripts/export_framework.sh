@@ -33,11 +33,6 @@ ifeq ($(UNAME_S),Linux)
     endif
     PLATFORM_CFLAGS = -D_GNU_SOURCE
     EVENT_LOOP_SRC = lib/event_loop_io_uring.c
-    ifeq ($(shell pkg-config --exists openssl 2>/dev/null && echo yes),yes)
-        OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl) -DCEXPRESS_HAS_TLS=1
-    else
-        OPENSSL_CFLAGS = -DCEXPRESS_HAS_TLS=0
-    endif
 else
     ifneq ($(shell which gcc-16 2>/dev/null),)
         CC = gcc-16
@@ -46,24 +41,16 @@ else
     endif
     PLATFORM_CFLAGS =
     EVENT_LOOP_SRC = lib/event_loop_kqueue.c
-    OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)
-    ifeq ($(shell test -d $(OPENSSL_PREFIX)/include/openssl && echo yes),yes)
-        OPENSSL_CFLAGS = -I$(OPENSSL_PREFIX)/include -DCEXPRESS_HAS_TLS=1
-    else ifeq ($(shell pkg-config --exists openssl 2>/dev/null && echo yes),yes)
-        OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl) -DCEXPRESS_HAS_TLS=1
-    else
-        OPENSSL_CFLAGS = -DCEXPRESS_HAS_TLS=0
-    endif
 endif
 
-CFLAGS = -Wall -Wextra -std=c11 -O2 -Ilib $(PLATFORM_CFLAGS) $(OPENSSL_CFLAGS)
+CFLAGS = -Wall -Wextra -std=c11 -O2 -Ilib $(PLATFORM_CFLAGS)
 AR = ar
 
 BUILD_DIR = build
 OBJ_DIR   = $(BUILD_DIR)/obj
 LIB_DIR   = $(BUILD_DIR)/lib
 
-LIB_SRCS = lib/connection.c $(EVENT_LOOP_SRC) lib/cluster.c lib/tls.c lib/http_parser.c \
+LIB_SRCS = lib/connection.c $(EVENT_LOOP_SRC) lib/cluster.c lib/http_parser.c \
            lib/router.c lib/response.c lib/middleware.c lib/multipart.c lib/urlencoded.c \
            lib/static.c lib/arena.c \
            lib/vendor/yyjson/yyjson.c lib/vendor/picohttpparser/picohttpparser.c
@@ -100,7 +87,7 @@ This directory contains the standalone CExpress engine without any application c
 - `lib/API.md`: Public API function reference.
 - `lib/examples/cookbook.c`: Reference recipes for common HTTP patterns.
 - `lib/vendor/`: vendored yyjson (JSON) and picohttpparser (HTTP parsing); nothing else to install.
-- `build/lib/libcexpress.a`: Compiled engine archive built via `make`. Link it with `-lssl -lcrypto` (when built with TLS) and, on Linux, `-luring`.
+- `build/lib/libcexpress.a`: Compiled engine archive built via `make`. Link it with `-luring` on Linux.
 README_EOF
 
 echo "==> CExpress framework successfully exported to ${DEST_DIR}"

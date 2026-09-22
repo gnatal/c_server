@@ -16,19 +16,12 @@
 #include "router.h"
 #include "response.h"
 #include "middleware.h"
-#include "tls.h"
 
-static ssize_t conn_read(App *app, Connection *conn, void *buf, size_t count) {
-    if (conn->ssl != NULL) {
-        return tls_connection_read(app, conn, buf, count);
-    }
+static ssize_t conn_read(Connection *conn, void *buf, size_t count) {
     return recv(conn->fd, buf, count, 0);
 }
 
-static ssize_t conn_write(App *app, Connection *conn, const void *buf, size_t count) {
-    if (conn->ssl != NULL) {
-        return tls_connection_write(app, conn, buf, count);
-    }
+static ssize_t conn_write(Connection *conn, const void *buf, size_t count) {
     return write(conn->fd, buf, count);
 }
 
@@ -106,10 +99,9 @@ Connection *connection_create(int fd) {
     conn->fd = fd;
     conn->file_fd = -1;
     conn->last_activity = time(NULL);
-    /* request_started stays 0 (calloc) until a request actually starts arriving, or (tls_connection_init)
-     * a TLS handshake begins: a freshly accepted, otherwise-silent connection is bounded by
-     * IDLE_TIMEOUT_SECONDS below, same as before (S1 targets a request/handshake that is under way but
-     * moving too slowly, not one that never starts). */
+    /* request_started stays 0 (calloc) until a request actually starts arriving: a freshly accepted,
+     * otherwise-silent connection is bounded by IDLE_TIMEOUT_SECONDS below, same as before (S1 targets
+     * a request that is under way but moving too slowly, not one that never starts). */
     arena_init(&conn->arena, (char *)(conn + 1), ARENA_SIZE);
     return conn;
 }
@@ -137,8 +129,6 @@ void connection_close(App *app, Connection *conn) {
         close(conn->file_fd);
         conn->file_fd = -1;
     }
-
-    tls_connection_close(app, conn);
 
     if (conn->fd >= 0) {
         close(conn->fd);
@@ -172,7 +162,6 @@ void app_destroy(App *app) {
         close(app->spare_fd);
         app->spare_fd = -1;
     }
-    tls_cleanup_app(app);
     free(app->connections);
     app->connections = NULL;
     app->connections_cap = 0;
@@ -265,24 +254,20 @@ static int ensure_connection_capacity(App *app, int fd) {
  * Best-effort and one nonblocking attempt only: a client that won't read even this gets no more
  * consideration than one that was never told anything, which is fine - the point is to answer
  * politely when possible, not to guarantee delivery under overload (that would need to hold and
- * retry the write, defeating the purpose of shedding cheaply). For a TLS listener the client
- * expects a TLS handshake, not plaintext HTTP, so writing this would just look like protocol
- * garbage instead of a 503 - skip straight to closing there.
+ * retry the write, defeating the purpose of shedding cheaply).
  */
-static void reject_overloaded_connection(int client_fd, int is_tls) {
-    if (!is_tls) {
-        const char *body = status_text(503);
-        char head[160];
-        int head_len = snprintf(head, sizeof(head),
-                                 "HTTP/1.1 503 %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
-                                 "Connection: close\r\n\r\n",
-                                 body, strlen(body));
-        set_nonblocking(client_fd);
-        if (head_len > 0 && (size_t)head_len < sizeof(head)) {
-            ssize_t n = write(client_fd, head, (size_t)head_len);
-            if (n == head_len) {
-                write(client_fd, body, strlen(body));
-            }
+static void reject_overloaded_connection(int client_fd) {
+    const char *body = status_text(503);
+    char head[160];
+    int head_len = snprintf(head, sizeof(head),
+                             "HTTP/1.1 503 %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
+                             "Connection: close\r\n\r\n",
+                             body, strlen(body));
+    set_nonblocking(client_fd);
+    if (head_len > 0 && (size_t)head_len < sizeof(head)) {
+        ssize_t n = write(client_fd, head, (size_t)head_len);
+        if (n == head_len) {
+            write(client_fd, body, strlen(body));
         }
     }
     close(client_fd);
@@ -321,7 +306,7 @@ void accept_connections(App *app) {
          * - this runs once per accepted connection, including every one we're about to reject, so it
          * must not become the O(n) scan it's replacing. */
         if (app->config.max_connections > 0 && app->open_connections >= app->config.max_connections) {
-            reject_overloaded_connection(client_fd, app->ssl_ctx != NULL);
+            reject_overloaded_connection(client_fd);
             continue;
         }
 
@@ -346,19 +331,7 @@ void accept_connections(App *app) {
         app->connections[client_fd] = conn;
         app->open_connections++; /* paired with connection_close's -- (S3) */
 
-        if (app->ssl_ctx != NULL) {
-            if (tls_connection_init(app, conn) != 0) {
-                connection_close(app, conn);
-                continue;
-            }
-            int hs = tls_connection_handshake(app, conn);
-            if (hs < 0) {
-                connection_close(app, conn);
-                continue;
-            }
-        } else {
-            event_loop_watch_read(app, client_fd, conn);
-        }
+        event_loop_watch_read(app, client_fd, conn);
     }
 }
 
@@ -375,7 +348,7 @@ void flush_connection(App *app, Connection *conn) {
 
     while (1) {
         while (conn->out_sent < conn->out_len) {
-            ssize_t n = conn_write(app, conn, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
+            ssize_t n = conn_write(conn, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     event_loop_watch_write(app, conn->fd, conn);
@@ -454,11 +427,6 @@ void flush_connection(App *app, Connection *conn) {
                 conn->in_buf = shrunk;
                 conn->in_cap = BUF_SIZE;
             }
-        }
-
-        if (tls_has_pending(conn)) {
-            handle_readable(app, conn);
-            return;
         }
     } else {
         connection_close(app, conn);
@@ -557,7 +525,7 @@ void handle_readable(App *app, Connection *conn) {
     }
 
     while (conn->in_len < conn->in_cap - 1) {
-        ssize_t n = conn_read(app, conn, conn->in_buf + conn->in_len, conn->in_cap - 1 - conn->in_len);
+        ssize_t n = conn_read(conn, conn->in_buf + conn->in_len, conn->in_cap - 1 - conn->in_len);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -649,11 +617,11 @@ void close_idle_connections(App *app) {
             continue;
         }
 
-        /* A request (or TLS handshake) in flight is bounded by request_started, independent of how
-         * often a byte arrives - closes the slow-drip case (one byte every N < 60s) that never goes
-         * "idle" under last_activity alone (S1). Headers incomplete: header deadline; headers already
-         * complete (body still pending): the more generous body deadline. request_framing is cheap and
-         * this only runs once per sweep second per connection, not on the per-byte hot path. */
+        /* A request in flight is bounded by request_started, independent of how often a byte arrives -
+         * closes the slow-drip case (one byte every N < 60s) that never goes "idle" under last_activity
+         * alone (S1). Headers incomplete: header deadline; headers already complete (body still
+         * pending): the more generous body deadline. request_framing is cheap and this only runs once
+         * per sweep second per connection, not on the per-byte hot path. */
         if (conn->request_started != 0) {
             size_t header_len = 0;
             int chunked = 0;
@@ -668,7 +636,7 @@ void close_idle_connections(App *app) {
             if (conn->in_len > 0) {
                 reject_request(app, conn, 408);
             } else {
-                connection_close(app, conn); /* nothing received yet (e.g. stalled TLS handshake): no 408 to send */
+                connection_close(app, conn); /* nothing received yet: no 408 to send */
             }
             continue;
         }
@@ -704,22 +672,13 @@ void app_listen_worker(App *app, int port) {
     /* Ignore SIGPIPE so a write() to a socket the peer already closed
      * (a client disconnecting mid-response - routine under real load, not
      * an error condition) returns EPIPE instead of terminating this
-     * process outright. Unconditional (not just under TLS - see
-     * lib/tls.c's history) and set here rather than once in main(), since
-     * this is the one function every serving process (standalone, or each
+     * process outright. Set here rather than once in main(), since this is
+     * the one function every serving process (standalone, or each
      * individual forked cluster worker) always runs before touching a
      * socket - same choke point run_worker_init_hooks (above) relies on. */
     signal(SIGPIPE, SIG_IGN);
 
     run_worker_init_hooks(app);
-
-    if (app->config.tls_enabled && app->ssl_ctx == NULL) {
-        if (tls_init_app(app) != 0) {
-            fprintf(stderr, "Failed to initialize TLS with cert '%s' and key '%s'\n",
-                    app->config.tls_cert_file, app->config.tls_key_file);
-            exit(EXIT_FAILURE);
-        }
-    }
 
     app->server_fd = create_server_socket(port);
     if (event_loop_init(app) != 0) {
@@ -729,11 +688,7 @@ void app_listen_worker(App *app, int port) {
     event_loop_watch_read(app, app->server_fd, NULL);
 
     if (!cluster_is_worker() || cluster_worker_id() == 0) {
-        if (app->config.tls_enabled) {
-            printf("Listening on port %d (HTTPS / TLS)\n", port);
-        } else {
-            printf("Listening on port %d\n", port);
-        }
+        printf("Listening on port %d\n", port);
     }
 
     LoopEvent events[MAX_EVENTS];
@@ -798,32 +753,10 @@ void app_listen_worker(App *app, int port) {
                 continue;
             }
 
-            if (conn->tls_state == TLS_STATE_HANDSHAKE) {
-                int hs = tls_connection_handshake(app, conn);
-                if (hs < 0) {
-                    connection_close(app, conn);
-                } else if (hs == 1) {
-                    if (tls_has_pending(conn)) {
-                        handle_readable(app, conn);
-                    }
-                }
-                continue;
-            }
-
             if (ev->type == LOOP_EVENT_READ) {
                 handle_readable(app, conn);
             } else if (ev->type == LOOP_EVENT_WRITE) {
                 flush_connection(app, conn);
-            }
-        }
-
-        if (app->ssl_ctx != NULL) {
-            for (int fd = 0; fd < app->connections_cap; fd++) {
-                Connection *c = app->connections[fd];
-                if (c != NULL && c->tls_state == TLS_STATE_CONNECTED &&
-                    c->out_buf == NULL && tls_has_pending(c)) {
-                    handle_readable(app, c);
-                }
             }
         }
 

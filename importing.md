@@ -59,15 +59,16 @@ From a checkout of the CExpress repository, `make export DEST=/path/to/my_app/ve
 |---|---|---|
 | A C11 compiler and GNU `make` | everything | The engine's own Makefile uses `gcc-16` on macOS (Homebrew) and `gcc` on Linux. |
 | **liburing** (`liburing-dev`, `liburing` on Alpine) | Linux only | The Linux event loop is io_uring; link `-luring`. Needs a kernel with multishot poll (5.13+). A container runtime that blocks io_uring makes the server exit at startup (see `concurrency.md`). |
-| OpenSSL headers and libraries | optional | HTTPS. Detected automatically when the engine is built; `make NO_TLS=1` in the engine builds without. Linking `-lssl -lcrypto` is harmless when it was built without. |
 | yyjson, picohttpparser | always | Vendored inside `lib/vendor/`. Nothing to install. |
 | SQLite | never | Only the demo app in `examples/todo_sqlite/` uses it. |
+
+There is no TLS dependency: the engine is plaintext HTTP/1.1 only. If your app needs HTTPS, terminate TLS at a gateway or reverse proxy in front of it (nginx, an ALB, a sidecar).
 
 ---
 
 ## 4. The Consumer `Makefile`
 
-Create a `Makefile` in the root of your new project. It compiles `libcexpress.a` on demand if it hasn't been built yet (through the engine's own Makefile), detects OpenSSL on macOS and Linux, and links your application.
+Create a `Makefile` in the root of your new project. It compiles `libcexpress.a` on demand if it hasn't been built yet (through the engine's own Makefile), and links your application.
 
 ```makefile
 # --- Compiler & Platform Detection ---
@@ -80,23 +81,13 @@ ifeq ($(UNAME_S),Linux)
     endif
     PLATFORM_CFLAGS = -D_GNU_SOURCE
     PLATFORM_LIBS   = -luring
-    OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null)
-    OPENSSL_LIBS   ?= $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
 else
-    # macOS: Homebrew GCC (the engine's own Makefile uses gcc-16); Homebrew OpenSSL detection
+    # macOS: Homebrew GCC (the engine's own Makefile uses gcc-16)
     ifeq ($(origin CC),default)
         CC = gcc-16
     endif
     PLATFORM_CFLAGS =
     PLATFORM_LIBS   =
-    OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)
-    ifeq ($(shell test -d $(OPENSSL_PREFIX)/include && echo yes),yes)
-        OPENSSL_CFLAGS = -I$(OPENSSL_PREFIX)/include
-        OPENSSL_LIBS   = -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
-    else
-        OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl 2>/dev/null)
-        OPENSSL_LIBS   = $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
-    endif
 endif
 
 # --- CExpress Engine Path ---
@@ -104,8 +95,8 @@ CEXPRESS_DIR = vendor/cexpress
 LIB_CEXPRESS = $(CEXPRESS_DIR)/build/lib/libcexpress.a
 
 # --- Build Flags ---
-CFLAGS = -Wall -Wextra -std=c11 -O2 -I$(CEXPRESS_DIR)/lib $(PLATFORM_CFLAGS) $(OPENSSL_CFLAGS)
-LDLIBS = $(LIB_CEXPRESS) $(OPENSSL_LIBS) $(PLATFORM_LIBS)
+CFLAGS = -Wall -Wextra -std=c11 -O2 -I$(CEXPRESS_DIR)/lib $(PLATFORM_CFLAGS)
+LDLIBS = $(LIB_CEXPRESS) $(PLATFORM_LIBS)
 
 TARGET = my_app
 
@@ -280,4 +271,3 @@ With this file in place, LLMs will consult `cookbook.c` and `API.md` directly, p
 | **Parse JSON body** | `yyjson_read_opts(req->body, len, 0, &alc, NULL)`, `yyjson_obj_get(root, "k")` | `vendor/yyjson/yyjson.h` |
 | **Set Status Code** | `res_status(res, 404)` | `response.h` |
 | **Set Cookie** | `res_set_cookie(res, "name", "val", &options)` | `response.h` |
-| **Enable TLS / HTTPS** | `app_enable_tls(App *app, "cert.pem", "key.pem")` | `router.h` |

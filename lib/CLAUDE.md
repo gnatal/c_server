@@ -4,6 +4,13 @@ Read order for a new task: this file → `API.md` (every public function) → `e
 (tested recipes) → the header of the module you touch. `examples/todo_sqlite/` is a full worked application.
 `../tradeoffs.md` explains why the arena, yyjson, picohttpparser and the Patricia router exist.
 
+**No TLS.** This engine speaks plaintext HTTP/1.1 only. TLS termination belongs at a gateway or reverse
+proxy in front of it (nginx, an ALB, a sidecar), not inside a library whose job is parsing HTTP/1.1 -
+mixing the two coupled OpenSSL's lifecycle (handshake state, buffer release, renegotiation hardening) into
+every connection's state machine for a concern the engine has no business owning. An OpenSSL-based
+non-blocking TLS layer (`tls.c/h`, `TLS_CERT`/`TLS_KEY` in the demo) existed through 2026-09-22 and was
+removed for this reason; see `../improvements_progress.md` for the removal record.
+
 ## Model
 A process runs one single-threaded, non-blocking event loop: kqueue on macOS/BSD, io_uring on Linux
 (readiness only: multishot `POLL_ADD` on each fd, then ordinary `recv`/`write`; needs liburing and a kernel with
@@ -22,7 +29,7 @@ Per request (`connection.c: handle_readable`):
 5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf` (allocated from the arena).
 6. `flush_connection` writes. Keep-alive: `arena_reset`, `in_len = 0`, shrink `in_buf`. Otherwise `connection_close`.
 
-Only `connection.c`, `event_loop_*.c`, `tls.c`, `cluster.c` do I/O. Parsing, routing, dispatch and
+Only `connection.c`, `event_loop_*.c`, `cluster.c` do I/O. Parsing, routing, dispatch and
 response building never touch a socket, so tests drive them with a fake `Connection` whose arena is a static buffer
 (see `tests/test_cookbook.c: fetch`). Keep it that way.
 
@@ -32,13 +39,12 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | `app_types.h` | every struct/typedef and every compile-time limit |
 | `arena.c/h` | per-connection bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`) |
 | `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text` |
-| `router.c/h` | route registration, one Patricia (segment-radix) tree per method, `app_mount`, `app_serve_static`, `app_enable_tls`, `app_free_routes` |
+| `router.c/h` | route registration, one Patricia (segment-radix) tree per method, `app_mount`, `app_serve_static`, `app_free_routes` |
 | `middleware.c/h` | pipeline (`chain_next`, `chain_error`, `dispatch`), 404/405/OPTIONS defaults |
 | `response.c/h` | response head assembly, cookies, chunked streaming, file streaming |
 | `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen |
 | `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals) |
 | `cluster.c/h` | fork workers, respawn, drain |
-| `tls.c/h` | non-blocking OpenSSL; stubs when built with `NO_TLS=1` |
 | `static.c/h` | traversal-safe file serving |
 | `multipart.c/h`, `urlencoded.c/h` | form body parsers (handler-invoked, not automatic) |
 | `vendor/picohttpparser/` | vendored HTTP/1.x request parser (MIT/Perl) |
@@ -82,15 +88,13 @@ and leaves the old block in the arena until the request ends; a static file is r
 | `yyjson_mut_write(doc, 0, &len)` result | libc malloc, **whatever allocator the doc uses** | caller, C `free` (forgetting it leaks once per request) |
 | `Route`, `PatriciaNode` | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy` |
 | `app->connections` | `app_init` | `app_destroy` |
-| `SSL`, `SSL_CTX` | `tls_connection_init`, `tls_init_app` | `tls_connection_close`, `tls_cleanup_app` |
 | `app->spare_fd` (S3, one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |
 
 ## Return conventions
-`0` ok / `-1` error for setup functions (`app_enable_tls`, `res_send_file`, `event_loop_*`, `create_*`).
+`0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
 `parse_http_request`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` a header name or value too long to store (→ 431, S5); after `-1`, `req.content_length == -2` means body too large (→ 413).
 `request_is_complete`: `1` for a complete request and also for invalid `Content-Length` / chunked+`Content-Length` framing (stop reading, let the parser report it);
 `0` while more bytes are needed, **and also (known gap, below) when the request line or headers are malformed**. `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
-`tls_connection_handshake`: `1` done, `0` in progress, `-1` fatal. `tls_connection_read/write`: bytes, `0` EOF, `-1` with `errno` (`EAGAIN` = wait).
 yyjson: read functions return `NULL` on failure; `yyjson_mut_*_add_*` return `false` on failure (the cookbook and demo do not check them).
 Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `errno` for logic outside the socket layer.
 
@@ -132,9 +136,8 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   `App.open_connections` (a running count, `++` in `accept_connections`, `--` in `connection_close` - not
   `app_count_connections`, an O(n) rescan used only at shutdown) checked against `ServerConfig.max_connections`
   (`0` = uncapped): past it, the fd is still `accept()`ed (has to be, to answer at all) but gets a hand-built 503 +
-  `Connection: close` and is closed immediately - no `Connection`, arena or event-loop registration. Skips the
-  plaintext write for a TLS listener (`app->ssl_ctx != NULL`): the client there expects a handshake, not HTTP, so
-  writing anything would just be protocol garbage. (2) `App.spare_fd`, one descriptor opened at `app_init` and held
+  `Connection: close` and is closed immediately - no `Connection`, arena or event-loop registration. (2)
+  `App.spare_fd`, one descriptor opened at `app_init` and held
   in reserve: on `accept()` failing with `EMFILE`/`ENFILE` (the process is out of descriptors, not just over
   `max_connections`), it's closed to free one slot and `accept_connections` retries. MEASURED (macOS/BSD): the
   connection that triggered *that* failure is already gone by then - the kernel dequeues and destroys it rather
@@ -160,17 +163,17 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   this particular check — that axis is bounded separately, below.
   A second, independent clock, `Connection.request_started`, bounds a request's *total* time regardless of how often a byte
   arrives (a client sending one byte every few seconds keeps `last_activity` fresh forever, so the check above alone never
-  fires): armed at the first byte of a request (`handle_readable`) or at the start of a TLS handshake (`tls_connection_init`,
-  restarted on handshake success), cleared back to 0 when a keep-alive response is fully queued (`flush_connection`). A
+  fires): armed at the first byte of a request (`handle_readable`), cleared back to 0 when a keep-alive response is fully
+  queued (`flush_connection`). A
   freshly accepted, still-silent connection (nothing sent yet at all) is unaffected and stays on the `last_activity` check
   alone, same as before this existed. The
   sweep applies `REQUEST_HEADER_TIMEOUT_SECONDS` while headers are still incomplete (checked with a throwaway
   `request_framing` call — negligible, it runs once per second per pending connection, not on the per-byte path) or the more
   generous `REQUEST_BODY_TIMEOUT_SECONDS` once they are complete and only the body is pending; either expiring closes with
-  408 (or a bare close if nothing was received yet, e.g. a stalled handshake). A connection idle *between* requests
+  408 (or a bare close if nothing was received yet). A connection idle *between* requests
   (`request_started == 0`) is governed only by the first, `last_activity`-based check.
   A third clock, `Connection.last_write_progress`, bounds a *pending response* that is making no progress at all: armed by
-  `flush_connection` the first time it runs for a given response, and advanced only when `write()`/`SSL_write()` actually
+  `flush_connection` the first time it runs for a given response, and advanced only when `write()` actually
   accepts bytes (not merely because `flush_connection` ran — an `EAGAIN` alone doesn't count as progress), reset to 0 once a
   keep-alive response is fully queued. The sweep closes (no response, nothing left to say) any connection with a response
   still pending whose `last_write_progress` is `≥ WRITE_TIMEOUT_SECONDS` old — a client that stopped reading, as opposed to
@@ -181,8 +184,6 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   SIGTERM, waits 6 s, then SIGKILLs.
 - **Workers and fork.** Never open a database or socket in `main()` before `app_listen`; register `app_on_worker_start`
   and open there (runs once per serving process, after fork). `SIGPIPE` is ignored per process in `app_listen_worker`.
-- **TLS.** `app_enable_tls` (or `TLS_CERT` / `TLS_KEY` in `examples/todo_sqlite/main.c`). TLS 1.2+, non-blocking handshake driven by the loop,
-  `SSL_pending` checked so pipelined bytes buffered inside OpenSSL are not stranded. `make NO_TLS=1` removes the dependency.
 - **Event loop.** `Connection.events_watched` mirrors what the loop has registered. Only the kqueue backend uses it to skip the syscall when the state already
   matches, so a keep-alive response costs no extra `kevent` there. The epoll and io_uring backends issue a syscall on every `watch_*` / `unwatch_*`
   (`epoll_ctl`; io_uring submits a poll-remove plus a new multishot poll), including the `unwatch_write` that `flush_connection` runs after every keep-alive response.

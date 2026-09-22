@@ -23,7 +23,7 @@
  * a stderr warning, not overflowed. Strings are copied, the caller's buffers need not outlive the call.
  */
 
-/* Resets an App: zero routes/middleware, no error handler, no TLS, allocates the connection table. Pair with app_destroy. */
+/* Resets an App: zero routes/middleware, no error handler, allocates the connection table. Pair with app_destroy. */
 void app_init(App *app);
 
 /* Generic form; every helper below is this with a fixed method. `method` is upper-case ("GET"). */
@@ -124,10 +124,6 @@ void app_use_body_limit(App *app, const char *prefix, size_t max_bytes);
 /* The effective body-size cap for `path`: the longest app_use_body_limit prefix that matches it, or
  * MAX_BODY_SIZE if none do. Exposed for the engine (connection.c) and tests. */
 size_t app_body_limit_for_path(const App *app, const char *path);
-
-/* Enables HTTPS with PEM files (TLS 1.2+). Returns 0, or -1 on bad arguments / path >= PATH_MAX.
- * The context is created per worker process at app_listen. */
-int app_enable_tls(App *app, const char *cert_file, const char *key_file);
 
 /* Frees dynamically allocated route tree memory. Called by app_destroy. */
 void app_free_routes(App *app);

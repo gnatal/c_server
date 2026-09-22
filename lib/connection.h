@@ -19,7 +19,7 @@
 void app_listen(App *app, int port);
 
 /* Same loop without cluster delegation: what app_listen runs in the standalone case and inside each
- * forked worker. Runs the app_on_worker_start hooks first, ignores SIGPIPE, sets up TLS, binds. */
+ * forked worker. Runs the app_on_worker_start hooks first, ignores SIGPIPE, binds. */
 void app_listen_worker(App *app, int port);
 
 /* Forces a cluster of num_workers processes regardless of app->config.workers. */
@@ -34,7 +34,7 @@ void app_listen_cluster(App *app, int port, int num_workers);
 void app_on_worker_start(App *app, WorkerInitHook hook);
 
 /* Closes every open connection, the event loop and the listen socket, frees app->connections
- * (the match for app_init's calloc) and TLS state. Safe on an App that never listened. */
+ * (the match for app_init's calloc). Safe on an App that never listened. */
 void app_destroy(App *app);
 
 /* Begins graceful shutdown: stop accepting, close idle keep-alive connections at once, mark

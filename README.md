@@ -30,7 +30,7 @@ A lightweight, high-performance HTTP/1.1 server and web framework written entire
 
 Modern backend applications often rely on high-level runtimes like Node.js or Go. This project brings the ergonomic, developer-friendly routing and middleware design of **Express.js** directly to **C**, providing:
 - **High Performance & Low Latency**: Native execution with minimal CPU overhead, sub-millisecond response times, and about 250,000 requests/sec on a minimal endpoint with 4 workers on an Apple M3 Pro laptop (single run, load generator on the same machine). See [Performance & Benchmarks](#performance--benchmarks).
-- **Small Footprint**: `lib/` has no system dependencies beyond standard C and POSIX APIs, `liburing` on Linux and (optionally) OpenSSL for TLS. JSON ([yyjson](https://github.com/ibireme/yyjson)) and HTTP tokenizing ([picohttpparser](https://github.com/h2o/picohttpparser)) are vendored as source in `lib/vendor/`. The bundled demo app additionally links SQLite (embedded, no server process) for its Todo persistence layer.
+- **Small Footprint**: `lib/` has no system dependencies beyond standard C and POSIX APIs, and `liburing` on Linux. JSON ([yyjson](https://github.com/ibireme/yyjson)) and HTTP tokenizing ([picohttpparser](https://github.com/h2o/picohttpparser)) are vendored as source in `lib/vendor/`. The bundled demo app additionally links SQLite (embedded, no server process) for its Todo persistence layer.
 - **Event-Driven Non-Blocking I/O**: Native `kqueue` on macOS / BSD and `io_uring` readiness polling on Linux, following the same architectural pattern as Node.js's underlying `libuv`.
 - **Memory Control**: Explicit bounded buffers, aggressive `const` correctness, hard input limits, and a per-connection arena allocator so per-request data needs no individual `free`. The trade is a larger per-connection footprint (see [`tradeoffs.md`](tradeoffs.md)).
 
@@ -200,8 +200,10 @@ Verified against the current code on 21 Sep 2026 and not yet fixed (details and 
 - **Build Tool**: GNU `make`.
 - **liburing** (Linux only): `liburing-dev` on Debian/Ubuntu and on Alpine. The Linux `Makefile` links `-luring`.
 - **SQLite development headers**: required to build the demo app (`examples/todo_sqlite/db.c`) — `sqlite-dev` on Alpine, `libsqlite3-dev` on Debian/Ubuntu, or `brew install sqlite` on macOS. The demo's `Makefile` auto-detects a Homebrew keg, falls back to `pkg-config`, then a bare `-lsqlite3`. The engine does not need SQLite.
-- **OpenSSL development headers** (optional): enables HTTPS. Auto-detected; if absent, or with `make NO_TLS=1`, the server builds without TLS.
 - **Optional**: Docker (containerized run), and [`wrk`](https://github.com/wg/wrk) for load testing (`brew install wrk` / `apt install wrk`).
+
+> [!NOTE]
+> This engine is plaintext HTTP/1.1 only; there is no TLS support. Terminate TLS at a gateway or reverse proxy in front of it (nginx, an ALB, a sidecar).
 
 > [!TIP]
 > On macOS, `gcc-16` is installed via Homebrew (`brew install gcc`). The `Makefile` detects macOS (`Darwin`) or Linux (`Linux`), selecting `gcc-16` on Darwin and `gcc` on Linux.
@@ -216,7 +218,6 @@ All commands run from the repository root unless noted. Build output goes to `bu
 ```bash
 make                # the library only: build/lib/libcexpress.a
 make demo           # library + demo app: examples/todo_sqlite/cexpress_demo
-make NO_TLS=1 demo  # same, without OpenSSL (plaintext only)
 make clean          # remove build/ and the demo's objects and binary (cexpress_demo is tracked by git, so this shows as a deletion)
 ```
 The Makefile tracks header dependencies, so editing a header rebuilds everything that includes it. The demo's own `Makefile` does not track the library: after changing `lib/`, rebuild it with `make -B -C examples/todo_sqlite`. Note that `examples/todo_sqlite/cexpress_demo` is committed to the repository: `make demo` rewrites it and `make clean` deletes it.
@@ -239,8 +240,6 @@ PORT=3000 ./cexpress_demo                          # different port
 WORKERS=4 QUIET=1 ./cexpress_demo                  # 4-process cluster, no per-request logging
 WORKERS=auto ./cexpress_demo                       # one worker per CPU core
 TODO_DB_PATH=/tmp/todos.db ./cexpress_demo         # database location
-TLS_CERT=../../tests/certs/server.crt TLS_KEY=../../tests/certs/server.key PORT=8443 ./cexpress_demo
-curl -k https://localhost:8443/api/todos           # -k: the bundled test certificate is self-signed
 ```
 Started from any other directory, `GET /` answers 404 and the `/static` mount is not registered.
 Write endpoints (`POST`/`PUT`/`PATCH`/`DELETE`) need `Authorization: Bearer <API_KEY>` (default `my-secret-api-key`);
@@ -265,7 +264,7 @@ make test
 ```
 
 builds and runs every suite (stops at the first failure; each prints `all ... tests passed`). Plain C `assert`
-tests, no framework, no network access needed except loopback. All 14 suites passed on macOS (gcc-16) on 21 Sep 2026, plain and under ASan + UBSan; the Linux build was not run for this update. **14 suites:**
+tests, no framework, no network access needed except loopback. All 13 suites passed on macOS (gcc-16) on 22 Sep 2026, plain and under ASan + UBSan; the Linux build was not run for this update. **13 suites:**
 
 | Binary (`build/bin/`) | Covers |
 |---|---|
@@ -279,7 +278,6 @@ tests, no framework, no network access needed except loopback. All 14 suites pas
 | `test_static` | path traversal and symlink escape prevention, MIME types, directory index |
 | `test_event_loop` | event-loop lifecycle, readiness polling, idle/shutdown timers |
 | `test_cluster` | worker count, `SO_REUSEPORT` multi-bind, concurrent serving, graceful drain |
-| `test_tls` | non-blocking TLS handshake and I/O (uses `tests/certs/`) |
 | `test_ping` | a minimal `/ping` route through parse → route → dispatch (the connection stress-test target's shape) |
 | `test_cookbook` | every recipe in `lib/examples/cookbook.c`, driven through the real parse → route → dispatch path (this is also the only automated JSON coverage) |
 
@@ -311,13 +309,13 @@ make check-docs        # fails if lib/API.md and the lib/*.h headers disagree ab
 ```
 
 ### Linux from a Mac
-The Docker build compiles the Linux engine but does not run the tests. To run `make test` on Linux use a Linux host or container with `gcc`, `make`, `openssl-dev`, `liburing-dev` and `sqlite-dev` (the builder stage of the `Dockerfile` lists the packages); this was not done for this update. On macOS, `make test_epoll` additionally exercises the epoll backend through `epoll-shim` when it is installed (`brew install epoll-shim`).
+The Docker build compiles the Linux engine but does not run the tests. To run `make test` on Linux use a Linux host or container with `gcc`, `make`, `liburing-dev` and `sqlite-dev` (the builder stage of the `Dockerfile` lists the packages); this was not done for this update. On macOS, `make test_epoll` additionally exercises the epoll backend through `epoll-shim` when it is installed (`brew install epoll-shim`).
 
 ---
 
 ## Configuration
 
-The demo app supports runtime environment variables; the engine itself is configured in code (`app.config`, `app_enable_tls`, ...):
+The demo app supports runtime environment variables; the engine itself is configured in code (`app.config`, ...):
 
 | Environment Variable | Default Value | Description |
 |---|---|---|
@@ -326,7 +324,6 @@ The demo app supports runtime environment variables; the engine itself is config
 | `API_KEY` | `my-secret-api-key` | Bearer token verified by the demo authentication middleware. |
 | `TODO_DB_PATH` | `todos.db` | Path to the SQLite database file backing the Todo CRUD demo. |
 | `QUIET` | unset | `1` disables the per-request access log (use it for benchmarks). |
-| `TLS_CERT` / `TLS_KEY` | unset | PEM certificate chain and private key; set **both** to serve HTTPS. |
 
 ### Running with Custom Configuration
 ```bash
@@ -457,7 +454,6 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │   ├── event_loop_io_uring.c # Linux io_uring readiness backend (liburing; timerfd + signalfd)
 │   ├── event_loop_epoll.c    # epoll backend, compiled with -DCEXPRESS_USE_EPOLL
 │   ├── connection.h/c    # Non-blocking socket I/O, buffers, arena lifetime & graceful shutdown
-│   ├── tls.h/c           # OpenSSL/LibreSSL non-blocking TLS lifecycle & fallback
 │   ├── http_parser.h/c   # Request parsing on picohttpparser, framing, query string, chunked decoding
 │   ├── router.h/c        # Route registration, per-method Patricia trees, sub-routers
 │   ├── response.h/c      # Response builder, streaming chunks & trailers, file streaming
@@ -482,9 +478,7 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │       └── docs/         # Directory-index fallback demo
 ├── tests/                # Isolated test suites (built into build/bin/test_*)
 │   ├── CLAUDE.md         # Test harness architecture, arena usage and socket mocking strategy
-│   ├── certs/            # RSA test certificates for TLS verification
 │   ├── test_connection.c # Socket I/O and lifecycle tests via socketpair(2)
-│   ├── test_tls.c        # Non-blocking TLS handshake, I/O & session tests
 │   ├── test_event_loop.c # Event-loop abstraction tests (lifecycle, I/O, timers)
 │   ├── test_cluster.c    # Multi-worker cluster tests (forking, SO_REUSEPORT, drain)
 │   ├── test_http_parser.c# Unit tests for HTTP parser and request dechunking
@@ -530,7 +524,6 @@ All 11 original architectural milestones have been completed:
 - [x] Streaming & chunked responses (`res_write`, `res_end`, `res_set_trailer`, `res_send_file`)
 - [x] Cross-platform event backend (`kqueue` for macOS/BSD, `epoll` then `io_uring` for Linux)
 - [x] Multi-process worker model (`SO_REUSEPORT`)
-- [x] TLS / HTTPS support (OpenSSL/LibreSSL non-blocking handshake integration)
 
 Engine changes since then (see [`tradeoffs.md`](tradeoffs.md)):
 - [x] yyjson replaces the in-house JSON library
@@ -538,5 +531,6 @@ Engine changes since then (see [`tradeoffs.md`](tradeoffs.md)):
 - [x] picohttpparser replaces the handwritten request parser
 - [x] Patricia-tree router (no fixed route cap)
 - [x] io_uring event loop on Linux
+- [x] TLS / HTTPS support (OpenSSL/LibreSSL non-blocking handshake integration) added, then removed (2026-09-22): TLS termination belongs at a gateway or reverse proxy in front of this engine, not inside a library that only parses HTTP/1.1
 
 Open items are listed under [Known Gaps](#known-gaps).

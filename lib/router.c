@@ -8,11 +8,7 @@
 void app_init(App *app) {
     app->config.port = DEFAULT_PORT;
     app->config.workers = 1;
-    app->config.tls_enabled = 0;
-    app->config.tls_cert_file[0] = '\0';
-    app->config.tls_key_file[0] = '\0';
     app->config.max_connections = DEFAULT_MAX_CONNECTIONS;
-    app->ssl_ctx = NULL;
     app->open_connections = 0;
     /* Best effort (S3): a failed open just means EMFILE gets the pre-existing silent behavior -
      * see App.spare_fd. */
@@ -678,22 +674,5 @@ const char *req_get_param(const Request *req, const char *name) {
         }
     }
     return NULL;
-}
-
-int app_enable_tls(App *app, const char *cert_file, const char *key_file) {
-    if (app == NULL || cert_file == NULL || key_file == NULL ||
-        cert_file[0] == '\0' || key_file[0] == '\0') {
-        return -1;
-    }
-    if (strlen(cert_file) >= sizeof(app->config.tls_cert_file) ||
-        strlen(key_file) >= sizeof(app->config.tls_key_file)) {
-        return -1;
-    }
-    strncpy(app->config.tls_cert_file, cert_file, sizeof(app->config.tls_cert_file) - 1);
-    app->config.tls_cert_file[sizeof(app->config.tls_cert_file) - 1] = '\0';
-    strncpy(app->config.tls_key_file, key_file, sizeof(app->config.tls_key_file) - 1);
-    app->config.tls_key_file[sizeof(app->config.tls_key_file) - 1] = '\0';
-    app->config.tls_enabled = 1;
-    return 0;
 }
 

@@ -25,17 +25,8 @@ else
     SQLITE_LDFLAGS = -lsqlite3
 endif
 
-OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)
-ifeq ($(shell test -d $(OPENSSL_PREFIX)/include/openssl && echo yes),yes)
-    OPENSSL_LDFLAGS = -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
-else ifeq ($(shell pkg-config --exists openssl 2>/dev/null && echo yes),yes)
-    OPENSSL_LDFLAGS = $(shell pkg-config --libs openssl)
-else
-    OPENSSL_LDFLAGS =
-endif
-
 CFLAGS += $(SQLITE_CFLAGS)
-LDFLAGS += $(SQLITE_LDFLAGS) $(OPENSSL_LDFLAGS)
+LDFLAGS += $(SQLITE_LDFLAGS)
 
 SRCS = main.c handlers.c middlewares.c db.c
 OBJS = $(SRCS:.c=.o)
