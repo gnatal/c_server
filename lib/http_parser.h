@@ -15,25 +15,36 @@
  *           -1  malformed (bad request line, no header terminator, bad/duplicate/
  *               oversized Content-Length, chunked + Content-Length together, bad chunk framing)
  *           -2  request-target path >= sizeof(req->path) (256)  -> caller sends 414
- *           -3  a header name (>= 64 chars) or value (>= MAX_HEADER_VALUE_LEN) would not fit -> caller
- *               sends 431 (S5: never silently truncated - a Bearer JWT or long cookie that overflowed
- *               the old 255-byte cap used to compare unequal to itself with no indication why)
+ *           -3  retired (P3): used to mean "a header name/value would not fit its fixed-size copy" (S5),
+ *               impossible now that req->headers holds views into `raw` instead of copies - any header
+ *               that made it into a complete request already fits inside the whole header block, which
+ *               was always capped independently (431 if the block itself exceeds BUF_SIZE, checked by
+ *               the caller before this is ever reached). Kept reserved, not reused for something else,
+ *               so old caller code branching on it is merely dead, never wrong.
  *           -4  a percent-decoded path, query name or query value contains an embedded NUL -> caller
  *               sends 400 (S6: "%00" - or a raw NUL byte - used to silently truncate everything read
  *               through it as a C string, e.g. "/style.css%00.png" looking like "/style.css" to a
- *               suffix check; never silently truncated now, same principle as -3 for headers)
+ *               suffix check; never silently truncated now)
  *   On -1, req->content_length == -2 means "body too large"      -> caller sends 413.
  *   Ownership: on success req->body is allocated from `arena` (content_length + 1 bytes, NUL-terminated,
  *   never NULL, may hold NUL bytes: use content_length, not strlen). Nobody free()s it: it is reclaimed
  *   when the arena is reset (the engine passes Connection.arena; tests pass their own Arena). It is NULL
- *   after any failure. Only the fields behind *_count are initialized; read arrays through the accessors.
+ *   after any failure. `req->arena` is also set to this same arena (P3): req_get_header/req_get_cookie
+ *   use it to materialize NUL-terminated strings out of the views/lazy split below. Only the fields
+ *   behind *_count (and the scalars) are initialized; read arrays through the accessors.
  *   Decoding: req->path is percent-decoded; req->query stays raw; query names/values are
  *   percent- and '+'-decoded; header and cookie values are not decoded.
+ *   Storage (P3): req->headers holds VIEWS into `raw` (name/value point into it, not NUL-terminated,
+ *   valid only as long as `raw` is unchanged - i.e. until the handler returns, same rule as everything
+ *   else reachable through req), not copies - there is no per-header size limit left to enforce, only
+ *   the pre-existing whole-header-block cap (BUF_SIZE, checked by the caller). Cookies are still split
+ *   into fixed-size copies (cookie_names/cookie_values), but lazily: parse_http_request does not call
+ *   parse_cookies itself any more - req_get_cookie does, once, on its first call for this request.
  *   Limits (never overflowed): method 7 chars (longer -> -1); more than MAX_HEADERS headers -> -1 (the
- *   request is rejected, not truncated); header name 63 chars / value MAX_HEADER_VALUE_LEN - 1 chars ->
- *   -3, not truncated (S5); query 255, MAX_QUERY_PARAMS and MAX_COOKIES (including each cookie's own
- *   name/value, 63/255 chars) are silently truncated or dropped. The request line and header block are
- *   parsed by the vendored picohttpparser (HTTP/1.x only; bare '\n' line endings are accepted).
+ *   request is rejected, not truncated); query 255, MAX_QUERY_PARAMS and MAX_COOKIES (including each
+ *   cookie's own name/value, 63/255 chars) are silently truncated or dropped. The request line and
+ *   header block are parsed by the vendored picohttpparser (HTTP/1.x only; bare '\n' line endings
+ *   are accepted).
  */
 int parse_http_request(const char *raw, size_t raw_len, Request *req, Arena *arena);
 
@@ -113,12 +124,20 @@ size_t chunked_body_decode(const char *body_start, size_t available, char *out);
 /* Component parsers (called by parse_http_request; exposed for tests). Each resets its own *_count.
  * parse_query_string returns 0 ok, -1 if a decoded name/value contains an embedded NUL (S6) - req is
  * still fully populated up to and including the offending pair, same "don't bother finishing what the
- * caller will reject anyway" convention as parse_http_request's own -3. */
+ * caller will reject anyway" convention as parse_http_request's own -4.
+ * parse_headers (P3) fills req->headers with VIEWS into header_block, not copies - same storage
+ * req_get_header expects, so it needs `arena` for the same reason parse_http_request does: materializing
+ * a NUL-terminated value on a later req_get_header call. header_block must outlive any such call. */
 int parse_query_string(const char *query, Request *req);    /* "a=1&b=2"; bare key -> "" */
-void parse_headers(const char *header_block, Request *req);  /* "Name: value\r\n..." */
+void parse_headers(const char *header_block, Request *req, Arena *arena);  /* "Name: value\r\n..." */
 void parse_cookies(const char *cookie_header, Request *req); /* NULL ok; "a=1; b=2" */
 
-/* Accessors: first match, NULL when absent. Returned pointers live as long as `req`. */
+/* Accessors: first match, NULL when absent. Returned pointers live as long as `req`.
+ * req_get_header (P3) materializes a NUL-terminated copy of the matching view into req->arena on every
+ * call (not cached); returns NULL without allocating if req->arena is NULL (a Request no parse function
+ * ever populated). req_get_cookie (P3) runs parse_cookies itself, once, the first time it's called for
+ * a given req (req->cookies_parsed) - a request whose Cookie header nobody reads never pays for the
+ * split at all. */
 const char *req_get_query(const Request *req, const char *name);  /* case-sensitive, decoded */
 const char *req_get_header(const Request *req, const char *name); /* case-INsensitive name */
 const char *req_get_cookie(const Request *req, const char *name); /* case-sensitive, not decoded */

@@ -42,8 +42,8 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 ## Read the request (`http_parser.h`, `router.h`)
 - `req_get_param(req, name)` — `:name` path parameter.
 - `req_get_query(req, name)` — query value, decoded, case-sensitive name.
-- `req_get_header(req, name)` — header value, case-insensitive name.
-- `req_get_cookie(req, name)` — cookie value, case-sensitive name.
+- `req_get_header(req, name)` — header value, case-insensitive name. No length limit of its own (P3: views into the raw request, not fixed-size copies) other than the whole header block fitting `BUF_SIZE`.
+- `req_get_cookie(req, name)` — cookie value, case-sensitive name. Splits the `Cookie` header on its first call per request (P3), not eagerly for every request.
 - Also on `Request`: `method`, `path`, `version`, `query` (raw), `body` (NUL-terminated; binary-safe with `content_length`; lives in the connection arena, never free it), `content_length`.
 - `url_decode(src, dst, dst_size, decode_plus)` — percent-decode a string.
 
@@ -78,7 +78,7 @@ serialize once, `free` the string.
 - `parse_http_request(raw, raw_len, Request *, Arena *)`, `request_is_complete(buf, len)`, `request_framing(buf, len, &header_len, &chunked, &path, &path_len)` (`path`/`path_len` out params optional, pass `NULL`), `request_wants_close(req)`.
 - `parse_request_head(buf, len, ParsedHead *)`, `request_head_is_complete(ParsedHead *, buf, len)`, `parse_http_request_from_head(raw, raw_len, ParsedHead *, Request *, Arena *)` (P2: one `phr_parse_request` pass, reused by `connection.c`'s body-limit check, completeness check and full parse instead of each running its own; `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers over these and unchanged in behavior).
 - `extract_content_length(block)`, `request_has_chunked_encoding(block)`, `chunked_body_scan(...)`, `chunked_body_decode(...)`.
-- `parse_query_string(query, req)`, `parse_headers(block, req)`, `parse_cookies(value, req)`, `status_text(code)`.
+- `parse_query_string(query, req)`, `parse_headers(block, req, Arena *)`, `parse_cookies(value, req)`, `status_text(code)`.
 
 ## Engine internals — do not call from app code
 - Connections (`connection.h`): `set_nonblocking`, `create_server_socket`, `connection_create`, `connection_close`, `accept_connections`, `handle_readable`, `flush_connection`, `close_idle_connections`.

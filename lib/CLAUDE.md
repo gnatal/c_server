@@ -23,7 +23,7 @@ If `event_loop_init` fails (for example io_uring is blocked by the runtime), `ap
 
 Per request (`connection.c: handle_readable`):
 1. `recv` into `conn->in_buf`, then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below (P2) - the body-limit check (S4), `request_head_is_complete` (a chunked scan when the body is chunked), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request before P2).
-2. `parse_http_request_from_head(in_buf, in_len, &head, &req, &conn->arena)` → `Request` on the stack (copies method/path/headers/cookies into its fixed arrays; the body is copied into the connection arena). Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request`/`request_is_complete`/`request_framing` remain as thin, unchanged-behavior wrappers over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
+2. `parse_http_request_from_head(in_buf, in_len, &head, &req, &conn->arena)` → `Request` on the stack (copies method/path/query into its fixed arrays; headers are stored as VIEWS into `in_buf`, not copies, and the body is copied into the connection arena - P3). Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request`/`request_is_complete`/`request_framing` remain as thin, unchanged-behavior wrappers over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
 4. `match_route` (per-method Patricia tree, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
@@ -39,7 +39,7 @@ response building never touch a socket, so tests drive them with a fake `Connect
 |---|---|
 | `app_types.h` | every struct/typedef and every compile-time limit |
 | `arena.c/h` | per-connection bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`) |
-| `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text`. One `parse_request_head` pass feeds the body-limit check, completeness check and full parse (P2); `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers kept for existing callers |
+| `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text`. One `parse_request_head` pass feeds the body-limit check, completeness check and full parse (P2); `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers kept for existing callers. Headers are stored as views into the input buffer and cookies are split lazily, on first access (P3) |
 | `router.c/h` | route registration, one Patricia (segment-radix) tree per method, `app_mount`, `app_serve_static`, `app_free_routes` |
 | `middleware.c/h` | pipeline (`chain_next`, `chain_error`, `dispatch`), 404/405/OPTIONS defaults |
 | `response.c/h` | response head assembly, cookies, chunked streaming, file streaming |
@@ -54,8 +54,9 @@ response building never touch a socket, so tests drive them with a fake `Connect
 
 ## Limits (all compile-time, in `app_types.h`; excess is truncated or dropped, never overflowed, except where marked)
 Routes: no fixed cap per App (each is malloc'd into a tree), 64 per Router (`MAX_ROUTER_ROUTES`), 16 distinct methods · app middleware 16 · route middleware 8 ·
-path params 8 (value 63) · query params 16 (63) · request headers 32 (name 63, value `MAX_HEADER_VALUE_LEN` 1024; **a 33rd
-header is a 400, a name or value that doesn't fit is a 431 (S5), neither is a silent drop or truncation**) ·
+path params 8 (value 63) · query params 16 (63) · request headers 32 (`MAX_HEADERS`; **a 33rd header is a 400**; a
+header name/value has no length cap of its own since P3 - it is a view into the input buffer, not a fixed-size copy -
+only the whole header block fitting `BUF_SIZE` bounds it) ·
 cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
 body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 ·
 form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB each, 64 MiB total, 1 s revalidation
@@ -96,7 +97,7 @@ and leaves the old block in the arena until the request ends; a static file is r
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
-`parse_http_request` / `parse_http_request_from_head`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` a header name or value too long to store (→ 431, S5), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413).
+`parse_http_request` / `parse_http_request_from_head`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` retired (P3: used to mean "a header name/value too long to store", impossible now that headers are views, not fixed-size copies - never returned, kept reserved rather than reused), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413).
 `url_decode` / `parse_query_string`: `0` ok, `-1` a decoded byte was NUL (S6) - the destination is still fully written and NUL-terminated, but the caller must treat it as invalid input rather than use it.
 `request_is_complete` / `request_head_is_complete`: `1` for a complete request and also for invalid `Content-Length` / chunked+`Content-Length` framing (stop reading, let the parser report it);
 `0` while more bytes are needed, **and also (known gap, below) when the request line or headers are malformed**. `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
@@ -137,14 +138,25 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   that frees it (tests; not called anywhere in the engine itself).
 - **Request parsing.** picohttpparser does the request line and header block; it is strict about tokens and accepts bare `\n` line endings, and rejects HTTP versions other than 1.x. `Content-Length`
   must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Header names are matched exactly and case-insensitively (never by substring). Method ≤ 7
-  chars. Query/headers/cookies parsed eagerly into fixed arrays. More than 32 headers → 400 (checked explicitly against
-  `MAX_HEADERS` in `parse_http_request_from_head`, since P2 raised the underlying `phr_parse_request` capacity itself to
-  `MAX_FRAMING_HEADERS`, above `MAX_HEADERS`, precisely so this case is diagnosed as malformed rather than mis-reported as
-  "incomplete" - see "Hot-path rules" and S8's known gap, which this must not widen). A header name over 63 chars or
-  value over `MAX_HEADER_VALUE_LEN` (1024) is rejected with 431, never silently truncated (S5: raised from the original
-  255-char value cap, which used to truncate a Bearer JWT or long cookie into a value that compared unequal to itself with
-  no indication why - `parse_headers`, the standalone component parser `tests/` uses directly and that the live request
-  path does *not* call, still truncates silently since it has no error path to signal through, a `void` function).
+  chars. Query and cookies are still parsed eagerly into fixed arrays (cookies lazily *triggered*, see below, but the
+  arrays themselves are fixed-size once triggered); headers are not copied at all. More than 32 headers → 400 (checked
+  explicitly against `MAX_HEADERS` in `parse_http_request_from_head`, since P2 raised the underlying `phr_parse_request`
+  capacity itself to `MAX_FRAMING_HEADERS`, above `MAX_HEADERS`, precisely so this case is diagnosed as malformed rather
+  than mis-reported as "incomplete" - see "Hot-path rules" and S8's known gap, which this must not widen).
+  **Header storage (P3).** `req->headers` holds `struct phr_header` VIEWS (`name`/`value` point into `in_buf`, not
+  NUL-terminated) instead of copies into fixed-size arrays, so there is no per-header length cap left to enforce - a
+  header of any length that fits within the whole header block (`BUF_SIZE`, 8 KiB, unrelated to this) is accepted.
+  This retired S5's `-3`/431 return code (`parse_http_request` never returns `-3` any more; kept reserved, not reused,
+  so old code branching on it is merely dead) and is the "proper fix" `improvements.md`'s S5 entry predicted P3 would
+  be, superseding the interim fix of simply raising the old fixed-size cap. `req_get_header` materializes a
+  NUL-terminated copy of the matching view into `req->arena` (set by `parse_http_request_from_head` to the same arena
+  `req->body` came from) on every call - not cached, since a handler reads a given header only a handful of times per
+  request at most. `parse_headers`, the standalone component parser `tests/` call directly (not on the live request
+  path), was changed the same way and takes an `Arena *` now for the same reason - it no longer truncates either.
+  **Cookie splitting is lazy (P3).** `parse_http_request_from_head` no longer calls `parse_cookies` itself; `req_get_cookie`
+  does, once, the first time it is called for a given request (`req->cookies_parsed`) - a request that carries a
+  `Cookie` header but whose handler never reads one never pays for the split. Cookie storage itself (`cookie_names`/
+  `cookie_values`, fixed 64/255-char slots) is unchanged; only *when* the split runs moved.
   Chunked bodies: extensions ignored, trailers discarded, decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at `header_len + MAX_BODY_SIZE`.
   **Embedded NUL (S6).** The path and query names/values are percent-decoded (`decode_bounded`/`url_decode`); a decoded byte
   that is NUL (`%00`, or a raw NUL byte already in the request line) is rejected with 400 (`parse_http_request`'s `-4`)
@@ -152,7 +164,7 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   (`improvements.md`, S6) `GET /static/style.css%00.png` used to be routed and served as `/static/style.css`, a bypass for
   any suffix/extension check performed on the path before use. Header and cookie values are not percent-decoded by this
   engine at all, so this vector does not apply to them (`req_get_header`/`req_get_cookie` already return raw bytes;
-  header/cookie length limits are the separate S5 concern above).
+  header values have no length limit at all since P3, see above; a cookie's own value, once split, still has one).
 - **Buffers.** `in_buf` starts at 8 KiB; with headers complete and a body pending it grows by doubling, capped at the
   known target size (S4: `Content-Length` and chunked both work this way now - `Content-Length` used to realloc straight
   to `header_len + content_length + 1` in one step, reserving virtual memory proportional to what the client merely
@@ -238,27 +250,45 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 
 ## Hot-path rules (measured; do not undo)
 Per-request CPU cost of the pure path (parse, route, dispatch, response build; no sockets, one core; `make bench`, Apple M3 Pro,
-gcc-16 -O2, 22 Sep 2026): minimal GET 180 ns, browser-shaped GET (10 headers, cookies, query) 514 ns, JSON POST 235 ns, 404 180 ns
-(single-run noise is ±15-20 ns at this scale, `make bench` re-run several times); a 20-row JSON list through yyjson 700 ns.
-(Previously 198 / 825 / 313 / 208 / 709 ns the same day, before P2 made `bench_hotpath.c`'s `one_request` call
-`parse_request_head` + `request_head_is_complete` + `parse_http_request_from_head` - one picohttpparser pass, matching the real
-`connection.c` hot path - instead of the separate `request_is_complete` + `parse_http_request` it called before, which cost two
-passes even after P2's own internal dedup of `parse_http_request`. **MEASURED** browser-shaped GET −38%, JSON POST −25%, matching
-`improvements.md`'s P2 PROJECTED estimate almost exactly; minimal GET and 404 move less because they carry only 1-2 headers, so
-there is less redundant tokenizing to remove. And before *that*, 208 / 781 / 315 / 186 / 659 ns on 21 Sep 2026, before S5 raised
-`Request.header_values`' per-slot size from 256 to `MAX_HEADER_VALUE_LEN` (1024, see "Behavior reference, Request parsing") -
-that delta was noise, not attributable to S5; this one is not.) The earlier version of this file recorded 390 / 800 / 470 / 430 ns
-for the handwritten-parser engine on the same machine (no A/B rebuild of that commit was done for this update); only ratios
-transfer between machines. What to keep:
+gcc-16 -O2, 22 Sep 2026): minimal GET 160 ns, browser-shaped GET (10 headers, cookies, query) 400 ns, JSON POST 195 ns, 404 170 ns
+(single-run noise is ±15-25 ns at this scale, `make bench` re-run several times); a 20-row JSON list through yyjson 700 ns.
+`bench_hotpath.c` also reports a second browser-shaped case where the handler actually calls `req_get_cookie` +
+`req_get_header` (the case P3's laziness can't help, since the handler reads them anyway): ~480 ns - still faster than the
+pre-P3 514 ns baseline, since header storage itself got cheaper independent of whether a handler reads one.
+
+History, most recent first (only ratios transfer between machines; each line is the same four/five cases in the same
+order as above): 180 / 514 / 235 / 180 ns, before P3 changed `req->headers` from fixed-size copies to views into `in_buf`
+(materialized lazily by `req_get_header`) and made cookie splitting lazy (`req_get_cookie`, on its first call per request)
+instead of eager in `parse_http_request_from_head` - **MEASURED** browser-shaped GET a further −22%, minimal GET −11%,
+JSON POST −17%, 404 −6%, roughly matching `improvements.md`'s P3 PROJECTED "further ~200 ns (browser-shaped)" (514 → 400 ns
+here is 114 ns, in the same range accounting for machine/run variance). Before that, 198 / 825 / 313 / 208 / 709 ns, before
+P2 made `bench_hotpath.c`'s `one_request` call `parse_request_head` + `request_head_is_complete` +
+`parse_http_request_from_head` - one picohttpparser pass, matching the real `connection.c` hot path - instead of the
+separate `request_is_complete` + `parse_http_request` it called before, which cost two passes even after P2's own internal
+dedup of `parse_http_request` - **MEASURED** browser-shaped GET −38%, JSON POST −25%, matching `improvements.md`'s P2
+PROJECTED estimate almost exactly; minimal GET and 404 move less because they carry only 1-2 headers, so there is less
+redundant tokenizing to remove. Before that, 208 / 781 / 315 / 186 / 659 ns on 21 Sep 2026, before S5 raised
+`Request.header_values`' per-slot size from 256 to 1024 (P3 later deleted this array and the cap entirely - see "Behavior
+reference, Request parsing") - that delta was noise, not attributable to S5. The earliest version of this file recorded
+390 / 800 / 470 / 430 ns for the handwritten-parser engine on the same machine (no A/B rebuild of that commit was done for
+this update). What to keep:
 - No `strtok_r` / `sscanf` / `strncpy` (zero-pads to the full size) / `strcasestr` over request bytes. Scan with lengths and `memchr`.
-- No whole-struct `memset` of `Request` (43,576 bytes, `sizeof`, `make bench`; grew from 19 KB when S5 raised the per-header
-  value cap - see above) or `Response` (16 KB). `parse_http_request_from_head` and `res_init` set scalars and
+- No whole-struct `memset` of `Request` (9,792 bytes, `sizeof`, `make bench` - down from 43,576 bytes when P3 replaced
+  `header_names`/`header_values[32][1024]` with `struct phr_header headers[32]`, 1,024 bytes of views instead of a
+  34,816-byte fixed-size copy; remaining bulk is `cookie_names`/`cookie_values` (5 KB) and `query_names`/`query_values`/
+  `param_names`/`param_values` (3 KB), still fixed-size copies, deliberately out of P3's scope - see "Known gaps") or
+  `Response` (16 KB). `parse_http_request_from_head` and `res_init` set scalars and
   `*_count` only; arrays are read up to their count and every slot is NUL-terminated on write.
 - One `phr_parse_request` pass per request on the hot path (P2), not up to four: `handle_readable` calls `parse_request_head`
   once and threads the result through the body-limit check, `request_head_is_complete` and `parse_http_request_from_head`.
   Don't reintroduce a second call to `request_framing` / `request_is_complete` / `parse_http_request` (the whole-buffer
   re-parsing wrappers) anywhere in `connection.c`'s per-`recv` loop - they exist for callers that only need one piece
   (tests, `fuzz_parser.c`) and each costs its own independent pass again.
+- Don't copy header names/values into `Request` (P3): `parse_http_request_from_head` stores views (`req->headers[i] =
+  head->headers[i]`, a struct assignment of two pointers and two `size_t`s) instead of `copy_bounded`-ing each one into
+  a fixed-size slot. A request whose headers nobody reads should cost nothing beyond that assignment; don't reintroduce
+  a per-header `memcpy` there. Don't call `parse_cookies` from `parse_http_request_from_head` either - `req_get_cookie`
+  triggers it lazily, once, on its own first call per request.
 - Routing is one tree walk over path segments with no allocation; `req == NULL` searches without capturing (used for the 405 `Allow` list).
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
 - Allocate per-request data from `conn->arena`, not `malloc`. Emit JSON through yyjson with `arena_yyjson_alc`.
@@ -283,12 +313,15 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
 - **Per-connection footprint is about 25 KB resident on macOS (72 KB allocated: 64 KiB arena + 8 KiB `in_buf`)**, up from about 7 KB before the arena; 10,000 idle connections are on the order of 250 MB there.
 - **`Request.body` is still a copy** (now into the arena), including a 1-byte allocation for empty bodies.
 - Path/query params over 63 chars and queries over 255 chars are truncated silently. So are individual cookie values
-  over 255 chars after the `Cookie` header is split (`parse_cookies` → `cookie_values[MAX_COOKIES][256]`) - S5 fixed
-  the *raw* `Cookie:` header line (`req->header_values`, now `MAX_HEADER_VALUE_LEN` before a 431), not each cookie's
-  own value once split out of it, so a single very long session-token cookie among several shorter ones can still be
-  truncated even though the header line as a whole fit. Request header values otherwise are not truncated: S5 raised
-  the per-header cap to `MAX_HEADER_VALUE_LEN` and rejects anything still over it with 431 instead of truncating -
-  see "Behavior reference, Request parsing".
+  over 255 chars after the `Cookie` header is split (`parse_cookies` → `cookie_values[MAX_COOKIES][256]`) - the raw
+  `Cookie:` header line itself has no length limit any more (P3: it's a view like every other header, materialized in
+  full by `req_get_header`/`req_get_cookie`), but a single very long session-token cookie among several shorter ones,
+  once split out of that line, can still be truncated to its own 255-byte slot. Request header values otherwise are
+  not truncated at all any more (P3: views, not fixed-size copies) - see "Behavior reference, Request parsing". Query
+  and path-parameter storage stayed fixed-size copies deliberately, out of P3's scope: `req->query_names`/`query_values`
+  is a small, session-eager array (S6 requires validating every value for an embedded NUL at parse time regardless of
+  whether a handler ever reads it, so there is no CPU to save by deferring the copy, only Request's overall size - and
+  query/param storage together are under 3 KB, a small fraction of what headers used to cost).
 - **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model).
 - The io_uring backend is used only as a readiness poller; sockets are still read and written with `recv` / `write`.
 - No HTTP/2, `Expect: 100-continue`, compression, `Range`, or WebSocket.

@@ -24,7 +24,10 @@
 #define MAX_ROUTE_MIDDLEWARES 8       /* per route */
 #define MAX_PARAMS 8                  /* path params per request (name/value 63 chars) */
 #define MAX_QUERY_PARAMS 16           /* name/value 63 chars, percent- and '+'-decoded */
-#define MAX_HEADERS 32                /* request headers kept (name 63 chars, value MAX_HEADER_VALUE_LEN) */
+#define MAX_HEADERS 32                /* request header VIEWS kept (P3: not copies - name/value point into
+                                        * the connection's in_buf, so there is no per-header size cap left to
+                                        * enforce; a header is bounded only by the whole header block fitting
+                                        * in BUF_SIZE, same as before) */
 #define MAX_FRAMING_HEADERS 100       /* ParsedHead's phr_parse_request capacity (P2): kept above MAX_HEADERS
                                         * so a request with more headers than the engine stores is diagnosed
                                         * by parse_http_request_from_head's explicit ">MAX_HEADERS" check as
@@ -32,9 +35,6 @@
                                         * request_head_is_complete's header_len == 0 check (which a smaller
                                         * capacity would trip via phr_parse_request's own internal error -
                                         * see S8's known gap in lib/CLAUDE.md, which this must not widen) */
-#define MAX_HEADER_VALUE_LEN 1024      /* single request header value cap (S5); over this (or over the 63-char
-                                        * name cap) is 431, never silently truncated - raised from the original
-                                        * 255 because bearer JWTs and long cookies commonly run 300-1,000 chars */
 #define MAX_COOKIES 16                /* request cookies kept (name 63, value 255 chars) */
 #define MAX_FORM_FIELDS 32            /* urlencoded body fields (name 63, value 255 chars) */
 #define MAX_MULTIPART_PARTS 16
@@ -95,13 +95,26 @@ typedef struct {
     char query_values[MAX_QUERY_PARAMS][64];
     int query_count;
 
-    char header_names[MAX_HEADERS][64];     /* value not decoded; name lookup is case-insensitive */
-    char header_values[MAX_HEADERS][MAX_HEADER_VALUE_LEN];
+    /* P3: raw VIEWS into the connection's in_buf, not copies - name/value are not NUL-terminated and
+     * are meaningless once in_buf is touched again (never happens before the handler returns; see
+     * lib/CLAUDE.md's request lifecycle). A request whose headers nobody reads costs nothing beyond
+     * this array (32 * sizeof(struct phr_header) = 1,024 bytes) instead of the old 32 * 1,088-byte
+     * fixed-size copy. req_get_header is the only supported way to read one: it materializes a
+     * NUL-terminated copy into `arena` below on every call (not cached - handlers read a given header
+     * at most a handful of times, so re-copying costs less than the bookkeeping a cache would need). */
+    struct phr_header headers[MAX_HEADERS];
     int header_count;
 
+    /* Cookie splitting stays eager-into-fixed-arrays (unlike headers above): MAX_COOKIES * (64 + 256)
+     * is a modest 5 KB regardless, and RFC 6265 cookie-pair syntax has no length limit of its own to
+     * relax the way S5 needed for headers. What *is* lazy (P3) is running the split at all: see
+     * cookies_parsed below - most requests carrying a Cookie header are never asked for one by name. */
     char cookie_names[MAX_COOKIES][64];     /* not decoded; name lookup is case-sensitive */
     char cookie_values[MAX_COOKIES][256];
     int cookie_count;
+    int cookies_parsed;       /* P3: req_get_cookie runs parse_cookies at most once, on its first call,
+                                * instead of parse_http_request_from_head running it for every request
+                                * whether or not a handler ever reads a cookie */
 
     int content_length;      /* body size in bytes (decoded size for chunked); -2 after a failed parse = too large */
 
@@ -109,6 +122,13 @@ typedef struct {
      * may contain NUL bytes: use content_length, not strlen). Reclaimed with the arena after the response is
      * flushed; nobody frees it, and handlers must not keep it past their return. */
     char *body;
+
+    /* P3: set by parse_http_request_from_head to the same arena `body` above came from. req_get_header
+     * and req_get_cookie (on its first call) allocate from it to materialize NUL-terminated strings out
+     * of the views above. NULL only for a Request no parse function has ever populated (e.g. a test
+     * fixture built and filled by hand without going through parse_http_request*) - req_get_header
+     * returns NULL rather than dereference it in that case. */
+    Arena *arena;
 } Request;
 
 /* One multipart/form-data part. `data` points INTO the parsed body buffer, is not NUL-terminated and

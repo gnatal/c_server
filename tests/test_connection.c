@@ -13,6 +13,7 @@
 #include "router.h"
 #include "response.h"
 #include "middleware.h"
+#include "http_parser.h"
 
 static void ping_handler(const Request *req, Response *res) {
     (void)req;
@@ -23,6 +24,14 @@ static void ping_handler(const Request *req, Response *res) {
 static void echo_len_handler(const Request *req, Response *res) {
     char body[64];
     snprintf(body, sizeof(body), "received %d bytes", req->content_length);
+    res_status(res, 200);
+    res_send(res, body);
+}
+
+static void auth_header_len_handler(const Request *req, Response *res) {
+    const char *auth = req_get_header(req, "Authorization");
+    char body[64];
+    snprintf(body, sizeof(body), "auth len=%d", auth ? (int)strlen(auth) : -1);
     res_status(res, 200);
     res_send(res, body);
 }
@@ -286,20 +295,25 @@ static void test_handle_readable_header_overflow_431(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
-/* S5: unlike the whole-header-block-over-BUF_SIZE case above, this is a single header value that
- * would not fit its MAX_HEADER_VALUE_LEN slot even though the request comfortably fits under BUF_SIZE
- * - a different code path (parse_http_request's -3 -> connection.c's 431 mapping) than the 431 above. */
-static void test_handle_readable_oversized_header_value_431(void) {
+/* P3: unlike the whole-header-block-over-BUF_SIZE case above, this is a single header value that used
+ * to be too long for its fixed-size MAX_HEADER_VALUE_LEN slot (S5's -3 -> 431) even though the request
+ * comfortably fits under BUF_SIZE. Now that req->headers holds views into conn->in_buf instead of
+ * fixed-size copies, there is no per-header cap left to trip: this exact shape parses successfully and
+ * the value round-trips through req_get_header exactly, uncut - the "proper fix" improvements.md's S5
+ * entry said P3 would be. */
+static void test_handle_readable_long_header_value_is_not_capped(void) {
     App app;
     int fds[2];
     Connection *conn;
     setup_test_connection(&app, fds, &conn);
+    app_get(&app, "/", auth_header_len_handler);
 
     int client_fd = fds[0];
 
     char req_line[1400];
     int n = snprintf(req_line, sizeof(req_line), "GET / HTTP/1.1\r\nAuthorization: Bearer ");
-    for (int i = 0; i < 1100; i++) req_line[n++] = 'x'; /* past MAX_HEADER_VALUE_LEN (1024) */
+    const int token_len = 1100; /* past the old MAX_HEADER_VALUE_LEN (1024) cap */
+    for (int i = 0; i < token_len; i++) req_line[n++] = 'x';
     n += snprintf(req_line + n, sizeof(req_line) - (size_t)n, "\r\n\r\n");
     assert(write(fds[1], req_line, (size_t)n) == n);
     handle_readable(&app, conn);
@@ -308,8 +322,11 @@ static void test_handle_readable_oversized_header_value_431(void) {
     memset(resp, 0, sizeof(resp));
     ssize_t r = read(fds[1], resp, sizeof(resp) - 1);
     assert(r > 0);
-    assert(strstr(resp, "HTTP/1.1 431 Request Header Fields Too Large") != NULL);
-    assert(app.connections[client_fd] == NULL); /* rejected and closed, same as any other 431 */
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    char expected[64];
+    snprintf(expected, sizeof(expected), "auth len=%d", (int)strlen("Bearer ") + token_len);
+    assert(strstr(resp, expected) != NULL);
+    assert(app.connections[client_fd] != NULL); /* keep-alive: not rejected, not closed */
 
     teardown_test_connection(&app, fds, conn);
 }
@@ -1437,7 +1454,7 @@ int main(void) {
     test_handle_readable_malformed_400();
     test_handle_readable_unmatched_route_404();
     test_handle_readable_header_overflow_431();
-    test_handle_readable_oversized_header_value_431();
+    test_handle_readable_long_header_value_is_not_capped();
     test_handle_readable_embedded_nul_in_path_400();
     test_handle_readable_large_body_grows_buffer();
     test_handle_readable_body_too_large_413();

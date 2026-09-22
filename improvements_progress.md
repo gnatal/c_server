@@ -1094,3 +1094,214 @@ than advertised:
 The `last_len` incremental-resume half of `improvements.md`'s suggested fix, and P9 (pipelining, which
 depends on it), remain open — not gaps this work introduced, the larger, PROJECTED-only part of P2's own
 fix list that this entry did not attempt, per the scoping above.
+
+---
+
+## P3 · Headers are copied into fixed arrays inside a 19 KB `Request`
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+`improvements.md`'s fix had three parts: keep `struct phr_header`-style views into the input buffer
+instead of copying every header, materialize a NUL-terminated value lazily on first `req_get_header`,
+and parse cookies and query strings lazily too. The header-view half and the cookie half were done in
+full; the query half was deliberately not attempted (see Deliberately scoped down) — query storage is a
+small fraction of `Request`'s size and S6 already requires validating every query value for an embedded
+NUL at parse time regardless of whether a handler ever reads it, so there is no CPU to save by deferring
+it, only bytes in an already-small array.
+
+- **Header storage (`lib/app_types.h`: `Request.headers`).** Replaced `header_names[MAX_HEADERS][64]` +
+  `header_values[MAX_HEADERS][MAX_HEADER_VALUE_LEN]` (32 × 1,088 bytes = 34,816 bytes) with
+  `struct phr_header headers[MAX_HEADERS]` (32 × 32 bytes = 1,024 bytes) — the exact same `phr_header`
+  type `ParsedHead.headers` already held, reused rather than inventing a parallel `HeaderView` type.
+  `name`/`value` point directly into the connection's `in_buf` (or, for a test calling `parse_headers`,
+  into that call's own buffer) and are not NUL-terminated. `MAX_HEADER_VALUE_LEN` (S5's raised 1024-byte
+  per-value cap) is deleted outright: a view has no fixed capacity to overflow, so there is nothing left
+  for it to bound.
+- **Populating the views (`lib/http_parser.c`: `parse_http_request_from_head`).** The old loop's two
+  `copy_bounded` calls per header (one for the name, one for the value, each first checked against its
+  destination array's size and rejected with S5's `-3` if either didn't fit) became a single struct
+  assignment, `req->headers[req->header_count] = head->headers[i]`, run unconditionally since
+  `head->num_headers > MAX_HEADERS` is already rejected with `-1` earlier in the same function (the
+  `req->header_count < MAX_HEADERS` guard is kept anyway, for the loop to stay correct on its own if that
+  invariant ever changes upstream, not because it can currently be tripped).
+- **Retiring S5's `-3` (`lib/http_parser.c`, `lib/http_parser.h`, `lib/connection.c`).** Since a view has
+  no per-header size limit, the code path that used to produce `-3` (→ 431) is gone — `parse_http_request`/
+  `parse_http_request_from_head` never return it any more. The numeric value is not reused for anything
+  else (documented in `http_parser.h` as "retired... kept reserved, not reused, so old caller code
+  branching on it is merely dead, never wrong") and `connection.c`'s `handle_readable` dropped the
+  `parse_status == -3 ? 431` branch from its status-mapping ternary rather than leave dead code behind.
+  This is the "proper fix" `improvements.md`'s own S5 entry predicted ("S5 is solved properly only by
+  P3"): a header of any length that fits within the pre-existing whole-header-block cap (`BUF_SIZE`, 8
+  KiB, unrelated to this change and unchanged) is now accepted and returned in full, superseding S5's
+  interim fix of simply raising the fixed-size cap from 255 to 1024 bytes.
+- **Lazy materialization (`lib/http_parser.c`: `req_get_header`).** Rewritten to scan `req->headers` for
+  a length-and-case-insensitive name match directly against the view (no NUL-termination needed for
+  comparison, since both sides have explicit lengths), and only on a match, `arena_alloc`s
+  `value_len + 1` bytes and copies the value into it, NUL-terminated. Not cached: a handler reads a given
+  header at most a handful of times per request, so re-copying a few dozen bytes from the arena each call
+  costs less than a cache field (and the invalidation rule it would need) would. Requires
+  `req->arena != NULL` (see below); returns `NULL` without allocating otherwise, matching "absent" rather
+  than crashing on a `Request` no parse function ever populated.
+- **`Request.arena` (`lib/app_types.h`), new field.** Set by `reset_request` (called from both
+  `parse_http_request_from_head` and `parse_http_request`'s early-malformed path, so it's always set
+  after any parse attempt, success or not) to the same `Arena *` `req->body` is allocated from.
+  `req_get_header` and `req_get_cookie` (below) use it to materialize NUL-terminated strings out of the
+  views/lazy split. A `Request` a test builds and fills entirely by hand (never passed through a parse
+  function) has `arena == NULL` from whatever initializer the test used (`memset(0)` in every case this
+  entry touched) — `req_get_header` returns `NULL` in that case rather than dereferencing it.
+- **Lazy cookie splitting (`lib/http_parser.c`: `req_get_cookie`, `lib/app_types.h`:
+  `Request.cookies_parsed`).** `parse_http_request_from_head` no longer calls
+  `parse_cookies(req_get_header(req, "Cookie"), req)` itself for every request. Instead,
+  `req_get_cookie`'s first call for a given request runs it (`parse_cookies(req_get_header(req, "Cookie"),
+  mutable_req)`, then sets `cookies_parsed = 1`); every later call for the same request just scans the
+  already-populated `cookie_names`/`cookie_values` arrays. This is a mutable-cache-through-a-const-pointer
+  idiom — `req_get_cookie` takes `const Request *req` but casts it back to `Request *` to write
+  `cookie_count`/`cookies_parsed`, which is well-defined in C precisely because the underlying `Request`
+  object was never actually declared `const` (it's a stack local in `handle_readable`, or a test's own
+  variable); only the accessor's *parameter* type is `const`, the same shallow-const situation the
+  pre-existing `Request.body`/`arena` pointer fields already relied on. Cookie *storage* itself
+  (`cookie_names[MAX_COOKIES][64]`/`cookie_values[MAX_COOKIES][256]`, ~5 KB) is unchanged — only *when*
+  the split runs moved, from "every request" to "only a request whose handler actually asks for a
+  cookie."
+- **`parse_headers` (`lib/http_parser.c`/`.h`), the standalone `void` component parser `tests/` calls
+  directly (not on the live request path).** Changed the same way as the live path for consistency and
+  because it was little extra work once the view type existed: it now takes an `Arena *` parameter (its
+  signature was `void parse_headers(const char *header_block, Request *req)`, now
+  `..., Arena *arena)`) and stores views into `header_block` instead of copying into fixed arrays. This
+  is a genuine, if incidental, second fix: `parse_headers` used to be the one place in the codebase
+  documented as "still truncating" (it had no error path to signal a `-3`-style rejection through, being
+  `void`) — with views instead of copies, there is nothing left for it to truncate either, so that
+  caveat is gone, not just narrowed.
+
+**Deliberately scoped down**, matching the S1–S7/P1/P2 precedent of narrowing rather than silently doing
+less than advertised:
+- **Query strings stay eager, fixed-size copies (`req->query_names`/`query_values`, ~2 KB) — not made
+  lazy.** `improvements.md`'s P3 fix list also said "parse query strings... on first access," but S6
+  requires every query name/value to be percent-decoded and checked for an embedded NUL *at parse time*,
+  rejecting the whole request with 400 before a handler ever runs if one is found — deferring the actual
+  decode to first access would mean either doing the decode twice (once to validate, once lazily to
+  store) or weakening S6's "reject before the handler sees it" guarantee to "reject only if the handler
+  happens to read that field," neither of which is what P3 was asking for. Since the array itself is
+  small regardless of when it's filled (2 KB, versus headers' pre-P3 34,816 bytes), there was no size win
+  available here to chase, only a CPU one that S6 already forecloses. `req->query` (the raw, undecoded
+  text after `?`) was already an eager, unconditional copy before this and stays that way — it's a public
+  `Request` field applications read directly, not something behind an accessor that could be made lazy.
+- **Path parameters (`param_names`/`param_values`, ~1 KB) are untouched.** They aren't filled by the
+  parser at all (`match_route` fills them after routing, from the already-decoded `req->path`), so they
+  were never part of the "copied eagerly whether or not the handler reads them" problem `improvements.md`
+  described — a request either matches a parameterized route, in which case the params are the whole
+  reason the route matched, or it doesn't, in which case `param_count` is 0 and nothing was copied.
+- **A cookie's own value, once split, can still be truncated to its fixed 255-byte slot.** Making the
+  *raw* `Cookie:` header line uncapped (it's a view like every other header now) does not extend to the
+  arrays `parse_cookies` splits it into — that's the same pre-existing gap `lib/CLAUDE.md`'s "Known gaps"
+  already documented for S5 (a single very long session-token cookie among several shorter ones can be
+  truncated even though the header line as a whole fits), carried forward unchanged, not newly introduced
+  or newly fixed by this entry.
+- **`sizeof(Request)` is 9,792 bytes (`make bench`), not the "~1–2 KB" `improvements.md` speculated.**
+  Headers went from 34,816 to 1,024 bytes as intended, but `cookie_names`/`cookie_values` (~5 KB) and
+  `query_names`/`query_values`/`param_names`/`param_values` (~3 KB) are unchanged fixed-size arrays, per
+  the scoping above — they account for the remaining bulk. A further reduction there would need the same
+  view treatment this entry gave headers, deliberately not attempted now.
+
+**Tests and results.**
+
+- Every test file that called the old fixed-array fields or the old `parse_headers(block, req)` two-
+  argument signature needed updating (not new behavior on its own, but required for the suite to compile
+  against the new `Request` layout — the S1–S7/P1/P2 precedent's own tests all needed the same kind of
+  mechanical update when `Request`/`Connection` fields changed shape):
+  - `tests/test_http_parser.c`: all 7 `parse_headers` call sites updated to the 3-argument form (`&req,
+    &test_arena`); the "no Cookie header" case (`test_parse_http_request`) now forces the lazy cookie
+    parse via an explicit `req_get_cookie` call before asserting `cookie_count == 0`, since that count
+    reads 0 from `reset_request` regardless of whether anything has actually run the split yet — asserting
+    it without first triggering the lazy path would prove nothing about cookie parsing, just about the
+    reset default.
+  - `tests/test_http_hardening.c`: `parse_headers` call sites updated the same way.
+    `test_header_value_whitespace_and_limits`'s old assertion that a 1,100-character header name/value
+    was truncated to `req.header_names[0]`/`header_values[0]`'s old fixed sizes was rewritten as
+    `test_parse_http_request_header_views_are_not_capped`-style round-trip assertions instead (materialize
+    the view's exact 100-char name via `memcpy`, since a view isn't NUL-terminated, then confirm
+    `req_get_header` returns the full un-truncated value for it). The old
+    `test_parse_http_request_rejects_oversized_header_431` (asserted `-3` for an oversized name/value) was
+    renamed `test_parse_http_request_header_views_are_not_capped` and rewritten to assert `0` (success)
+    and an exact, uncut round-trip through `req_get_header` for the same oversized name/value inputs —
+    the same request shapes, the opposite, now-correct expectation.
+  - `tests/test_connection.c`: added `#include "http_parser.h"` (needed for `req_get_header`, not
+    previously included since no handler in this file had called an accessor before) and a new
+    `auth_header_len_handler` (reflects `req_get_header(req, "Authorization")`'s length into the response
+    body, the same pattern as the pre-existing `echo_len_handler`). The old
+    `test_handle_readable_oversized_header_value_431` (a 1,100-char `Authorization` value, asserted 431)
+    was renamed `test_handle_readable_long_header_value_is_not_capped` and rewritten to register
+    `auth_header_len_handler`, assert `200 OK` with the exact expected length in the body
+    (`"auth len=1107"`), and assert the connection is *not* closed (keep-alive, not rejected) — exercising
+    the fix end to end through the real `handle_readable` path, the same shape S1–S6's own end-to-end
+    tests use, not just the pure-parser layer.
+  - `tests/bench_hotpath.c`: added `handler_reads_cookie_and_header` (calls `req_get_cookie` +
+    `req_get_header`, discards both) and a matching request/route (`/cookie-check`) so `make bench`
+    reports both ends of the laziness trade-off — the common case (a handler that never reads a cookie)
+    and the "worst case" (one that reads both) — rather than only the faster number, which would have
+    been true but incomplete on its own.
+- `make test`: all 13 suites pass.
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan — meaningful
+  here specifically because `req->headers` now holds pointers into `in_buf`/a caller's buffer that
+  outlive the `ParsedHead` they were copied from, the exact kind of dangling-pointer-shaped change a
+  sanitizer run is well-suited to catch; it found nothing.
+- `make fuzz FUZZ_ITERS=300000`: clean (40,522 parsed, 43,650 complete) — `fuzz_parser.c` already calls
+  `req_get_header`/`req_get_query`/`req_get_cookie` after every successful parse, so this exercises the
+  view-materialization and lazy-cookie paths against mutated, adversarial input, not just the hand-written
+  test cases above.
+- `make check-docs`: passes (124 engine functions covered — `parse_headers`'s signature changed but its
+  name didn't, so no new/removed entries were needed; `lib/API.md` updated to show the 3-argument form and
+  to note headers have no length cap and cookies split lazily).
+- Compiled `lib/http_parser.c`, `lib/connection.c`, `lib/app_types.h` (transitively) with the project's
+  `-Wall -Wextra -std=c11 -O2` flags: no new warnings.
+- **`make bench` (Apple M3 Pro, gcc-16 -O2, 22 Sep 2026, three runs for stability):**
+  `sizeof(Request)`: **43,576 → 9,792 bytes (−77.5%)**. Per-request CPU: minimal GET ~160 ns (was 180),
+  browser-shaped GET (10 headers, cookies, query; handler never reads either) ~380–420 ns (was 514,
+  **MEASURED ≈ −22 to −26%**), JSON POST ~190–210 ns (was 235), 404 ~165–180 ns (was 180). The same
+  browser-shaped request against a handler that *does* call `req_get_cookie` + `req_get_header` (the
+  "worst case," added to `bench_hotpath.c` specifically to report this honestly rather than only the
+  faster number) measured ~460–500 ns — still faster than the pre-P3 514 ns baseline, since header
+  storage itself got cheaper independent of whether a handler reads one, though by a smaller margin than
+  the common case. `improvements.md`'s own PROJECTED figure for P3 was "a further ~200 ns (browser-shaped)"
+  on top of P2's gains; the measured ~100–130 ns reduction here is smaller than that projection but in the
+  same direction and of the same order of magnitude — the PROJECTED number was arithmetic on the
+  components measured for P3 in isolation ("about 240 ns of the 538 ns... is copying and decoding"), not
+  an end-to-end rebuild-and-measure, so some divergence from a real measurement is expected (the same
+  caveat `improvements.md`'s own "How to read the gains" table attaches to every PROJECTED figure).
+- **Live end-to-end verification against `examples/todo_sqlite`'s demo** (`QUIET=1`, rebuilt against the
+  fresh `libcexpress.a`; a stale `SO_REUSEPORT` worker from an earlier, pre-fix build left running on the
+  same port during the first pass of this verification produced a misleading 431 for exactly one test
+  case before it was noticed and killed — a reminder that `SO_REUSEPORT` will silently load-balance a
+  fresh client onto an old, un-rebuilt worker process, not a finding about the fix itself; re-run against
+  a clean process tree after `pkill`ing every stale `cexpress_demo`):
+  - `GET /ping`: 200. `GET /api/todos` with `Authorization: Bearer my-secret-api-key`: 200 (ordinary
+    request-path regression check, unaffected).
+  - A 1,100-character `Authorization: Bearer <token>` value (past the old, now-deleted 1024-byte cap):
+    **200**, not 431 — the exact MEASURED problem `improvements.md`'s S5 entry described, now provably
+    fixed at the storage layer rather than papered over with a bigger cap. A 5,000-character value (an
+    order of magnitude past the old cap, still comfortably under the unrelated whole-header-block 8 KiB
+    cap): also 200, confirming there is genuinely no per-header cap left, not just a bigger one.
+  - `POST /api/todos` with the *correct* API key (short, ordinary length): 201, unaffected. `POST
+    /api/todos` with a 1,100-character *wrong* key: 401 — confirming the long value materialized by
+    `req_get_header` is the real, exact, correctly-received bytes (not, say, always comparing "long
+    enough" as a match, or corrupting the comparison) — `mw_authenticate`'s constant-time comparison
+    correctly rejects a wrong key of the same unusual length as a right one.
+  - A request with a `Cookie` header the handler never reads (`GET /api/todos` with `Cookie:
+    session=abc123; theme=dark` alongside the `Authorization` header): 200, confirming the lazy-cookie
+    change doesn't disturb a request that happens to carry cookies without using them.
+  - `GET /static/style.css%00.png` (S6's regression shape, unrelated to this fix but re-checked since it
+    also flows through `parse_http_request_from_head`): still 400, confirming S6 wasn't disturbed by the
+    header/cookie storage change next to it.
+  - Two sequential requests over one keep-alive connection (`curl` given two URLs on one invocation):
+    both 200, confirming request-to-request state (`cookies_parsed`, `header_count`, the views themselves)
+    doesn't leak or dangle across keep-alive reuse of the same connection/arena.
+
+**Status:** Fixed for the two parts of `improvements.md`'s fix list that carried the measured problem —
+header views (no copy, no per-header size cap, S5's `-3` retired) and lazy cookie splitting. Lazy query
+parsing was deliberately not attempted, per the scoping above (S6's eager-validation requirement forecloses
+the CPU win, and the array itself was never the size problem headers were). `sizeof(Request)` landed at
+9,792 bytes, well short of `improvements.md`'s "~1–2 KB" speculation but still a 77.5% reduction — the
+remaining bulk is cookie/query/param storage, unchanged fixed-size arrays out of this entry's scope, not a
+shortfall in the header-view work itself.

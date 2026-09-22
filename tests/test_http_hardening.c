@@ -122,20 +122,21 @@ static void test_wants_close_header_forms(void) {
     strncpy(req.version, "HTTP/1.1", sizeof(req.version) - 1);
 
     /* Regression: "Connection:close" (no space) used to be missed by a substring search. */
-    parse_headers("Connection:close\r\n", &req);
+    parse_headers("Connection:close\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 1);
-    parse_headers("connection: CLOSE\r\n", &req);
+    parse_headers("connection: CLOSE\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 1);
-    parse_headers("Connection: keep-alive, Upgrade\r\n", &req);
+    parse_headers("Connection: keep-alive, Upgrade\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 0);
-    parse_headers("Connection: upgrade, close\r\n", &req);
+    parse_headers("Connection: upgrade, close\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 1);
     /* Only a real Connection header counts, not one quoted inside another header's value. */
-    parse_headers("X-Debug: Connection: close\r\n", &req);
+    parse_headers("X-Debug: Connection: close\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 0);
     /* Token match, not substring: "closed" is not "close". */
-    parse_headers("Connection: closed-form\r\n", &req);
+    parse_headers("Connection: closed-form\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 0);
+    arena_reset(&test_arena);
 }
 
 static void test_request_line_limits(void) {
@@ -205,18 +206,16 @@ static void test_header_value_whitespace_and_limits(void) {
     memset(&req, 0, sizeof(req));
 
     /* Optional whitespace (spaces and tabs) around the value is trimmed on both sides. */
-    parse_headers("A:   spaced   \r\nB:\ttabbed\t\r\nC:x y  z\r\n", &req);
+    parse_headers("A:   spaced   \r\nB:\ttabbed\t\r\nC:x y  z\r\n", &req, &test_arena);
     assert(strcmp(req_get_header(&req, "A"), "spaced") == 0);
     assert(strcmp(req_get_header(&req, "B"), "tabbed") == 0);
     assert(strcmp(req_get_header(&req, "C"), "x y  z") == 0);
+    arena_reset(&test_arena);
 
-    /* parse_headers (unlike parse_http_request, S5) has no way to signal an error - it's a `void`
-     * component parser exposed for tests, not called from the live request path (that path duplicates
-     * this loop inline in parse_http_request so it can return -3 instead). It still truncates
-     * silently to whatever the array holds, so an over-long name or value is still truncated to its
-     * slot, still NUL-terminated - the value here (1100 chars) exceeds the raised MAX_HEADER_VALUE_LEN
-     * (1024) that a Bearer JWT or long cookie would now fit under; see
-     * test_parse_http_request_rejects_oversized_header_431 below for the production 431 behavior. */
+    /* P3: parse_headers stores views into header_block now, the same as the live request path
+     * (parse_http_request_from_head) - there is no fixed-size slot left to truncate into, so a header
+     * name or value far past the old 255/1024-byte caps round-trips through req_get_header exactly,
+     * uncut. header_block must outlive the req_get_header call below (it does: it's a local array). */
     char big[2048];
     int n = 0;
     for (int i = 0; i < 100; i++) big[n++] = 'N';
@@ -225,47 +224,64 @@ static void test_header_value_whitespace_and_limits(void) {
     big[n++] = '\r';
     big[n++] = '\n';
     big[n] = '\0';
-    parse_headers(big, &req);
+    parse_headers(big, &req, &test_arena);
     assert(req.header_count == 1);
-    assert(strlen(req.header_names[0]) == sizeof(req.header_names[0]) - 1);
-    assert(strlen(req.header_values[0]) == sizeof(req.header_values[0]) - 1);
+    /* req.headers[0].name is a view, not NUL-terminated - materialize it the same way req_get_header
+     * would, just to hand its exact 100-char name to req_get_header as a C string. */
+    char name_buf[128];
+    memcpy(name_buf, req.headers[0].name, req.headers[0].name_len);
+    name_buf[req.headers[0].name_len] = '\0';
+    assert(strlen(name_buf) == 100);
+    const char *value = req_get_header(&req, name_buf);
+    assert(value != NULL && strlen(value) == 1100);
+    arena_reset(&test_arena);
 }
 
-/* S5: parse_http_request (the function actually on the live request path, unlike parse_headers above)
- * rejects an over-long header name or value with -3 instead of silently truncating it - the fix for
- * the exact problem improvements.md measured: a 400-character Bearer token used to be stored as 255
- * characters with a successful (wrong) parse. */
-static void test_parse_http_request_rejects_oversized_header_431(void) {
+/* P3: parse_http_request stores header views into `raw`, not fixed-size copies, so there is no per-
+ * header length left to overflow - the "proper fix" improvements.md's S5 entry predicted ("S5 is solved
+ * properly only by P3"). A header name or value of any length that fits within a complete request round-
+ * trips through req_get_header exactly; parse_http_request no longer returns -3 for this (that return
+ * code is retired, see http_parser.h). */
+static void test_parse_http_request_header_views_are_not_capped(void) {
     Request req;
 
-    /* A value just past the new cap (1024) is rejected: a Bearer token in this range used to be the
-     * silently-truncated case improvements.md measured (at the old, smaller 255-byte cap). */
+    /* A value far past the old 1024-byte cap (a Bearer token in this range used to be the silently-
+     * truncated case improvements.md measured, at the original, smaller 255-byte cap) now parses fine
+     * and round-trips exactly. */
     char oversized_value[1400];
     int n = snprintf(oversized_value, sizeof(oversized_value), "POST /a HTTP/1.1\r\nAuthorization: Bearer ");
-    for (int i = 0; i < 1100; i++) oversized_value[n++] = 'x';
+    const int oversized_len = 1100;
+    for (int i = 0; i < oversized_len; i++) oversized_value[n++] = 'x';
     n += snprintf(oversized_value + n, sizeof(oversized_value) - (size_t)n, "\r\nContent-Length: 0\r\n\r\n");
-    assert(parse_http_request(oversized_value, (size_t)n, &req, &test_arena) == -3);
+    assert(parse_http_request(oversized_value, (size_t)n, &req, &test_arena) == 0);
+    const char *auth1 = req_get_header(&req, "Authorization");
+    assert(auth1 != NULL && strlen(auth1) == strlen("Bearer ") + (size_t)oversized_len);
+    arena_reset(&test_arena);
 
-    /* A value comfortably within the new cap (a realistic ~600-char JWT-shaped token) parses fine and
-     * is NOT truncated - this is the actual compatibility half of the fix, not just the loud-failure
-     * half: JWTs in the 300-1,000 char range improvements.md called out now round-trip exactly. */
+    /* A realistic ~600-char JWT-shaped token, comfortably within even the old cap, is unaffected. */
     char within_cap[1200];
     n = snprintf(within_cap, sizeof(within_cap), "POST /a HTTP/1.1\r\nAuthorization: Bearer ");
     const int token_len = 600;
     for (int i = 0; i < token_len; i++) within_cap[n++] = 'a' + (i % 26);
     n += snprintf(within_cap + n, sizeof(within_cap) - (size_t)n, "\r\nContent-Length: 0\r\n\r\n");
     assert(parse_http_request(within_cap, (size_t)n, &req, &test_arena) == 0);
-    const char *auth = req_get_header(&req, "Authorization");
-    assert(auth != NULL);
-    assert(strlen(auth) == strlen("Bearer ") + (size_t)token_len); /* exact, not truncated */
+    const char *auth2 = req_get_header(&req, "Authorization");
+    assert(auth2 != NULL);
+    assert(strlen(auth2) == strlen("Bearer ") + (size_t)token_len); /* exact, not truncated */
+    arena_reset(&test_arena);
 
-    /* An over-long header NAME is rejected the same way, for the same reason (never silently cut a
-     * header to fit, whichever side of the colon overflows). */
+    /* An over-long header NAME is unaffected the same way, for the same reason. */
     char oversized_name[400];
     n = snprintf(oversized_name, sizeof(oversized_name), "POST /a HTTP/1.1\r\n");
     for (int i = 0; i < 100; i++) oversized_name[n++] = 'N';
     n += snprintf(oversized_name + n, sizeof(oversized_name) - (size_t)n, ": v\r\nContent-Length: 0\r\n\r\n");
-    assert(parse_http_request(oversized_name, (size_t)n, &req, &test_arena) == -3);
+    assert(parse_http_request(oversized_name, (size_t)n, &req, &test_arena) == 0);
+    char name_buf[128];
+    memset(name_buf, 'N', 100);
+    name_buf[100] = '\0';
+    const char *v = req_get_header(&req, name_buf);
+    assert(v != NULL && strcmp(v, "v") == 0);
+    arena_reset(&test_arena);
 }
 
 static void test_percent_decoding_at_boundaries(void) {
@@ -340,7 +356,7 @@ int main(void) {
     test_content_length_is_strict();
     test_request_framing();
     test_request_framing_path_out();
-    test_parse_http_request_rejects_oversized_header_431();
+    test_parse_http_request_header_views_are_not_capped();
     test_wants_close_header_forms();
     test_request_line_limits();
     test_parse_does_not_depend_on_zeroed_request();

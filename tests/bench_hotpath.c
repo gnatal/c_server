@@ -19,6 +19,18 @@ char test_arena_buf[64 * 1024];
 static void handler_ok(const Request *req, Response *res) { (void)req; res_json(res, "{\"ok\":true}"); }
 static void mw_pass(const Request *req, Response *res, MiddlewareChain *chain) { (void)req; (void)res; chain_next(chain); }
 
+/* P3: req_get_cookie/req_get_header (Connection is already read by request_wants_close on every
+ * request regardless of handler, see one_request below) are lazy now - a handler that never calls
+ * them never pays for the split/materialization. handler_ok above is the common case; this one is
+ * the "handler actually reads a cookie and a header" case, run separately below so both ends of that
+ * trade-off are on the record, not just the faster one. */
+static void handler_reads_cookie_and_header(const Request *req, Response *res) {
+    const char *session = req_get_cookie(req, "session");
+    const char *ua = req_get_header(req, "User-Agent");
+    (void)session; (void)ua;
+    res_json(res, "{\"ok\":true}");
+}
+
 static double now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -37,6 +49,14 @@ static const char *BROWSER_GET =
 static const char *POST_JSON =
     "POST /api/todos HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 23\r\n\r\n{\"title\":\"buy the milk\"}";
 static const char *MISS_404 = "GET /nope/nothing/here HTTP/1.1\r\nHost: x\r\n\r\n";
+static const char *BROWSER_GET_COOKIE_ROUTE =
+    "GET /cookie-check?done=true&q=hello%20world HTTP/1.1\r\n"
+    "Host: localhost:8080\r\nConnection: keep-alive\r\n"
+    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36\r\n"
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n"
+    "Accept-Encoding: gzip, deflate, br\r\nAccept-Language: en-US,en;q=0.9\r\n"
+    "Cookie: session=abcdef0123456789; theme=dark; _ga=GA1.1.123456789.1700000000\r\n"
+    "Sec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Dest: empty\r\n\r\n";
 
 /* Same sequence as connection.c: handle_readable (P2: one parse_request_head pass, reused by the
  * completeness check and the full parse, instead of request_is_complete and parse_http_request each
@@ -109,11 +129,13 @@ int main(void) {
     router_patch(&todos, "/:id", handler_ok);
     router_delete(&todos, "/:id", handler_ok);
     app_mount(&app, "/api/todos", &todos);
+    app_get(&app, "/cookie-check", handler_reads_cookie_and_header);
 
     const int n = 500000;
     printf("request path (8 routes, 1 middleware):\n");
     run("  minimal GET (2 headers)", &app, MINIMAL_GET, n);
     run("  browser GET (10 headers, cookies, query)", &app, BROWSER_GET, n);
+    run("  ...same, handler reads a cookie+header", &app, BROWSER_GET_COOKIE_ROUTE, n);
     run("  POST with JSON body", &app, POST_JSON, n);
     run("  404 (no route matches)", &app, MISS_404, n);
 

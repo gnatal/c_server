@@ -36,7 +36,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | S12 | Startup allocations and `exit()` calls in library code | Reliability | Low | S | Errors reach the application | Code reading |
 | P1 | ~~Static and file responses go through slow paths~~ (static-file cache only) | Performance | | M | **PARTIALLY FIXED 2026-09-22**: see `improvements_progress.md` - the `/static` mount's 6.6× gap is closed; `res_send_file`/large-file streaming (item 1's other sub-parts) are untouched | MEASURED |
 | P2 | ~~Request headers are parsed three times~~ | Performance | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - `last_len` incremental resume across separate `recv`s (and P9, which depends on it) are untouched | MEASURED (was PROJECTED from MEASURED parts) |
-| P3 | Headers are copied into fixed 19 KB `Request` arrays | Performance / Memory | | L | A further ~200 ns (browser-shaped); fixes S5 | PROJECTED |
+| P3 | ~~Headers are copied into fixed 19 KB `Request` arrays~~ | Performance / Memory | | L | **FIXED 2026-09-22**: see `improvements_progress.md` - headers are views (S5's `-3`/431 retired) and cookies parse lazily; query parsing left eager, out of scope | MEASURED (was PROJECTED) |
 | P4 | epoll and io_uring issue a syscall on every interest change | Performance | | S | ~5–25% per keep-alive request on Linux | ESTIMATED |
 | P5 | ~~With TLS on, every loop iteration scans the whole connection table~~ | Performance | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
 | P6 | SQLite statements are re-prepared on every call | Performance (demo) | | S | 41% off a list query, 61% off get-by-id | MEASURED |
@@ -110,8 +110,10 @@ record.
 
 ### S5 · ~~Header values over 255 characters are silently truncated~~ (FIXED 2026-09-22)
 **Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record (note: individual
-post-split cookie values and path/query param values remain truncating, per that record). Kept below
-for historical record.
+post-split cookie values and path/query param values remain truncating, per that record). **Superseded
+the same day by P3**, below: once headers became views into the input buffer instead of fixed-size
+copies, the raise-the-cap-and-431 fix here was replaced by "no cap at all" (P3's own record has the
+retirement of the `-3`/431 return code this fix introduced). Kept below for historical record.
 
 **Problem.** `copy_bounded` (`http_parser.c:22`) cuts header values at 255 bytes. Bearer tokens (JWTs are commonly 300–1,000 characters) and long cookies are silently shortened, so a valid `Authorization: Bearer <JWT>` fails comparison, and code that only checks a prefix would accept a wrong token. No error is raised.
 **Measured.** A 400-character header value was stored as 255 characters with a successful parse.
@@ -208,7 +210,10 @@ for historical record.
 **Fix.** Parse once. Have the first pass fill a small `ParsedHead { header_len, content_length, chunked, phr_headers[], num_headers }` stored on the `Connection`, pass `last_len` for incremental resume, and let `parse_http_request` consume that result instead of re-tokenizing.
 **Probable gain.** **PROJECTED** ≈ 300 ns of the 781 ns pure path for a browser-shaped GET (−38%) and ≈ 40 ns of 208 ns for a minimal GET (−20%). End to end the pure path is roughly 1–5% of a `/ping` request (syscalls dominate), so expect low single-digit percent for tiny requests and up to ~10% for header-heavy ones.
 
-### P3 · Headers are copied into fixed arrays inside a 19 KB `Request`
+### P3 · ~~Headers are copied into fixed arrays inside a 19 KB `Request`~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record (note: query-string parsing
+stayed eager, out of scope, per that record). Kept below for historical record.
+
 **Problem.** `parse_http_request` copies every header name/value, the cookies and query pairs into fixed arrays (`Request` is 19,000 bytes; `http_parser.c:282-289`, `parse_cookies`, `parse_query_string`), decoding query strings eagerly whether or not the handler reads them. This is also what causes the 255-character truncation (S5) and the 32-header cap.
 **Measured.** About 240 ns of the 538 ns in `parse_http_request` for the browser-shaped request is copying and decoding beyond the two tokenizer passes.
 **Fix.** Keep `struct phr_header`-style views (`ptr`, `len`) into `in_buf` and materialize NUL-terminated copies lazily in the arena on first `req_get_header` / `req_get_query`. Parse cookies and query strings on first access. `Request` shrinks to ~1–2 KB.

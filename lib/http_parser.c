@@ -281,7 +281,7 @@ int request_is_complete(const char *buf, const size_t len) {
 
 /* ---- request parsing ---- */
 
-static void reset_request(Request *req) {
+static void reset_request(Request *req, Arena *arena) {
     req->method[0] = '\0';
     req->path[0] = '\0';
     req->query[0] = '\0';
@@ -290,13 +290,18 @@ static void reset_request(Request *req) {
     req->query_count = 0;
     req->header_count = 0;
     req->cookie_count = 0;
+    req->cookies_parsed = 0;
     req->content_length = 0;
     req->body = NULL;
+    /* P3: set even on a parse that goes on to fail - req_get_header/req_get_cookie need it to
+     * materialize a value regardless of how far parsing got, and there is no reason to leave it
+     * dangling from whatever a reused stack Request last held. */
+    req->arena = arena;
 }
 
 int parse_http_request_from_head(const char *raw, const size_t raw_len, const ParsedHead *head,
                                  Request *req, Arena *arena) {
-    reset_request(req);
+    reset_request(req, arena);
 
     /* S5/"33rd header": parse_request_head's own phr_parse_request runs with a larger header-array
      * capacity (MAX_FRAMING_HEADERS) than the engine stores (MAX_HEADERS) precisely so a request with
@@ -335,23 +340,19 @@ int parse_http_request_from_head(const char *raw, const size_t raw_len, const Pa
         return -4;
     }
 
+    /* P3: store views (pointers into `raw`), not copies - head->num_headers <= MAX_HEADERS is already
+     * guaranteed by the ">MAX_HEADERS" check above, so this can never truncate; the guard is kept only
+     * so this loop stays correct on its own if that invariant ever changes upstream. There is no longer
+     * a per-header size check (S5's old -3): a view has no fixed capacity to overflow. */
     for (size_t i = 0; i < head->num_headers; i++) {
         if (req->header_count < MAX_HEADERS) {
-            /* S5: a name or value that would not fit is rejected (431), never silently truncated -
-             * copy_bounded used to cut a value at 255 bytes with no error, so a Bearer JWT or a long
-             * cookie header compared unequal to itself with nothing in the response explaining why. */
-            if (head->headers[i].name_len >= sizeof(req->header_names[0]) ||
-                head->headers[i].value_len >= sizeof(req->header_values[0])) {
-                return -3;
-            }
-            copy_bounded(req->header_names[req->header_count], sizeof(req->header_names[0]),
-                        head->headers[i].name, head->headers[i].name_len);
-            copy_bounded(req->header_values[req->header_count], sizeof(req->header_values[0]),
-                        head->headers[i].value, head->headers[i].value_len);
+            req->headers[req->header_count] = head->headers[i];
             req->header_count++;
         }
     }
-    parse_cookies(req_get_header(req, "Cookie"), req);
+    /* Cookie splitting is lazy now (P3): req_get_cookie runs parse_cookies itself, once, the first
+     * time a handler actually asks for a cookie by name - most requests that carry a Cookie header
+     * are never asked for one. */
 
     if (head->content_length < 0) {
         req->content_length = head->content_length;
@@ -392,23 +393,23 @@ int parse_http_request(const char *raw, const size_t raw_len, Request *req, Aren
     ParsedHead head;
     parse_request_head(raw, raw_len, &head);
     if (head.header_len == 0) {
-        reset_request(req);
+        reset_request(req, arena);
         return -1;
     }
     return parse_http_request_from_head(raw, raw_len, &head, req, arena);
 }
 
-void parse_headers(const char *header_block, Request *req) {
+void parse_headers(const char *header_block, Request *req, Arena *arena) {
     struct phr_header headers[MAX_HEADERS];
     size_t num_headers = MAX_HEADERS;
     int res = phr_parse_headers(header_block, strlen(header_block), headers, &num_headers, 0);
     if (res == -1) return;
-    
+
     req->header_count = 0;
+    req->arena = arena;
     for (size_t i = 0; i < num_headers; i++) {
         if (req->header_count < MAX_HEADERS) {
-            copy_bounded(req->header_names[req->header_count], sizeof(req->header_names[0]), headers[i].name, headers[i].name_len);
-            copy_bounded(req->header_values[req->header_count], sizeof(req->header_values[0]), headers[i].value, headers[i].value_len);
+            req->headers[req->header_count] = headers[i];
             req->header_count++;
         }
     }
@@ -416,9 +417,23 @@ void parse_headers(const char *header_block, Request *req) {
 
 
 const char *req_get_header(const Request *req, const char *name) {
+    if (req->arena == NULL) {
+        return NULL;
+    }
+    const size_t name_len = strlen(name);
     for (int i = 0; i < req->header_count; i++) {
-        if (strcasecmp(req->header_names[i], name) == 0) {
-            return req->header_values[i];
+        if (req->headers[i].name_len == name_len &&
+            strncasecmp(req->headers[i].name, name, name_len) == 0) {
+            /* Materialize a NUL-terminated copy of the view every call - not cached. A handler reads a
+             * given header at most a handful of times per request, so re-copying a few dozen bytes from
+             * the arena each time costs less than a cache field (and its invalidation rules) would. */
+            char *value = arena_alloc(req->arena, req->headers[i].value_len + 1);
+            if (value == NULL) {
+                return NULL;
+            }
+            memcpy(value, req->headers[i].value, req->headers[i].value_len);
+            value[req->headers[i].value_len] = '\0';
+            return value;
         }
     }
     return NULL;
@@ -453,6 +468,17 @@ void parse_cookies(const char *cookie_header, Request *req) {
 }
 
 const char *req_get_cookie(const Request *req, const char *name) {
+    if (!req->cookies_parsed) {
+        /* P3: split the Cookie header on first access instead of on every parsed request - a mutable-
+         * through-const-pointer cache, the same idiom req->arena-backed materialization above relies on
+         * implicitly: req is never actually const-qualified at its point of definition (a stack local in
+         * handle_readable, or a test's own Request), only the parameter type here is, so writing through
+         * a cast-away-const pointer to it is well-defined C, not the "modifying a truly const object" UB
+         * case. */
+        Request *mutable_req = (Request *)req;
+        parse_cookies(req_get_header(req, "Cookie"), mutable_req);
+        mutable_req->cookies_parsed = 1;
+    }
     for (int i = 0; i < req->cookie_count; i++) {
         if (strcmp(req->cookie_names[i], name) == 0) {
             return req->cookie_values[i];

@@ -78,25 +78,25 @@ static void test_request_wants_close(void) {
     /* Explicit Connection: close */
     memset(&req, 0, sizeof(req));
     strncpy(req.version, "HTTP/1.1", sizeof(req.version) - 1);
-    parse_headers("Host: localhost\r\nConnection: close\r\n", &req);
+    parse_headers("Host: localhost\r\nConnection: close\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 1);
 
     /* Explicit Connection: keep-alive overrides HTTP/1.0 */
     memset(&req, 0, sizeof(req));
     strncpy(req.version, "HTTP/1.0", sizeof(req.version) - 1);
-    parse_headers("Host: localhost\r\nConnection: keep-alive\r\n", &req);
+    parse_headers("Host: localhost\r\nConnection: keep-alive\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 0);
 
     /* HTTP/1.1 default without Connection header is keep-alive */
     memset(&req, 0, sizeof(req));
     strncpy(req.version, "HTTP/1.1", sizeof(req.version) - 1);
-    parse_headers("Host: localhost\r\n", &req);
+    parse_headers("Host: localhost\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 0);
 
     /* HTTP/1.0 default without Connection header is close */
     memset(&req, 0, sizeof(req));
     strncpy(req.version, "HTTP/1.0", sizeof(req.version) - 1);
-    parse_headers("Host: localhost\r\n", &req);
+    parse_headers("Host: localhost\r\n", &req, &test_arena);
     assert(request_wants_close(&req) == 1);
 
     /* Non-HTTP/1.1 version defaults to close */
@@ -187,9 +187,13 @@ static void test_parse_http_request(void) {
     assert(req_get_cookie(&req, "missing") == NULL);
     arena_reset(&test_arena);
 
-    /* No Cookie header at all -> zero parsed cookies, not a parse error. */
+    /* No Cookie header at all -> zero parsed cookies, not a parse error. Cookie splitting is lazy
+     * (P3): req.cookie_count reads 0 immediately after parsing regardless (nothing has run yet), so
+     * force the lazy parse via req_get_cookie first to actually exercise the "absent Cookie header"
+     * path through parse_cookies, not just an unparsed default. */
     const char *raw_no_cookies = "GET /profile HTTP/1.1\r\nHost: localhost\r\n\r\n";
     assert(parse_http_request(raw_no_cookies, strlen(raw_no_cookies), &req, &test_arena) == 0);
+    assert(req_get_cookie(&req, "session") == NULL);
     assert(req.cookie_count == 0);
     arena_reset(&test_arena);
 
@@ -543,12 +547,12 @@ static void test_parse_headers(void) {
     memset(&req, 0, sizeof(req));
 
     /* Empty header block yields zero headers */
-    parse_headers("", &req);
+    parse_headers("", &req, &test_arena);
     assert(req.header_count == 0);
     assert(req_get_header(&req, "Host") == NULL);
 
     /* Basic Name: value pairs, leading space after ':' trimmed */
-    parse_headers("Host: example.com\r\nContent-Type: application/json\r\n", &req);
+    parse_headers("Host: example.com\r\nContent-Type: application/json\r\n", &req, &test_arena);
     assert(req.header_count == 2);
     assert(strcmp(req_get_header(&req, "Host"), "example.com") == 0);
     assert(strcmp(req_get_header(&req, "Content-Type"), "application/json") == 0);
@@ -558,7 +562,7 @@ static void test_parse_headers(void) {
     assert(strcmp(req_get_header(&req, "CONTENT-TYPE"), "application/json") == 0);
 
     /* A value with no leading space after ':' is still captured as-is */
-    parse_headers("X-Flag:on\r\n", &req);
+    parse_headers("X-Flag:on\r\n", &req, &test_arena);
     assert(strcmp(req_get_header(&req, "X-Flag"), "on") == 0);
 }
 
