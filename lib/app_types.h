@@ -11,6 +11,7 @@
 #include <time.h>
 #include <limits.h>
 #include "arena.h"
+#include "vendor/picohttpparser/picohttpparser.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -24,6 +25,13 @@
 #define MAX_PARAMS 8                  /* path params per request (name/value 63 chars) */
 #define MAX_QUERY_PARAMS 16           /* name/value 63 chars, percent- and '+'-decoded */
 #define MAX_HEADERS 32                /* request headers kept (name 63 chars, value MAX_HEADER_VALUE_LEN) */
+#define MAX_FRAMING_HEADERS 100       /* ParsedHead's phr_parse_request capacity (P2): kept above MAX_HEADERS
+                                        * so a request with more headers than the engine stores is diagnosed
+                                        * by parse_http_request_from_head's explicit ">MAX_HEADERS" check as
+                                        * malformed (400), not mis-reported as "incomplete" by
+                                        * request_head_is_complete's header_len == 0 check (which a smaller
+                                        * capacity would trip via phr_parse_request's own internal error -
+                                        * see S8's known gap in lib/CLAUDE.md, which this must not widen) */
 #define MAX_HEADER_VALUE_LEN 1024      /* single request header value cap (S5); over this (or over the 63-char
                                         * name cap) is 431, never silently truncated - raised from the original
                                         * 255 because bearer JWTs and long cookies commonly run 300-1,000 chars */
@@ -124,6 +132,31 @@ typedef struct {
     char field_values[MAX_FORM_FIELDS][256];
     int field_count;
 } UrlEncodedForm;
+
+/*
+ * One phr_parse_request pass over a raw buffer, cached for reuse (P2, http_parser.h). Before this
+ * existed, handle_readable's per-request hot path ran up to four independent phr_parse_request /
+ * request_framing passes over the same bytes: the body-limit check (S4), the completeness check, and
+ * parse_http_request's own top-level parse plus its internal second request_framing call. Filling one
+ * of these once and passing it to parse_http_request_from_head / request_head_is_complete / the body-
+ * limit check collapses that to one.
+ * header_len == 0 means headers are still incomplete (or malformed - distinguished only by the
+ * function's own return value, mirroring request_framing's pre-existing contract); every other field
+ * is then not meaningful. method/path point into the buffer that was parsed, not a copy - valid only
+ * as long as that buffer is unchanged.
+ */
+typedef struct {
+    size_t header_len;
+    const char *method;
+    size_t method_len;
+    const char *path;
+    size_t path_len;
+    int minor_version;
+    struct phr_header headers[MAX_FRAMING_HEADERS];
+    size_t num_headers;
+    int content_length;      /* request_framing's code: 0 absent/zero, >0 value, -1 malformed/conflicting, -2 oversized */
+    int chunked;
+} ParsedHead;
 
 /* ---- connection and event loop ---- */
 

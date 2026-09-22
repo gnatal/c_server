@@ -38,6 +38,35 @@
 int parse_http_request(const char *raw, size_t raw_len, Request *req, Arena *arena);
 
 /*
+ * parse_request_head: runs phr_parse_request once over buf[0..len) and fills head with the raw
+ * tokenization (method/path/headers) and the framing verdict (content-length/chunked, same codes
+ * request_framing returns) so a caller that needs more than one of those - the body-limit check, the
+ * completeness check, the full parse - doesn't pay for its own pass over the same bytes (P2).
+ * head->header_len == 0 means incomplete or malformed (distinguished only by this function's return
+ * value, exactly as request_framing already worked): every other field is then not meaningful.
+ * request_framing and request_is_complete are now thin wrappers over this plus request_head_is_complete;
+ * they keep their own signatures for existing callers and are unaffected in behavior.
+ */
+int parse_request_head(const char *buf, size_t len, ParsedHead *head);
+
+/*
+ * request_head_is_complete: the request_is_complete logic against an already-parsed head instead of
+ * re-parsing (P2). head must come from parse_request_head over buf[0..len). Same return convention as
+ * request_is_complete.
+ */
+int request_head_is_complete(const ParsedHead *head, const char *buf, size_t len);
+
+/*
+ * parse_http_request_from_head: the population half of parse_http_request, given an already-parsed
+ * head (parse_request_head) instead of re-running phr_parse_request/request_framing on the same bytes
+ * (P2). head->header_len must be > 0 (the caller already confirmed headers are complete, e.g. via
+ * request_head_is_complete). Same return codes, ownership and limits as parse_http_request, which is
+ * now a thin wrapper: parse_request_head + this.
+ */
+int parse_http_request_from_head(const char *raw, size_t raw_len, const ParsedHead *head, Request *req,
+                                 Arena *arena);
+
+/*
  * request_framing: locate the header block and decide how the body is framed.
  *   *header_len_out = bytes up to and including "\r\n\r\n", or 0 if headers are incomplete.
  *   *chunked_out    = 1 for "Transfer-Encoding: chunked".

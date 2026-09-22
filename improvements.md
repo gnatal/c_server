@@ -35,7 +35,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | S11 | Bare `\n` and substring `chunked` accepted (smuggling ambiguity) | Security | Low | S | Removes proxy desync ambiguity | Code reading + MEASURED (bare LF) |
 | S12 | Startup allocations and `exit()` calls in library code | Reliability | Low | S | Errors reach the application | Code reading |
 | P1 | ~~Static and file responses go through slow paths~~ (static-file cache only) | Performance | | M | **PARTIALLY FIXED 2026-09-22**: see `improvements_progress.md` - the `/static` mount's 6.6× gap is closed; `res_send_file`/large-file streaming (item 1's other sub-parts) are untouched | MEASURED |
-| P2 | Request headers are parsed three times | Performance | | M | ~300 ns of 781 ns pure path (browser-shaped); ~40 of 208 ns (minimal) | PROJECTED from MEASURED parts |
+| P2 | ~~Request headers are parsed three times~~ | Performance | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - `last_len` incremental resume across separate `recv`s (and P9, which depends on it) are untouched | MEASURED (was PROJECTED from MEASURED parts) |
 | P3 | Headers are copied into fixed 19 KB `Request` arrays | Performance / Memory | | L | A further ~200 ns (browser-shaped); fixes S5 | PROJECTED |
 | P4 | epoll and io_uring issue a syscall on every interest change | Performance | | S | ~5–25% per keep-alive request on Linux | ESTIMATED |
 | P5 | ~~With TLS on, every loop iteration scans the whole connection table~~ | Performance | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
@@ -192,7 +192,11 @@ writes, `sendfile(2)` for large files, `realpath` caching for the resolve step, 
 **Fix.** (1) A small-file cache: on first request, read files up to a size cap (say 256 KB each, 64 MB total) into memory with their mtime; revalidate with `stat` at most once per second per file; serve with `res_send_bytes`. (2) Build head and body into one buffer (or use `writev`) so one segment leaves. (3) For large files use `sendfile(2)` (plain sockets) instead of `read`+`write`, and stream instead of reading the whole file in `static_serve_file`. (4) Resolve and cache the `realpath` result per file. (5) Emit `ETag`/`Last-Modified` and answer `If-None-Match`/`If-Modified-Since` with 304.
 **Probable gain.** **MEASURED 3.8×** for a small file (66k → 250k req/s); the `/static` mount is 6.6× below the in-memory path (37.6k vs 250k), so a cache there is PROJECTED at up to ~6× for small files. For large files the gain is memory (50 MiB → 16 KiB per request) and no event-loop stalls (ESTIMATED). 304 responses also cut bytes on the wire.
 
-### P2 · Request headers are parsed three times
+### P2 · ~~Request headers are parsed three times~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record (note: `last_len` incremental
+resume across separate `recv`s, and P9 which depends on it, are untouched, per that record). Kept below
+for historical record.
+
 **Problem.** For every request `handle_readable` calls `request_is_complete`, which runs `request_framing` (a full `phr_parse_request`, `http_parser.c:80`); then `parse_http_request` runs `phr_parse_request` again (`:259`) and then `request_framing` again (`:296`). On a request that arrives in several `recv`s the first pass repeats each time. picohttpparser has an incremental mode (`last_len`) that is never used (always `0`).
 **Measured** (`make bench`-style harness, single core):
 

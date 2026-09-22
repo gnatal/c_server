@@ -38,12 +38,17 @@ static const char *POST_JSON =
     "POST /api/todos HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 23\r\n\r\n{\"title\":\"buy the milk\"}";
 static const char *MISS_404 = "GET /nope/nothing/here HTTP/1.1\r\nHost: x\r\n\r\n";
 
-/* Same sequence as connection.c: handle_readable. */
+/* Same sequence as connection.c: handle_readable (P2: one parse_request_head pass, reused by the
+ * completeness check and the full parse, instead of request_is_complete and parse_http_request each
+ * running their own). */
 static void one_request(const App *app_const, const char *raw, const size_t len, Connection *conn) {
     App *app = (App *)app_const;
     Request req;
     req.body = NULL;
-    if (request_is_complete(raw, len) && parse_http_request(raw, len, &req, &test_arena) == 0) {
+    ParsedHead head;
+    parse_request_head(raw, len, &head);
+    if (request_head_is_complete(&head, raw, len) &&
+        parse_http_request_from_head(raw, len, &head, &req, &test_arena) == 0) {
         Response res;
         res_init(&res, conn);
         conn->keep_alive = !request_wants_close(&req);

@@ -90,27 +90,12 @@ static int list_has_token(const char *value, const char *token) {
 
 /* ---- message framing (Content-Length / Transfer-Encoding) ---- */
 
-int request_framing(const char *buf, const size_t len, size_t *header_len_out, int *chunked_out,
-                    const char **path_out, size_t *path_len_out) {
-    *header_len_out = 0;
+/* Shared by parse_request_head: derives the Content-Length / Transfer-Encoding framing verdict from an
+ * already-tokenized header array (P2 - this used to be inlined once in request_framing and duplicated,
+ * differently, a second time inside parse_http_request; now there is exactly one copy). */
+static int compute_content_length_and_chunked(const struct phr_header *headers, const size_t num_headers,
+                                               int *chunked_out) {
     *chunked_out = 0;
-
-    const char *method, *path;
-    size_t method_len, path_len;
-    int minor_version;
-    struct phr_header headers[100];
-    size_t num_headers = 100;
-
-    int res = phr_parse_request(buf, len, &method, &method_len, &path, &path_len,
-                                &minor_version, headers, &num_headers, 0);
-
-    if (res == -2) return 0; // Incomplete
-    if (res == -1) return -1; // Parse error
-
-    *header_len_out = (size_t)res;
-    if (path_out != NULL) *path_out = path;
-    if (path_len_out != NULL) *path_len_out = path_len;
-
     int content_length = 0;
     int has_cl = 0;
 
@@ -150,6 +135,45 @@ int request_framing(const char *buf, const size_t len, size_t *header_len_out, i
 
     if (*chunked_out && has_cl) return -1;
     return content_length;
+}
+
+int parse_request_head(const char *buf, const size_t len, ParsedHead *head) {
+    head->header_len = 0;
+    head->method = NULL;
+    head->method_len = 0;
+    head->path = NULL;
+    head->path_len = 0;
+    head->minor_version = 0;
+    head->content_length = 0;
+    head->chunked = 0;
+    head->num_headers = MAX_FRAMING_HEADERS;
+
+    const int res = phr_parse_request(buf, len, &head->method, &head->method_len, &head->path, &head->path_len,
+                                      &head->minor_version, head->headers, &head->num_headers, 0);
+
+    if (res == -2) return 0; // Incomplete: header_len stays 0
+    if (res == -1) {
+        /* Malformed request line: header_len stays 0 too, distinguished from "incomplete" only by this
+         * return value - mirrors request_framing's pre-existing contract, including its S8 known gap
+         * (request_head_is_complete checks header_len == 0 before this). */
+        head->content_length = -1;
+        return -1;
+    }
+
+    head->header_len = (size_t)res;
+    head->content_length = compute_content_length_and_chunked(head->headers, head->num_headers, &head->chunked);
+    return head->content_length;
+}
+
+int request_framing(const char *buf, const size_t len, size_t *header_len_out, int *chunked_out,
+                    const char **path_out, size_t *path_len_out) {
+    ParsedHead head;
+    const int result = parse_request_head(buf, len, &head);
+    *header_len_out = head.header_len;
+    *chunked_out = head.chunked;
+    if (path_out != NULL) *path_out = head.path;
+    if (path_len_out != NULL) *path_len_out = head.path_len;
+    return result;
 }
 
 
@@ -237,24 +261,27 @@ int request_wants_close(const Request *req) {
 }
 
 
-int request_is_complete(const char *buf, const size_t len) {
-    size_t header_len;
-    int chunked;
-    const int content_length = request_framing(buf, len, &header_len, &chunked, NULL, NULL);
-    if (header_len == 0) return 0;
-    if (content_length < 0) return 1;
+int request_head_is_complete(const ParsedHead *head, const char *buf, const size_t len) {
+    if (head->header_len == 0) return 0;
+    if (head->content_length < 0) return 1;
 
-    const size_t body_have = len - header_len;
-    if (chunked) {
+    const size_t body_have = len - head->header_len;
+    if (head->chunked) {
         size_t decoded_len;
-        return chunked_body_scan(buf + header_len, body_have, MAX_BODY_SIZE, &decoded_len) != 0;
+        return chunked_body_scan(buf + head->header_len, body_have, MAX_BODY_SIZE, &decoded_len) != 0;
     }
-    return body_have >= (size_t)content_length;
+    return body_have >= (size_t)head->content_length;
+}
+
+int request_is_complete(const char *buf, const size_t len) {
+    ParsedHead head;
+    parse_request_head(buf, len, &head);
+    return request_head_is_complete(&head, buf, len);
 }
 
 /* ---- request parsing ---- */
 
-int parse_http_request(const char *raw, const size_t raw_len, Request *req, Arena *arena) {
+static void reset_request(Request *req) {
     req->method[0] = '\0';
     req->path[0] = '\0';
     req->query[0] = '\0';
@@ -265,28 +292,33 @@ int parse_http_request(const char *raw, const size_t raw_len, Request *req, Aren
     req->cookie_count = 0;
     req->content_length = 0;
     req->body = NULL;
+}
 
-    const char *method, *path;
-    size_t method_len, path_len;
-    int minor_version;
-    struct phr_header headers[MAX_HEADERS];
-    size_t num_headers = MAX_HEADERS;
+int parse_http_request_from_head(const char *raw, const size_t raw_len, const ParsedHead *head,
+                                 Request *req, Arena *arena) {
+    reset_request(req);
 
-    int res = phr_parse_request(raw, raw_len, &method, &method_len, &path, &path_len,
-                                &minor_version, headers, &num_headers, 0);
+    /* S5/"33rd header": parse_request_head's own phr_parse_request runs with a larger header-array
+     * capacity (MAX_FRAMING_HEADERS) than the engine stores (MAX_HEADERS) precisely so a request with
+     * more headers than the engine keeps is diagnosed here as malformed, not mis-reported as
+     * "incomplete" by request_head_is_complete's header_len == 0 check (S8's known gap - this must not
+     * widen it). Checked before anything else is copied, so a rejected request leaves req exactly as
+     * reset above, same as when phr_parse_request itself used to fail outright on this (its own
+     * capacity was MAX_HEADERS before this split). */
+    if (head->num_headers > MAX_HEADERS) {
+        return -1;
+    }
 
-    if (res <= 0) return -1;
+    if (head->method_len >= sizeof(req->method)) return -1;
 
-    if (method_len >= sizeof(req->method)) return -1;
+    copy_bounded(req->method, sizeof(req->method), head->method, head->method_len);
+    snprintf(req->version, sizeof(req->version), "HTTP/1.%d", head->minor_version);
 
-    copy_bounded(req->method, sizeof(req->method), method, method_len);
-    snprintf(req->version, sizeof(req->version), "HTTP/1.%d", minor_version);
-
-    const char *qmark = memchr(path, '?', path_len);
-    size_t p_len = qmark ? (size_t)(qmark - path) : path_len;
+    const char *qmark = memchr(head->path, '?', head->path_len);
+    size_t p_len = qmark ? (size_t)(qmark - head->path) : head->path_len;
     if (p_len >= sizeof(req->path)) return -2;
-    
-    copy_bounded(req->path, sizeof(req->path), path, p_len);
+
+    copy_bounded(req->path, sizeof(req->path), head->path, p_len);
     if (url_decode(req->path, req->path, sizeof(req->path), 0) != 0) {
         /* S6: "%00" (or a raw NUL byte) decoded into the middle of the path - a filter that checks
          * req->path's suffix/extension before using it (e.g. a static-file extension check) would see
@@ -296,42 +328,40 @@ int parse_http_request(const char *raw, const size_t raw_len, Request *req, Aren
     }
 
     if (qmark) {
-        size_t q_len = path_len - p_len - 1;
+        size_t q_len = head->path_len - p_len - 1;
         copy_bounded(req->query, sizeof(req->query), qmark + 1, q_len);
     }
     if (parse_query_string(req->query, req) != 0) {
         return -4;
     }
 
-    for (size_t i = 0; i < num_headers; i++) {
+    for (size_t i = 0; i < head->num_headers; i++) {
         if (req->header_count < MAX_HEADERS) {
             /* S5: a name or value that would not fit is rejected (431), never silently truncated -
              * copy_bounded used to cut a value at 255 bytes with no error, so a Bearer JWT or a long
              * cookie header compared unequal to itself with nothing in the response explaining why. */
-            if (headers[i].name_len >= sizeof(req->header_names[0]) ||
-                headers[i].value_len >= sizeof(req->header_values[0])) {
+            if (head->headers[i].name_len >= sizeof(req->header_names[0]) ||
+                head->headers[i].value_len >= sizeof(req->header_values[0])) {
                 return -3;
             }
-            copy_bounded(req->header_names[req->header_count], sizeof(req->header_names[0]), headers[i].name, headers[i].name_len);
-            copy_bounded(req->header_values[req->header_count], sizeof(req->header_values[0]), headers[i].value, headers[i].value_len);
+            copy_bounded(req->header_names[req->header_count], sizeof(req->header_names[0]),
+                        head->headers[i].name, head->headers[i].name_len);
+            copy_bounded(req->header_values[req->header_count], sizeof(req->header_values[0]),
+                        head->headers[i].value, head->headers[i].value_len);
             req->header_count++;
         }
     }
     parse_cookies(req_get_header(req, "Cookie"), req);
 
-    size_t header_len = (size_t)res;
-    const char *body_start = raw + header_len;
-    const size_t available = raw_len - header_len;
-
-    int chunked = 0;
-    int content_length = request_framing(raw, raw_len, &header_len, &chunked, NULL, NULL);
-    
-    if (content_length < 0) {
-        req->content_length = content_length;
+    if (head->content_length < 0) {
+        req->content_length = head->content_length;
         return -1;
     }
 
-    if (chunked) {
+    const char *body_start = raw + head->header_len;
+    const size_t available = raw_len - head->header_len;
+
+    if (head->chunked) {
         size_t decoded_len = 0;
         int scan = chunked_body_scan(body_start, available, MAX_BODY_SIZE, &decoded_len);
         if (scan == -2) {
@@ -346,16 +376,26 @@ int parse_http_request(const char *raw, const size_t raw_len, Request *req, Aren
         req->content_length = (int)written;
         return 0;
     }
-    
-    req->content_length = content_length;
-    
-    size_t body_len = (size_t)content_length;
+
+    req->content_length = head->content_length;
+
+    size_t body_len = (size_t)head->content_length;
     if (body_len > available) body_len = available;
     req->body = arena_alloc(arena, body_len + 1);
     if (!req->body) return -1;
     memcpy(req->body, body_start, body_len);
     req->body[body_len] = '\0';
     return 0;
+}
+
+int parse_http_request(const char *raw, const size_t raw_len, Request *req, Arena *arena) {
+    ParsedHead head;
+    parse_request_head(raw, raw_len, &head);
+    if (head.header_len == 0) {
+        reset_request(req);
+        return -1;
+    }
+    return parse_http_request_from_head(raw, raw_len, &head, req, arena);
 }
 
 void parse_headers(const char *header_block, Request *req) {

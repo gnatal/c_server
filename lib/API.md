@@ -76,6 +76,7 @@ serialize once, `free` the string.
 
 ## Parser internals (`http_parser.h`) — engine and tests
 - `parse_http_request(raw, raw_len, Request *, Arena *)`, `request_is_complete(buf, len)`, `request_framing(buf, len, &header_len, &chunked, &path, &path_len)` (`path`/`path_len` out params optional, pass `NULL`), `request_wants_close(req)`.
+- `parse_request_head(buf, len, ParsedHead *)`, `request_head_is_complete(ParsedHead *, buf, len)`, `parse_http_request_from_head(raw, raw_len, ParsedHead *, Request *, Arena *)` (P2: one `phr_parse_request` pass, reused by `connection.c`'s body-limit check, completeness check and full parse instead of each running its own; `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers over these and unchanged in behavior).
 - `extract_content_length(block)`, `request_has_chunked_encoding(block)`, `chunked_body_scan(...)`, `chunked_body_decode(...)`.
 - `parse_query_string(query, req)`, `parse_headers(block, req)`, `parse_cookies(value, req)`, `status_text(code)`.
 

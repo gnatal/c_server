@@ -944,3 +944,153 @@ this codebase's own standing guidance to avoid backwards-compatibility hacks for
 deliberately removed, not renamed.
 
 **Status:** Done. TLS is not a feature of this engine; terminate it at a gateway or reverse proxy.
+
+---
+
+## P2 · Request headers are parsed three times
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+Before this fix, `handle_readable`'s per-`recv` hot path ran an independent `phr_parse_request` pass for
+each of three separate checks — and, after S4 added its own, a fourth: `reject_if_over_body_limit`'s own
+`request_framing` call, `request_is_complete`'s own `request_framing` call, and `parse_http_request`'s
+*two* passes (its own top-level `phr_parse_request` call, then a second, entirely redundant
+`request_framing` call at its old line 327 to recompute the same `header_len`/`content_length`/`chunked`
+it could have kept from the first). `improvements.md`'s own MEASURED numbers (`request_is_complete` 165 ns,
+`parse_http_request` 538–546 ns for a browser-shaped GET) predate S4; this fix targets the whole chain as
+it stands today, not just the two functions originally named.
+
+- **New shared type, `ParsedHead` (`lib/app_types.h`).** One `phr_parse_request` pass's result — the
+  tokenized method/path/headers plus the framing verdict (content-length/chunked) — kept in a struct that
+  every downstream check can read instead of re-deriving. Its `headers[MAX_FRAMING_HEADERS]` array is
+  sized at `MAX_FRAMING_HEADERS` (100), deliberately **larger** than `MAX_HEADERS` (32, what the engine
+  actually stores): keeping the underlying `phr_parse_request` call at the old `request_framing` capacity
+  (100) rather than dropping it to 32 was not optional — with a 32-header cap, `phr_parse_request` itself
+  fails (returns -1, "header capacity exceeded") for any request with 33+ headers, which this refactor's
+  `header_len == 0` check (preserving S8's known gap on purpose, see below) would then read as
+  "incomplete" and loop forever waiting for more bytes instead of answering 400 the way the pre-fix code
+  already did (pre-fix, `request_framing`/`request_is_complete` used a 100-header capacity of their own,
+  so a 33+-header request's framing succeeded there and only failed later, correctly, inside
+  `parse_http_request`'s own 32-header-capped call). `app_types.h` now includes
+  `vendor/picohttpparser/picohttpparser.h` for `struct phr_header`, matching this codebase's existing
+  convention of keeping every struct in a dedicated header rather than a `.c` file (`CLAUDE.md`, "Coding
+  Standards").
+- **New functions (`lib/http_parser.c/h`), added alongside the existing ones, not replacing them:**
+  - `parse_request_head(buf, len, ParsedHead *)` — the one `phr_parse_request` call, done once.
+  - `request_head_is_complete(ParsedHead *, buf, len)` — `request_is_complete`'s exact logic (chunked
+    scan included) against an already-parsed head instead of re-parsing.
+  - `parse_http_request_from_head(raw, raw_len, ParsedHead *, Request *, Arena *)` — the population half
+    of `parse_http_request` (method/path/query/header/cookie copying, body extraction), given a head
+    instead of re-running `phr_parse_request`/`request_framing` on the same bytes. Same return codes,
+    ownership and limits as `parse_http_request` (`-1`/`-2`/`-3`/`-4`, `req.body` always NUL after any
+    outcome — see Tests below for the regression this had to keep passing).
+  - A private helper, `compute_content_length_and_chunked(headers, num_headers, chunked_out)`, factors out
+    the Content-Length/Transfer-Encoding scan that used to be inlined once in `request_framing` and
+    duplicated a second time, slightly differently, inside `parse_http_request`'s old second pass — there
+    is now exactly one copy of this logic, called by `parse_request_head`.
+- **The existing public functions become thin, behavior-identical wrappers**, kept for every caller that
+  doesn't need more than one piece (tests, `fuzz_parser.c`, anything outside `connection.c`):
+  `request_framing` = `parse_request_head` + unpacking its fields into the old out-parameters;
+  `request_is_complete` = `parse_request_head` + `request_head_is_complete`; `parse_http_request` =
+  `parse_request_head` + (`header_len == 0` ? reset-and-`-1` : `parse_http_request_from_head`). None of
+  these three had their signature or documented behavior changed.
+- **`connection.c`'s hot path (`handle_readable`) now calls `parse_request_head` exactly once per `recv`**
+  and threads the result through `reject_if_over_body_limit` (which dropped its own `request_framing`
+  call entirely, now just reading `head->header_len`/`chunked`/`content_length`/`path`), the completeness
+  check (`request_head_is_complete`) and the full parse (`parse_http_request_from_head`) — one
+  `phr_parse_request` pass total instead of up to four. The rare "buffer full, headers still incomplete"
+  branch after the read loop (a separate, infrequent code path, not the common "request completed within
+  this recv" one this fix targets) was deliberately left calling `request_framing` on its own — see
+  Deliberately scoped down.
+- **`tests/bench_hotpath.c`'s `one_request`** (its own comment says "Same sequence as connection.c:
+  handle_readable") was updated to match: it now calls `parse_request_head` +
+  `request_head_is_complete` + `parse_http_request_from_head`, the same one-pass sequence, instead of the
+  two-call `request_is_complete` + `parse_http_request` it used before — so `make bench`'s numbers
+  reflect the real fix rather than a partial one.
+
+**Deliberately scoped down**, matching the S1–S7/P1 precedent of narrowing rather than silently doing less
+than advertised:
+- **No incremental (`last_len`) resume across separate `recv`s.** `improvements.md`'s suggested fix also
+  mentioned passing picohttpparser's `last_len` so a request that arrives in several `recv`s doesn't
+  re-tokenize bytes it already saw on a prior, incomplete call. Not done: the measured problem (three to
+  four passes over the *same* bytes within one `recv`'s worth of data) is what this fix closes; the
+  cross-`recv` case needs `ParsedHead` (or at least the partially-parsed header array and byte position)
+  to persist *on the `Connection`* across event-loop turns, which is a materially larger change (a new
+  `Connection` field, invalidation rules for when `in_buf` moves under `realloc`/`memmove`) for a case
+  `improvements.md` itself only calls a PROJECTED, unmeasured, secondary win, not the MEASURED 165–546 ns
+  figures the ID is named for. Also explicitly not attempted: `P9` (pipelining), which
+  `improvements.md`'s own dependency note says "needs P2's cached `header_len`" — this fix keeps
+  `ParsedHead` as a per-`recv` stack local in `handle_readable`, not a `Connection`-resident cache, so
+  there is nothing here yet for a future P9 fix to consume across requests on the same connection.
+- **The rare buffer-full branch (`handle_readable`, after the read loop) still runs its own
+  `request_framing` call**, not the `head` computed inside the loop. Considered hoisting `head` out of the
+  loop to reuse it there too, but rejected: that branch can be reached on a call to `handle_readable` where
+  the read loop's body never executed at all this call (a connection already sitting exactly at
+  `in_cap - 1` from a previous call's `grow_in_buf` "already large enough, wait for more" case — see
+  `grow_in_buf`'s own comment) — a hoisted-but-unset `head` would be read as uninitialized memory in that
+  case. Left alone: it is a single, infrequent parse (Slowloris-shaped or a body larger than the current
+  buffer), not the up-to-four-passes-per-ordinary-request problem this fix targets.
+- **`request_framing`/`request_is_complete`/`parse_http_request` are not deprecated or hidden** — every
+  test file, `fuzz_parser.c`, and any external code built against this library keeps working unmodified;
+  only `connection.c`'s own hot path was moved onto the new, single-pass functions.
+
+**Tests and results.**
+
+- No new test file: this is an internal refactor of already load-bearing code, not new behavior — the
+  correctness bar is "every existing test still passes with the exact same assertions," which is a
+  stronger check for a change like this than a handful of new cases would be (a subtly wrong refactor
+  that still passes new cases written *for* the refactor proves less than one that has to pass tests
+  written *before* it existed, especially test_http_hardening.c's `test_parse_does_not_depend_on_zeroed_request`
+  and its assertion that `parse_http_request` resets `req.body` to `NULL` even when the very first
+  `phr_parse_request` call fails outright — the exact case `parse_http_request`'s new wrapper had to keep
+  handling by resetting `req` itself before returning `-1`, without ever reaching
+  `parse_http_request_from_head`).
+- `make test`: all 13 suites pass, unmodified assertions, including every case in `test_http_parser.c` and
+  `test_http_hardening.c` that calls `request_framing`/`request_is_complete`/`parse_http_request` directly
+  (the `>32`-header/431/-3/-4/chunked/duplicate-`Content-Length` regressions from S5/S6 and earlier), and
+  `test_connection.c`'s S1–S6 end-to-end cases through the real `handle_readable`.
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan — meaningful
+  here specifically because `ParsedHead.headers` is a 100-entry array now shared by reference
+  (`const ParsedHead *`) across `reject_if_over_body_limit`/`request_head_is_complete`/
+  `parse_http_request_from_head` rather than copied per call, the kind of lifetime change a sanitizer run
+  is well-suited to catch.
+- `make fuzz FUZZ_ITERS=300000`: clean (40,522 parsed, 43,650 complete) — `fuzz_parser.c` exercises
+  `request_framing`, `request_is_complete` and `parse_http_request` directly (their signatures are
+  unchanged), so this covers the wrapper path, not the new `connection.c` call sequence; `test_connection.c`
+  and the live checks below cover that.
+- `make check-docs`: passes (124 engine functions, up from 121 — `parse_request_head`,
+  `request_head_is_complete`, `parse_http_request_from_head` added to `lib/API.md`).
+- Compiled `lib/http_parser.c` and `lib/connection.c` directly with the project's
+  `-Wall -Wextra -std=c11 -O2` flags: no new warnings.
+- **`make bench` (Apple M3 Pro, gcc-16 -O2, 22 Sep 2026, several runs for stability):** minimal GET
+  198 → ~180 ns, browser-shaped GET (10 headers, cookies, query) 825 → ~514–587 ns (**MEASURED −30 to
+  −38%**, matching `improvements.md`'s PROJECTED "≈300 ns of 781 ns, −38%" almost exactly), JSON POST
+  313 → ~230–247 ns (**MEASURED −21 to −27%**), 404 208 → ~172–193 ns. Minimal GET and 404 move the least
+  in absolute terms because they carry only 1–2 headers, so there is less redundant tokenizing per extra
+  pass to remove; the browser-shaped and JSON-body cases (more headers, the cases `improvements.md`
+  measured) show the larger, PROJECTED-matching wins. `lib/CLAUDE.md`'s "Hot-path rules" section records
+  the exact numbers.
+- Live end-to-end verification against `examples/todo_sqlite`'s demo (`QUIET=1`, built with `gcc-16`):
+  - `GET /ping`, `GET /api/todos` (with the demo's `Authorization: Bearer my-secret-api-key`): 200, exact
+    bodies unchanged.
+  - A request with 40 headers (`X-Extra-00` … `X-Extra-39`) against `/ping`: **`400 Bad Request`**, not a
+    hang — the exact regression this fix's `MAX_FRAMING_HEADERS`-above-`MAX_HEADERS` sizing exists to
+    prevent (see Deliberately scoped down / the `ParsedHead` bullet above): with the header-array capacity
+    dropped to 32 instead of kept at 100, this same request would have looped forever waiting for more
+    bytes instead of answering 400.
+  - `GET /static/style.css%00.png` (S6's exact regression shape): still `400`.
+  - Two sequential `GET /ping` requests over one kept-alive connection (raw socket, no reconnect): both
+    `200`, confirming `body_limit_checked`/`request_started` reset correctly between requests on the new
+    path.
+  - A `POST /api/todos` with a properly-framed `Transfer-Encoding: chunked` body (raw socket, hand-built
+    chunk framing — `curl`'s own `--data-binary` with a manually-set `Transfer-Encoding` header does not
+    actually chunk-encode its payload, which is a `curl` behavior, not an engine one): `201 Created` with
+    the decoded JSON body reflected back correctly.
+
+**Status:** Fixed for the measured problem (the hot path's redundant `phr_parse_request` passes,
+`handle_readable` → `reject_if_over_body_limit`/completeness/full-parse, collapsed from up to four to one).
+The `last_len` incremental-resume half of `improvements.md`'s suggested fix, and P9 (pipelining, which
+depends on it), remain open — not gaps this work introduced, the larger, PROJECTED-only part of P2's own
+fix list that this entry did not attempt, per the scoping above.

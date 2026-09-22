@@ -22,8 +22,8 @@ sleep) stalls that whole worker, so scale with workers, not threads. State is pe
 If `event_loop_init` fails (for example io_uring is blocked by the runtime), `app_listen_worker` prints the error and exits; there is no runtime fallback to epoll.
 
 Per request (`connection.c: handle_readable`):
-1. `recv` into `conn->in_buf` until `request_is_complete` (`http_parser.c`: runs picohttpparser over the headers, plus a chunked scan when the body is chunked).
-2. `parse_http_request(in_buf, in_len, &req, &conn->arena)` → `Request` on the stack (copies method/path/headers/cookies into its fixed arrays; the body is copied into the connection arena). Failure → reject (400 / 413 / 414 / 431), close.
+1. `recv` into `conn->in_buf`, then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below (P2) - the body-limit check (S4), `request_head_is_complete` (a chunked scan when the body is chunked), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request before P2).
+2. `parse_http_request_from_head(in_buf, in_len, &head, &req, &conn->arena)` → `Request` on the stack (copies method/path/headers/cookies into its fixed arrays; the body is copied into the connection arena). Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request`/`request_is_complete`/`request_framing` remain as thin, unchanged-behavior wrappers over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
 4. `match_route` (per-method Patricia tree, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
@@ -39,7 +39,7 @@ response building never touch a socket, so tests drive them with a fake `Connect
 |---|---|
 | `app_types.h` | every struct/typedef and every compile-time limit |
 | `arena.c/h` | per-connection bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`) |
-| `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text` |
+| `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text`. One `parse_request_head` pass feeds the body-limit check, completeness check and full parse (P2); `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers kept for existing callers |
 | `router.c/h` | route registration, one Patricia (segment-radix) tree per method, `app_mount`, `app_serve_static`, `app_free_routes` |
 | `middleware.c/h` | pipeline (`chain_next`, `chain_error`, `dispatch`), 404/405/OPTIONS defaults |
 | `response.c/h` | response head assembly, cookies, chunked streaming, file streaming |
@@ -96,10 +96,11 @@ and leaves the old block in the arena until the request ends; a static file is r
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
-`parse_http_request`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` a header name or value too long to store (→ 431, S5), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413).
+`parse_http_request` / `parse_http_request_from_head`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` a header name or value too long to store (→ 431, S5), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413).
 `url_decode` / `parse_query_string`: `0` ok, `-1` a decoded byte was NUL (S6) - the destination is still fully written and NUL-terminated, but the caller must treat it as invalid input rather than use it.
-`request_is_complete`: `1` for a complete request and also for invalid `Content-Length` / chunked+`Content-Length` framing (stop reading, let the parser report it);
+`request_is_complete` / `request_head_is_complete`: `1` for a complete request and also for invalid `Content-Length` / chunked+`Content-Length` framing (stop reading, let the parser report it);
 `0` while more bytes are needed, **and also (known gap, below) when the request line or headers are malformed**. `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
+`parse_request_head`: same codes as `request_framing` (`0` absent/zero-length or incomplete, `>0` value, `-1` malformed/conflicting, `-2` oversized) - check `ParsedHead.header_len == 0` to tell "incomplete" apart from "malformed" (both return via this same ambiguity, P2, matching `request_framing`'s pre-existing contract).
 yyjson: read functions return `NULL` on failure; `yyjson_mut_*_add_*` return `false` on failure (the cookbook and demo do not check them).
 Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `errno` for logic outside the socket layer.
 
@@ -136,7 +137,10 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   that frees it (tests; not called anywhere in the engine itself).
 - **Request parsing.** picohttpparser does the request line and header block; it is strict about tokens and accepts bare `\n` line endings, and rejects HTTP versions other than 1.x. `Content-Length`
   must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Header names are matched exactly and case-insensitively (never by substring). Method ≤ 7
-  chars. Query/headers/cookies parsed eagerly into fixed arrays. More than 32 headers → 400. A header name over 63 chars or
+  chars. Query/headers/cookies parsed eagerly into fixed arrays. More than 32 headers → 400 (checked explicitly against
+  `MAX_HEADERS` in `parse_http_request_from_head`, since P2 raised the underlying `phr_parse_request` capacity itself to
+  `MAX_FRAMING_HEADERS`, above `MAX_HEADERS`, precisely so this case is diagnosed as malformed rather than mis-reported as
+  "incomplete" - see "Hot-path rules" and S8's known gap, which this must not widen). A header name over 63 chars or
   value over `MAX_HEADER_VALUE_LEN` (1024) is rejected with 431, never silently truncated (S5: raised from the original
   255-char value cap, which used to truncate a Bearer JWT or long cookie into a value that compared unequal to itself with
   no indication why - `parse_headers`, the standalone component parser `tests/` uses directly and that the live request
@@ -176,14 +180,16 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 - **Body limits (S4).** `app_use_body_limit(app, prefix, max_bytes)` (`router.c`) registers a `BodyLimitEntry` in
   `App.body_limits` (same segment-boundary prefix match as app-wide middleware; `max_bytes` clamped down to
   `MAX_BODY_SIZE`, never loosened past it). `connection.c`'s `reject_if_over_body_limit`, called from
-  `handle_readable` right after every `recv` (before `request_is_complete`), runs `request_framing` once per
-  request (`Connection.body_limit_checked` guards repeat calls, cleared with `request_started` in
-  `flush_connection`'s keep-alive branch) and, as soon as headers are complete, compares a declared
-  `Content-Length` against `app_body_limit_for_path` (longest matching prefix wins, independent of registration
-  order; `MAX_BODY_SIZE` if nothing matches) - over it is 413, sent before a single body byte is buffered or
-  `in_buf` is grown. Only `Content-Length` is covered; chunked bodies stay governed by the global `MAX_BODY_SIZE`
-  raw-wire cap in `grow_in_buf`/`chunked_body_scan` only (a deliberate scope decision, not a gap: chunked's raw-cap
-  doubling was already proportional to bytes received, which is what S4 was chiefly about for `Content-Length`).
+  `handle_readable` right after every `recv` (before the completeness check), takes the `ParsedHead` that
+  `handle_readable` already computed for this `recv` (P2: it no longer runs its own `request_framing` pass -
+  `Connection.body_limit_checked` still guards it running its actual check more than once per request, cleared
+  with `request_started` in `flush_connection`'s keep-alive branch) and, as soon as headers are complete,
+  compares a declared `Content-Length` against `app_body_limit_for_path` (longest matching prefix wins,
+  independent of registration order; `MAX_BODY_SIZE` if nothing matches) - over it is 413, sent before a single
+  body byte is buffered or `in_buf` is grown. Only `Content-Length` is covered; chunked bodies stay governed by
+  the global `MAX_BODY_SIZE` raw-wire cap in `grow_in_buf`/`chunked_body_scan` only (a deliberate scope decision,
+  not a gap: chunked's raw-cap doubling was already proportional to bytes received, which is what S4 was chiefly
+  about for `Content-Length`).
 - **Timeouts.** `last_activity` advances on received bytes only. Sweep every second; ≥ 60 s silent → close (408 first if a
   request was half-received). A connection with a response pending (`out_buf != NULL` or `file_fd >= 0`) is exempt from
   this particular check — that axis is bounded separately, below.
@@ -232,23 +238,32 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 
 ## Hot-path rules (measured; do not undo)
 Per-request CPU cost of the pure path (parse, route, dispatch, response build; no sockets, one core; `make bench`, Apple M3 Pro,
-gcc-16 -O2, 22 Sep 2026): minimal GET 198 ns, browser-shaped GET (10 headers, cookies, query) 825 ns, JSON POST 313 ns, 404 208 ns;
-a 20-row JSON list through yyjson 709 ns. (Previously 208 / 781 / 315 / 186 / 659 ns on 21 Sep 2026, before S5 raised
-`Request.header_values`' per-slot size from 256 to `MAX_HEADER_VALUE_LEN` (1024, see "Behavior reference, Request parsing"):
-the deltas above are within ordinary single-run noise, not attributable to that change - `copy_bounded` copies only
-`headers[i].value_len` bytes actually present, never the destination array's capacity, so a bigger unused slot costs nothing
-per request; only `sizeof(Request)` grew, not its CPU cost.) The earlier version of this file recorded 390 / 800 / 470 / 430 ns
+gcc-16 -O2, 22 Sep 2026): minimal GET 180 ns, browser-shaped GET (10 headers, cookies, query) 514 ns, JSON POST 235 ns, 404 180 ns
+(single-run noise is ±15-20 ns at this scale, `make bench` re-run several times); a 20-row JSON list through yyjson 700 ns.
+(Previously 198 / 825 / 313 / 208 / 709 ns the same day, before P2 made `bench_hotpath.c`'s `one_request` call
+`parse_request_head` + `request_head_is_complete` + `parse_http_request_from_head` - one picohttpparser pass, matching the real
+`connection.c` hot path - instead of the separate `request_is_complete` + `parse_http_request` it called before, which cost two
+passes even after P2's own internal dedup of `parse_http_request`. **MEASURED** browser-shaped GET −38%, JSON POST −25%, matching
+`improvements.md`'s P2 PROJECTED estimate almost exactly; minimal GET and 404 move less because they carry only 1-2 headers, so
+there is less redundant tokenizing to remove. And before *that*, 208 / 781 / 315 / 186 / 659 ns on 21 Sep 2026, before S5 raised
+`Request.header_values`' per-slot size from 256 to `MAX_HEADER_VALUE_LEN` (1024, see "Behavior reference, Request parsing") -
+that delta was noise, not attributable to S5; this one is not.) The earlier version of this file recorded 390 / 800 / 470 / 430 ns
 for the handwritten-parser engine on the same machine (no A/B rebuild of that commit was done for this update); only ratios
 transfer between machines. What to keep:
 - No `strtok_r` / `sscanf` / `strncpy` (zero-pads to the full size) / `strcasestr` over request bytes. Scan with lengths and `memchr`.
 - No whole-struct `memset` of `Request` (43,576 bytes, `sizeof`, `make bench`; grew from 19 KB when S5 raised the per-header
-  value cap - see above) or `Response` (16 KB). `parse_http_request` and `res_init` set scalars and
+  value cap - see above) or `Response` (16 KB). `parse_http_request_from_head` and `res_init` set scalars and
   `*_count` only; arrays are read up to their count and every slot is NUL-terminated on write.
+- One `phr_parse_request` pass per request on the hot path (P2), not up to four: `handle_readable` calls `parse_request_head`
+  once and threads the result through the body-limit check, `request_head_is_complete` and `parse_http_request_from_head`.
+  Don't reintroduce a second call to `request_framing` / `request_is_complete` / `parse_http_request` (the whole-buffer
+  re-parsing wrappers) anywhere in `connection.c`'s per-`recv` loop - they exist for callers that only need one piece
+  (tests, `fuzz_parser.c`) and each costs its own independent pass again.
 - Routing is one tree walk over path segments with no allocation; `req == NULL` searches without capturing (used for the 405 `Allow` list).
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
 - Allocate per-request data from `conn->arena`, not `malloc`. Emit JSON through yyjson with `arena_yyjson_alc`.
 - No syscall on a path that changes nothing (`events_watched`; enforced on kqueue only, see Event loop).
-Verification tools: `make bench`, `make test` (14 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
+Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
 `make fuzz` (mutation fuzzer over parser/router/response), `make check-docs`. Run sanitizers and fuzz after touching
 `http_parser.c`, `router.c`, `response.c` or `arena.c`. The Makefile tracks header dependencies (`-MMD`).
 

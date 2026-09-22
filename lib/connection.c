@@ -488,30 +488,25 @@ static int grow_in_buf(Connection *conn, const size_t header_len, const int chun
  * just before in_buf is grown to fit it. Runs at most once per request (conn->body_limit_checked).
  * Only Content-Length is covered: chunked bodies stay governed by the global MAX_BODY_SIZE raw-wire
  * cap in grow_in_buf/chunked_body_scan (see app_use_body_limit's header comment for why).
+ * Takes an already-parsed head (P2) instead of running its own request_framing pass over conn->in_buf.
  * Returns 1 if the request was rejected (caller must not touch conn again), 0 otherwise.
  */
-static int reject_if_over_body_limit(App *app, Connection *conn) {
+static int reject_if_over_body_limit(App *app, Connection *conn, const ParsedHead *head) {
     if (conn->body_limit_checked) {
         return 0;
     }
-    size_t header_len;
-    int chunked;
-    const char *path;
-    size_t path_len;
-    const int content_length = request_framing(conn->in_buf, conn->in_len, &header_len, &chunked,
-                                               &path, &path_len);
-    if (header_len == 0) {
+    if (head->header_len == 0) {
         return 0; /* headers still incomplete: nothing to check yet, try again next read */
     }
     conn->body_limit_checked = 1;
-    if (chunked || content_length < 0) {
+    if (head->chunked || head->content_length < 0) {
         return 0; /* not this check's job: chunked, absent, or already malformed/oversized globally */
     }
     char path_buf[256];
-    const size_t n = path_len < sizeof(path_buf) - 1 ? path_len : sizeof(path_buf) - 1;
-    memcpy(path_buf, path, n);
+    const size_t n = head->path_len < sizeof(path_buf) - 1 ? head->path_len : sizeof(path_buf) - 1;
+    memcpy(path_buf, head->path, n);
     path_buf[n] = '\0';
-    if ((size_t)content_length > app_body_limit_for_path(app, path_buf)) {
+    if ((size_t)head->content_length > app_body_limit_for_path(app, path_buf)) {
         reject_request(app, conn, 413);
         return 1;
     }
@@ -542,13 +537,19 @@ void handle_readable(App *app, Connection *conn) {
         conn->in_buf[conn->in_len] = '\0';
         conn->last_activity = time(NULL);
 
-        if (reject_if_over_body_limit(app, conn)) {
+        /* One phr_parse_request pass, reused below by the body-limit check, the completeness check
+         * and the full parse (P2) - these used to each run their own independent pass over the same
+         * bytes, up to four per request after S4 added the body-limit check's own. */
+        ParsedHead head;
+        parse_request_head(conn->in_buf, conn->in_len, &head);
+
+        if (reject_if_over_body_limit(app, conn, &head)) {
             return;
         }
 
-        if (request_is_complete(conn->in_buf, conn->in_len)) {
+        if (request_head_is_complete(&head, conn->in_buf, conn->in_len)) {
             Request req;
-            const int parse_status = parse_http_request(conn->in_buf, conn->in_len, &req, &conn->arena);
+            const int parse_status = parse_http_request_from_head(conn->in_buf, conn->in_len, &head, &req, &conn->arena);
             if (parse_status != 0) {
                 /* -2: path too long (414). -3: a header name/value too long to store, never silently
                  * truncated (431, S5). -4: a percent-decoded path/query name/query value contained an
