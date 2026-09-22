@@ -15,9 +15,12 @@ removed for this reason; see `../improvements_progress.md` for the removal recor
 A process runs one single-threaded, non-blocking event loop: kqueue on macOS/BSD, io_uring on Linux
 (readiness only: multishot `POLL_ADD` on each fd, then ordinary `recv`/`write`; needs liburing and a kernel with
 multishot poll, 5.13+). An epoll backend (`event_loop_epoll.c`) is kept for `-DCEXPRESS_USE_EPOLL`; the Makefile does not select it
-on Linux, and on macOS it is only built for `make test_epoll` through epoll-shim. `workers != 1` forks N such processes sharing
-the port via `SO_REUSEPORT`; a master respawns any that die, with backoff and a restart budget (S7, see "Behavior
-reference, Workers and fork"). Handlers run synchronously on the loop: a blocking call (DB,
+on Linux, and on macOS it is only built for `make test_epoll` through epoll-shim. `workers != 1` forks N such processes. On
+Linux, each opens its own listen socket sharing the port via `SO_REUSEPORT` (4-tuple hashing balances them). On macOS/BSD
+(`CEXPRESS_SINGLE_ACCEPTOR` - C4: `SO_REUSEPORT` does not balance there, MEASURED over 90% of load on one worker of four),
+only the master binds and `accept()`s; each accepted fd is handed to a worker over a private socketpair via `SCM_RIGHTS`,
+round-robin (see "Behavior reference, Workers and fork"). Either way, a master respawns any worker that dies, with backoff
+and a restart budget (S7, same section). Handlers run synchronously on the loop: a blocking call (DB,
 sleep) stalls that whole worker, so scale with workers, not threads. State is per process; there is no shared memory.
 If `event_loop_init` fails (for example io_uring is blocked by the runtime), `app_listen_worker` prints the error and exits; there is no runtime fallback to epoll.
 
@@ -45,7 +48,7 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | `response.c/h` | response head assembly, cookies, chunked streaming, file streaming |
 | `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen |
 | `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals) |
-| `cluster.c/h` | fork workers, respawn (with backoff and a restart budget, S7), drain |
+| `cluster.c/h` | fork workers, respawn (with backoff and a restart budget, S7), drain; on macOS/BSD (`CEXPRESS_SINGLE_ACCEPTOR`, C4) also the single acceptor - binds the one listen socket, `accept()`s, and hands fds to workers round-robin over per-worker socketpairs |
 | `static.c/h` | traversal-safe file serving, with an in-memory cache of recently served files (P1) |
 | `multipart.c/h`, `urlencoded.c/h` | form body parsers (handler-invoked, not automatic) |
 | `vendor/picohttpparser/` | vendored HTTP/1.x request parser (MIT/Perl) |
@@ -110,6 +113,8 @@ arena at all - see above).
 | `Route`, `PatriciaNode` | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy` |
 | `app->connections` | `app_init` | `app_destroy` |
 | `app->spare_fd` (S3, one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |
+| `cluster.c`'s `listen_fd` (C4, `CEXPRESS_SINGLE_ACCEPTOR` only - the master's one real listen socket, replacing per-worker binds) | `cluster_listen` (`create_server_socket`) | `cluster_listen`, after every worker has drained, at the end of the same function |
+| `ClusterWorkerSlot.control_fd` per slot (C4 - the master-side end of that worker's socketpair; the worker keeps the other end, `sv[1]`, as its own `server_fd`) | `spawn_worker`, fresh on every spawn *and* every respawn (S7) | `spawn_worker`'s next respawn for that slot (closes the stale one first), or `cluster_listen`'s final cleanup once every worker has drained |
 | Static file cache entries (P1: cached path string + file bytes, `static.c`'s own process-lifetime global, not tied to any `App`) | `static_serve_file`, on a cache miss or a changed file | replaced in place on the next change, evicted (stalest first) once `STATIC_CACHE_MAX_ENTRIES` is reached, or all of them via `static_cache_clear` (tests; nothing in the engine calls it) |
 
 ## Return conventions
@@ -253,13 +258,38 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   connections, in-flight ones get `Connection: close`, 5 s deadline; a second signal exits at once. Cluster master forwards
   SIGTERM, waits 6 s, then SIGKILLs.
 - **Workers and fork.** Never open a database or socket in `main()` before `app_listen`; register `app_on_worker_start`
-  and open there (runs once per serving process, after fork). `SIGPIPE` is ignored per process in `app_listen_worker`.
-  **Respawn (S7).** Before forking anyone, `cluster_listen` calls `create_server_socket(port)` once itself and closes
-  the fd - this is purely a validation call: `create_server_socket` already `perror`s and `exit()`s (S12: still
-  unfixed there) on a bind/listen failure, so a fatal, permanent misconfiguration (the port already taken, permission
-  denied on a privileged port, ...) now stops the master with one clear message instead of forking `workers_count`
-  children that would all fail the exact same way - MEASURED (`improvements.md`, S7) 10,594 respawns and 31,788 log
-  lines in about 4 seconds with `WORKERS=2` and the port already taken. A worker that exits abnormally *after*
+  and open there (runs once per serving process, after fork). `SIGPIPE` is ignored per process in `app_listen_worker`
+  (and, under `CEXPRESS_SINGLE_ACCEPTOR`, in the master too - see below). `cluster_listen` always calls
+  `create_server_socket(port)` once itself before forking anyone - this doubles as the S7 preflight validation
+  (`create_server_socket` already `perror`s and `exit()`s, S12: still unfixed there, on a bind/listen failure, so a
+  fatal, permanent misconfiguration stops the master with one clear message instead of forking `workers_count`
+  children that would all fail identically - MEASURED, `improvements.md` S7, 10,594 respawns and 31,788 log lines
+  in about 4 seconds with `WORKERS=2` and the port already taken).
+  **Single acceptor (C4, `CEXPRESS_SINGLE_ACCEPTOR`, macOS/BSD only).** That one listen socket (`listen_fd`) is kept
+  open, not closed, for the master's entire lifetime - it never binds a second one, and no worker binds any listen
+  socket at all. Each worker instead runs `app_listen_worker_via_control_socket`, which points its `server_fd` at
+  the worker-side end of a private `AF_UNIX SOCK_STREAM` socketpair with the master (`ClusterWorkerSlot.control_fd`
+  is the master-side end) and sets `App.accept_via_fd_passing` - the event loop treats that fd exactly like a listen
+  socket (`LOOP_EVENT_ACCEPT` still just means "`server_fd` is readable", unchanged across every `event_loop_*.c`
+  backend), except `connection.c`'s `accept_passed_connections` drains it with `recvmsg`/`SCM_RIGHTS` instead of
+  `accept_connections`'s `accept()`. The master's own supervision loop replaces its unconditional 50 ms
+  `nanosleep` with a `poll()` on `listen_fd` of the same 50 ms timeout (adds no latency: `poll()` returns the
+  instant a connection is pending, same backoff/`waitpid` cadence as before), `accept()`s everything pending each
+  wake, and hands each fd to the next active worker round-robin (`dispatch_client_fd`, `cluster.c`) - a worker with
+  no active slot available gets its fd closed with no response (best-effort shed, same philosophy as S3, not
+  duplicated here to keep this scoped). `set_nonblocking`/`TCP_NODELAY` are applied once, by the master right after
+  its own `accept()`, and are never reapplied worker-side: both are file-status/socket-option properties of the
+  underlying open file description, already in effect once the fd rides across via `SCM_RIGHTS` (same as across
+  `dup()`/`fork()`). Both ends of every socketpair are set non-blocking too - the event loop's readiness contract is
+  "drain until `EAGAIN`"; a blocking control socket's final `recvmsg` after draining everything pending would block
+  forever instead, freezing that worker's entire single-threaded loop. The per-worker S3 `max_connections`/
+  `spare_fd` overload logic is untouched and still runs worker-side, now inside `accept_passed_connections` instead
+  of `accept_connections` - it doesn't care how a client fd arrived. MEASURED (`improvements.md` C4 update): the
+  pre-fix imbalance (over 90% of load on one worker of four) is gone - a live 4-worker run under `wrk -c5000` split
+  requests dead evenly across all four (824/824/824/824 dispatched, 0 failures, instrumented count), and
+  `scripts/stress_test.sh`'s peak-memory sampler moved from ~88% of total RSS on the largest single process to
+  ~24%, matching the four-way split.
+  **Respawn (S7).** A worker that exits abnormally *after*
   startup (a real crash, not a bind failure) is respawned with exponential backoff per slot (100 ms, doubling, capped
   at 30 s) instead of instantly; if a slot fails more than `CLUSTER_RESTART_BUDGET` (5) times within
   `CLUSTER_RESTART_WINDOW_MS` (60 s) - a sliding window, not a lifetime count, so an occasional unrelated crash over a
@@ -268,7 +298,11 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   returned to `app_listen`/`main()`). Both mechanisms are implementation details of `cluster.c` (the constants above
   are file-local, not in `app_types.h`, same convention as `connection.c`'s `ARENA_SIZE`) and share one accounting
   helper, `record_worker_failure`, so a `fork()` failure while trying to (re)spawn a slot counts against the same
-  budget as an abnormal exit rather than looping unbounded on its own.
+  budget as an abnormal exit rather than looping unbounded on its own. Under `CEXPRESS_SINGLE_ACCEPTOR`, a respawn
+  also creates a brand new socketpair for that slot every attempt (the dead worker's own end died with its process;
+  the master's stale `control_fd` for that slot is explicitly closed first, or it would leak one fd per respawn) -
+  the child closes every *other* slot's inherited master-side `control_fd` right after `fork()` (it must not be able
+  to read or write a sibling's fd-handoff channel), keeping only its own.
 - **Event loop.** `Connection.events_watched` mirrors what the loop has registered. Only the kqueue backend uses it to skip the syscall when the state already
   matches, so a keep-alive response costs no extra `kevent` there. The epoll and io_uring backends issue a syscall on every `watch_*` / `unwatch_*`
   (`epoll_ctl`; io_uring submits a poll-remove plus a new multishot poll), including the `unwatch_write` that `flush_connection` runs after every keep-alive response.
@@ -351,6 +385,20 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
   query/param storage together are under 3 KB, a small fraction of what headers used to cost).
 - **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model).
 - The io_uring backend is used only as a readiness poller; sockets are still read and written with `recv` / `write`.
+- **The io_uring backend closes every keep-alive connection after its first request (C6, MEASURED on real Linux via Docker,
+  2026-09-22 - not fixed).** `event_loop_io_uring.c`'s `update_poll` (called by all four `watch_*`/`unwatch_*` functions)
+  re-arms a connection's multishot poll with `IORING_OP_POLL_REMOVE` then a fresh `IORING_OP_POLL_ADD`, both keyed by the
+  same fixed `UDATA_FD(fd)`. Canceling the still-active old registration generates an extra completion for that same fd -
+  `res = -ECANCELED`, no `IORING_CQE_F_MORE` - which `event_loop_poll` (never inspects `cqe->flags`) can't distinguish
+  from a real socket error; it reports `LOOP_EVENT_ERROR` and `connection.c` closes the connection. `flush_connection`
+  calls `event_loop_unwatch_write` after every keep-alive response regardless of whether write was ever registered
+  (P4), so this fires on essentially every request. Not a kqueue or epoll problem: kqueue skips a no-op `update_poll` via
+  `events_watched` (see "Event loop" above) before ever reaching this pattern, and epoll's synchronous `epoll_ctl(MOD)`
+  has no async cancellation-completion to misfire this way. See `improvements.md` C6 for the full reproduction and fix
+  sketch (recognize `-ECANCELED`+no-`F_MORE` as a superseded registration, not an error; or give each registration
+  generation its own user_data). This means HTTP keep-alive has never actually worked on Linux/io_uring - the primary
+  target backend for real deployments - discovered only now because nothing in this project had run on real Linux
+  before (T5).
 - No HTTP/2, `Expect: 100-continue`, compression, `Range`, or WebSocket.
 - **`res_send_file` and large (uncached) static files are still not optimized** (`improvements.md`, P1's other sub-items,
   not addressed by the static-file cache above): the response head and the file body still go out as separate `write`

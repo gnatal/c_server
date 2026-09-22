@@ -19,6 +19,7 @@ void app_init(App *app) {
     app->error_handler = NULL;
     app->worker_init_hook_count = 0;
     app->server_fd = -1;
+    app->accept_via_fd_passing = 0;
 #if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
     app->ring = NULL;
 #else

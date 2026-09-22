@@ -1542,3 +1542,167 @@ byte) were not attempted - sorted-array binary search was the fix it actually re
 the range it PROJECTED, so there was no reason to reach for the alternatives. Parameterized (`:name`/`*`)
 routes were never part of the problem (single pointers, not scanned) and remain unaffected, as `improvements.md`
 itself noted going in.
+
+---
+
+## C4 · macOS `SO_REUSEPORT` does not balance workers
+
+**Date completed.** 2026-09-22.
+
+**Scope, confirmed with the user before implementation.** macOS/BSD only, behind a new compile-time
+gate, `CEXPRESS_SINGLE_ACCEPTOR` (`#if !defined(__linux__)`, `app_types.h`). Linux's `SO_REUSEPORT`
+4-tuple hashing isn't reported broken (`lib/CLAUDE.md` already called it "expected to work as
+designed"), so it keeps its existing per-worker-listens-and-accepts path completely unchanged - zero
+new fields touched, zero new syscalls, zero behavior change on that platform. A uniform-everywhere
+version was considered and rejected: it would add an extra `sendmsg`/`recvmsg` hop per accepted
+connection on the one platform (Linux) that isn't measured to need it, for a problem `improvements.md`
+itself scoped as macOS-specific.
+
+**How it was completed.**
+
+`improvements.md`'s own suggested fix - "have the master `accept` and pass the descriptor" - implemented
+as a single acceptor: only the cluster master binds and `accept()`s the one listen socket; each
+accepted client fd is handed to a worker over a private `AF_UNIX SOCK_STREAM` socketpair via
+`SCM_RIGHTS`, round-robin across the currently-active workers.
+
+- **The seam this reused, at no cost to any `event_loop_*.c` backend:** `event_loop_kqueue.c`/
+  `event_loop_epoll.c`/`event_loop_io_uring.c` all key `LOOP_EVENT_ACCEPT` purely off
+  `fd == app->server_fd` - none of them call `accept()` themselves or know it's specifically a TCP
+  listen socket. So a worker's `server_fd` could simply be repointed at its *control socket* (the
+  worker-side end of its socketpair with the master) and the exact same readiness event fires when the
+  master writes a passed fd to it. Zero lines changed in any `event_loop_*.c` file.
+- **`app_types.h`:** the `CEXPRESS_SINGLE_ACCEPTOR` macro (see Scope above), plus `App.accept_via_fd_passing`
+  (0 = `server_fd` is a real listen socket, the existing behavior and the only mode on Linux; 1 = it's
+  a control socket, new connections arrive as passed fds, never `accept()`ed by this process) and
+  `ClusterWorkerSlot.control_fd` (`cluster.c`; the master-side end of a slot's socketpair, `-1` when no
+  worker currently occupies it).
+- **`connection.c`:**
+  - Factored `accept_connections`'s S3/table-growth/`Connection`-setup tail into a new shared static
+    helper, `admit_connection(App *, int client_fd)`, deliberately *not* including
+    `set_nonblocking`/`TCP_NODELAY` - those are properties of the underlying open file description,
+    already set once by whichever side actually calls `accept()` (POSIX: shared across an
+    `SCM_RIGHTS` handoff the same way they're shared across `dup()`/`fork()`), so re-applying them
+    worker-side would be redundant, not wrong.
+  - New `accept_passed_connections(App *)` (`CEXPRESS_SINGLE_ACCEPTOR` only): the `recvmsg`/`SCM_RIGHTS`
+    counterpart of `accept_connections`, same drain-until-nothing-pending loop shape, feeding
+    `admit_connection` the fd it extracts from each message's ancillary data.
+  - `app_listen_worker`'s `LOOP_EVENT_ACCEPT` branch now calls `accept_passed_connections` instead of
+    `accept_connections` when `app->accept_via_fd_passing` is set; its one `create_server_socket(port)`
+    call is skipped in that case (the fd is already set by the caller below). Every other line -
+    `run_worker_init_hooks`, `event_loop_init`, shutdown, the timers - is untouched, so this remains a
+    no-op change for every existing caller (standalone mode, Linux workers, every test).
+  - New `app_listen_worker_via_control_socket(App *, int control_fd)`: sets `server_fd`/
+    `accept_via_fd_passing` and calls `app_listen_worker` - the entry point a `CEXPRESS_SINGLE_ACCEPTOR`
+    worker runs instead of `app_listen_worker(app, port)`.
+- **`cluster.c`:**
+  - `spawn_worker` (renamed the shared fork/child-teardown skeleton to `spawn_worker_common`, called by
+    two thin variants - the existing per-worker-bind one on Linux, unchanged, and a new
+    `CEXPRESS_SINGLE_ACCEPTOR` one) now creates a fresh `socketpair(AF_UNIX, SOCK_STREAM, 0, sv)` before
+    every `fork()` - both the initial spawn and every S7 respawn, since a dead worker's own `sv[1]` died
+    with its process. The child branch closes the master's real `listen_fd` (never needed by a worker)
+    and every *other* slot's inherited master-side `control_fd` before calling
+    `app_listen_worker_via_control_socket` - leaving a sibling's control fd open in this process would
+    let it read or write another worker's fd-handoff channel, effectively letting one worker forge
+    `SCM_RIGHTS` messages into another's inbound queue.
+  - `cluster_listen`'s existing preflight `create_server_socket(port)` call (S7's bind-validation-before-
+    forking-anyone check) is kept open instead of closed under this macro - it becomes `listen_fd`, the
+    master's one real socket for the cluster's whole lifetime, closed only at final cleanup after every
+    worker has drained.
+  - New round-robin dispatcher, `dispatch_client_fd`: builds one `sendmsg` with a one-byte data payload
+    (a bare `SCM_RIGHTS`-only message is ill-defined on some `AF_UNIX` implementations) plus the fd as
+    ancillary data, tries up to `workers_count` active slots starting from a persistent cursor, and
+    advances the cursor past whichever slot actually succeeded.
+  - The master's supervision loop's unconditional 50 ms `nanosleep` (reached whenever `waitpid` found
+    nothing that tick) is replaced with `poll(listen_fd, POLLIN, 50)`: `poll()` returns immediately once
+    a connection is pending, so this adds no latency over the old per-worker `accept()` path, while still
+    guaranteeing the same ~50 ms upper bound between backoff/`waitpid` scans the plain sleep gave it
+    before. On `POLLIN`, drains `accept()` in a loop and dispatches each fd; a fd that can't be dispatched
+    (every worker slot down - e.g. mid crash-loop) is just closed, deliberately not duplicating
+    `reject_overloaded_connection`'s hand-built 503 in the master to keep this change scoped to C4.
+  - `signal(SIGPIPE, SIG_IGN)` added to the master itself: it now writes to worker control sockets
+    (`sendmsg`), and a worker that has already closed its end (draining, or dead but not yet reaped) must
+    fail that call with `EPIPE`, not take the master down via the default `SIGPIPE` disposition - workers
+    already ignored it themselves, the master never had to before this change.
+  - Both `socketpair` ends are set non-blocking immediately after creation, before `fork()` - **this was
+    the one real bug caught during implementation, not anticipated in the plan**: the event loop's
+    readiness contract everywhere else is "drain until `EAGAIN`", and a `socketpair()` fd is blocking by
+    default. `accept_passed_connections`'s drain loop calling a blocking `recvmsg` after genuinely
+    draining everything pending would block forever instead of returning `EAGAIN`, freezing that
+    worker's entire single-threaded event loop - reproduced directly: `make test` hung indefinitely on
+    `test_cluster_http_serving_and_shutdown` (the test's own `read()` blocked forever waiting for a
+    response nothing would ever send) until this fix, after which it passed immediately. Setting it
+    before `fork()` applies to both processes' views of the same underlying open file description
+    (`O_NONBLOCK` is a file-status flag, shared the same way across `fork()` as across `SCM_RIGHTS`).
+
+**Deliberately scoped down**, matching the S1-S7/P1-P3/M1 precedent of narrowing rather than silently
+doing less than advertised:
+- **macOS/BSD only** (see Scope above) - confirmed with the user before writing any code, not a
+  unilateral call.
+- **No 503 for an unroutable fd in the master.** If every worker slot is down when a connection arrives
+  (a narrow, transient window - mid crash-loop before the first respawn lands), the master just closes
+  the fd with no response, rather than duplicating `connection.c`'s hand-built 503 responder in
+  `cluster.c` as well. The per-worker S3 `max_connections`/`spare_fd` overload logic itself needed no
+  changes at all - it already runs after a fd is admitted (now via `accept_passed_connections` instead
+  of `accept_connections`), and doesn't care how the fd arrived.
+- **`test_so_reuseport_multi_bind`** (the existing raw-socket test of the OS primitive itself) was left
+  in place with a clarifying comment, not removed or rewritten - it still validates a true fact about
+  the platform, just one the cluster module no longer depends on for balance on macOS.
+
+**Tests and results.**
+
+- New regression, `test_cluster_balances_across_workers` (`tests/test_cluster.c`, registered in
+  `main`): a real 4-worker cluster, a handler that echoes `cluster_worker_id()` into the response body,
+  40 requests each over its own fresh connection (a fresh ephemeral source port per call, so this
+  exercises distribution the same way independent real clients would - relevant even on a
+  hypothetically-Linux run of this same test, where the fix doesn't apply but a working `SO_REUSEPORT`
+  hash should still show up as more than one worker id). Asserts more than one distinct worker id was
+  served - the direct regression for C4 itself: MEASURED (`improvements.md`) that the pre-fix path put
+  over 90% of load on a single worker of four, so a naive version of this test would very plausibly have
+  seen `distinct == 1`.
+- `make test`: all 13 suites pass, including the pre-existing `test_cluster_http_serving_and_shutdown`
+  (HTTP end to end through the new single-acceptor path), `test_cluster_master_exits_fast_when_port_is_taken`
+  (S7's preflight-bind-failure-exits-fast behavior, unchanged since it's the same `create_server_socket`
+  call, just no longer closed afterward), and `test_cluster_master_exits_after_restart_budget_exceeded`
+  (exercises the new per-respawn socketpair create/close path six times in quick succession, the
+  worker-crashes-immediately-before-ever-touching-a-socket shape).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan - meaningful
+  here specifically because this introduces new fd lifecycle code (`socketpair`, `sendmsg`/`recvmsg`
+  with `SCM_RIGHTS`, per-respawn close-then-recreate) that is exactly the class of bug (double-close,
+  use-after-close, fd leak) a sanitizer run is well-suited to catch; the restart-budget test's six rapid
+  respawns are the most direct exercise of that path and came back clean.
+- `make check-docs`: passes (126 engine functions, up from 124 - `accept_passed_connections` and
+  `app_listen_worker_via_control_socket` added to `lib/API.md`, both noted there as cluster-internal,
+  not meant for application code).
+- Compiled `lib/cluster.c` and `lib/connection.c` with the project's `-Wall -Wextra -std=c11 -O2` flags:
+  no new warnings.
+- **Live verification, instrumented (temporary debug counters, added and removed for this
+  verification only - not part of the shipped diff):** `examples/todo_sqlite` demo, `WORKERS=4`,
+  `wrk -t8 -c5000 -d6s` against `/ping`. Every dispatched fd was counted per worker in `cluster.c`
+  itself: **824 / 824 / 824 / 824 across all four workers, 0 dispatch failures** - a dead-even split,
+  not merely "improved."
+- **Live verification, `scripts/stress_test.sh`** (the same script and methodology the user ran against
+  the pre-fix build earlier in this conversation): `WORKERS=4`, `GET /ping` keep-alive, `wrk -c5000`.
+  "Largest single process" RSS as a fraction of "total across 5 processes" (master + 4 workers) went
+  from **~88-90%** (pre-fix, both `improvements.md`'s own MEASURED figure - 124.3 of 133.7 MB - and the
+  user's own run earlier this conversation - 42.1 of 47.8 MB) to **~24-25%** post-fix (12.2-12.3 of
+  50.2-50.3 MB) - within noise of the ideal 20-25% a truly even four-way split (plus the master's own
+  small footprint) would produce.
+  **One caveat surfaced by this same live testing, not a regression this fix introduced:** the demo's
+  own build wiring (`make demo`, `examples/todo_sqlite/Makefile`) did not always relink
+  `cexpress_demo` after `lib/cluster.c`/`lib/connection.c` changed and `build/lib/libcexpress.a` was
+  re-archived - confirmed by `strings`-checking the binary for debug output that should have been
+  present and finding it missing until the stale binary was removed and rebuilt from scratch. Purely a
+  verification-workflow snag (a stale binary silently serving old code), not a change to any shipped
+  file; not investigated further here since it's outside C4's scope, but worth knowing if a future fix's
+  live verification via `make demo` looks unexpectedly unchanged.
+- The full `scripts/stress_test.sh` battery (all four phases: ping, churn, read, write) was not run
+  end to end for this verification - a run past the `churn`/`conn: close` phases hit a `set -e` abort
+  partway into the `read` phase on an unrelated, pre-existing script path (not reproduced or diagnosed
+  further; the script's own comments already document `churn`-phase `TIME_WAIT` flakiness on macOS).
+  The `ping`-phase numbers above are the direct, apples-to-apples comparison against the user's own
+  pre-fix run and are sufficient to confirm the fix; the demo's own end-to-end correctness (HTTP
+  responses, not just balance) is separately covered by `test_cluster_http_serving_and_shutdown`.
+
+**Status:** Fixed for the measured problem on its stated platform (macOS/BSD). Linux is untouched by
+design, confirmed with the user before implementation - not a gap, the deliberate scope. No 503 path
+for the master's own "no worker available" edge case, per the scoping above.

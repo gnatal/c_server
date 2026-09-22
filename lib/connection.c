@@ -288,6 +288,45 @@ static void reject_overloaded_connection(int client_fd) {
     close(client_fd);
 }
 
+/*
+ * Shared tail of admitting one already-obtained client fd (via accept() or, under
+ * CEXPRESS_SINGLE_ACCEPTOR, a passed fd received over a control socket - C4): S3's overload check,
+ * table growth and Connection setup. Does NOT set O_NONBLOCK/TCP_NODELAY - callers that actually
+ * accept() the fd themselves do that once, right there; a passed fd already has both set (POSIX:
+ * file status flags and socket options are properties of the underlying open file description, not
+ * the fd number, so they carry over across an SCM_RIGHTS handoff same as across dup()/fork()).
+ */
+static void admit_connection(App *app, int client_fd) {
+    /* S3: shed load past the configured cap instead of accumulating connections (and their
+     * arenas) without bound. Checked before ensure_connection_capacity/connection_create so an
+     * overloaded server doesn't pay for either. open_connections is O(1) (see App.open_connections)
+     * - this runs once per accepted connection, including every one we're about to reject, so it
+     * must not become the O(n) scan it's replacing. */
+    if (app->config.max_connections > 0 && app->open_connections >= app->config.max_connections) {
+        reject_overloaded_connection(client_fd);
+        return;
+    }
+
+    /* Past the cap above, fd is bounded only by the process's own RLIMIT_NOFILE (accept()
+     * itself starts failing with EMFILE once that's hit, handled by the caller) - no fixed ceiling
+     * here, just grow the table to fit. A failed grow (genuine OOM) rejects just this one
+     * connection, without affecting any already-open ones. */
+    if (ensure_connection_capacity(app, client_fd) != 0) {
+        close(client_fd);
+        return;
+    }
+
+    Connection *conn = connection_create(app, client_fd);
+    if (conn == NULL) {
+        close(client_fd);
+        return;
+    }
+    app->connections[client_fd] = conn;
+    app->open_connections++; /* paired with connection_close's -- (S3) */
+
+    event_loop_watch_read(app, client_fd, conn);
+}
+
 void accept_connections(App *app) {
     while (1) {
         struct sockaddr_in client_addr;
@@ -315,40 +354,55 @@ void accept_connections(App *app) {
             break;
         }
 
-        /* S3: shed load past the configured cap instead of accumulating connections (and their
-         * arenas) without bound. Checked before ensure_connection_capacity/connection_create so an
-         * overloaded server doesn't pay for either. open_connections is O(1) (see App.open_connections)
-         * - this runs once per accepted connection, including every one we're about to reject, so it
-         * must not become the O(n) scan it's replacing. */
-        if (app->config.max_connections > 0 && app->open_connections >= app->config.max_connections) {
-            reject_overloaded_connection(client_fd);
-            continue;
-        }
-
-        /* Past the cap above, fd is bounded only by the process's own RLIMIT_NOFILE (accept()
-         * itself starts failing with EMFILE once that's hit, handled above) - no fixed ceiling
-         * here, just grow the table to fit. A failed grow (genuine OOM) rejects just this one
-         * connection, without affecting any already-open ones. */
-        if (ensure_connection_capacity(app, client_fd) != 0) {
-            close(client_fd);
-            continue;
-        }
-
         set_nonblocking(client_fd);
         const int nodelay = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        Connection *conn = connection_create(app, client_fd);
-        if (conn == NULL) {
-            close(client_fd);
-            continue;
-        }
-        app->connections[client_fd] = conn;
-        app->open_connections++; /* paired with connection_close's -- (S3) */
-
-        event_loop_watch_read(app, client_fd, conn);
+        admit_connection(app, client_fd);
     }
 }
+
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+/*
+ * C4: this worker's server_fd is a control socket (the worker-side end of a socketpair with the
+ * cluster master), not a listen socket - accept_via_fd_passing is set. New connections arrive as fds
+ * passed over it via SCM_RIGHTS (cluster.c: dispatch_client_fd), never accept()ed by this process.
+ * Drains every pending message until EAGAIN, same loop shape as accept_connections.
+ */
+void accept_passed_connections(App *app) {
+    while (1) {
+        char data_buf[1];
+        char cmsg_buf[CMSG_SPACE(sizeof(int))];
+        struct iovec iov = { .iov_base = data_buf, .iov_len = sizeof(data_buf) };
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf;
+        msg.msg_controllen = sizeof(cmsg_buf);
+
+        ssize_t n = recvmsg(app->server_fd, &msg, 0);
+        if (n <= 0) {
+            /* n == 0: the master closed its end of this control socket (e.g. this worker is
+             * draining/exiting) - nothing more to read, same as accept() returning EAGAIN below.
+             * n < 0: EAGAIN/EWOULDBLOCK (no more pending hand-offs right now) or a transient error;
+             * either way, stop draining this wake. */
+            break;
+        }
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+            /* A message arrived with no fd attached - nothing to admit. Shouldn't happen (the
+             * master only ever sends one-byte-plus-fd messages), but harmless to just skip it. */
+            continue;
+        }
+
+        int client_fd;
+        memcpy(&client_fd, CMSG_DATA(cmsg), sizeof(int));
+        admit_connection(app, client_fd);
+    }
+}
+#endif
 
 void flush_connection(App *app, Connection *conn) {
     size_t bytes_written_this_flush = 0;
@@ -750,14 +804,21 @@ void app_listen_worker(App *app, int port) {
 
     run_worker_init_hooks(app);
 
-    app->server_fd = create_server_socket(port);
+    /* C4 (CEXPRESS_SINGLE_ACCEPTOR only): a worker running under the single-acceptor cluster model
+     * arrives here with server_fd already set to its control socket by
+     * app_listen_worker_via_control_socket, and must not clobber it with a real listen socket of its
+     * own - it never accept()s directly. Every other caller (standalone, or a Linux cluster worker)
+     * is unaffected: accept_via_fd_passing is 0 for them, same bind-here behavior as before. */
+    if (!app->accept_via_fd_passing) {
+        app->server_fd = create_server_socket(port);
+    }
     if (event_loop_init(app) != 0) {
         perror("event_loop_init");
         exit(EXIT_FAILURE);
     }
     event_loop_watch_read(app, app->server_fd, NULL);
 
-    if (!cluster_is_worker() || cluster_worker_id() == 0) {
+    if (!app->accept_via_fd_passing && (!cluster_is_worker() || cluster_worker_id() == 0)) {
         printf("Listening on port %d\n", port);
     }
 
@@ -804,6 +865,12 @@ void app_listen_worker(App *app, int port) {
             }
 
             if (ev->type == LOOP_EVENT_ACCEPT) {
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+                if (app->accept_via_fd_passing) {
+                    accept_passed_connections(app);
+                    continue;
+                }
+#endif
                 accept_connections(app);
                 continue;
             }
@@ -845,6 +912,12 @@ shutdown_complete:
         }
     }
     event_loop_close(app);
+}
+
+void app_listen_worker_via_control_socket(App *app, int control_fd) {
+    app->server_fd = control_fd;
+    app->accept_via_fd_passing = 1;
+    app_listen_worker(app, 0); /* port unused: server_fd is already the control socket, not bound here */
 }
 
 void app_listen(App *app, int port) {

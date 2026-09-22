@@ -37,6 +37,12 @@ static void test_cluster_worker_identification(void) {
     assert(cluster_worker_id() == -1);
 }
 
+/* Raw OS-level check only: two sockets CAN share a port via SO_REUSEPORT, independent of what the
+ * cluster module actually does with that capability. On macOS/BSD (CEXPRESS_SINGLE_ACCEPTOR, C4),
+ * cluster_listen no longer relies on the kernel balancing across such sockets - only the master binds
+ * one and hands fds to workers itself - so this test's pass/fail is unrelated to worker balance;
+ * see test_cluster_balances_across_workers for that. Left in place: it's still a valid, useful check
+ * of the primitive itself. */
 static void test_so_reuseport_multi_bind(void) {
     int s1 = socket(AF_INET, SOCK_STREAM, 0);
     assert(s1 >= 0);
@@ -78,6 +84,13 @@ static void test_so_reuseport_multi_bind(void) {
 static void ping_handler(const Request *req, Response *res) {
     (void)req;
     res_send(res, "pong");
+}
+
+static void worker_id_handler(const Request *req, Response *res) {
+    (void)req;
+    char body[16];
+    snprintf(body, sizeof(body), "%d", cluster_worker_id());
+    res_send(res, body);
 }
 
 static int get_ephemeral_port(void) {
@@ -176,6 +189,105 @@ static void test_cluster_http_serving_and_shutdown(void) {
     assert(WEXITSTATUS(status) == 0);
 }
 
+/* Connects, sends one GET, reads the worker id worker_id_handler wrote into the body, and closes -
+ * a fresh connection (and thus, on this loopback client, a fresh ephemeral source port) every call,
+ * so repeated calls exercise a cluster's connection distribution across workers the same way
+ * independent real clients would. Returns the parsed worker id, or -1 on any failure. */
+static int request_worker_id(int port) {
+    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_in srv_addr;
+    memset(&srv_addr, 0, sizeof(srv_addr));
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    srv_addr.sin_port = htons(port);
+
+    if (connect(client_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) != 0) {
+        close(client_fd);
+        return -1;
+    }
+
+    const char *req_str = "GET /worker-id HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if (write(client_fd, req_str, strlen(req_str)) != (ssize_t)strlen(req_str)) {
+        close(client_fd);
+        return -1;
+    }
+
+    char buf[256];
+    memset(buf, 0, sizeof(buf));
+    ssize_t nread = read(client_fd, buf, sizeof(buf) - 1);
+    close(client_fd);
+    if (nread <= 0) {
+        return -1;
+    }
+
+    const char *body = strstr(buf, "\r\n\r\n");
+    if (body == NULL) {
+        return -1;
+    }
+    return atoi(body + 4);
+}
+
+/* C4: MEASURED (improvements.md) that per-worker SO_REUSEPORT listen sockets on macOS do not balance
+ * accepted connections across workers - over 90% of load landed on a single worker of four. This is
+ * the direct regression test: a real 4-worker cluster must actually spread sequential, independently
+ * connected requests across more than just one worker id. */
+static void test_cluster_balances_across_workers(void) {
+    int test_port = get_ephemeral_port();
+
+    pid_t master_pid = fork();
+    assert(master_pid >= 0);
+
+    if (master_pid == 0) {
+        App app;
+        app_init(&app);
+        app.config.workers = 4;
+        app_get(&app, "/worker-id", worker_id_handler);
+        app_listen(&app, test_port);
+        app_destroy(&app);
+        exit(0);
+    }
+
+    struct timespec delay = {0, 200000000L}; /* 200ms */
+    nanosleep(&delay, NULL);
+
+    enum { NUM_REQUESTS = 40 };
+    int seen[MAX_CLUSTER_WORKERS];
+    memset(seen, 0, sizeof(seen));
+    int distinct = 0;
+
+    for (int i = 0; i < NUM_REQUESTS; i++) {
+        int id = -1;
+        /* The first few requests may race the cluster still spawning workers; retry briefly. */
+        for (int retry = 0; retry < 10 && id < 0; retry++) {
+            id = request_worker_id(test_port);
+            if (id < 0) {
+                nanosleep(&delay, NULL);
+            }
+        }
+        assert(id >= 0 && id < MAX_CLUSTER_WORKERS);
+        if (!seen[id]) {
+            seen[id] = 1;
+            distinct++;
+        }
+    }
+
+    assert(kill(master_pid, SIGTERM) == 0);
+    int status = 0;
+    pid_t waited = waitpid(master_pid, &status, 0);
+    assert(waited == master_pid);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 0);
+
+    /* The direct regression: more than one of the 4 workers actually served a request. A naive
+     * version of this test under the pre-fix per-worker-SO_REUSEPORT path would very plausibly see
+     * distinct == 1 here, matching the ~90%+-to-one-worker imbalance improvements.md measured. */
+    assert(distinct > 1);
+}
+
 /* S7: before this fix, a fatal, permanent misconfiguration (the port already taken) made every one of
  * WORKERS children fail create_server_socket's own bind() identically, and the master respawned each
  * one instantly forever - MEASURED (improvements.md, S7) 10,594 respawns in about 4 seconds with
@@ -269,6 +381,7 @@ int main(void) {
     test_cluster_worker_identification();
     test_so_reuseport_multi_bind();
     test_cluster_http_serving_and_shutdown();
+    test_cluster_balances_across_workers();
     test_cluster_master_exits_fast_when_port_is_taken();
     test_cluster_master_exits_after_restart_budget_exceeded();
 

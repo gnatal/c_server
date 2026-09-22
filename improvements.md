@@ -12,7 +12,7 @@ Every gain carries one of three tags, so you can tell a number from a guess:
 | **PROJECTED** | Arithmetic on measured components (for example "parse is 3 passes of ~150 ns, so removing 2 saves ~300 ns"). Sound, but the end-to-end effect was not run. |
 | **ESTIMATED** | Reasoning from how the kernel or library works, or published behavior of similar systems. Not measured here; treat as a hypothesis to test. |
 
-Nothing was measured on Linux, so everything about io_uring and epoll is ESTIMATED. Experiments were done in scratch copies of the code; **no repository file was changed for this document** (the experiment programs live outside the repo; say so if you want them added under `tests/experiments/`).
+Nothing was measured on Linux, so everything about io_uring and epoll is ESTIMATED, **except C6** (added 2026-09-22, MEASURED on real Linux via `docker_stress_test.sh` - see that entry for how). Experiments were done in scratch copies of the code; **no repository file was changed for this document** (the experiment programs live outside the repo; say so if you want them added under `tests/experiments/`).
 
 Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severity is for security/reliability items only.
 
@@ -54,15 +54,16 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | C1 | `Expect: 100-continue` is ignored | Correctness | | S | **1.007 s → 2.4 ms** per large upload | MEASURED |
 | C2 | Path parameter names are stored per tree position | Correctness | | S | Removes a silent `NULL` | MEASURED |
 | C3 | No `Date` header; 204 carries `Content-Length` | Correctness | | S | RFC compliance | MEASURED |
-| C4 | macOS `SO_REUSEPORT` does not balance workers | Reliability | | M | Up to ~N× on macOS if balanced (client-bound here) | MEASURED (imbalance) |
+| C4 | ~~macOS `SO_REUSEPORT` does not balance workers~~ | Reliability | | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (imbalance, and the fix) |
 | C5 | io_uring failure kills the server (no epoll fallback) | Reliability | | M | Runs under restrictive seccomp | Code reading |
+| C6 | io_uring backend closes every keep-alive connection after its first request | Correctness / Reliability | | S | Makes HTTP keep-alive actually work on Linux | MEASURED (real Linux, via Docker) |
 | T1 | Test and tooling gaps that let the bugs above through | Testing | | S–M | Prevents regressions | Code reading |
 
 ---
 
 ## 2. Suggested order
 
-**Quick wins (each S, do first):** S8 (two-line fix), S6, S7, S1, S2, C1, C3, P5, M3, P6, P7, S9.
+**Quick wins (each S, do first):** S8 (two-line fix), S6, S7, S1, S2, C1, C3, P5, M3, P6, P7, S9, **C6 (MEASURED 2026-09-22, breaks Linux keep-alive - do this one early)**.
 **Then (M):** S3+S4 together, P1, M1+M2 together, P4, P2, C2, P8, P9.
 **Larger (L):** P3, M5, C4, C5.
 
@@ -356,7 +357,10 @@ record.
 **Fix.** Add a cached, per-second-refreshed `Date` string (the loop already calls `time(NULL)`), and skip the framing headers for 1xx/204/304. Optionally add `X-Content-Type-Options: nosniff` for static responses.
 **Probable gain.** Compliance with strict clients, caches and proxies. Cost: ~37 extra bytes per response (a `memcpy` of a cached string); no syscalls.
 
-### C4 · macOS `SO_REUSEPORT` does not balance workers
+### C4 · ~~macOS `SO_REUSEPORT` does not balance workers~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** (Finding 4 in `finds.md`.) On macOS the kernel does not spread TCP connections across the workers' listen sockets.
 **Measured.** 4 workers, 5,000 connections from one client: the largest worker held 124.3 of 133.7 MB. With 1 worker `/ping` reached 221,611 req/s versus 250,055 with 4.
 **Fix.** For development on macOS, either document that `WORKERS>1` does not scale, or implement a single acceptor that hands accepted fds to workers round-robin (`SCM_RIGHTS` over a socketpair), or have the master `accept` and pass the descriptor. Linux (4-tuple hashing) is expected to work as designed but was not measured.
@@ -366,6 +370,12 @@ record.
 **Problem.** `event_loop_init` failure makes `app_listen_worker` print and `exit()` (`connection.c:548-551`). Under a runtime that blocks `io_uring_setup` the process cannot start, and in cluster mode the master respawns it in a loop (S7). The epoll backend is already in the tree but only compiled with `-DCEXPRESS_USE_EPOLL`.
 **Fix.** Compile both Linux backends and select at runtime: try io_uring, fall back to epoll on `ENOSYS`/`EPERM`, and log which one is active. Because `event_loop.h` is already an abstraction, this is a function-pointer table (or link-time symbol prefixing).
 **Probable gain.** Works in containers and hardened kernels without special flags; no fast-path cost.
+
+### C6 · io_uring backend closes every keep-alive connection after its first request
+**Problem.** `event_loop_io_uring.c`'s `update_poll` (called by `event_loop_watch_write`/`unwatch_write`/`watch_read`/`unwatch_read`, all four) re-arms a connection's multishot poll by issuing `IORING_OP_POLL_REMOVE` against the existing registration, then submitting a fresh `IORING_OP_POLL_ADD` multishot in the same batch - both keyed by the same fixed `UDATA_FD(fd)` user_data. Canceling the still-active old registration generates a *third* completion for that fd, carrying `cqe->res = -ECANCELED` (-125) and no `IORING_CQE_F_MORE`, delivered with the same user_data as the live connection. `event_loop_poll`'s completion loop (`:299-333`) never inspects `cqe->flags`, and its `if (res < 0)` check (`:303`) can't tell this self-inflicted cancellation apart from a real socket error - it reports `LOOP_EVENT_ERROR`, and `connection.c`'s dispatcher closes the connection on the spot. `flush_connection` calls `event_loop_unwatch_write` after *every* keep-alive response regardless of whether write interest was ever registered (already flagged, unrelated reason, as P4), so this fires on essentially every single request on Linux.
+**Measured.** Reproduced on real Linux via Docker (`docker_stress_test.sh`'s new native-arch `wrk` image, plus a raw Python socket to rule out any client quirk): a single connection sending sequential `GET /ping` requests with `Connection: keep-alive` gets a correct `200` for request 1, then `recv()` returns 0 bytes (server-initiated close) on request 2 - reproduced with `WORKERS=1` (not a multi-worker interaction) and via both container-to-container and host-mapped access (not a Docker networking artifact). Instrumenting the CQE loop directly confirms the sequence: `res=1 flags=2 more=1` (the request's real `POLLIN`) immediately followed by `res=-125 flags=0 more=0` on the same fd (the `update_poll`-triggered cancellation), then `LOOP_EVENT_ERROR` and a close. `wrk` against the same setup reports read-error counts *exceeding* the successful-request count (e.g. 207,454 errors against 205,423 requests at `-c100 -d4s`), matching every keep-alive connection dying after one request. **Not the same bug as T6's still-unexplained macOS read errors** - this reproduction is Linux/io_uring only; the kqueue backend already skips a no-op `update_poll` call via `events_watched` (`lib/CLAUDE.md`, "Event loop"), so a keep-alive response that never needed write interest never triggers kqueue's equivalent of this remove-then-add churn in the first place, and epoll's synchronous `epoll_ctl(MOD)` has no async-cancellation-completion concept to misfire this way either - this is believed to be specific to io_uring's async poll-remove/re-add pattern.
+**Fix.** In `event_loop_poll`, recognize and drop a self-inflicted cancellation instead of forwarding it as `LOOP_EVENT_ERROR`: either check `cqe->flags & IORING_CQE_F_MORE` was absent *and* `res == -ECANCELED` and treat that combination as "this registration was superseded, not an error" (skip the event), or - more robust against future `update_poll` call sites - give each *generation* of a connection's poll registration its own user_data (e.g. a per-connection sequence counter folded into the encoded value) so a stale cancellation for a superseded registration is trivially distinguishable from a live one by user_data alone, not by inference over `res`/`flags`. The latter also removes the current reliance on remove-then-add ordering being race-free. Fixing P4 (skip `update_poll` entirely when the requested mask already matches `events_watched`, as the kqueue backend already does) would incidentally hide this for the common no-write-needed path, but not the underlying misclassification - a response that doesn't fully flush in one `write()` (needing real write-interest toggling) would still hit it.
+**Probable gain.** Makes HTTP keep-alive actually work on Linux/io_uring, the primary target backend for real deployments of this engine. Currently every keep-alive connection behaves as if the server force-closed after one request regardless of what the client asked for, which both defeats the point of keep-alive (a fresh TCP handshake, and on Linux a fresh io_uring poll registration, per request) and would explain unexpectedly poor Linux throughput/latency numbers in any future benchmark that wasn't specifically chasing this down.
 
 ---
 
@@ -377,7 +387,7 @@ record.
 | T2 | No test for "literal beats `:param`", different parameter names at one position, `%00`, over-long headers, 33 headers | Add to `test_router.c` / `test_http_hardening.c` (C2, S5, S6) |
 | T3 | `tests/test_router.c` frees only `app->connections`, so route trees leak; a Linux LeakSanitizer run would report them | Call `app_free_routes` in `cleanup_app` |
 | T4 | `scripts/stress_test.sh` starts the demo from the repo root (its `GET /` measures a 404) and its memory sampler disagrees with direct measurement | `cd examples/todo_sqlite` before launching; verify the sampler against `ps` |
-| T5 | No Linux run of any test, benchmark or io_uring code path in this environment | Add a CI job on Linux (build + `make test` + sanitizers + a `wrk` smoke run); every ESTIMATED tag above needs it |
+| T5 | No Linux run of any test, benchmark or io_uring code path in this environment | Add a CI job on Linux (build + `make test` + sanitizers + a `wrk` smoke run); every ESTIMATED tag above needs it. Partially closed 2026-09-22: a manual Docker run (`docker_stress_test.sh`) found C6 (io_uring closes every keep-alive connection after one request) on the first real Linux exercise of this codebase - exactly the kind of bug this gap predicted. A real CI job, not an ad-hoc manual run, is still needed |
 | T6 | Read errors at 5,000 connections (hundreds to a couple thousand per run) are unexplained | Run the same `wrk -c5000` against a trivial known-good server (a 30-line kqueue echo, or nginx) on the same machine: if it shows the same errors, it is the OS or `wrk`, not CExpress; otherwise log `errno` at every `connection_close` caused by `LOOP_EVENT_ERROR` to see which condition drops connections. Also raise `BACKLOG` and compare |
 | T7 | `make bench` has no static-file, JSON-list-through-response, or many-routes case | Add the P1/P7 experiments as benchmark cases so future changes are measured |
 
@@ -416,5 +426,6 @@ All on an Apple M3 Pro laptop, macOS, gcc-16 -O2, 21 Sep 2026. Servers were the 
 | S8 | Raw-socket script against the running demo (also in `finds.md`) |
 | C2 | Scratch program registering conflicting patterns and calling `match_route` + `req_get_param` |
 | C4 | 4-worker cluster, script opening 100 / 1,000 / 5,000 connections, `ps` RSS per process |
+| C6 | **The one Linux measurement in this document** (2026-09-22, via Docker on the same M3 Pro, `docker_stress_test.sh`'s native-arch `wrk` image against the real io_uring backend): `wrk` and a raw Python socket script against a single `GET /ping` connection with `Connection: keep-alive`; temporary `fprintf` instrumentation in `event_loop_io_uring.c`'s CQE loop and `connection.c`'s `LOOP_EVENT_ERROR` branch (added, used, then reverted - no trace left in the diff) to capture the exact `res`/`flags` sequence |
 
-Limits of this evidence: single runs; client and server share cores; macOS only; no Linux; network effects (real latency, real packet loss) absent. Re-run anything you plan to rely on for a decision.
+Limits of this evidence: single runs; client and server share cores; macOS only except C6 (Linux, via Docker); network effects (real latency, real packet loss) absent. Re-run anything you plan to rely on for a decision.

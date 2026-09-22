@@ -17,6 +17,18 @@
 #define PATH_MAX 4096
 #endif
 
+/* C4: on macOS/BSD, per-worker SO_REUSEPORT listen sockets do not balance accepted connections across
+ * workers the way Linux's 4-tuple hashing does (improvements.md, C4 - MEASURED over 90% of load
+ * landing on one of four workers). Gated to non-Linux only: Linux keeps its existing, unmeasured-but-
+ * not-reported-broken per-worker accept path untouched, matching the same "narrow, platform-scoped
+ * fix" precedent as the io_uring/kqueue split below. Under this macro, only the master process binds
+ * and accept()s the listening socket (cluster.c: cluster_listen); each accepted fd is handed to a
+ * worker over a per-worker AF_UNIX SOCK_STREAM socketpair via SCM_RIGHTS, round-robin across active
+ * workers (see App.accept_via_fd_passing below and lib/CLAUDE.md, "Workers and fork"). */
+#if !defined(__linux__)
+#define CEXPRESS_SINGLE_ACCEPTOR 1
+#endif
+
 /* ---- limits ---- */
 #define MAX_ROUTER_ROUTES 64          /* per Router (sub-router staging limit) */
 #define MAX_MIDDLEWARES 16            /* app-wide and per Router */
@@ -460,6 +472,13 @@ typedef struct {
 
     ErrorHandler error_handler;
     int server_fd;
+    /* C4 (CEXPRESS_SINGLE_ACCEPTOR only): 0 = server_fd is a real listen socket, accept() directly
+     * (the default, and the only mode on Linux). 1 = server_fd is this worker's control socket (the
+     * worker-side end of a socketpair with the cluster master); new connections arrive as passed fds
+     * via recvmsg/SCM_RIGHTS (connection.c: accept_passed_connections), never accept()ed by this
+     * process. Set once by app_listen_worker_via_control_socket, before app_listen_worker's event loop
+     * starts; never toggled afterward. */
+    int accept_via_fd_passing;
     union {
         int kq;          /* macOS/BSD */
         int epoll_fd;    /* Linux epoll backend (-DCEXPRESS_USE_EPOLL) */

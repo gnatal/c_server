@@ -9,6 +9,12 @@
 #include <sys/wait.h>
 #include "cluster.h"
 #include "connection.h"
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <netinet/tcp.h>
+#endif
 
 static int g_is_worker = 0;
 static int g_worker_id = -1;
@@ -37,6 +43,10 @@ typedef struct {
     long long backoff_until_ms;   /* monotonic time the next respawn attempt for this slot is allowed */
     int consecutive_failures;     /* failures counted within the current restart-budget window */
     long long window_start_ms;    /* when the current window started; 0 = no window yet */
+    /* C4, CEXPRESS_SINGLE_ACCEPTOR only: the master-side end (sv[0]) of this slot's socketpair with
+     * its worker, used to hand it accepted client fds via SCM_RIGHTS (dispatch_client_fd). -1 when no
+     * worker is currently running in this slot. Unused (always -1) on the non-single-acceptor path. */
+    int control_fd;
 } ClusterWorkerSlot;
 
 static long long monotonic_ms(void) {
@@ -118,7 +128,12 @@ static void master_signal_handler(int signo) {
     }
 }
 
-static pid_t spawn_worker(App *app, int port, int worker_id) {
+/* Shared by both spawn_worker variants below: the fork()+child-teardown skeleton every worker slot
+ * uses. `run_child` does whatever is left to set server_fd up (bind its own SO_REUSEPORT socket, or -
+ * C4 - close everything but its own control socket and use that) before app_listen_worker's event
+ * loop starts. */
+static pid_t spawn_worker_common(App *app, int worker_id, void (*run_child)(App *app, int port, void *ctx),
+                                  int port, void *ctx) {
     /* fork() duplicates the master's stdio buffers as-is: an unflushed line (stdout to a pipe/file is
      * fully buffered, not line-buffered) would otherwise be flushed a second time by the child's own
      * exit(), printing it twice. Immaterial for one worker at startup, but S7's respawn loop can fork
@@ -149,8 +164,7 @@ static pid_t spawn_worker(App *app, int port, int worker_id) {
         sigaction(SIGTERM, &sa, NULL);
         sigaction(SIGCHLD, &sa, NULL);
 
-        /* Run isolated worker event loop */
-        app_listen_worker(app, port);
+        run_child(app, port, ctx);
 
         /* Teardown worker resources and exit */
         app_destroy(app);
@@ -159,6 +173,128 @@ static pid_t spawn_worker(App *app, int port, int worker_id) {
 
     return pid;
 }
+
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+/* C4: fd-passing context handed through spawn_worker_common to the child branch - everything the
+ * child needs to close (fds it inherited via fork() but does not need) and its own control fd. */
+typedef struct {
+    int listen_fd;                 /* the master's real listen socket - never needed by a worker */
+    ClusterWorkerSlot *workers;    /* every slot's *master-side* control_fd, to close all but this one */
+    int workers_count;
+    int slot_idx;                  /* this worker's own slot, and the fd (worker_control_fd) to keep */
+    int worker_control_fd;         /* sv[1]: this worker's own control socket */
+} FdPassingChildCtx;
+
+static void run_child_fd_passing(App *app, int port, void *ctx_ptr) {
+    (void)port;
+    FdPassingChildCtx *ctx = (FdPassingChildCtx *)ctx_ptr;
+
+    /* Close every fd this child inherited via fork() but does not need: the master's real listen
+     * socket (this worker never accept()s directly), and every *other* slot's master-side control
+     * fd (this worker must not be able to read or write another worker's inbound fd-handoff channel
+     * - leaving those open would let a buggy or malicious worker inject fabricated SCM_RIGHTS
+     * messages into a sibling's control socket). */
+    close(ctx->listen_fd);
+    for (int j = 0; j < ctx->workers_count; j++) {
+        if (j != ctx->slot_idx && ctx->workers[j].control_fd >= 0) {
+            close(ctx->workers[j].control_fd);
+        }
+    }
+
+    app_listen_worker_via_control_socket(app, ctx->worker_control_fd);
+}
+
+/* C4: single-acceptor variant. Creates a fresh AF_UNIX socketpair for this slot before forking - the
+ * parent keeps sv[0] (control_fd, used to hand this worker client fds) and the child keeps sv[1]
+ * (passed to app_listen_worker_via_control_socket). Called both for the initial spawn and for every
+ * respawn (S7): a dead worker's old sv[1] died with its process, so each attempt needs its own pair. */
+static pid_t spawn_worker(App *app, int listen_fd, ClusterWorkerSlot *workers, int workers_count, int slot_idx) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        perror("cluster: socketpair");
+        return -1;
+    }
+    /* Both ends must be non-blocking, matching the event loop's readiness model: the worker's
+     * accept_passed_connections drains recvmsg() in a loop until EAGAIN, the same "poll says
+     * readable, read until it isn't" contract every other watched fd follows (event_loop_*.c). On a
+     * blocking socket, the loop's final recvmsg call after draining every pending message would
+     * block forever instead of returning EAGAIN, freezing this worker's entire single-threaded event
+     * loop. Setting it here, before fork(), applies to both processes' views of the same underlying
+     * open file descriptions (O_NONBLOCK is a file-status flag, shared across fork() same as it is
+     * across SCM_RIGHTS/dup()). The master's own dispatch_client_fd sendmsg calls don't strictly need
+     * this (the control socket's send buffer is normally far from full), but non-blocking keeps a
+     * slow/stuck worker from ever stalling the master's own accept loop either. */
+    set_nonblocking(sv[0]);
+    set_nonblocking(sv[1]);
+
+    FdPassingChildCtx ctx = {
+        .listen_fd = listen_fd,
+        .workers = workers,
+        .workers_count = workers_count,
+        .slot_idx = slot_idx,
+        .worker_control_fd = sv[1],
+    };
+    pid_t pid = spawn_worker_common(app, slot_idx, run_child_fd_passing, 0, &ctx);
+    if (pid < 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return -1;
+    }
+
+    /* Parent: only the master-side end is ours to keep. */
+    close(sv[1]);
+    workers[slot_idx].control_fd = sv[0];
+    return pid;
+}
+
+/* C4: hands one accepted client fd to worker `*next` (or the next active one after it) via
+ * SCM_RIGHTS over its control socket, round-robin. A one-byte data payload rides along with the
+ * ancillary data - a zero-length SCM_RIGHTS-only message is ill-defined on some AF_UNIX
+ * implementations; the worker's recvmsg reads and discards this byte, only the cmsg fd matters.
+ * Returns 1 and advances *next past the worker it used on success, 0 if no active worker could take
+ * it (every slot down, or every sendmsg failed - e.g. mid crash-loop with no live worker at all). */
+static int dispatch_client_fd(ClusterWorkerSlot *workers, int workers_count, int *next, int client_fd) {
+    for (int tries = 0; tries < workers_count; tries++) {
+        int i = (*next + tries) % workers_count;
+        if (!workers[i].active || workers[i].control_fd < 0) {
+            continue;
+        }
+
+        char data_byte = 'x';
+        struct iovec iov = { .iov_base = &data_byte, .iov_len = 1 };
+        char cmsg_buf[CMSG_SPACE(sizeof(int))];
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf;
+        msg.msg_controllen = sizeof(cmsg_buf);
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &client_fd, sizeof(int));
+
+        if (sendmsg(workers[i].control_fd, &msg, 0) >= 0) {
+            *next = (i + 1) % workers_count;
+            return 1;
+        }
+    }
+    return 0;
+}
+#else
+static void run_child_direct_listen(App *app, int port, void *ctx) {
+    (void)ctx;
+    /* Run isolated worker event loop: binds its own SO_REUSEPORT socket (create_server_socket, via
+     * app_listen_worker) and accept()s directly. */
+    app_listen_worker(app, port);
+}
+
+static pid_t spawn_worker(App *app, int port, int worker_id) {
+    return spawn_worker_common(app, worker_id, run_child_direct_listen, port, NULL);
+}
+#endif
 
 void cluster_listen(App *app, int port, int num_workers) {
     int workers_count = cluster_resolve_worker_count(num_workers);
@@ -179,11 +315,23 @@ void cluster_listen(App *app, int port, int num_workers) {
      * error stops the whole server once) on any such failure, so calling it here for the sole purpose
      * of validating and then discarding the fd turns what used to be a fork storm into that single
      * message. */
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+    /* C4: kept open (not closed like the preflight-only check below) - this is the one real listen
+     * socket for the whole cluster's lifetime; only the master accepts on it. */
+    int listen_fd = create_server_socket(port);
+#else
     close(create_server_socket(port));
+#endif
 
     ClusterWorkerSlot workers[MAX_CLUSTER_WORKERS];
     memset(workers, 0, sizeof(workers));
+    for (int i = 0; i < MAX_CLUSTER_WORKERS; i++) {
+        workers[i].control_fd = -1; /* the plain memset above would otherwise leave fd 0 (stdin) here */
+    }
     int fatal = 0;
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+    int next_worker = 0; /* round-robin cursor for dispatch_client_fd, persists across loop iterations */
+#endif
 
     g_shutdown_requested = 0;
     g_shutdown_signo = 0;
@@ -198,12 +346,30 @@ void cluster_listen(App *app, int port, int num_workers) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGCHLD, &sa, NULL);
 
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+    /* C4: the master now itself writes to worker control sockets (dispatch_client_fd's sendmsg); a
+     * worker that has already closed its end (draining, or dead but not yet reaped) must fail that
+     * call with EPIPE, not take down the master with the default SIGPIPE disposition - workers
+     * already ignore it themselves (app_listen_worker), the master never had to before this. */
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
     printf("CExpress cluster master (PID %d) starting %d workers on port %d\n",
            (int)getpid(), workers_count, port);
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+    /* C4: the master itself owns the one real listen socket now (each worker used to print this
+     * line for itself, from inside its own bind - see app_listen_worker's now-suppressed print when
+     * accept_via_fd_passing is set). */
+    printf("Listening on port %d\n", port);
+#endif
 
     for (int i = 0; i < workers_count; i++) {
         workers[i].worker_id = i;
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+        pid_t pid = spawn_worker(app, listen_fd, workers, workers_count, i);
+#else
         pid_t pid = spawn_worker(app, port, i);
+#endif
         if (pid > 0) {
             workers[i].pid = pid;
             workers[i].active = 1;
@@ -268,7 +434,18 @@ void cluster_listen(App *app, int port, int num_workers) {
             for (int i = 0; i < workers_count; i++) {
                 if (workers[i].pending_respawn && now >= workers[i].backoff_until_ms) {
                     workers[i].pending_respawn = 0;
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+                    /* The dead worker's own sv[1] died with its process; the master's sv[0] copy for
+                     * this slot is still open and must be closed before spawn_worker overwrites it
+                     * with a fresh pair below, or it leaks one fd per respawn. */
+                    if (workers[i].control_fd >= 0) {
+                        close(workers[i].control_fd);
+                        workers[i].control_fd = -1;
+                    }
+                    pid_t new_pid = spawn_worker(app, listen_fd, workers, workers_count, i);
+#else
                     pid_t new_pid = spawn_worker(app, port, i);
+#endif
                     if (new_pid > 0) {
                         workers[i].pid = new_pid;
                         workers[i].active = 1;
@@ -283,8 +460,35 @@ void cluster_listen(App *app, int port, int num_workers) {
         }
 
         if (exited_pid <= 0) {
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+            /* C4: wait on listen_fd instead of an unconditional sleep - poll() returns immediately
+             * once a connection is pending, so this adds no latency over the old per-worker accept()
+             * path, while still guaranteeing the loop wakes at least every 50ms for the waitpid/
+             * backoff scan above, same cadence the plain nanosleep gave it before. */
+            struct pollfd pfd = { .fd = listen_fd, .events = POLLIN, .revents = 0 };
+            int pr = poll(&pfd, 1, 50);
+            if (pr > 0 && (pfd.revents & POLLIN)) {
+                while (1) {
+                    int client_fd = accept(listen_fd, NULL, NULL);
+                    if (client_fd < 0) {
+                        break; /* EAGAIN (drained) or a transient error: stop draining this wake */
+                    }
+                    set_nonblocking(client_fd);
+                    const int nodelay = 1;
+                    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+                    if (!dispatch_client_fd(workers, workers_count, &next_worker, client_fd)) {
+                        /* No active worker could take it (e.g. mid crash-loop, every slot down).
+                         * Best-effort shed, same philosophy as accept_connections' own S3 overload
+                         * handling - deliberately not duplicating reject_overloaded_connection's
+                         * hand-built 503 here in the master to keep this change scoped to C4. */
+                        close(client_fd);
+                    }
+                }
+            }
+#else
             struct timespec req = {0, 50000000L}; /* 50ms sleep */
             nanosleep(&req, NULL);
+#endif
         }
     }
 
@@ -348,6 +552,19 @@ void cluster_listen(App *app, int port, int num_workers) {
         struct timespec req = {0, 50000000L}; /* 50ms sleep */
         nanosleep(&req, NULL);
     }
+
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+    /* Every worker has exited by this point (the drain-wait loop above only exits once none are
+     * active), so any still-open control_fd is just the master's own unclosed copy - close it here
+     * rather than leaking it past cluster_listen's return. */
+    close(listen_fd);
+    for (int i = 0; i < workers_count; i++) {
+        if (workers[i].control_fd >= 0) {
+            close(workers[i].control_fd);
+            workers[i].control_fd = -1;
+        }
+    }
+#endif
 
     printf("All workers terminated cleanly. Master exiting.\n");
 
