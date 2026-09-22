@@ -27,7 +27,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | S3 | ~~No connection limit or overload handling~~ | Security | High | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (fd limit) |
 | S4 | ~~A declared `Content-Length` reserves 10 MiB per connection at once~~ | Security / Memory | Med | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (+3,000 MB virtual for 300 conns) |
 | S5 | ~~Header values over 255 chars are silently truncated (JWTs break)~~ | Security / Correctness | Med | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED |
-| S6 | `%00` in a path truncates it | Security | Med | S | Removes a filter-bypass primitive | MEASURED (`style.css%00.png` → 200) |
+| S6 | ~~`%00` in a path truncates it~~ | Security | Med | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (`style.css%00.png` → 200) |
 | S7 | Failing workers are respawned with no backoff | Reliability | High | S | Stops a fork/log storm | MEASURED (10,594 respawns in 4 s) |
 | S8 | Malformed request line gets no response | Security / Correctness | Med | S | Frees the connection at once instead of after 8 KiB or 60 s+ | MEASURED |
 | S9 | Demo ships a default API key | Security | Med | S | Removes a known-credential default | Code reading |
@@ -118,7 +118,10 @@ for historical record.
 **Fix.** Short term: answer `431` when a header exceeds the stored size, or raise the value size for `Authorization` and `Cookie`. Proper fix: P3 (views into the input buffer, no per-header cap).
 **Probable gain.** Removes a silent failure class for token-based auth; correctness, no performance cost.
 
-### S6 · `%00` in a path truncates it
+### S6 · ~~`%00` in a path truncates it~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** `decode_bounded` (`http_parser.c:32-49`) writes a decoded `%00` as a real NUL, and everything after it is treated as a C string terminator.
 **Measured.** `GET /static/style.css%00.png` returned **200** with `style.css`: the router and the static handler saw `/static/style.css`. Any application that checks a suffix or extension on `req->path` before using it can be bypassed the same way.
 **Fix.** After decoding the path (and query names/values, cookie values), reject an embedded NUL with `400`. It is one `memchr` over data already in cache.

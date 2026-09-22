@@ -22,7 +22,7 @@ If `event_loop_init` fails (for example io_uring is blocked by the runtime), `ap
 
 Per request (`connection.c: handle_readable`):
 1. `recv` into `conn->in_buf` until `request_is_complete` (`http_parser.c`: runs picohttpparser over the headers, plus a chunked scan when the body is chunked).
-2. `parse_http_request(in_buf, in_len, &req, &conn->arena)` → `Request` on the stack (copies method/path/headers/cookies into its fixed arrays; the body is copied into the connection arena). Failure → reject (400 / 413 / 414), close.
+2. `parse_http_request(in_buf, in_len, &req, &conn->arena)` → `Request` on the stack (copies method/path/headers/cookies into its fixed arrays; the body is copied into the connection arena). Failure → reject (400 / 413 / 414 / 431), close.
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
 4. `match_route` (per-method Patricia tree, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
@@ -95,7 +95,8 @@ and leaves the old block in the arena until the request ends; a static file is r
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
-`parse_http_request`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` a header name or value too long to store (→ 431, S5); after `-1`, `req.content_length == -2` means body too large (→ 413).
+`parse_http_request`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` a header name or value too long to store (→ 431, S5), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413).
+`url_decode` / `parse_query_string`: `0` ok, `-1` a decoded byte was NUL (S6) - the destination is still fully written and NUL-terminated, but the caller must treat it as invalid input rather than use it.
 `request_is_complete`: `1` for a complete request and also for invalid `Content-Length` / chunked+`Content-Length` framing (stop reading, let the parser report it);
 `0` while more bytes are needed, **and also (known gap, below) when the request line or headers are malformed**. `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
 yyjson: read functions return `NULL` on failure; `yyjson_mut_*_add_*` return `false` on failure (the cookbook and demo do not check them).
@@ -140,6 +141,13 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   no indication why - `parse_headers`, the standalone component parser `tests/` uses directly and that the live request
   path does *not* call, still truncates silently since it has no error path to signal through, a `void` function).
   Chunked bodies: extensions ignored, trailers discarded, decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at `header_len + MAX_BODY_SIZE`.
+  **Embedded NUL (S6).** The path and query names/values are percent-decoded (`decode_bounded`/`url_decode`); a decoded byte
+  that is NUL (`%00`, or a raw NUL byte already in the request line) is rejected with 400 (`parse_http_request`'s `-4`)
+  rather than silently truncating everything downstream that reads `req->path`/`req_get_query` as a C string - MEASURED
+  (`improvements.md`, S6) `GET /static/style.css%00.png` used to be routed and served as `/static/style.css`, a bypass for
+  any suffix/extension check performed on the path before use. Header and cookie values are not percent-decoded by this
+  engine at all, so this vector does not apply to them (`req_get_header`/`req_get_cookie` already return raw bytes;
+  header/cookie length limits are the separate S5 concern above).
 - **Buffers.** `in_buf` starts at 8 KiB; with headers complete and a body pending it grows by doubling, capped at the
   known target size (S4: `Content-Length` and chunked both work this way now - `Content-Length` used to realloc straight
   to `header_len + content_length + 1` in one step, reserving virtual memory proportional to what the client merely

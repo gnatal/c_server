@@ -18,6 +18,10 @@
  *           -3  a header name (>= 64 chars) or value (>= MAX_HEADER_VALUE_LEN) would not fit -> caller
  *               sends 431 (S5: never silently truncated - a Bearer JWT or long cookie that overflowed
  *               the old 255-byte cap used to compare unequal to itself with no indication why)
+ *           -4  a percent-decoded path, query name or query value contains an embedded NUL -> caller
+ *               sends 400 (S6: "%00" - or a raw NUL byte - used to silently truncate everything read
+ *               through it as a C string, e.g. "/style.css%00.png" looking like "/style.css" to a
+ *               suffix check; never silently truncated now, same principle as -3 for headers)
  *   On -1, req->content_length == -2 means "body too large"      -> caller sends 413.
  *   Ownership: on success req->body is allocated from `arena` (content_length + 1 bytes, NUL-terminated,
  *   never NULL, may hold NUL bytes: use content_length, not strlen). Nobody free()s it: it is reclaimed
@@ -77,8 +81,11 @@ int request_wants_close(const Request *req);
 int chunked_body_scan(const char *body_start, size_t available, size_t max_decoded_len, size_t *decoded_len_out);
 size_t chunked_body_decode(const char *body_start, size_t available, char *out);
 
-/* Component parsers (called by parse_http_request; exposed for tests). Each resets its own *_count. */
-void parse_query_string(const char *query, Request *req);   /* "a=1&b=2"; bare key -> "" */
+/* Component parsers (called by parse_http_request; exposed for tests). Each resets its own *_count.
+ * parse_query_string returns 0 ok, -1 if a decoded name/value contains an embedded NUL (S6) - req is
+ * still fully populated up to and including the offending pair, same "don't bother finishing what the
+ * caller will reject anyway" convention as parse_http_request's own -3. */
+int parse_query_string(const char *query, Request *req);    /* "a=1&b=2"; bare key -> "" */
 void parse_headers(const char *header_block, Request *req);  /* "Name: value\r\n..." */
 void parse_cookies(const char *cookie_header, Request *req); /* NULL ok; "a=1; b=2" */
 
@@ -88,8 +95,9 @@ const char *req_get_header(const Request *req, const char *name); /* case-INsens
 const char *req_get_cookie(const Request *req, const char *name); /* case-sensitive, not decoded */
 
 /* Percent-decode src into dst (dst_size incl. NUL, truncates). dst may equal src. '+' -> ' ' only if decode_plus.
- * A '%' without two hex digits is copied literally. */
-void url_decode(const char *src, char *dst, size_t dst_size, int decode_plus);
+ * A '%' without two hex digits is copied literally. Returns 0 ok, -1 if a decoded byte is NUL (S6) -
+ * dst is still fully written and NUL-terminated, but the caller should treat it as invalid input. */
+int url_decode(const char *src, char *dst, size_t dst_size, int decode_plus);
 
 /* Reason phrase for the 28 statuses the engine knows; "Unknown" otherwise. */
 const char *status_text(int status);

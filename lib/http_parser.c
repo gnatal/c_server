@@ -27,29 +27,42 @@ static void copy_bounded(char *dst, const size_t dst_size, const char *src, size
     dst[len] = '\0';
 }
 
-/* Percent-decodes src[0..src_len) into dst (dst_size bytes incl. NUL). dst may equal src:
- * output is never longer than input, so the write cursor never overtakes the read cursor. */
-static void decode_bounded(char *dst, const size_t dst_size, const char *src, const size_t src_len,
-                           const int decode_plus) {
+/*
+ * Percent-decodes src[0..src_len) into dst (dst_size bytes incl. NUL). dst may equal src: output is
+ * never longer than input, so the write cursor never overtakes the read cursor. Returns 0 on success,
+ * -1 if a decoded byte is NUL (S6: a raw NUL byte, or "%00", decoded into the middle of dst - dst is
+ * still fully written and NUL-terminated in that case, but every C-string function downstream
+ * (strlen, strcmp, the router, a handler's own strstr/strcmp on req->path) would silently see only the
+ * bytes up to that NUL, treating "/style.css%00.png" as "/style.css" with no error and no indication
+ * anything was cut. Callers must reject such input (400) rather than use dst). */
+static int decode_bounded(char *dst, const size_t dst_size, const char *src, const size_t src_len,
+                          const int decode_plus) {
     if (dst_size == 0) {
-        return;
+        return 0;
     }
     size_t out = 0;
+    int has_embedded_nul = 0;
     for (size_t i = 0; i < src_len && out + 1 < dst_size; i++) {
+        char c;
         if (src[i] == '%' && i + 2 < src_len && hex_value(src[i + 1]) >= 0 && hex_value(src[i + 2]) >= 0) {
-            dst[out++] = (char)((hex_value(src[i + 1]) << 4) | hex_value(src[i + 2]));
+            c = (char)((hex_value(src[i + 1]) << 4) | hex_value(src[i + 2]));
             i += 2;
         } else if (src[i] == '+' && decode_plus) {
-            dst[out++] = ' ';
+            c = ' ';
         } else {
-            dst[out++] = src[i];
+            c = src[i];
         }
+        if (c == '\0') {
+            has_embedded_nul = 1;
+        }
+        dst[out++] = c;
     }
     dst[out] = '\0';
+    return has_embedded_nul ? -1 : 0;
 }
 
-void url_decode(const char *src, char *dst, const size_t dst_size, const int decode_plus) {
-    decode_bounded(dst, dst_size, src, strlen(src), decode_plus);
+int url_decode(const char *src, char *dst, const size_t dst_size, const int decode_plus) {
+    return decode_bounded(dst, dst_size, src, strlen(src), decode_plus);
 }
 
 
@@ -274,13 +287,21 @@ int parse_http_request(const char *raw, const size_t raw_len, Request *req, Aren
     if (p_len >= sizeof(req->path)) return -2;
     
     copy_bounded(req->path, sizeof(req->path), path, p_len);
-    url_decode(req->path, req->path, sizeof(req->path), 0);
-    
+    if (url_decode(req->path, req->path, sizeof(req->path), 0) != 0) {
+        /* S6: "%00" (or a raw NUL byte) decoded into the middle of the path - a filter that checks
+         * req->path's suffix/extension before using it (e.g. a static-file extension check) would see
+         * only the bytes up to the NUL, so "/style.css%00.png" would look like "/style.css". Reject
+         * outright (400) rather than route on a silently truncated path. */
+        return -4;
+    }
+
     if (qmark) {
         size_t q_len = path_len - p_len - 1;
         copy_bounded(req->query, sizeof(req->query), qmark + 1, q_len);
     }
-    parse_query_string(req->query, req);
+    if (parse_query_string(req->query, req) != 0) {
+        return -4;
+    }
 
     for (size_t i = 0; i < num_headers; i++) {
         if (req->header_count < MAX_HEADERS) {
@@ -553,7 +574,7 @@ size_t chunked_body_decode(const char *body_start, const size_t available, char 
 
     return out_len;
 }
-void parse_query_string(const char *query, Request *req) {
+int parse_query_string(const char *query, Request *req) {
     req->query_count = 0;
     const char *p = query;
     while (*p != '\0' && req->query_count < MAX_QUERY_PARAMS) {
@@ -565,15 +586,21 @@ void parse_query_string(const char *query, Request *req) {
             const char *value = eq != NULL ? eq + 1 : p + pair_len;
             const size_t value_len = eq != NULL ? pair_len - name_len - 1 : 0;
 
-            decode_bounded(req->query_names[req->query_count], sizeof(req->query_names[0]), p, name_len, 1);
-            decode_bounded(req->query_values[req->query_count], sizeof(req->query_values[0]), value, value_len, 1);
+            const int name_ok = decode_bounded(req->query_names[req->query_count], sizeof(req->query_names[0]), p, name_len, 1) == 0;
+            const int value_ok = decode_bounded(req->query_values[req->query_count], sizeof(req->query_values[0]), value, value_len, 1) == 0;
             req->query_count++;
+            if (!name_ok || !value_ok) {
+                /* S6: a %00 (or a raw NUL byte) decoded into this pair - reject the whole request (400)
+                 * rather than let req_get_query silently hand back a truncated name or value. */
+                return -1;
+            }
         }
         if (amp == NULL) {
             break;
         }
         p = amp + 1;
     }
+    return 0;
 }
 
 const char *req_get_query(const Request *req, const char *name) {

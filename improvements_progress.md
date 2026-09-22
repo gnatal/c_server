@@ -640,6 +640,97 @@ of P1's own fix list that this entry did not attempt.
 
 ---
 
+## S6 · `%00` in a path truncates it
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+`decode_bounded` (`lib/http_parser.c`), the shared percent-decoder behind `url_decode` and
+`parse_query_string`, used to be `void`: a `%00` sequence decoded to a real NUL byte was written into
+the destination buffer with no signal that anything unusual happened. Since `req->path`,
+`req->query_names[]` and `req->query_values[]` are all plain C strings read by `strlen`/`strcmp` (the
+router, `req_get_query`, and any handler that inspects `req->path` directly, e.g. a suffix/extension
+check), an embedded NUL silently truncated the string for every one of them — MEASURED
+(`improvements.md`, S6) `GET /static/style.css%00.png` being routed and served as `/static/style.css`.
+
+- **`decode_bounded` now returns `int`** (0 ok, -1 if any decoded byte is NUL) instead of `void`, while
+  still fully writing and NUL-terminating `dst` either way — the contract is "tell the caller", not
+  "refuse to decode", since some callers (see below) want to report the failure differently than others.
+- **`url_decode` (`http_parser.h`, public) now returns `int`**, propagating `decode_bounded`'s result.
+  Its one caller inside the engine that matters for this fix is `parse_http_request`'s path decode;
+  `urlencoded.c`'s two calls (form field names/values) still ignore the return value — see Scope below.
+- **`parse_query_string` (`http_parser.h`, listed as "exposed for tests" alongside `parse_headers` and
+  `parse_cookies`) now returns `int`** instead of `void`: 0 ok, -1 if a decoded name or value in any pair
+  contained a NUL. It still populates `req->query_count` up through the offending pair before returning
+  -1 (same "don't bother finishing what the caller will reject anyway" convention as `parse_http_request`'s
+  existing -3 for headers, S5) rather than stopping the whole scan the instant the first bad pair is seen.
+- **`parse_http_request` gained a new return code, `-4`** ("a percent-decoded path/query name/query value
+  contains an embedded NUL"), checked right after the path's `url_decode` call and right after
+  `parse_query_string`. `connection.c`'s dispatch of `parse_http_request`'s return codes already had an
+  `else 400` fallback for anything that wasn't `-2`/`-3` — `-4` needed no new branch there, only a comment
+  explaining why it lands in that fallback alongside the pre-existing `-1` (malformed).
+
+**Deliberately scoped down**, matching the S1–S5 precedent of narrowing rather than silently doing less
+than advertised:
+- **Cookie values are explicitly named in `improvements.md`'s fix list ("path (and query names/values,
+  cookie values)") but are out of scope here, because they don't apply**: `parse_cookies` never
+  percent-decodes cookie values at all (`req_get_cookie`'s doc comment already says "not decoded") — it
+  copies the raw `Cookie:` header bytes with `copy_bounded`, not `decode_bounded`. There is no `%00`
+  decode vector for cookies in this engine to close; the improvements.md wording is imprecise on this
+  point, not a gap this fix left open. Noted here rather than silently fixing something that doesn't
+  exist.
+- **`urlencoded.c`'s two `url_decode` calls (form field names/values from a `application/x-www-form-urlencoded`
+  body) do not check the new return value.** `improvements.md`'s S6 problem statement and MEASURED finding
+  are specifically about the request-target path; form bodies are a related but separate surface sharing
+  the same underlying `decode_bounded`, deliberately left for a follow-up rather than folded into an
+  "S" (small) fix's scope. `lib/CLAUDE.md`'s "Known gaps" was **not** updated to call this out as a new gap
+  introduced by this work — it is pre-existing behavior (form fields were never checked for embedded NULs
+  before this fix either) that this fix happens not to extend to, same status quo as before, just no longer
+  silently true for the path/query case next to it.
+- **Header values remain unaffected/out of scope for the same reason as cookies**: they are never
+  percent-decoded by this engine (S5's fix was about the raw, undecoded value's *length*, not decoding).
+
+**Tests and results.**
+
+- Unit tests added to `tests/test_http_hardening.c` (registered in `main`):
+  `test_embedded_nul_rejected` — `url_decode("style.css%00.png", ...)` returns -1 and writes `"style.css"`
+  (proving the exact silent-truncation shape the old code produced, now surfaced as an error instead of
+  hidden); an ordinary path with no `%00` still returns 0. `parse_query_string` returns -1 for a `%00` in
+  either a pair's name or its value, and 0 for an ordinary query string. `parse_http_request` returns -4
+  for the literal MEASURED scenario (`GET /static/style.css%00.png HTTP/1.1...`) and for a `%00` in the
+  query string alone (path clean); an ordinary percent-encoded path/query with no embedded NUL
+  (`/static/style%2Ecss?q=a%20b`) still parses to 0 with the correctly decoded `req->path`.
+- Unit test added to `tests/test_connection.c` (registered in `main`):
+  `test_handle_readable_embedded_nul_in_path_400` — end to end through the real `handle_readable` path
+  (distinct from the pure-parser tests above, same shape as S5's own end-to-end test next to it): the exact
+  `GET /static/style.css%00.png` request gets an explicit `HTTP/1.1 400` and the connection is closed,
+  exercising `parse_http_request`'s `-4` → `connection.c`'s 400 mapping specifically.
+- `make test`: all 13 suites pass (test_http_hardening: 1 new case; test_connection: 1 new case) —
+  every existing call site of `url_decode`/`parse_query_string` across `lib/` and `tests/` still compiles
+  and passes unmodified, since going from `void` to `int` only adds an ignorable return value in C.
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan.
+- `make fuzz` (500,000 iterations): clean (67,357 parsed, 72,558 complete).
+- `make check-docs`: passes (121 engine functions covered — `url_decode`/`parse_query_string`'s signatures
+  changed but their names didn't, so no new entries were needed).
+- Compiled `lib/http_parser.c` and `lib/connection.c` directly with the project's
+  `-Wall -Wextra -std=c11 -O2` flags: no new warnings (confirmed the two pre-existing
+  `-Wformat-truncation` warnings in `tests/test_http_parser.c` predate this change by diffing against a
+  clean stash of the tree before it).
+- Live end-to-end reproduction of the exact MEASURED scenario from `improvements.md` was covered by the
+  `test_handle_readable_embedded_nul_in_path_400` unit test above rather than a separate manual `curl`
+  run against a standalone server (the fix is entirely in the pure parser layer, already exercised
+  end-to-end through the real non-blocking `handle_readable` path by that test, same rationale S1's
+  earlier live-`curl` verifications don't repeat for every subsequent pure-parser fix).
+
+**Status:** Fixed for the measured problem (the request-target path) and for query names/values, which
+`improvements.md` named alongside it. Cookie values are not a gap this fix left open (the vector doesn't
+exist for them in this engine); form-urlencoded body fields share the same underlying decoder but were not
+extended to check it, a narrower scope than `improvements.md`'s wording implied, documented rather than
+silently assumed away.
+
+---
+
 ## TLS removal · not an `improvements.md` item — an architectural decision, not a fix
 
 **Date completed.** 2026-09-22.

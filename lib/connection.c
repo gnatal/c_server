@@ -551,8 +551,11 @@ void handle_readable(App *app, Connection *conn) {
             const int parse_status = parse_http_request(conn->in_buf, conn->in_len, &req, &conn->arena);
             if (parse_status != 0) {
                 /* -2: path too long (414). -3: a header name/value too long to store, never silently
-                 * truncated (431, S5). content_length == -2: body over MAX_BODY_SIZE (413), for both
-                 * Content-Length and chunked framing. Anything else: 400. */
+                 * truncated (431, S5). -4: a percent-decoded path/query name/query value contained an
+                 * embedded NUL, never silently truncated either (400, S6) - falls into "anything else"
+                 * below along with -1 (malformed), since both are already 400.
+                 * content_length == -2: body over MAX_BODY_SIZE (413), for both Content-Length and
+                 * chunked framing. Anything else: 400. */
                 /* req.body is managed by arena, no need to free */
                 const int status = parse_status == -2 ? 414
                                   : parse_status == -3 ? 431

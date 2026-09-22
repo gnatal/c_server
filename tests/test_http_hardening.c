@@ -295,6 +295,45 @@ static void test_percent_decoding_at_boundaries(void) {
     assert(strlen(req.query_values[0]) <= sizeof(req.query_values[0]) - 1);
 }
 
+static void test_embedded_nul_rejected(void) {
+    /* url_decode itself: "%00" decodes to a real NUL - returns -1, but still writes and NUL-terminates
+     * dst (the caller decides what to do with a rejected decode, same contract as decode_bounded). */
+    char dst[64];
+    assert(url_decode("style.css%00.png", dst, sizeof(dst), 0) == -1);
+    assert(strcmp(dst, "style.css") == 0); /* what a strlen/strcmp-based check downstream would see */
+
+    /* A path with no embedded NUL is unaffected. */
+    assert(url_decode("style.css", dst, sizeof(dst), 0) == 0);
+    assert(strcmp(dst, "style.css") == 0);
+
+    /* parse_query_string: a %00 in either the name or the value of a pair is rejected (-1), not just
+     * silently decoded - improvements.md's S6 names query names/values alongside the path. */
+    Request req;
+    memset(&req, 0, sizeof(req));
+    assert(parse_query_string("a=1&b=x%00y", &req) == -1);
+    memset(&req, 0, sizeof(req));
+    assert(parse_query_string("x%00y=1", &req) == -1);
+    /* An ordinary query string is unaffected. */
+    memset(&req, 0, sizeof(req));
+    assert(parse_query_string("a=1&b=2", &req) == 0);
+
+    /* parse_http_request: the exact scenario improvements.md measured - "%00" in the request-target
+     * path used to truncate it, so "/static/style.css%00.png" was routed as "/static/style.css" with a
+     * 200. Now the whole request is rejected (-4) before routing ever sees it. */
+    const char *nul_path = "GET /static/style.css%00.png HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(parse_http_request(nul_path, strlen(nul_path), &req, &test_arena) == -4);
+
+    /* A %00 in the query string alone (path itself clean) is rejected the same way. */
+    const char *nul_query = "GET /search?q=a%00b HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(parse_http_request(nul_query, strlen(nul_query), &req, &test_arena) == -4);
+
+    /* An ordinary percent-encoded path/query (no embedded NUL) still parses normally. */
+    const char *clean = "GET /static/style%2Ecss?q=a%20b HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(parse_http_request(clean, strlen(clean), &req, &test_arena) == 0);
+    assert(strcmp(req.path, "/static/style.css") == 0);
+    arena_reset(&test_arena);
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_framing_is_line_anchored();
@@ -307,6 +346,7 @@ int main(void) {
     test_parse_does_not_depend_on_zeroed_request();
     test_header_value_whitespace_and_limits();
     test_percent_decoding_at_boundaries();
+    test_embedded_nul_rejected();
     printf("all http hardening tests passed\n");
     return 0;
 }

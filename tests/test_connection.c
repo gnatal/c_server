@@ -314,6 +314,33 @@ static void test_handle_readable_oversized_header_value_431(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+/* S6: "%00" in the request-target used to decode into a real NUL, silently truncating req->path for
+ * every C-string function reading it afterward - improvements.md measured "GET /static/style.css%00.png"
+ * being routed (and served) as "/static/style.css". parse_http_request now rejects this outright (-4)
+ * before routing ever runs, so the connection gets an explicit 400 instead of a 200 for the truncated
+ * path. */
+static void test_handle_readable_embedded_nul_in_path_400(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    int client_fd = fds[0];
+
+    const char *req_line = "GET /static/style.css%00.png HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(write(fds[1], req_line, strlen(req_line)) == (ssize_t)strlen(req_line));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t r = read(fds[1], resp, sizeof(resp) - 1);
+    assert(r > 0);
+    assert(strstr(resp, "HTTP/1.1 400") != NULL);
+    assert(app.connections[client_fd] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_large_body_grows_buffer(void) {
     App app;
     int fds[2];
@@ -1411,6 +1438,7 @@ int main(void) {
     test_handle_readable_unmatched_route_404();
     test_handle_readable_header_overflow_431();
     test_handle_readable_oversized_header_value_431();
+    test_handle_readable_embedded_nul_in_path_400();
     test_handle_readable_large_body_grows_buffer();
     test_handle_readable_body_too_large_413();
     test_handle_readable_content_length_grows_geometrically();
