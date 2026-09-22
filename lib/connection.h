@@ -49,7 +49,8 @@ int app_count_connections(const App *app);
  *
  * handle_readable: recv() into conn->in_buf until EAGAIN. Once request_is_complete, it parses,
  *   routes and dispatches synchronously, then flush_connection. Rejects with 431 (headers over
- *   BUF_SIZE), 414 (path over 255), 413 (body over MAX_BODY_SIZE), 400 (malformed), 500 (OOM growing
+ *   BUF_SIZE, or a single header name/value too long to store - S5), 414 (path over 255), 413 (body
+ *   over MAX_BODY_SIZE or an app_use_body_limit prefix - S4), 400 (malformed), 500 (OOM growing
  *   the buffer); each rejection closes the connection. in_buf grows to fit a declared body and
  *   shrinks back to BUF_SIZE once the connection is idle.
  * flush_connection: non-blocking write of conn->out_buf (and a streamed file, 64 KB per turn).

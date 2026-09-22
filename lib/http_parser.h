@@ -15,6 +15,9 @@
  *           -1  malformed (bad request line, no header terminator, bad/duplicate/
  *               oversized Content-Length, chunked + Content-Length together, bad chunk framing)
  *           -2  request-target path >= sizeof(req->path) (256)  -> caller sends 414
+ *           -3  a header name (>= 64 chars) or value (>= MAX_HEADER_VALUE_LEN) would not fit -> caller
+ *               sends 431 (S5: never silently truncated - a Bearer JWT or long cookie that overflowed
+ *               the old 255-byte cap used to compare unequal to itself with no indication why)
  *   On -1, req->content_length == -2 means "body too large"      -> caller sends 413.
  *   Ownership: on success req->body is allocated from `arena` (content_length + 1 bytes, NUL-terminated,
  *   never NULL, may hold NUL bytes: use content_length, not strlen). Nobody free()s it: it is reclaimed
@@ -23,9 +26,10 @@
  *   Decoding: req->path is percent-decoded; req->query stays raw; query names/values are
  *   percent- and '+'-decoded; header and cookie values are not decoded.
  *   Limits (never overflowed): method 7 chars (longer -> -1); more than MAX_HEADERS headers -> -1 (the
- *   request is rejected, not truncated); header name 63 / value 255 chars, query 255, MAX_QUERY_PARAMS and
- *   MAX_COOKIES are silently truncated or dropped. The request line and header block are parsed by the
- *   vendored picohttpparser (HTTP/1.x only; bare '\n' line endings are accepted).
+ *   request is rejected, not truncated); header name 63 chars / value MAX_HEADER_VALUE_LEN - 1 chars ->
+ *   -3, not truncated (S5); query 255, MAX_QUERY_PARAMS and MAX_COOKIES (including each cookie's own
+ *   name/value, 63/255 chars) are silently truncated or dropped. The request line and header block are
+ *   parsed by the vendored picohttpparser (HTTP/1.x only; bare '\n' line endings are accepted).
  */
 int parse_http_request(const char *raw, size_t raw_len, Request *req, Arena *arena);
 

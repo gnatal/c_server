@@ -210,12 +210,18 @@ static void test_header_value_whitespace_and_limits(void) {
     assert(strcmp(req_get_header(&req, "B"), "tabbed") == 0);
     assert(strcmp(req_get_header(&req, "C"), "x y  z") == 0);
 
-    /* Over-long name and value are truncated to their slots, still NUL-terminated. */
-    char big[1024];
+    /* parse_headers (unlike parse_http_request, S5) has no way to signal an error - it's a `void`
+     * component parser exposed for tests, not called from the live request path (that path duplicates
+     * this loop inline in parse_http_request so it can return -3 instead). It still truncates
+     * silently to whatever the array holds, so an over-long name or value is still truncated to its
+     * slot, still NUL-terminated - the value here (1100 chars) exceeds the raised MAX_HEADER_VALUE_LEN
+     * (1024) that a Bearer JWT or long cookie would now fit under; see
+     * test_parse_http_request_rejects_oversized_header_431 below for the production 431 behavior. */
+    char big[2048];
     int n = 0;
     for (int i = 0; i < 100; i++) big[n++] = 'N';
     n += snprintf(big + n, sizeof(big) - (size_t)n, ": ");
-    for (int i = 0; i < 400; i++) big[n++] = 'v';
+    for (int i = 0; i < 1100; i++) big[n++] = 'v';
     big[n++] = '\r';
     big[n++] = '\n';
     big[n] = '\0';
@@ -223,6 +229,43 @@ static void test_header_value_whitespace_and_limits(void) {
     assert(req.header_count == 1);
     assert(strlen(req.header_names[0]) == sizeof(req.header_names[0]) - 1);
     assert(strlen(req.header_values[0]) == sizeof(req.header_values[0]) - 1);
+}
+
+/* S5: parse_http_request (the function actually on the live request path, unlike parse_headers above)
+ * rejects an over-long header name or value with -3 instead of silently truncating it - the fix for
+ * the exact problem improvements.md measured: a 400-character Bearer token used to be stored as 255
+ * characters with a successful (wrong) parse. */
+static void test_parse_http_request_rejects_oversized_header_431(void) {
+    Request req;
+
+    /* A value just past the new cap (1024) is rejected: a Bearer token in this range used to be the
+     * silently-truncated case improvements.md measured (at the old, smaller 255-byte cap). */
+    char oversized_value[1400];
+    int n = snprintf(oversized_value, sizeof(oversized_value), "POST /a HTTP/1.1\r\nAuthorization: Bearer ");
+    for (int i = 0; i < 1100; i++) oversized_value[n++] = 'x';
+    n += snprintf(oversized_value + n, sizeof(oversized_value) - (size_t)n, "\r\nContent-Length: 0\r\n\r\n");
+    assert(parse_http_request(oversized_value, (size_t)n, &req, &test_arena) == -3);
+
+    /* A value comfortably within the new cap (a realistic ~600-char JWT-shaped token) parses fine and
+     * is NOT truncated - this is the actual compatibility half of the fix, not just the loud-failure
+     * half: JWTs in the 300-1,000 char range improvements.md called out now round-trip exactly. */
+    char within_cap[1200];
+    n = snprintf(within_cap, sizeof(within_cap), "POST /a HTTP/1.1\r\nAuthorization: Bearer ");
+    const int token_len = 600;
+    for (int i = 0; i < token_len; i++) within_cap[n++] = 'a' + (i % 26);
+    n += snprintf(within_cap + n, sizeof(within_cap) - (size_t)n, "\r\nContent-Length: 0\r\n\r\n");
+    assert(parse_http_request(within_cap, (size_t)n, &req, &test_arena) == 0);
+    const char *auth = req_get_header(&req, "Authorization");
+    assert(auth != NULL);
+    assert(strlen(auth) == strlen("Bearer ") + (size_t)token_len); /* exact, not truncated */
+
+    /* An over-long header NAME is rejected the same way, for the same reason (never silently cut a
+     * header to fit, whichever side of the colon overflows). */
+    char oversized_name[400];
+    n = snprintf(oversized_name, sizeof(oversized_name), "POST /a HTTP/1.1\r\n");
+    for (int i = 0; i < 100; i++) oversized_name[n++] = 'N';
+    n += snprintf(oversized_name + n, sizeof(oversized_name) - (size_t)n, ": v\r\nContent-Length: 0\r\n\r\n");
+    assert(parse_http_request(oversized_name, (size_t)n, &req, &test_arena) == -3);
 }
 
 static void test_percent_decoding_at_boundaries(void) {
@@ -258,6 +301,7 @@ int main(void) {
     test_content_length_is_strict();
     test_request_framing();
     test_request_framing_path_out();
+    test_parse_http_request_rejects_oversized_header_431();
     test_wants_close_header_forms();
     test_request_line_limits();
     test_parse_does_not_depend_on_zeroed_request();

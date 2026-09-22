@@ -23,7 +23,10 @@
 #define MAX_ROUTE_MIDDLEWARES 8       /* per route */
 #define MAX_PARAMS 8                  /* path params per request (name/value 63 chars) */
 #define MAX_QUERY_PARAMS 16           /* name/value 63 chars, percent- and '+'-decoded */
-#define MAX_HEADERS 32                /* request headers kept (name 63, value 255 chars) */
+#define MAX_HEADERS 32                /* request headers kept (name 63 chars, value MAX_HEADER_VALUE_LEN) */
+#define MAX_HEADER_VALUE_LEN 1024      /* single request header value cap (S5); over this (or over the 63-char
+                                        * name cap) is 431, never silently truncated - raised from the original
+                                        * 255 because bearer JWTs and long cookies commonly run 300-1,000 chars */
 #define MAX_COOKIES 16                /* request cookies kept (name 63, value 255 chars) */
 #define MAX_FORM_FIELDS 32            /* urlencoded body fields (name 63, value 255 chars) */
 #define MAX_MULTIPART_PARTS 16
@@ -81,7 +84,7 @@ typedef struct {
     int query_count;
 
     char header_names[MAX_HEADERS][64];     /* value not decoded; name lookup is case-insensitive */
-    char header_values[MAX_HEADERS][256];
+    char header_values[MAX_HEADERS][MAX_HEADER_VALUE_LEN];
     int header_count;
 
     char cookie_names[MAX_COOKIES][64];     /* not decoded; name lookup is case-sensitive */

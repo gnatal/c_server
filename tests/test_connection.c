@@ -286,6 +286,34 @@ static void test_handle_readable_header_overflow_431(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+/* S5: unlike the whole-header-block-over-BUF_SIZE case above, this is a single header value that
+ * would not fit its MAX_HEADER_VALUE_LEN slot even though the request comfortably fits under BUF_SIZE
+ * - a different code path (parse_http_request's -3 -> connection.c's 431 mapping) than the 431 above. */
+static void test_handle_readable_oversized_header_value_431(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    int client_fd = fds[0];
+
+    char req_line[1400];
+    int n = snprintf(req_line, sizeof(req_line), "GET / HTTP/1.1\r\nAuthorization: Bearer ");
+    for (int i = 0; i < 1100; i++) req_line[n++] = 'x'; /* past MAX_HEADER_VALUE_LEN (1024) */
+    n += snprintf(req_line + n, sizeof(req_line) - (size_t)n, "\r\n\r\n");
+    assert(write(fds[1], req_line, (size_t)n) == n);
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t r = read(fds[1], resp, sizeof(resp) - 1);
+    assert(r > 0);
+    assert(strstr(resp, "HTTP/1.1 431 Request Header Fields Too Large") != NULL);
+    assert(app.connections[client_fd] == NULL); /* rejected and closed, same as any other 431 */
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_large_body_grows_buffer(void) {
     App app;
     int fds[2];
@@ -1382,6 +1410,7 @@ int main(void) {
     test_handle_readable_malformed_400();
     test_handle_readable_unmatched_route_404();
     test_handle_readable_header_overflow_431();
+    test_handle_readable_oversized_header_value_431();
     test_handle_readable_large_body_grows_buffer();
     test_handle_readable_body_too_large_413();
     test_handle_readable_content_length_grows_geometrically();

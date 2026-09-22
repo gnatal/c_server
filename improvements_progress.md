@@ -411,3 +411,119 @@ received, not declared) and for the "reject early" half of the fix (per-route/pr
 before any buffering). Chunked bodies and non-ASCII-prefix matching are explicitly out of scope, per
 the narrowing above — not gaps introduced by this work, but existing global behavior this change did
 not touch.
+
+---
+
+## S5 · Header values over 255 characters are silently truncated
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+`improvements.md` offered two alternative short-term fixes — "answer 431 when a header exceeds the
+stored size, **or** raise the value size for `Authorization` and `Cookie`" — with the proper fix (view-
+based headers, no per-header cap at all) deferred to P3. Did both halves rather than picking one, since
+they solve different parts of the same problem: raising the cap makes realistic tokens (JWTs, long
+cookies) work *correctly* instead of failing at all, while the loud-rejection half makes whatever still
+doesn't fit fail *safely* instead of silently.
+
+- **Raised the cap (`lib/app_types.h`).** `Request.header_values`' per-slot size was a hardcoded `256`
+  (255 usable chars) shared identically by all `MAX_HEADERS` (32) slots — the project has no
+  per-header-name storage (no field or array is dedicated to `Authorization` specifically), so "raise it
+  for `Authorization` and `Cookie`" in practice meant raising it for every slot, since any header could
+  occupy any slot. Named it `MAX_HEADER_VALUE_LEN` (1024, so 1023 usable chars) rather than leaving it a
+  bare literal, matching the project's existing pattern for exactly this kind of limit
+  (`MAX_SET_COOKIE_LEN`, response-side, is the same idea: "value doesn't fit → reject/drop, never
+  truncate"). 1024 was chosen directly off `improvements.md`'s own numbers ("JWTs are commonly 300–1,000
+  characters") rather than an arbitrary round number — it comfortably covers the range the report itself
+  measured as the real-world problem, with headroom.
+- **Reject what still doesn't fit, instead of truncating (`lib/http_parser.c`: `parse_http_request`).**
+  The header-copying loop (which duplicates `parse_headers`' logic inline rather than calling it — see
+  below) now checks `headers[i].name_len`/`value_len` against the destination array sizes *before*
+  calling `copy_bounded`, and returns a new sentinel, `-3`, instead of ever truncating. Checked both
+  sides of the colon (name and value), not just the value `improvements.md` named — the same
+  `copy_bounded` call and the same silent-corruption failure mode apply symmetrically to an over-long
+  header *name*, even though real-world header names essentially never exceed 63 chars in practice.
+  `-3` slots into the existing `parse_http_request` return-code convention next to `-2` (path too long
+  → 414): documented in `lib/http_parser.h`, and `lib/connection.c`'s dispatch (`handle_readable`) maps
+  it to 431 (`Request Header Fields Too Large`) — the same status code already used for the
+  whole-header-block-over-`BUF_SIZE` case, since both are "a header (or the header block) is bigger than
+  we're willing to store," just at different granularities.
+- **`parse_headers` (the standalone `void` component parser in the same file) was deliberately left
+  truncating.** It's exposed for tests (`lib/http_parser.h`: "Component parsers ... exposed for tests")
+  and is *not* on the live request path — `parse_http_request` does not call it; it re-implements the
+  same header-copy loop inline so it can return an error code, which `parse_headers`' `void` signature
+  has no way to do. Changing that signature to add error reporting would ripple into every test file
+  that calls it directly (`tests/test_http_parser.c`, `tests/test_http_hardening.c`) for a function the
+  actual security-relevant path never touches, so it was left as-is — still benefits from the raised
+  1024-byte array size (it shares `Request.header_values`), just without the loud-rejection behavior.
+
+**Deliberately scoped down**, matching the S1–S4 precedent of narrowing rather than silently doing less
+than advertised:
+- **Individual cookie values (post-split) are not covered.** The raised cap and the 431 rejection apply
+  to the *raw* `Cookie:` header line (`req->header_values`) — once that line is complete and within
+  `MAX_HEADER_VALUE_LEN`, `parse_cookies` still splits it into `cookie_names`/`cookie_values[MAX_COOKIES][256]`,
+  each capped at the original 255 chars with no error signal (`parse_cookies` is also `void`). A single
+  very long session-token cookie among several shorter ones on the same header line can therefore still
+  be silently truncated even though the header line as a whole fit under the new cap. Out of scope here
+  because `improvements.md`'s S5 problem statement and MEASURED finding are specifically about
+  `copy_bounded` in the *header*-value path (`http_parser.c:22`, called from the header loop), not the
+  separate cookie-splitting one; fixing it would mean giving `parse_cookies` an error return too, a
+  larger change than this entry's effort budget (M) covers on its own.
+- **Path/query param values (63 chars) and the raw query string (255 chars) are unaffected** — same
+  reasoning: not what `improvements.md` measured for S5, and each is its own separate truncation point
+  requiring its own scoping decision, better left to a dedicated pass (or P3's structural fix, which
+  would remove all of these caps at once via views into `in_buf` instead of fixed copies).
+- **`Request` grew from ~19 KB to 43,576 bytes** (`sizeof`, `make bench`) — all in
+  `header_values[32][1024]` vs. the old `[32][256]`. Confirmed this costs nothing per-request in CPU
+  (see Tests below): `copy_bounded` copies only the bytes actually present in the header value, never
+  the destination array's capacity, so an unused larger slot is free at runtime, just heavier on the
+  stack frame `Request req` occupies in `handle_readable`. Not reduced further (e.g. per-header-name
+  sizing) because the engine has no way to know a given slot will hold `Authorization` versus `Accept`
+  until it's already copying it in.
+
+**Tests and results.**
+
+- Unit tests added to `tests/test_http_hardening.c` (registered in `main`):
+  `test_parse_http_request_rejects_oversized_header_431` — a value 1100 chars past the header keyword
+  (comfortably over the 1024 cap) returns `-3`; a realistic ~600-char JWT-shaped `Authorization: Bearer`
+  token returns `0` and round-trips through `req_get_header` at its *exact* length (`strlen(auth) ==
+  strlen("Bearer ") + 600`, not truncated) — this is the compatibility half of the fix, not just the
+  loud-failure half; and a 100-char header *name* also returns `-3`, confirming the check is symmetric
+  across the colon. Also updated the pre-existing `test_header_value_whitespace_and_limits` (which calls
+  `parse_headers`, not `parse_http_request` — see scoping above): its 400-char over-long value no longer
+  demonstrates truncation now that 400 < 1024, so raised it to 1100 chars to keep testing
+  `parse_headers`' own (deliberately unchanged) truncating behavior, with a comment explaining why that
+  function still truncates while `parse_http_request` next to it does not.
+- Unit test added to `tests/test_connection.c` (registered in `main`):
+  `test_handle_readable_oversized_header_value_431` — end-to-end through the real `handle_readable` path
+  (distinct from the pre-existing `test_handle_readable_header_overflow_431`, which exercises the
+  whole-header-block-over-`BUF_SIZE` 431 — this one is a single header value over `MAX_HEADER_VALUE_LEN`
+  in a request that comfortably fits under `BUF_SIZE`, so it's specifically exercising
+  `parse_http_request`'s `-3` → `connection.c`'s 431 mapping): gets an explicit
+  `431 Request Header Fields Too Large` and the connection is closed, same shape as every other
+  rejection in this suite.
+- `make test`: all 14 suites pass (test_http_hardening: 1 new case + 1 updated; test_connection: 1 new
+  case).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 14 suites pass clean under ASan + UBSan.
+- `make fuzz` (200,000 iterations): clean.
+- `make check-docs`: passes (130 engine functions covered).
+- Compiled `lib/http_parser.c` and `lib/connection.c` directly with the project's
+  `-Wall -Wextra -std=c11 -O2` flags: no new warnings.
+- `make bench`: re-ran to get the new `sizeof(Request)` (43,576 bytes, up from ~19,000) for
+  `lib/CLAUDE.md`. Per-request CPU numbers moved within ordinary single-run noise (minimal GET 208→198 ns,
+  browser-shaped GET 781→825 ns, JSON POST 315→313 ns, 404 186→208 ns, 20-row JSON list 659→709 ns) —
+  consistent with the "bigger unused array costs nothing per request" reasoning above, not a regression
+  attributable to this change; `lib/CLAUDE.md`'s Hot-path rules section records both runs and why the
+  deltas aren't causal.
+- Live end-to-end verification against a minimal standalone server built with the real library
+  (`req_get_header(req, "Authorization")` echoed back as a length): a raw-socket request with a
+  realistic 600-char `Bearer` token got back `auth len=607` (`"Bearer "` + 600, exact — previously this
+  would have been silently cut to 255 total) confirming the compatibility half of the fix live, not just
+  in the pure-parser unit tests; a 1200-char token (past the cap) got `431 Request Header Fields Too
+  Large` instead of a corrupted, silently-wrong comparison.
+
+**Status:** Fixed. The silent-truncation failure class is closed for request header names and values on
+the live request path (`parse_http_request`); `parse_headers` (test-only component parser), individual
+post-split cookie values, and path/query param values remain truncating, per the scoping above — not
+newly introduced gaps, pre-existing behavior this entry's effort budget did not extend to.

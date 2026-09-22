@@ -284,6 +284,13 @@ int parse_http_request(const char *raw, const size_t raw_len, Request *req, Aren
 
     for (size_t i = 0; i < num_headers; i++) {
         if (req->header_count < MAX_HEADERS) {
+            /* S5: a name or value that would not fit is rejected (431), never silently truncated -
+             * copy_bounded used to cut a value at 255 bytes with no error, so a Bearer JWT or a long
+             * cookie header compared unequal to itself with nothing in the response explaining why. */
+            if (headers[i].name_len >= sizeof(req->header_names[0]) ||
+                headers[i].value_len >= sizeof(req->header_values[0])) {
+                return -3;
+            }
             copy_bounded(req->header_names[req->header_count], sizeof(req->header_names[0]), headers[i].name, headers[i].name_len);
             copy_bounded(req->header_values[req->header_count], sizeof(req->header_values[0]), headers[i].value, headers[i].value_len);
             req->header_count++;

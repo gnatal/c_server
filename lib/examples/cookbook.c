@@ -24,9 +24,10 @@
  *  8. register two routes that name the same path position differently ("/orders/:id/items" and "/orders/:oid/notes"):
  *     both capture under the first name. Use one name per position.
  *
- * Limits (excess is truncated or dropped, never overflowed; a 33rd request header is rejected with 400):
+ * Limits (excess is truncated or dropped, never overflowed; a 33rd request header is rejected with 400;
+ * a header name over 63 chars or value over 1023 chars is rejected with 431, not truncated):
  * no cap on routes per app (64 per Router), 16 app middlewares, 8 per-route middlewares, 8 path params (value 63 chars),
- * 16 query params (name/value 63 chars), 32 request headers (value 255 chars), 16 cookies (value 255 chars),
+ * 16 query params (name/value 63 chars), 32 request headers (value up to 1023 chars), 16 cookies (value 255 chars),
  * 16 response headers, 16 Set-Cookie lines, request body 10 MiB, request headers 8 KiB.
  */
 

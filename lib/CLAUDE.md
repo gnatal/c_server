@@ -47,7 +47,8 @@ response building never touch a socket, so tests drive them with a fake `Connect
 
 ## Limits (all compile-time, in `app_types.h`; excess is truncated or dropped, never overflowed, except where marked)
 Routes: no fixed cap per App (each is malloc'd into a tree), 64 per Router (`MAX_ROUTER_ROUTES`), 16 distinct methods · app middleware 16 · route middleware 8 ·
-path params 8 (value 63) · query params 16 (63) · request headers 32 (value 255; **a 33rd header is a 400, not a drop**) ·
+path params 8 (value 63) · query params 16 (63) · request headers 32 (name 63, value `MAX_HEADER_VALUE_LEN` 1024; **a 33rd
+header is a 400, a name or value that doesn't fit is a 431 (S5), neither is a silent drop or truncation**) ·
 cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
 body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 ·
 form fields 32 · static file 50 MiB · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
@@ -86,7 +87,7 @@ and leaves the old block in the arena until the request ends; a static file is r
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`app_enable_tls`, `res_send_file`, `event_loop_*`, `create_*`).
-`parse_http_request`: `0` ok, `-1` malformed, `-2` path too long (→ 414); after `-1`, `req.content_length == -2` means body too large (→ 413).
+`parse_http_request`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` a header name or value too long to store (→ 431, S5); after `-1`, `req.content_length == -2` means body too large (→ 413).
 `request_is_complete`: `1` for a complete request and also for invalid `Content-Length` / chunked+`Content-Length` framing (stop reading, let the parser report it);
 `0` while more bytes are needed, **and also (known gap, below) when the request line or headers are malformed**. `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
 `tls_connection_handshake`: `1` done, `0` in progress, `-1` fatal. `tls_connection_read/write`: bytes, `0` EOF, `-1` with `errno` (`EAGAIN` = wait).
@@ -112,7 +113,11 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   never lists. Reads the whole file into memory (≤ 50 MiB) and sends it with `res_send_bytes`. The root is resolved against the process's working directory.
 - **Request parsing.** picohttpparser does the request line and header block; it is strict about tokens and accepts bare `\n` line endings, and rejects HTTP versions other than 1.x. `Content-Length`
   must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Header names are matched exactly and case-insensitively (never by substring). Method ≤ 7
-  chars. Query/headers/cookies parsed eagerly into fixed arrays. More than 32 headers → 400. Header values over 255 chars are truncated silently.
+  chars. Query/headers/cookies parsed eagerly into fixed arrays. More than 32 headers → 400. A header name over 63 chars or
+  value over `MAX_HEADER_VALUE_LEN` (1024) is rejected with 431, never silently truncated (S5: raised from the original
+  255-char value cap, which used to truncate a Bearer JWT or long cookie into a value that compared unequal to itself with
+  no indication why - `parse_headers`, the standalone component parser `tests/` uses directly and that the live request
+  path does *not* call, still truncates silently since it has no error path to signal through, a `void` function).
   Chunked bodies: extensions ignored, trailers discarded, decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at `header_len + MAX_BODY_SIZE`.
 - **Buffers.** `in_buf` starts at 8 KiB; with headers complete and a body pending it grows by doubling, capped at the
   known target size (S4: `Content-Length` and chunked both work this way now - `Content-Length` used to realloc straight
@@ -185,11 +190,17 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 
 ## Hot-path rules (measured; do not undo)
 Per-request CPU cost of the pure path (parse, route, dispatch, response build; no sockets, one core; `make bench`, Apple M3 Pro,
-gcc-16 -O2, 21 Sep 2026): minimal GET 208 ns, browser-shaped GET (10 headers, cookies, query) 781 ns, JSON POST 315 ns, 404 186 ns;
-a 20-row JSON list through yyjson 659 ns. The earlier version of this file recorded 390 / 800 / 470 / 430 ns for the handwritten-parser engine on the same machine
-(no A/B rebuild of that commit was done for this update); only ratios transfer between machines. What to keep:
+gcc-16 -O2, 22 Sep 2026): minimal GET 198 ns, browser-shaped GET (10 headers, cookies, query) 825 ns, JSON POST 313 ns, 404 208 ns;
+a 20-row JSON list through yyjson 709 ns. (Previously 208 / 781 / 315 / 186 / 659 ns on 21 Sep 2026, before S5 raised
+`Request.header_values`' per-slot size from 256 to `MAX_HEADER_VALUE_LEN` (1024, see "Behavior reference, Request parsing"):
+the deltas above are within ordinary single-run noise, not attributable to that change - `copy_bounded` copies only
+`headers[i].value_len` bytes actually present, never the destination array's capacity, so a bigger unused slot costs nothing
+per request; only `sizeof(Request)` grew, not its CPU cost.) The earlier version of this file recorded 390 / 800 / 470 / 430 ns
+for the handwritten-parser engine on the same machine (no A/B rebuild of that commit was done for this update); only ratios
+transfer between machines. What to keep:
 - No `strtok_r` / `sscanf` / `strncpy` (zero-pads to the full size) / `strcasestr` over request bytes. Scan with lengths and `memchr`.
-- No whole-struct `memset` of `Request` (19 KB) or `Response` (16 KB). `parse_http_request` and `res_init` set scalars and
+- No whole-struct `memset` of `Request` (43,576 bytes, `sizeof`, `make bench`; grew from 19 KB when S5 raised the per-header
+  value cap - see above) or `Response` (16 KB). `parse_http_request` and `res_init` set scalars and
   `*_count` only; arrays are read up to their count and every slot is NUL-terminated on write.
 - Routing is one tree walk over path segments with no allocation; `req == NULL` searches without capturing (used for the 405 `Allow` list).
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
@@ -214,7 +225,13 @@ Verification tools: `make bench`, `make test` (14 suites), `make SANITIZE=1 BUIL
   quadratic in the worst case up to 10 MiB, so a slow-drip client can burn CPU. Fix: keep scan position and decoded length per connection.
 - **Per-connection footprint is about 25 KB resident on macOS (72 KB allocated: 64 KiB arena + 8 KiB `in_buf`)**, up from about 7 KB before the arena; 10,000 idle connections are on the order of 250 MB there.
 - **`Request.body` is still a copy** (now into the arena), including a 1-byte allocation for empty bodies.
-- Header values over 255 chars, params over 63 and queries over 255 are truncated silently.
+- Path/query params over 63 chars and queries over 255 chars are truncated silently. So are individual cookie values
+  over 255 chars after the `Cookie` header is split (`parse_cookies` → `cookie_values[MAX_COOKIES][256]`) - S5 fixed
+  the *raw* `Cookie:` header line (`req->header_values`, now `MAX_HEADER_VALUE_LEN` before a 431), not each cookie's
+  own value once split out of it, so a single very long session-token cookie among several shorter ones can still be
+  truncated even though the header line as a whole fit. Request header values otherwise are not truncated: S5 raised
+  the per-header cap to `MAX_HEADER_VALUE_LEN` and rejects anything still over it with 431 instead of truncating -
+  see "Behavior reference, Request parsing".
 - **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model).
 - The io_uring backend is used only as a readiness poller; sockets are still read and written with `recv` / `write`.
 - No HTTP/2, `Expect: 100-continue`, compression, `Range`, or WebSocket.
