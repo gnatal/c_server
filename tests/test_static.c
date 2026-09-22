@@ -8,6 +8,13 @@
 #include "static.h"
 #include "response.h"
 
+/* ---- static_serve_file's in-memory cache (P1) ---- */
+
+static void sleep_past_revalidate_window(void) {
+    /* STATIC_CACHE_REVALIDATE_SECONDS is 1 (app_types.h); comfortably clear it. */
+    sleep(2);
+}
+
 /* ---- static_resolve_relative_path (pure) ---- */
 
 static void test_resolve_literal_subpath(void) {
@@ -252,6 +259,92 @@ static void test_serve_directory_falls_back_to_index(void) {
     teardown_fixture(&fx);
 }
 
+static void test_cache_serves_stale_content_within_revalidate_window(void) {
+    StaticFixture fx;
+    setup_fixture(&fx);
+    Route route = make_static_route(&fx);
+    Request req = make_request("/static/file.txt");
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    static_serve_file(&route, &req, &res); /* populates the cache */
+    assert(res.status == 200);
+    assert(strstr(conn->out_buf, "hello static\n") != NULL);
+
+    /* Overwrite the file with different content and, separately, prove the cache - not the filesystem -
+     * is what answered the second request by removing the file outright: within the revalidation
+     * window, static_serve_file must never touch the filesystem again. */
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof(path), "%s/file.txt", fx.root);
+    unlink(path);
+
+    Response res2 = { .conn = conn, .status = 0 };
+    static_serve_file(&route, &req, &res2);
+    assert(res2.status == 200);
+    assert(strstr(conn->out_buf, "hello static\n") != NULL);
+
+    /* Restore the file so teardown_fixture's own unlink doesn't fail. */
+    write_file(path, "hello static\n");
+
+    free_conn(conn);
+    teardown_fixture(&fx);
+    static_cache_clear();
+}
+
+static void test_cache_revalidates_after_window_and_serves_unchanged_content(void) {
+    StaticFixture fx;
+    setup_fixture(&fx);
+    Route route = make_static_route(&fx);
+    Request req = make_request("/static/file.txt");
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    static_serve_file(&route, &req, &res);
+    assert(res.status == 200);
+
+    sleep_past_revalidate_window();
+
+    /* File untouched: the mtime/size revalidation should find it unchanged and reuse the cached bytes
+     * (this exercises the "existing, but stale check" branch, not the fast within-window one above). */
+    Response res2 = { .conn = conn, .status = 0 };
+    static_serve_file(&route, &req, &res2);
+    assert(res2.status == 200);
+    assert(strstr(conn->out_buf, "hello static\n") != NULL);
+
+    free_conn(conn);
+    teardown_fixture(&fx);
+    static_cache_clear();
+}
+
+static void test_cache_picks_up_change_after_window_expires(void) {
+    StaticFixture fx;
+    setup_fixture(&fx);
+    Route route = make_static_route(&fx);
+    Request req = make_request("/static/file.txt");
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+
+    static_serve_file(&route, &req, &res);
+    assert(res.status == 200);
+    assert(strstr(conn->out_buf, "hello static\n") != NULL);
+
+    sleep_past_revalidate_window();
+
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof(path), "%s/file.txt", fx.root);
+    write_file(path, "updated content, different size\n");
+
+    Response res2 = { .conn = conn, .status = 0 };
+    static_serve_file(&route, &req, &res2);
+    assert(res2.status == 200);
+    assert(strstr(conn->out_buf, "updated content, different size\n") != NULL);
+    assert(strstr(conn->out_buf, "hello static\n") == NULL);
+
+    free_conn(conn);
+    teardown_fixture(&fx);
+    static_cache_clear();
+}
+
 int main(void) {
     test_resolve_literal_subpath();
     test_resolve_root_mount();
@@ -268,6 +361,9 @@ int main(void) {
     test_serve_traversal_attempt_403();
     test_serve_symlink_escape_403();
     test_serve_directory_falls_back_to_index();
+    test_cache_serves_stale_content_within_revalidate_window();
+    test_cache_revalidates_after_window_and_serves_unchanged_content();
+    test_cache_picks_up_change_after_window_expires();
 
     printf("all static tests passed\n");
     return 0;

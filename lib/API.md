@@ -83,4 +83,4 @@ serialize once, `free` the string.
 - Connections (`connection.h`): `set_nonblocking`, `create_server_socket`, `connection_create`, `connection_close`, `accept_connections`, `handle_readable`, `flush_connection`, `close_idle_connections`.
 - Event loop (`event_loop.h`; kqueue on macOS/BSD, io_uring on Linux, epoll behind `CEXPRESS_USE_EPOLL`): `event_loop_init`, `event_loop_close`, `event_loop_watch_read`, `event_loop_unwatch_read`, `event_loop_watch_write`, `event_loop_unwatch_write`, `event_loop_unwatch_all`, `event_loop_arm_shutdown_timer`, `event_loop_poll`.
 - Cluster (`cluster.h`): `cluster_listen`, `cluster_resolve_worker_count`, `cluster_is_worker`, `cluster_worker_id`.
-- Static files (`static.h`): `static_serve_file`, `static_resolve_relative_path`, `static_mime_type`.
+- Static files (`static.h`): `static_serve_file`, `static_resolve_relative_path`, `static_mime_type`, `static_cache_clear` (P1: clears `static_serve_file`'s in-memory file cache; tests and app-triggered reloads only, nothing in the engine calls it).

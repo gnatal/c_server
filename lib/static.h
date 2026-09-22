@@ -51,7 +51,21 @@ const char *static_mime_type(const char *path);
  *     Content-Type from static_mime_type otherwise.
  * Called from chain_next's final fallback (lib/middleware.c) in place of a
  * Handler - a static route has none, see Route.static_root (app_types.h).
+ *
+ * P1 (performance): files up to STATIC_CACHE_MAX_ENTRY_BYTES (app_types.h) are cached in memory after
+ * their first successful read. A request within STATIC_CACHE_REVALIDATE_SECONDS of the last check for
+ * the same path is served straight from the cache with no filesystem call at all (not even realpath or
+ * stat); past that window, one stat confirms the file is unchanged (by size and mtime) before either
+ * reusing the cached bytes or re-reading it. See lib/CLAUDE.md, "Static", for the resulting trade-off.
  */
 void static_serve_file(const Route *route, const Request *req, Response *res);
+
+/*
+ * Frees every entry in the static-file cache described above (static_serve_file). The cache is
+ * process-lifetime and shared across every mount, so this is for tests that need a clean slate between
+ * runs and for an application that wants to force a reload (e.g. after redeploying static assets)
+ * without restarting the worker; nothing in the engine itself calls it.
+ */
+void static_cache_clear(void);
 
 #endif /* STATIC_H */

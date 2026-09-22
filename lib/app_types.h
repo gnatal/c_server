@@ -45,6 +45,10 @@
 #define BUF_SIZE 8192                 /* connection input buffer start size; also the request-header limit (431 beyond) */
 #define MAX_BODY_SIZE (10 * 1024 * 1024)        /* request body (Content-Length or decoded chunked) and streamed response buffer; 413 beyond */
 #define MAX_STATIC_FILE_SIZE (50 * 1024 * 1024) /* static_serve_file refuses larger files with 500 */
+#define STATIC_CACHE_MAX_ENTRIES 256            /* distinct cached files per process (static.c); LRU-by-staleness eviction beyond it */
+#define STATIC_CACHE_MAX_ENTRY_BYTES (256 * 1024)      /* a file bigger than this is served but never cached (P1) */
+#define STATIC_CACHE_MAX_TOTAL_BYTES (64 * 1024 * 1024) /* combined cap across all cached entries; evicts the stalest first */
+#define STATIC_CACHE_REVALIDATE_SECONDS 1       /* a cache hit within this long of its last stat skips the filesystem entirely */
 #define STREAM_CHUNK_SIZE (16 * 1024)           /* res_send_file reads this much per write; 4 chunks per event-loop turn */
 #define IDLE_TIMEOUT_SECONDS 60       /* no bytes received for this long: close (408 if mid-request) */
 #define REQUEST_HEADER_TIMEOUT_SECONDS 10  /* deadline from the first byte of a request to a complete header

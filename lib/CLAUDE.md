@@ -45,7 +45,7 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen |
 | `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals) |
 | `cluster.c/h` | fork workers, respawn, drain |
-| `static.c/h` | traversal-safe file serving |
+| `static.c/h` | traversal-safe file serving, with an in-memory cache of recently served files (P1) |
 | `multipart.c/h`, `urlencoded.c/h` | form body parsers (handler-invoked, not automatic) |
 | `vendor/picohttpparser/` | vendored HTTP/1.x request parser (MIT/Perl) |
 | `vendor/yyjson/` | vendored yyjson 0.13.0; JSON reading and writing. `cexpress.h` includes it. There is no engine JSON layer of its own |
@@ -57,7 +57,9 @@ path params 8 (value 63) · query params 16 (63) · request headers 32 (name 63,
 header is a 400, a name or value that doesn't fit is a 431 (S5), neither is a silent drop or truncation**) ·
 cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
 body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 ·
-form fields 32 · static file 50 MiB · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
+form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB each, 64 MiB total, 1 s revalidation
+(`STATIC_CACHE_*`, `static.c`; a file over the per-entry cap is served but never cached; see "Static" below - P1) ·
+idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
 pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
 worker init hooks 4 · cluster workers 128 · arena 64 KiB per connection (see below; exceeding it falls back to malloc, it is not a limit) ·
 max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped) ·
@@ -89,6 +91,7 @@ and leaves the old block in the arena until the request ends; a static file is r
 | `Route`, `PatriciaNode` | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy` |
 | `app->connections` | `app_init` | `app_destroy` |
 | `app->spare_fd` (S3, one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |
+| Static file cache entries (P1: cached path string + file bytes, `static.c`'s own process-lifetime global, not tied to any `App`) | `static_serve_file`, on a cache miss or a changed file | replaced in place on the next change, evicted (stalest first) once `STATIC_CACHE_MAX_ENTRIES` is reached, or all of them via `static_cache_clear` (tests; nothing in the engine calls it) |
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
@@ -115,6 +118,20 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 - **Static.** `app_serve_static` registers `GET <prefix>/*`, `realpath`s the root once (a missing root registers nothing and logs it, so every request under the prefix is a 404), refuses `..` (403), re-checks the
   resolved path stays under the root after symlink resolution (403), 404 for non-files, serves `index.html` for a directory,
   never lists. Reads the whole file into memory (≤ 50 MiB) and sends it with `res_send_bytes`. The root is resolved against the process's working directory.
+  **File cache (P1).** `static_serve_file` caches files up to `STATIC_CACHE_MAX_ENTRY_BYTES` after their first read, keyed by
+  the pre-`realpath` candidate path (`static_root` + the already-traversal-checked subpath), not the resolved one - MEASURED
+  (`improvements.md`, P1) a 6.6x gap between the static-mount path and an equivalent in-memory response, almost entirely
+  `open`/`fstat`/`realpath`/`fopen`/`fread`/`malloc`/`free` paid on every request for the same handful of files. A request
+  within `STATIC_CACHE_REVALIDATE_SECONDS` (1 s) of the same candidate's last check is served straight from the cache with
+  **no filesystem call at all**, not even `realpath`/`stat` - re-verified live at 255,941 req/s for a 52-byte file
+  (`wrk -t4 -c100 -d8s`, matching the in-memory `res_send_bytes` baseline in `improvements.md`, up from the 37,647 req/s
+  measured there before this fix). Past that window, one `stat` compares size and mtime; unchanged reuses the cached bytes
+  (skips `fopen`/`fread`), changed re-reads and replaces the entry. **Trade-off, by design:** a symlink swapped in place, or
+  a file rewritten with the same size and the same one-second mtime, can serve stale content for up to the revalidation
+  window - the same trade every `stat`-based file cache (e.g. nginx's `open_file_cache`) makes. A file over the per-entry cap
+  is served normally but never cached (no behavior change for large files). The cache is a single process-lifetime table
+  shared by every mount, not scoped to an `App` - see Ownership above and `static_cache_clear` (`static.h`) for the one thing
+  that frees it (tests; not called anywhere in the engine itself).
 - **Request parsing.** picohttpparser does the request line and header block; it is strict about tokens and accepts bare `\n` line endings, and rejects HTTP versions other than 1.x. `Content-Length`
   must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Header names are matched exactly and case-insensitively (never by substring). Method ≤ 7
   chars. Query/headers/cookies parsed eagerly into fixed arrays. More than 32 headers → 400. A header name over 63 chars or
@@ -236,6 +253,10 @@ Verification tools: `make bench`, `make test` (14 suites), `make SANITIZE=1 BUIL
 - **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model).
 - The io_uring backend is used only as a readiness poller; sockets are still read and written with `recv` / `write`.
 - No HTTP/2, `Expect: 100-continue`, compression, `Range`, or WebSocket.
+- **`res_send_file` and large (uncached) static files are still not optimized** (`improvements.md`, P1's other sub-items,
+  not addressed by the static-file cache above): the response head and the file body still go out as separate `write`
+  calls (no single buffer / `writev`), and large files are read with plain `read`/`write` in `STREAM_CHUNK_SIZE` pieces
+  rather than `sendfile(2)`. No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.
 
 ## Where to change what
 Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`. Add a parser feature → `http_parser.c/h` +

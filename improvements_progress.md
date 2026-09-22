@@ -530,6 +530,116 @@ newly introduced gaps, pre-existing behavior this entry's effort budget did not 
 
 ---
 
+## P1 · Static and file responses go through slow paths (static-file cache half only)
+
+**Date completed.** 2026-09-22.
+
+**Scope.** `improvements.md`'s P1 bundles five fixes under one ID. This entry covers only fix (1), "a small
+file cache" for `app_serve_static`/`static_serve_file` — the half responsible for the MEASURED 6.6×
+`/static` gap. Fixes (2) writev/single-buffer heads, (3) `sendfile(2)` for large files, (4) cached
+`realpath`, and (5) `ETag`/`Last-Modified`/`304`/`Cache-Control` are **not done**; `lib/CLAUDE.md`'s "Known
+gaps" was updated to say so explicitly rather than let a partial fix read as a complete one.
+
+**How it was completed.**
+
+`static_serve_file` (`lib/static.c`) used to pay `realpath` + `stat` (twice for a directory index) +
+`fopen`/`malloc`/`fread`/`fclose`/`free` on every single request, even for the same handful of files
+requested repeatedly — the common case for a static mount. Added a small in-memory cache, file-static to
+`static.c` (not `App`-scoped: two different mounts can never resolve to the same candidate string, each
+being rooted under its own canonical `static_root`, so one process-lifetime table is enough and avoids
+threading a cache pointer through `dispatch`/`MiddlewareChain`/`match_route`, none of which currently carry
+anything mutable per mount).
+
+- **Cache key is the pre-`realpath` candidate path** (`static_root` + the already-traversal-checked
+  subpath from `static_resolve_relative_path`), not the resolved one. This is what lets a cache *hit within
+  the revalidation window* skip `realpath`/`stat` entirely, not just the file read — the biggest share of
+  the measured gap, since `open`/`fstat`-class syscalls dominate at these file sizes, not the read itself.
+- **Two-tier lookup**, both new code paths added to `static_serve_file`:
+  1. Before any syscall: `cache_lookup_fresh(candidate, now)` — a hit checked within
+     `STATIC_CACHE_REVALIDATE_SECONDS` (1 s, `app_types.h`) of its last confirmation is served straight from
+     the cache, zero filesystem calls.
+  2. After `resolve_and_stat` (and the directory-index retry, and the `MAX_STATIC_FILE_SIZE` check) but
+     before `fopen`: if a cache entry for the candidate exists and its stored `mtime`/`size` match the fresh
+     `stat`, the read is skipped and the cached bytes are served, with `last_checked` refreshed — this is the
+     "server has been up more than a second" steady state: one `stat` per file per second, not one full read
+     per request.
+  3. Otherwise (miss, or the file changed): the original `fopen`/`malloc`/`fread` path runs unchanged, and
+     `cache_insert` is given ownership of the freshly read buffer (files over `STATIC_CACHE_MAX_ENTRY_BYTES`,
+     256 KiB, are served but never cached — no behavior change for those, just no speedup).
+- **Bounded, no separate byte-accounting to get wrong.** `STATIC_CACHE_MAX_ENTRIES` (256) ×
+  `STATIC_CACHE_MAX_ENTRY_BYTES` (256 KiB) = `STATIC_CACHE_MAX_TOTAL_BYTES` (64 MiB) exactly (`app_types.h`),
+  asserted at compile time (`_Static_assert` in `static.c`) — capping entry count alone caps total bytes, so
+  there is no independent running-total check to keep in sync with the eviction logic. Eviction (when the
+  entry cap is hit on an insert for a genuinely new candidate) drops whichever entry was least recently
+  confirmed fresh (`cache_evict_stalest`, linear scan — the table is at most 256 entries and this only runs
+  on a miss, never on the hit path).
+- **Ownership**, matching this codebase's "every malloc has a matching free" rule: `cache_insert` takes
+  ownership of the caller's already-allocated file buffer on success (0) — no extra copy — and leaves it
+  untouched on failure (-1: too big to cache, or `malloc` failed for the cache's own path-string
+  bookkeeping), so `static_serve_file` frees it itself exactly when `cache_insert` didn't take it. New
+  public function `static_cache_clear(void)` (`static.h`, listed in `API.md` per `make check-docs`) frees
+  every entry; nothing in the engine calls it (documented as being for tests, and for an application that
+  wants to force a reload without restarting the worker).
+
+**Deliberately scoped down / trade-offs, matching the S1-S5 precedent of narrowing rather than silently
+doing less than advertised:**
+- **Revalidation is `stat`-based with a 1 s window, same trade-off nginx's `open_file_cache valid=1s` makes.**
+  A symlink swapped in place, or a file rewritten with the same size and the same one-second-resolution
+  mtime, can serve stale content for up to that window. Documented in `lib/CLAUDE.md`'s "Static" section and
+  `static_serve_file`'s doc comment, not silently assumed away.
+- **`res_send_file` (non-static-mount file responses) and large static files (`MAX_STATIC_FILE_SIZE`, 50
+  MiB, still read whole into memory when under that cap and over the cache's 256 KiB per-entry cap) are
+  unaffected by this change.** They still go through the pre-existing slow path `improvements.md` also flags
+  under P1 — see Scope above.
+- **No `ETag`/`Last-Modified`/`304`/`Range`/`Cache-Control`** — a served file still returns 200 with the
+  full body every time, cached or not; this fix is about server-side cost, not bytes on the wire.
+
+**Tests and results.**
+
+- Unit tests added to `tests/test_static.c` (registered in `main`):
+  - `test_cache_serves_stale_content_within_revalidate_window` — serves a file once, deletes it from disk,
+    then serves the same request again within the 1 s window and asserts the original content still comes
+    back: since the file no longer exists, any codepath that touched the filesystem would 404, so a 200 with
+    the original body proves the fast path took no filesystem call at all. Restores the file before
+    `teardown_fixture` so its own cleanup doesn't fail.
+  - `test_cache_revalidates_after_window_and_serves_unchanged_content` — a real `sleep(2)` (comfortably past
+    `STATIC_CACHE_REVALIDATE_SECONDS`) then a second request against the untouched file, exercising the
+    "existing entry, stale check, but `stat` confirms unchanged" branch specifically (distinct from the
+    within-window test above).
+  - `test_cache_picks_up_change_after_window_expires` — same `sleep(2)`, then the file is rewritten with
+    different content *and* a different size before the second request: asserts the new content is served
+    and the old content is gone, proving a genuine change invalidates the cache correctly rather than
+    latching onto stale bytes forever.
+  - All three call `static_cache_clear()` at the end (process-lifetime global state, shared across every
+    test in the binary — the unique `mkdtemp` root per test already prevents key collisions with other
+    `test_static.c` cases, but clearing anyway is one line and keeps the suite's assertions self-contained
+    rather than relying on that as an implicit invariant).
+- `make test`: all 13 suites pass (test_static: 3 new cases; ~4 s added to the suite's runtime from the two
+  `sleep(2)` calls, not considered worth engineering around for a one-file addition).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan.
+- `make fuzz` (1,000,000 iterations): clean (134,879 parsed, 145,303 complete) — `fuzz_parser.c` already
+  links `static.c` for the response-builder path; no seed changes needed since fuzzing doesn't exercise
+  `static_serve_file` directly.
+- `make check-docs`: passes (121 engine functions, up from 120 — `static_cache_clear`).
+- Compiled `lib/static.c` directly with the project's `-Wall -Wextra -std=c11 -O2` flags: no new warnings.
+- **Live reproduction of the exact MEASURED scenario from `improvements.md`** (4 workers, 100 connections,
+  `examples/todo_sqlite`'s demo, `wrk -t4 -c100 -d8s` against `/static/style.css`, a 52-byte file):
+  **255,941 req/s** after this fix, up from the 37,647 req/s `improvements.md` measured before it — a
+  **6.8×** improvement, matching (and slightly exceeding) the PROJECTED "up to ~6×" and landing within noise
+  of the in-memory `res_send_bytes` baseline the same document measured (249,811-256,126 req/s), i.e. the
+  static-mount path now costs about the same as serving from memory directly.
+- Live end-to-end sanity check against the same demo: `GET /ping` and `GET /api/todos` unaffected (200);
+  `GET /static/style.css` 200 with the correct 52-byte body; `GET /static/does-not-exist` 404;
+  `GET /static/` 404 — pre-existing, documented behavior unrelated to this change (a trailing `*` route
+  never matches the bare mount prefix, so the request never reaches `static_serve_file` at all; see
+  `static.h`'s doc comment on `static_resolve_relative_path`).
+
+**Status:** Fixed for the measured `/static`-mount problem. `res_send_file`, large-file streaming and
+HTTP caching headers remain open, per the Scope note above — not gaps introduced by this work, but the rest
+of P1's own fix list that this entry did not attempt.
+
+---
+
 ## TLS removal · not an `improvements.md` item — an architectural decision, not a fix
 
 **Date completed.** 2026-09-22.

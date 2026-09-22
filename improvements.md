@@ -22,11 +22,11 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 
 | ID | Problem | Kind | Sev. | Effort | Probable gain | Evidence |
 |---|---|---|---|---|---|---|
-| S1 | Slow-drip clients hold connections forever | Security | High | S | Closes an unauthenticated DoS | MEASURED (168 s and still open) |
-| S2 | No write timeout: a client that stops reading holds its connection forever | Security | High | S | Closes a second DoS | Code reading |
-| S3 | No connection limit or overload handling | Security | High | S | Bounded memory; clean 503 at the limit | MEASURED (fd limit) |
-| S4 | A declared `Content-Length` reserves 10 MiB per connection at once | Security / Memory | Med | S | Virtual reservation drops from 10 MiB × connections to what is sent | MEASURED (+3,000 MB virtual for 300 conns) |
-| S5 | Header values over 255 chars are silently truncated (JWTs break) | Security / Correctness | Med | M | Removes a silent auth failure class | MEASURED |
+| S1 | ~~Slow-drip clients hold connections forever~~ | Security | High | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (168 s and still open) |
+| S2 | ~~No write timeout: a client that stops reading holds its connection forever~~ | Security | High | S | **FIXED 2026-09-22**: see `improvements_progress.md` | Code reading |
+| S3 | ~~No connection limit or overload handling~~ | Security | High | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (fd limit) |
+| S4 | ~~A declared `Content-Length` reserves 10 MiB per connection at once~~ | Security / Memory | Med | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (+3,000 MB virtual for 300 conns) |
+| S5 | ~~Header values over 255 chars are silently truncated (JWTs break)~~ | Security / Correctness | Med | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED |
 | S6 | `%00` in a path truncates it | Security | Med | S | Removes a filter-bypass primitive | MEASURED (`style.css%00.png` → 200) |
 | S7 | Failing workers are respawned with no backoff | Reliability | High | S | Stops a fork/log storm | MEASURED (10,594 respawns in 4 s) |
 | S8 | Malformed request line gets no response | Security / Correctness | Med | S | Frees the connection at once instead of after 8 KiB or 60 s+ | MEASURED |
@@ -34,7 +34,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | S10 | ~~TLS hardening gaps (renegotiation, handshake deadline)~~ | Security | Low | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | ESTIMATED |
 | S11 | Bare `\n` and substring `chunked` accepted (smuggling ambiguity) | Security | Low | S | Removes proxy desync ambiguity | Code reading + MEASURED (bare LF) |
 | S12 | Startup allocations and `exit()` calls in library code | Reliability | Low | S | Errors reach the application | Code reading |
-| P1 | Static and file responses go through slow paths | Performance | | M | **3.8×** small files; `/static` up to ~6.6× | MEASURED |
+| P1 | ~~Static and file responses go through slow paths~~ (static-file cache only) | Performance | | M | **PARTIALLY FIXED 2026-09-22**: see `improvements_progress.md` - the `/static` mount's 6.6× gap is closed; `res_send_file`/large-file streaming (item 1's other sub-parts) are untouched | MEASURED |
 | P2 | Request headers are parsed three times | Performance | | M | ~300 ns of 781 ns pure path (browser-shaped); ~40 of 208 ns (minimal) | PROJECTED from MEASURED parts |
 | P3 | Headers are copied into fixed 19 KB `Request` arrays | Performance / Memory | | L | A further ~200 ns (browser-shaped); fixes S5 | PROJECTED |
 | P4 | epoll and io_uring issue a syscall on every interest change | Performance | | S | ~5–25% per keep-alive request on Linux | ESTIMATED |
@@ -72,30 +72,47 @@ Dependencies to respect: M1 and M2 change how `Connection.arena` and `in_buf` ar
 
 ## 3. Security and robustness
 
-### S1 · Slow-drip clients hold connections forever
+### S1 · ~~Slow-drip clients hold connections forever~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** `last_activity` is refreshed on **every received byte** (`lib/connection.c:437`, `lib/tls.c:170`) and `close_idle_connections` (`connection.c:483-509`) only closes a connection that has been silent for a full 60 s. A client that sends one byte every 59 s is never "idle". There is no deadline for receiving the request line and headers, and none for the body, so the documented Slowloris defence (431) only covers *size*, not *time*. A TLS client that connects and never finishes the handshake is bound by the same rule.
 **Measured.** A client sending 1 byte every 20 s was still connected after **168 s** (the test was stopped, not the connection). Each held connection pins a file descriptor and ~25 KB resident (72 KB allocated).
 **Fix.** Add `request_started` to `Connection`: set when the first byte of a request arrives after an idle period, cleared when a response is queued. In `close_idle_connections` close (408) any connection whose `now - request_started` exceeds a header deadline (10–30 s) or, once headers are complete, a body deadline (a total limit, or a minimum-rate rule such as 1 KB/s after a grace period). Apply the same clock to unfinished TLS handshakes. One store per request; no hot-path cost.
 **Probable gain.** Closes an unauthenticated resource-exhaustion attack. Cost: one timestamp write per request (well under 1 ns amortized).
 
-### S2 · A client that stops reading holds its connection forever
+### S2 · ~~A client that stops reading holds its connection forever~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** `close_idle_connections` skips any connection with `out_buf != NULL` or `file_fd >= 0` (`connection.c:495-497`, commented "slow readers are not this timeout's job"). A client that requests a large response (a big static file, a 10 MiB streamed body) and never reads it keeps the fd, the arena and the whole response buffer indefinitely.
 **Fix.** Track `last_write_progress` (advance when `write` accepts bytes, which `flush_connection` already sees at `:303`) and close when a pending response makes no progress for N seconds (30–60 s). Optionally cap pending output per connection.
 **Probable gain.** Closes a second DoS with the same mechanism as S1; up to `MAX_BODY_SIZE` (10 MiB) of memory per stuck connection returned to the pool. Not tested (needs a response larger than the socket buffers).
 
-### S3 · No connection limit, no overload behavior
+### S3 · ~~No connection limit, no overload behavior~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record (note: the fd-exhaustion/
+EMFILE half carries a caveat, not a full fix, per that record). Kept below for historical record.
+
 **Problem.** Connections are bounded only by `RLIMIT_NOFILE` (`accept_connections`, `connection.c:241-285`); there is no per-worker, per-IP or global limit and no reserve for overload. At the descriptor limit `accept()` fails and the loop just stops accepting.
 **Measured.** With `ulimit -n 40` and 100 clients, the first clients were served and a late client received an empty reply; the server stayed idle (0% CPU, so no busy loop on macOS) and never told anyone it was full. Memory scales as ~25 KB per connection (macOS), so 100,000 connections is ~2.5 GB with no cap.
 **Fix.** (1) Config `max_connections` per worker; beyond it, accept and immediately send `503 Service Unavailable` + `Connection: close` (or stop watching the listen socket until below the limit). (2) Keep a spare descriptor open so that on `EMFILE` you can accept, answer 503 and close. (3) Optional per-IP cap. Also raise `BACKLOG` (128, `app_types.h`) toward `SOMAXCONN`; on Linux the kernel cap is usually larger (macOS `kern.ipc.somaxconn` is 128 here, so it cannot help there).
 **Probable gain.** Bounded memory under attack; graceful degradation instead of silent drops. No cost when below the limit.
 
-### S4 · A declared `Content-Length` reserves 10 MiB per connection immediately
+### S4 · ~~A declared `Content-Length` reserves 10 MiB per connection immediately~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record (note: per-route body
+limits cover `Content-Length` only, not chunked bodies, per that record). Kept below for historical
+record.
+
 **Problem.** As soon as the 8 KiB buffer fills with a body pending, `grow_in_buf` (`connection.c:398-418`) reallocates straight to `header_len + content_length + 1`, trusting the client's header. `MAX_BODY_SIZE` is also a single global 10 MiB for every route.
 **Measured.** 300 connections, each declaring a 10 MiB body and sending 9 KB: virtual size rose by **~3,000 MB**, resident memory by only ~14 MB. So this is a reservation, not (yet) resident memory, but it can hit strict-overcommit systems, `RLIMIT_AS`, or container accounting that counts mapped memory, and it hands an attacker a 1000:1 reservation ratio.
 **Fix.** Grow geometrically as bytes actually arrive (as the chunked path already does), and add per-route or per-prefix body limits (`app_use_body_limit(prefix, bytes)`, default e.g. 1 MiB, with 10 MiB opt-in). Reject early with 413 when the declared length exceeds the route limit.
 **Probable gain.** Virtual reservation proportional to data received instead of declared; a JSON API rejects a 5 MiB body at the header stage instead of buffering it.
 
-### S5 · Header values over 255 characters are silently truncated
+### S5 · ~~Header values over 255 characters are silently truncated~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record (note: individual
+post-split cookie values and path/query param values remain truncating, per that record). Kept below
+for historical record.
+
 **Problem.** `copy_bounded` (`http_parser.c:22`) cuts header values at 255 bytes. Bearer tokens (JWTs are commonly 300–1,000 characters) and long cookies are silently shortened, so a valid `Authorization: Bearer <JWT>` fails comparison, and code that only checks a prefix would accept a wrong token. No error is raised.
 **Measured.** A 400-character header value was stored as 255 characters with a successful parse.
 **Fix.** Short term: answer `431` when a header exceeds the stored size, or raise the value size for `Authorization` and `Cookie`. Proper fix: P3 (views into the input buffer, no per-header cap).
@@ -147,7 +164,12 @@ of an HTTP/1.1 parsing library, not inside it). This entry is kept for historica
 
 ## 4. Performance
 
-### P1 · Static and file responses go through slow paths
+### P1 · ~~Static and file responses go through slow paths~~ (PARTIALLY FIXED 2026-09-22)
+**The `/static` mount half of this was fixed on 2026-09-22** — see `improvements_progress.md` for the fix
+record (a small in-memory file cache in `static.c`, fix (1) below). `res_send_file`'s separate head/body
+writes, `sendfile(2)` for large files, `realpath` caching for the resolve step, and `ETag`/`Last-Modified`/
+`304`/`Cache-Control` (fixes (2)-(5) below) are untouched — still open. Kept below for historical record.
+
 **Problem.** Three separate paths, all slow:
 - `res_send_file` (`response.c:502`): per request `open`, `fstat`, write the head alone, `read` into an arena chunk, `write` the body, `close` (about 7 syscalls in all). The head and the body are two separate `write` calls on a `TCP_NODELAY` socket, so they will normally leave as two TCP segments (inferred from the code; packets were not captured).
 - `app_serve_static` / `static_serve_file` (`static.c:138-229`): `realpath` (twice for a directory index) plus `stat` per request, then `fopen`/`malloc`/`fread` of the **whole file** (up to 50 MiB) on the event loop, then a second copy into the arena. A 50 MiB file blocks every connection on that worker while it is read, and holds ~100 MiB transiently.
