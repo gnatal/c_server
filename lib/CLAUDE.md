@@ -128,6 +128,15 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   search tries, in this order and with backtracking: a literal child, then the `:name` / mid-pattern `*` child, then a trailing `*`.
   So **specificity beats registration order**: `/users/me` wins over `/users/:id` even when registered second.
   A mid-pattern `*` matches one segment and captures nothing. A trailing `*` matches one or more segments (never the bare prefix). A duplicate pattern for the same method keeps the first and warns.
+  **Static children are sorted, not registration order (P7).** A node's `children` array is kept sorted by segment
+  (short-lexicographic: shared-prefix bytes compare first, the shorter segment sorts before a longer one that starts
+  with it) and searched with binary search (`find_child`) instead of a linear `memcmp` scan, both on `tree_insert`
+  (new child inserted at its sorted position via `memmove`) and on `tree_search_recursive`'s per-segment lookup - a
+  path segment with many static siblings (`/api/<many resources>`) is now O(log siblings) instead of O(siblings).
+  MEASURED (`improvements.md`, P7): 8,401 ns → ~80 ns per lookup at 5,000 siblings on a scratch benchmark (one worker
+  process, 1,000,000 lookups). Only static children are affected; `param_child`/`catch_all_child` are still single
+  pointers, unaffected. Irrelevant for a hand-written route table (dozens of siblings at most); matters for a
+  generated one.
   `HEAD` falls back to the same path's `GET` route (body suppressed, `Content-Length` kept). `OPTIONS` on a known path
   → 200 + `Allow` (with `HEAD` added if `GET` exists). Explicit `app_head` / `app_options` win. Path is percent-decoded before routing (so `%2F` becomes a segment break).
   `match_path` is a standalone pattern matcher that the router itself no longer calls; it is kept for tests and does not reproduce every tree rule (it is first-match, per pattern).
@@ -307,6 +316,7 @@ this update). What to keep:
   a per-header `memcpy` there. Don't call `parse_cookies` from `parse_http_request_from_head` either - `req_get_cookie`
   triggers it lazily, once, on its own first call per request.
 - Routing is one tree walk over path segments with no allocation; `req == NULL` searches without capturing (used for the 405 `Allow` list).
+- A Patricia node's static `children` stay sorted; find/insert through `find_child` (binary search), not a linear scan (P7 - "Behavior reference, Routing" above).
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
 - Allocate per-request data from `conn->arena`, not `malloc`. Emit JSON through yyjson with `arena_yyjson_alc`.
 - No syscall on a path that changes nothing (`events_watched`; enforced on kqueue only, see Event loop).

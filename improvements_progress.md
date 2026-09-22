@@ -1456,3 +1456,89 @@ advertised:
 follow-on risks `improvements.md`'s own fix list named (partial-write copy-out, file-streaming buffers) -
 neither was left as a known gap. M2 (`in_buf`) remains open, per the scoping above - a related but distinct
 change, not a shortfall in this entry's own scope.
+
+---
+
+## P7 · Router child lookup is a linear scan
+
+**Date completed.** 2026-09-22.
+
+**How it was completed.**
+
+`improvements.md`'s own suggested fix ("keep children sorted by segment and binary-search") was implemented
+as written, not the hashing/first-byte-index alternative it also floated.
+
+- **`lib/router.c`: two new static helpers.**
+  - `compare_seg(a, a_len, b, b_len)` — a total order over segment bytes (short-lexicographic: shared-prefix
+    bytes compare first with `memcmp`; if one segment is a strict prefix of the other, the shorter one sorts
+    first). This exact comparator has to be the single source of truth for both insert and lookup, or a
+    sorted-order mismatch between the two would make binary search silently miss real matches - both now call
+    it through one shared function rather than each hand-rolling an equivalent one.
+  - `find_child(children, child_count, seg, seg_len, *out_idx)` — binary search over a `children` array kept
+    sorted by `compare_seg`. Returns 1 and the matching index on a hit, or 0 and the sorted insertion point on
+    a miss (`out_idx` is meaningful in both cases, which is what lets `tree_insert` reuse the same call for
+    "does this child already exist" and "where do I put a new one").
+- **`tree_insert`'s static-child branch** (`router.c`, was the `for` loop with a `memcmp` at `:508-514`
+  plus an always-append at `:515-522`) now calls `find_child` once: a hit reuses the existing child exactly as
+  before; a miss grows `children` (unchanged doubling `realloc`) and inserts the new node at the sorted
+  position with one `memmove` of the tail, instead of always appending at `child_count`. `param_child` and
+  `catch_all_child` are untouched - they were already single pointers, not scanned arrays, so P7 didn't apply
+  to them.
+- **`tree_search_recursive`'s static-child loop** (was `for (int i = 0; i < node->child_count; i++)` with a
+  `memcmp` at `:556-565`) replaced by one `find_child` call. A static segment can only ever have one matching
+  child by construction (insert de-duplicates via the same `find_child`), so the loop's "keep scanning after a
+  miss" behavior had no case it was actually needed for; a single lookup is exactly equivalent.
+- No change to `PatriciaNode`'s layout (`app_types.h`) - `children`/`child_count`/`child_cap` keep their
+  existing types and ownership, only the invariant "sorted by `compare_seg`" was added, upheld solely by
+  `tree_insert` (the only place that ever writes into `children`).
+
+**Tests and results.**
+
+- New regression test, `test_match_route_many_siblings` (`tests/test_router.c`, registered in `main`): 200
+  static sibling routes (`/api/res0` … `/api/res199`) registered in a deterministically shuffled order (not
+  sorted, and not reverse-sorted either, to catch an insert bug that only breaks on already-sorted input),
+  then looks up the first, second, middle, second-to-last and last registered path plus one path that was
+  never registered and is also a *prefix* of real ones textually adjacent to it in sort order
+  (`/api/resNotThere` sorts near `/api/res1`/`/api/res19*` under `compare_seg`) - the shape most likely to
+  expose an off-by-one in `find_child`'s insertion-point math or a wrong tie-break direction in `compare_seg`.
+  All five registered lookups return the exact right route; the unregistered one returns `NULL`.
+- `make test`: all 13 suites pass, including every pre-existing `test_router.c` case unmodified (duplicate
+  pattern registration, literal-vs-`:param`-vs-`*` precedence, `HEAD`→`GET` fallback, `app_mount` prefixing,
+  body-limit prefix matching) - none of that logic sits downstream of child ordering, so this is confirming no
+  regression, not testing P7 itself.
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan - meaningful here
+  specifically because insertion now does a `memmove` of live `PatriciaNode *` pointers within a `realloc`'d
+  array (a spot where an off-by-one would read or write one slot outside the array, exactly what ASan catches)
+  instead of the old code's simple append.
+- `make fuzz FUZZ_ITERS=1000000`: clean (134,879 parsed, 145,303 complete) - `fuzz_parser.c` exercises
+  `match_route` against mutated request paths on every completed parse, so this covers `find_child`'s lookup
+  side under adversarial segment bytes (including segments that are prefixes of each other, empty, or contain
+  bytes that sort unusually under plain `memcmp`), though the seed routes it registers are few, not thousands.
+- `make check-docs`: passes (124 engine functions, unchanged - `compare_seg`/`find_child` are file-static, not
+  part of the public API).
+- Compiled `lib/router.c` with the project's `-Wall -Wextra -std=c11 -O2` flags: no new warnings.
+- **Benchmark reproducing `improvements.md`'s own P7 methodology** (a scratch program outside the repo, C
+  program calling `match_route` in a loop after registering N static siblings under one path, matching the
+  document's stated method): looking up the last-registered literal route among N siblings, 1,000,000
+  iterations, Apple M3 Pro, gcc-16 -O2:
+
+  | Sibling routes | Before (linear scan, `improvements.md`) | After (binary search, this fix) |
+  |---|---|---|
+  | 10 | 61 ns | 39.0 ns |
+  | 100 | 266 ns | 41.3 ns |
+  | 1,000 | 2,369 ns | 49.6 ns |
+  | 5,000 | 8,401 ns | 80.6 ns |
+
+  **MEASURED** ≈ 104x at 5,000 siblings (8,401 → 80.6 ns) and ≈ 6.4x at 100 (266 → 41.3 ns), both beating
+  `improvements.md`'s own PROJECTED "≈80x at 5,000; ≈2-3x at 100" - the after-column includes `match_route`'s
+  own per-call overhead (a `strcmp` against the method-tree name, `param_count` reset) on top of the pure tree
+  walk, which is why even the 10-sibling case doesn't collapse to a few nanoseconds; that fixed overhead is
+  also why the after-column grows sublinearly but not perfectly flat with N (39 → 80.6 ns, not ~39 ns flat) -
+  `find_child` itself is O(log N) as designed, but it's a small and shrinking fraction of a lookup that also
+  does two path-segment scans and a method-tree string compare.
+
+**Status:** Fixed as scoped. `improvements.md`'s alternative fixes (hashing small segments, indexing by first
+byte) were not attempted - sorted-array binary search was the fix it actually recommended and measures within
+the range it PROJECTED, so there was no reason to reach for the alternatives. Parameterized (`:name`/`*`)
+routes were never part of the problem (single pointers, not scanned) and remain unaffected, as `improvements.md`
+itself noted going in.

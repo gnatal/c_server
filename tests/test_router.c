@@ -175,6 +175,55 @@ static void test_match_route(void) {
     cleanup_app(&app);
 }
 
+/* P7: children are now kept sorted and found by binary search instead of a linear scan - this
+ * proves that still finds the right sibling regardless of registration order, including segments
+ * that are prefixes of one another (e.g. "res1" vs "res10"), where a naive length-then-bytes or
+ * bytes-then-length comparator could misorder the array and make binary search miss a match. */
+static void test_match_route_many_siblings(void) {
+    App app;
+    app_init(&app);
+
+    enum { N = 200 };
+    char paths[N][32];
+    int order[N];
+    for (int i = 0; i < N; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "/api/res%d", i);
+        order[i] = i;
+    }
+    /* Scramble registration order (deterministic shuffle) so insertion, not just lookup, is
+     * exercised out of sorted order. */
+    for (int i = N - 1; i > 0; i--) {
+        int j = (i * 7919 + 104729) % (i + 1);
+        int tmp = order[i];
+        order[i] = order[j];
+        order[j] = tmp;
+    }
+    for (int i = 0; i < N; i++) {
+        app_get(&app, paths[order[i]], dummy_handler_a);
+    }
+
+    Request req;
+    int check[] = {0, 1, N / 2, N - 2, N - 1};
+    for (size_t k = 0; k < sizeof(check) / sizeof(check[0]); k++) {
+        int idx = check[k];
+        memset(&req, 0, sizeof(req));
+        strncpy(req.method, "GET", sizeof(req.method) - 1);
+        strncpy(req.path, paths[idx], sizeof(req.path) - 1);
+        const Route *matched = match_route(&app, &req);
+        assert(matched != NULL);
+        assert(strcmp(matched->path, paths[idx]) == 0);
+    }
+
+    /* A sibling that was never registered, including one that is a strict prefix of a real one
+     * ("/api/res1" vs "/api/res10") and one whose registered form is a prefix of it. */
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/api/resNotThere", sizeof(req.path) - 1);
+    assert(match_route(&app, &req) == NULL);
+
+    cleanup_app(&app);
+}
+
 static void test_match_route_allowed_methods(void) {
     App app;
     app_init(&app);
@@ -750,6 +799,7 @@ int main(void) {
     test_match_path_max_params();
     test_match_path_wildcards();
     test_match_route();
+    test_match_route_many_siblings();
     test_match_route_allowed_methods();
     test_app_add_route_overflow();
     test_app_get_mw_stores_route_middleware();

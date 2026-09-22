@@ -466,6 +466,40 @@ int match_path(const char *pattern, const char *path, Request *req) {
     return pattern_seg == NULL && path_seg == NULL;
 }
 
+/* Total order over segment bytes (short-lexicographic: shared prefix compares first, shorter wins
+ * ties) so children can be kept sorted and searched with binary search instead of a linear scan
+ * (P7: was O(siblings) per segment, 8.4 us at 5,000 siblings). */
+static int compare_seg(const char *a, size_t a_len, const char *b, size_t b_len) {
+    size_t min_len = a_len < b_len ? a_len : b_len;
+    int c = memcmp(a, b, min_len);
+    if (c != 0) return c;
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}
+
+/* Binary search current->children (kept sorted by compare_seg) for seg. Returns the index of an
+ * exact match via *out_idx and 1, or the sorted insertion point via *out_idx and 0. */
+static int find_child(PatriciaNode *const *children, int child_count, const char *seg, size_t seg_len,
+                       int *out_idx) {
+    int low = 0, high = child_count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        int c = compare_seg(seg, seg_len, children[mid]->prefix, (size_t)children[mid]->prefix_len);
+        if (c == 0) {
+            *out_idx = mid;
+            return 1;
+        }
+        if (c < 0) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    *out_idx = low;
+    return 0;
+}
+
 static PatriciaNode *create_patricia_node(const char *prefix, size_t prefix_len, NodeType type) {
     PatriciaNode *n = calloc(1, sizeof(PatriciaNode));
     if (prefix_len > 0) {
@@ -505,20 +539,19 @@ static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route)
         PatriciaNode *next_node = NULL;
         
         if (type == NODE_STATIC) {
-            for (int i = 0; i < current->child_count; i++) {
-                if (current->children[i]->prefix_len == (int)seg_len &&
-                    memcmp(current->children[i]->prefix, seg, seg_len) == 0) {
-                    next_node = current->children[i];
-                    break;
-                }
-            }
-            if (!next_node) {
+            int idx;
+            if (find_child(current->children, current->child_count, seg, seg_len, &idx)) {
+                next_node = current->children[idx];
+            } else {
                 if (current->child_count >= current->child_cap) {
                     current->child_cap = current->child_cap == 0 ? 4 : current->child_cap * 2;
                     current->children = realloc(current->children, current->child_cap * sizeof(PatriciaNode *));
                 }
                 next_node = create_patricia_node(seg, seg_len, NODE_STATIC);
-                current->children[current->child_count++] = next_node;
+                memmove(&current->children[idx + 1], &current->children[idx],
+                        (size_t)(current->child_count - idx) * sizeof(PatriciaNode *));
+                current->children[idx] = next_node;
+                current->child_count++;
             }
         } else if (type == NODE_PARAM) {
             if (!current->param_child) {
@@ -553,15 +586,13 @@ static const Route *tree_search_recursive(PatriciaNode *node, const char *cursor
         return node->route;
     }
     
-    for (int i = 0; i < node->child_count; i++) {
-        PatriciaNode *child = node->children[i];
-        if (child->prefix_len == (int)seg_len && memcmp(child->prefix, seg, seg_len) == 0) {
-            const char *next_cursor = cursor;
-            size_t next_seg_len;
-            const char *next_seg = next_segment(&next_cursor, &next_seg_len);
-            const Route *res = tree_search_recursive(child, next_cursor, next_seg, next_seg_len, req);
-            if (res) return res;
-        }
+    int idx;
+    if (find_child(node->children, node->child_count, seg, seg_len, &idx)) {
+        const char *next_cursor = cursor;
+        size_t next_seg_len;
+        const char *next_seg = next_segment(&next_cursor, &next_seg_len);
+        const Route *res = tree_search_recursive(node->children[idx], next_cursor, next_seg, next_seg_len, req);
+        if (res) return res;
     }
     
     if (node->param_child) {

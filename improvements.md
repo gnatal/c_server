@@ -40,7 +40,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | P4 | epoll and io_uring issue a syscall on every interest change | Performance | | S | ~5–25% per keep-alive request on Linux | ESTIMATED |
 | P5 | ~~With TLS on, every loop iteration scans the whole connection table~~ | Performance | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
 | P6 | SQLite statements are re-prepared on every call | Performance (demo) | | S | 41% off a list query, 61% off get-by-id | MEASURED |
-| P7 | Router child lookup is a linear scan | Performance | | S | 8.4 µs → ~0.1 µs at 5,000 sibling routes | MEASURED (problem) / PROJECTED (fix) |
+| P7 | ~~Router child lookup is a linear scan~~ | Performance | | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (problem and fix) |
 | P8 | Chunked bodies are re-scanned from the start on every `recv` | Performance / Security | Med | M | Removes a ~75 s CPU amplification | MEASURED rate, extrapolated |
 | P9 | HTTP pipelining is dropped | Performance / Correctness | | M | Large for pipelining clients | ESTIMATED |
 | P10 | `accept` path uses 4 syscalls plus setup | Performance | | S | Fewer syscalls per new connection on Linux | ESTIMATED |
@@ -254,7 +254,10 @@ Kept for historical record.
 **Fix.** Prepare each statement once per worker in `db_worker_init` with `sqlite3_prepare_v3(..., SQLITE_PREPARE_PERSISTENT, ...)`, then `sqlite3_reset` + `sqlite3_clear_bindings` per use; finalize in `db_close`. Use `INSERT ... RETURNING` (SQLite 3.35+) for create/replace/patch to drop the follow-up `SELECT`.
 **Probable gain.** **MEASURED** ~2 µs off every list request and ~1.4 µs off every get-by-id, a few percent of per-request CPU at the measured throughput (**PROJECTED**). `RETURNING` saved ~5% on create here (34.6 → 32.8 µs), within noise: create/replace/patch are dominated by the commit, see P11.
 
-### P7 · Router child lookup is a linear scan
+### P7 · ~~Router child lookup is a linear scan~~ (FIXED 2026-09-22)
+**Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** Each Patricia node keeps `children` in an unsorted array and finds a segment with a `memcmp` loop (`router.c:443-449` on insert, `:491-500` on lookup). A path segment with many siblings (`/api/<many resources>`) is O(siblings).
 **Measured** (lookup of the last-registered literal route among N siblings):
 
