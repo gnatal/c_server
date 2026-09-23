@@ -479,13 +479,17 @@ void cluster_listen(App *app, int port, int num_workers) {
                     if (client_fd < 0) {
                         break; /* EAGAIN (drained) or a transient error: stop draining this wake */
                     }
-                    if (!dispatch_client_fd(workers, workers_count, &next_worker, client_fd)) {
-                        /* No active worker could take it (e.g. mid crash-loop, every slot down).
-                         * Best-effort shed, same philosophy as accept_connections' own overload
-                         * handling - deliberately not duplicating reject_overloaded_connection's
-                         * hand-built 503 here in the master to keep the single acceptor simple. */
-                        close(client_fd);
-                    }
+                    /* Closed whether or not dispatch succeeded. On success SCM_RIGHTS gave the worker
+                     * its own reference to the socket, and the master's copy must go: while it stays
+                     * open the worker's close() never sends a FIN (Connection: close and idle
+                     * timeouts don't end the TCP stream), and the master leaks one fd per connection
+                     * until accept() hits EMFILE and the whole cluster stops taking connections.
+                     * On failure no active worker could take it (e.g. mid crash-loop, every slot
+                     * down): best-effort shed, same philosophy as accept_connections' own overload
+                     * handling - deliberately not duplicating reject_overloaded_connection's
+                     * hand-built 503 here in the master to keep the single acceptor simple. */
+                    (void)dispatch_client_fd(workers, workers_count, &next_worker, client_fd);
+                    close(client_fd);
                 }
             }
 #else

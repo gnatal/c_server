@@ -11,6 +11,8 @@
 #include <arpa/inet.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 #include "cexpress.h"
 #include "cluster.h"
 
@@ -344,6 +346,110 @@ static void test_cluster_master_exits_fast_when_port_is_taken(void) {
     close(blocker_fd);
 }
 
+/* Reads until EOF or error, with a receive timeout. Returns 1 when the peer closed the stream (read()
+ * returned 0) and the bytes read contain `expect`, 0 otherwise (timeout, reset, or wrong body). */
+static int read_until_eof_contains(int fd, const char *expect, int timeout_s) {
+    struct timeval tv = { .tv_sec = timeout_s, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        return 0;
+    }
+    char buf[1024];
+    size_t used = 0;
+    while (1) {
+        if (used == sizeof(buf) - 1) {
+            used = 0; /* only the tail matters for these tiny responses */
+        }
+        const ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
+        if (n == 0) {
+            buf[used] = '\0';
+            return strstr(buf, expect) != NULL;
+        }
+        if (n < 0) {
+            return 0;
+        }
+        used += (size_t)n;
+    }
+}
+
+static int connect_loopback(int port) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_in srv_addr;
+    memset(&srv_addr, 0, sizeof(srv_addr));
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    srv_addr.sin_port = htons(port);
+    if (connect(fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* On macOS/BSD (CEXPRESS_SINGLE_ACCEPTOR) the master used to keep its copy of every client fd it
+ * handed to a worker. Two visible effects, both checked here: a Connection: close response never
+ * reached EOF at the client (the worker's close() sent no FIN while the master still held the socket),
+ * and the master ran out of fds - MEASURED with `ulimit -n 64`, every request after the 57th failed.
+ * The master runs with RLIMIT_NOFILE 64 and must serve far more than 64 sequential connections, each
+ * ending in EOF well before the timeout. On Linux (per-worker SO_REUSEPORT) this passes trivially. */
+static void test_cluster_master_does_not_leak_client_fds(void) {
+    int test_port = get_ephemeral_port();
+
+    pid_t master_pid = fork();
+    assert(master_pid >= 0);
+    if (master_pid == 0) {
+        const struct rlimit lim = { .rlim_cur = 64, .rlim_max = 64 };
+        if (setrlimit(RLIMIT_NOFILE, &lim) != 0) {
+            exit(3);
+        }
+        App app;
+        app_init(&app);
+        app.config.workers = 2;
+        app_get(&app, "/ping", ping_handler);
+        app_listen(&app, test_port);
+        app_destroy(&app);
+        exit(0);
+    }
+
+    struct timespec delay = {0, 200000000L}; /* 200ms */
+    nanosleep(&delay, NULL);
+
+    const char *req_str = "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    enum { NUM_REQUESTS = 150 };
+    for (int i = 0; i < NUM_REQUESTS; i++) {
+        int fd = -1;
+        /* The first request may race the cluster still spawning workers; retry briefly. */
+        for (int retry = 0; retry < 10 && fd < 0; retry++) {
+            fd = connect_loopback(test_port);
+            if (fd < 0) {
+                nanosleep(&delay, NULL);
+            }
+        }
+        assert(fd >= 0);
+        assert(write(fd, req_str, strlen(req_str)) == (ssize_t)strlen(req_str));
+        const int ok = read_until_eof_contains(fd, "pong", 2);
+        close(fd);
+        if (!ok) {
+            printf("request %d: no complete response ending in EOF\n", i);
+            fflush(stdout);
+            /* Drain the cluster before failing, or its orphaned workers keep the port (and any pipe
+             * on stdout) open after this runner aborts. */
+            kill(master_pid, SIGTERM);
+            waitpid(master_pid, NULL, 0);
+        }
+        assert(ok);
+    }
+
+    assert(kill(master_pid, SIGTERM) == 0);
+    int status = 0;
+    pid_t waited = waitpid(master_pid, &status, 0);
+    assert(waited == master_pid);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 0);
+}
+
 static void crash_immediately_hook(void) {
     /* Simulates a worker that can never come up (a real crash, a bad config only that process hits,
      * ...): exits with a fixed nonzero code the instant it starts, before any socket work, so each
@@ -382,6 +488,7 @@ int main(void) {
     test_so_reuseport_multi_bind();
     test_cluster_http_serving_and_shutdown();
     test_cluster_balances_across_workers();
+    test_cluster_master_does_not_leak_client_fds();
     test_cluster_master_exits_fast_when_port_is_taken();
     test_cluster_master_exits_after_restart_budget_exceeded();
 

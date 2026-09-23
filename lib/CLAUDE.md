@@ -135,6 +135,7 @@ arena at all - see above).
 | `App.poll_regs` (io_uring backend only: one `PollRegistration` per fd) | `event_loop_io_uring.c`'s `registration_for`, grown by doubling on the first interest change for an fd past its size | `event_loop_close` |
 | `app->spare_fd` (one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |
 | `cluster.c`'s `listen_fd` (`CEXPRESS_SINGLE_ACCEPTOR` only - the master's one real listen socket, replacing per-worker binds) | `cluster_listen` (`create_server_socket`) | `cluster_listen`, after every worker has drained, at the end of the same function |
+| The master's copy of each accepted client fd (`CEXPRESS_SINGLE_ACCEPTOR` only) | `cluster_listen`'s accept loop (`accept_client`) | the same loop, right after `dispatch_client_fd`, success or not - the worker owns its own `SCM_RIGHTS` copy from then on |
 | `ClusterWorkerSlot.control_fd` per slot (the master-side end of that worker's socketpair; the worker keeps the other end, `sv[1]`, as its own `server_fd`) | `spawn_worker`, fresh on every spawn *and* every respawn | `spawn_worker`'s next respawn for that slot (closes the stale one first), or `cluster_listen`'s final cleanup once every worker has drained |
 | Static file cache entries (cached path string + file bytes, `static.c`'s own process-lifetime global, not tied to any `App`) | `static_serve_file`, on a cache miss or a changed file | replaced in place on the next change, evicted (stalest first) once `STATIC_CACHE_MAX_ENTRIES` is reached, or all of them via `static_cache_clear` (tests; nothing in the engine calls it) |
 
@@ -427,8 +428,10 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   `accept_connections`'s `accept()`. The master's own supervision loop replaces its unconditional 50 ms
   `nanosleep` with a `poll()` on `listen_fd` of the same 50 ms timeout (adds no latency: `poll()` returns the
   instant a connection is pending, same backoff/`waitpid` cadence as before), `accept()`s everything pending each
-  wake, and hands each fd to the next active worker round-robin (`dispatch_client_fd`, `cluster.c`) - a worker with
-  no active slot available gets its fd closed with no response (best-effort shed, same philosophy as Overload, not
+  wake, and hands each fd to the next active worker round-robin (`dispatch_client_fd`, `cluster.c`), then closes its
+  own copy either way: `SCM_RIGHTS` gives the worker its own reference, and while the master's stays open the worker's
+  `close()` sends no FIN and the master leaks one fd per connection until `accept()` fails with `EMFILE`. A connection with
+  no active slot available is closed with no response (best-effort shed, same philosophy as Overload, not
   duplicated here to keep this scoped). `set_nonblocking`/`TCP_NODELAY` are applied once, by the master right after
   its own `accept()`, and are never reapplied worker-side: both are file-status/socket-option properties of the
   underlying open file description, already in effect once the fd rides across via `SCM_RIGHTS` (same as across

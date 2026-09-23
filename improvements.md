@@ -22,7 +22,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | ID | Problem | Impact | Effort | Evidence |
 |---|---|---|---|---|
 | **S1** | ~~Prefix middleware (auth) is bypassed with `//admin/...` or `/%2Fadmin/...`~~ **FIXED 2026-09-23** | **High** | S | MEASURED |
-| **M1** | macOS cluster master never closes the fds it hands to workers | **High** (cluster stops accepting; no FIN) | S | MEASURED |
+| **M1** | ~~macOS cluster master never closes the fds it hands to workers~~ **FIXED 2026-09-23** | **High** (cluster stops accepting; no FIN) | S | MEASURED |
 | **S2** | `app_use_body_limit` is bypassed by a query string, encoding, `//`, or chunked encoding | High | S | MEASURED |
 | **M2** | Large static files: whole file read and copied twice; slow readers pin the full size each | High (memory DoS) | S | MEASURED |
 | **S3** | Chunk-size parsing accepts `0x5`, `+5` and ` 5` (request smuggling behind a proxy) | Medium | S | MEASURED |
@@ -148,6 +148,10 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
 ## M — Memory management
 
 ### M1 · macOS cluster: the master leaks every client fd it passes to a worker
+- **Status: FIXED 2026-09-23.** The master now closes `client_fd` after `dispatch_client_fd` whether it succeeded
+  or not (`lib/cluster.c`, single-acceptor loop). Test: `test_cluster_master_does_not_leak_client_fds`
+  (`tests/test_cluster.c`) runs the master with `RLIMIT_NOFILE` 64, sends 150 sequential `Connection: close`
+  requests and requires each to end in EOF within 2 s; on the old code it fails at request 0 (no FIN).
 - **Impact:** **High**, on macOS/BSD with `workers > 1` (`CEXPRESS_SINGLE_ACCEPTOR`)
   - **Leak:** one fd per connection, forever.
   - **Broken close:** a worker's `close()` never sends a FIN, because the master still holds the socket.
