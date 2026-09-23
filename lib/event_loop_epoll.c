@@ -15,6 +15,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include "event_loop.h"
+#include "event_loop_backend.h"
 
 #ifndef __linux__
 #ifndef _STRUCT_ITIMERSPEC
@@ -27,7 +28,9 @@ struct itimerspec {
 #endif
 
 
-int event_loop_init(App *app) {
+static void epoll_close(App *app);
+
+static int epoll_init(App *app) {
     if (app == NULL) {
         return -1;
     }
@@ -88,7 +91,7 @@ int event_loop_init(App *app) {
     app->timer_idle_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (app->timer_idle_fd < 0) {
         perror("timerfd_create: idle timer");
-        event_loop_close(app);
+        epoll_close(app);
         return -1;
     }
 
@@ -98,7 +101,7 @@ int event_loop_init(App *app) {
     its.it_value = its.it_interval;
     if (timerfd_settime(app->timer_idle_fd, 0, &its, NULL) < 0) {
         perror("timerfd_settime: idle timer");
-        event_loop_close(app);
+        epoll_close(app);
         return -1;
     }
 
@@ -108,18 +111,18 @@ int event_loop_init(App *app) {
     timer_ev.data.fd = app->timer_idle_fd;
     if (epoll_ctl(app->epoll_fd, EPOLL_CTL_ADD, app->timer_idle_fd, &timer_ev) < 0) {
         perror("epoll_ctl: idle timerfd");
-        event_loop_close(app);
+        epoll_close(app);
         return -1;
     }
 
     return 0;
 }
 
-int event_loop_is_open(const App *app) {
+static int epoll_is_open(const App *app) {
     return app != NULL && app->epoll_fd >= 0;
 }
 
-void event_loop_close(App *app) {
+static void epoll_close(App *app) {
     if (app == NULL) {
         return;
     }
@@ -151,7 +154,7 @@ void event_loop_close(App *app) {
     }
 }
 
-int event_loop_watch_read(App *app, int fd, void *udata) {
+static int epoll_watch_read(App *app, int fd, void *udata) {
     if (app == NULL || app->epoll_fd < 0 || fd < 0) {
         return -1;
     }
@@ -193,7 +196,7 @@ int event_loop_watch_read(App *app, int fd, void *udata) {
     return 0;
 }
 
-int event_loop_unwatch_read(App *app, int fd) {
+static int epoll_unwatch_read(App *app, int fd) {
     if (app == NULL || app->epoll_fd < 0 || fd < 0) {
         return -1;
     }
@@ -215,7 +218,7 @@ int event_loop_unwatch_read(App *app, int fd) {
     return epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
 }
 
-int event_loop_watch_write(App *app, int fd, void *udata) {
+static int epoll_watch_write(App *app, int fd, void *udata) {
     if (app == NULL || app->epoll_fd < 0 || fd < 0) {
         return -1;
     }
@@ -257,7 +260,7 @@ int event_loop_watch_write(App *app, int fd, void *udata) {
     return 0;
 }
 
-int event_loop_unwatch_write(App *app, int fd, void *udata) {
+static int epoll_unwatch_write(App *app, int fd, void *udata) {
     if (app == NULL || app->epoll_fd < 0 || fd < 0) {
         return -1;
     }
@@ -283,7 +286,7 @@ int event_loop_unwatch_write(App *app, int fd, void *udata) {
     return epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
 }
 
-int event_loop_unwatch_all(App *app, int fd) {
+static int epoll_unwatch_all(App *app, int fd) {
     if (app == NULL || app->epoll_fd < 0 || fd < 0) {
         return -1;
     }
@@ -299,7 +302,7 @@ int event_loop_unwatch_all(App *app, int fd) {
     return rc;
 }
 
-int event_loop_arm_shutdown_timer(App *app) {
+static int epoll_arm_shutdown_timer(App *app) {
     if (app == NULL || app->epoll_fd < 0) {
         return -1;
     }
@@ -336,7 +339,7 @@ int event_loop_arm_shutdown_timer(App *app) {
     return 0;
 }
 
-int event_loop_poll(App *app, LoopEvent *out_events, int max_events, int timeout_ms) {
+static int epoll_poll(App *app, LoopEvent *out_events, int max_events, int timeout_ms) {
     if (app == NULL || app->epoll_fd < 0 || out_events == NULL || max_events <= 0) {
         return -1;
     }
@@ -418,5 +421,20 @@ int event_loop_poll(App *app, LoopEvent *out_events, int max_events, int timeout
 
     return out_count;
 }
+
+/* C5: the only exported symbol; event_loop_linux.c selects it at runtime (event_loop_backend.h). */
+const EventLoopOps epoll_loop_ops = {
+    .name = "epoll",
+    .init = epoll_init,
+    .is_open = epoll_is_open,
+    .close_loop = epoll_close,
+    .watch_read = epoll_watch_read,
+    .unwatch_read = epoll_unwatch_read,
+    .watch_write = epoll_watch_write,
+    .unwatch_write = epoll_unwatch_write,
+    .unwatch_all = epoll_unwatch_all,
+    .arm_shutdown_timer = epoll_arm_shutdown_timer,
+    .poll_events = epoll_poll,
+};
 
 #endif /* defined(__linux__) || defined(CEXPRESS_USE_EPOLL) */

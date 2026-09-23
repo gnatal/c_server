@@ -90,10 +90,11 @@ The multi-process architecture is specifically engineered to operate cleanly and
   * It detects the actual number of online CPU cores allocated to the container environment and spawns the exact number of workers needed to saturate hardware.
 
 ### D. io_uring in Containers
-* The Linux build polls for readiness with `io_uring` (liburing, multishot poll: kernel 5.13 or newer). The `Dockerfile` installs `liburing-dev` in the builder and `liburing` in the runtime image.
-* If `io_uring_queue_init` fails (for example because the container runtime's seccomp profile blocks the `io_uring_*` syscalls), `event_loop_init` returns `-1` and `app_listen_worker` prints the error and exits with a failure status. There is no runtime fallback to `epoll`. In cluster mode the master treats that as an abnormal worker exit and respawns the worker (from reading `lib/cluster.c`; a blocked-io_uring crash loop was not reproduced).
-* `scripts/docker_stress_test.sh` runs the server with `--security-opt seccomp=unconfined --ulimit memlock=-1:-1`. Whether Docker's default profile actually blocks io_uring on a given host was not tested for this document; if the server exits immediately in a container, try those flags first.
-* An `epoll` backend (`lib/event_loop_epoll.c`, selected by `-DCEXPRESS_USE_EPOLL`) is kept in the tree but is not wired into the Linux `Makefile`.
+* The Linux build polls for readiness with `io_uring` (liburing; multishot poll needs kernel 5.13 or newer) and falls back to `epoll` at runtime. The `Dockerfile` installs `liburing-dev` in the builder and `liburing` in the runtime image.
+* Docker's default seccomp profile blocks io_uring: `io_uring_setup` fails with `EPERM` (tested 2026-09-23, Docker Desktop, kernel 6.8). Each worker then logs `event_loop_init: io_uring unavailable (Operation not permitted), falling back to epoll` once and serves on epoll. The startup line names the backend in use, for example `Listening on port 8080 (epoll)`. The same fallback covers a kernel without io_uring (`ENOSYS`), `kernel.io_uring_disabled` (`EPERM`) and a small `RLIMIT_MEMLOCK` (`ENOMEM`).
+* Before this fallback existed (C5), the server exited at startup in that environment, and in cluster mode the master respawned the failing worker until its restart budget ran out (reproduced: five respawns in 2 seconds, nothing served).
+* `CEXPRESS_EVENT_LOOP=epoll` or `CEXPRESS_EVENT_LOOP=io_uring` forces one backend, with no fallback. With io_uring forced where it is refused, the worker exits instead of silently running on epoll. `make NO_URING=1` builds without liburing and uses epoll only.
+* `scripts/docker_stress_test.sh` still runs the server with `--security-opt seccomp=unconfined --ulimit memlock=-1:-1`, so it benchmarks io_uring. Without those flags it now benchmarks epoll.
 
 ### E. Orchestration Signals & Rolling Updates
 * When `docker stop` or Kubernetes pod termination occurs, the container runtime sends `SIGTERM` to PID 1 (the master process).

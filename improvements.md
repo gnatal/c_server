@@ -52,7 +52,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | C2 | ~~Path parameter names are stored per tree position~~ | Correctness | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED |
 | C3 | ~~No `Date` header; 204 carries `Content-Length`~~ | Correctness | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED |
 | C4 | ~~macOS `SO_REUSEPORT` does not balance workers~~ | Reliability | | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (imbalance, and the fix) |
-| C5 | io_uring failure kills the server (no epoll fallback) | Reliability | | M | Runs under restrictive seccomp | Code reading |
+| C5 | ~~io_uring failure kills the server (no epoll fallback)~~ | Reliability | | M | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (Docker default seccomp: exit/crash loop → serves on epoll) |
 | C6 | ~~io_uring backend closes every keep-alive connection after its first request~~ | Correctness / Reliability | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (real Linux, via Docker: 1/20 → 1000/1000 requests per connection) |
 | T1 | Test and tooling gaps that let the bugs above through | Testing | | S–M | Prevents regressions | Code reading |
 
@@ -378,7 +378,10 @@ record.
 **Fix.** For development on macOS, either document that `WORKERS>1` does not scale, or implement a single acceptor that hands accepted fds to workers round-robin (`SCM_RIGHTS` over a socketpair), or have the master `accept` and pass the descriptor. Linux (4-tuple hashing) is expected to work as designed but was not measured.
 **Probable gain.** Up to ~N× on macOS in a server-bound test (not measurable here because the client shares the machine), and balanced memory across workers.
 
-### C5 · io_uring failure kills the server
+### C5 · ~~io_uring failure kills the server~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** `event_loop_init` failure makes `app_listen_worker` print and `exit()` (`connection.c:548-551`). Under a runtime that blocks `io_uring_setup` the process cannot start, and in cluster mode the master respawns it in a loop (S7). The epoll backend is already in the tree but only compiled with `-DCEXPRESS_USE_EPOLL`.
 **Fix.** Compile both Linux backends and select at runtime: try io_uring, fall back to epoll on `ENOSYS`/`EPERM`, and log which one is active. Because `event_loop.h` is already an abstraction, this is a function-pointer table (or link-time symbol prefixing).
 **Probable gain.** Works in containers and hardened kernels without special flags; no fast-path cost.

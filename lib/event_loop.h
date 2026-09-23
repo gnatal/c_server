@@ -4,13 +4,19 @@
 #include "app_types.h"
 
 /*
- * Initializes the event loop subsystem (kqueue on BSD/macOS, io_uring on Linux, or epoll when built
- * with CEXPRESS_USE_EPOLL; exactly one backend file is linked, see the Makefile).
+ * Initializes the event loop subsystem. macOS/BSD: kqueue. Linux (C5): io_uring, falling back at runtime
+ * to epoll (logged on stderr) when the kernel or container refuses to create a ring - seccomp, the
+ * kernel.io_uring_disabled sysctl, RLIMIT_MEMLOCK, a pre-5.1 kernel. CEXPRESS_EVENT_LOOP=epoll|io_uring
+ * forces one on Linux (no fallback; any other non-empty value fails); it is ignored by kqueue builds.
+ * NO_URING=1 (Makefile, -DCEXPRESS_USE_EPOLL) builds epoll only, without liburing.
  * Sets up signal interception for SIGINT and SIGTERM, and registers the
  * periodic idle-connection sweep timer (IDLE_SWEEP_INTERVAL_MS).
- * Returns 0 on success, -1 on failure.
+ * Returns 0 on success, -1 on failure (every backend failed, or the forced one did).
  */
 int event_loop_init(App *app);
+
+/* The open backend: "kqueue", "io_uring" or "epoll"; "none" when no loop is open. Static string. */
+const char *event_loop_backend_name(const App *app);
 
 /*
  * 1 between a successful event_loop_init and event_loop_close, else 0. The backend handle shares a
@@ -69,7 +75,9 @@ int event_loop_arm_shutdown_timer(App *app);
 /*
  * Blocks waiting for events up to timeout_ms (-1 for indefinite wait).
  * Populates out_events with normalized LoopEvent structures, up to max_events.
- * Returns the number of events ready, 0 on timeout, or -1 on error.
+ * Returns the number of events ready, 0 on timeout, or -1 on error. -1 with errno EINTR is not an error:
+ * poll again (C5: on Linux, epoll_wait returns it spuriously after the process has torn down an io_uring
+ * ring; SIGINT/SIGTERM never cause it - they arrive as LOOP_EVENT_SIGNAL).
  */
 int event_loop_poll(App *app, LoopEvent *out_events, int max_events, int timeout_ms);
 

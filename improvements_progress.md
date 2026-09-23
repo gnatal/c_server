@@ -2876,3 +2876,117 @@ sending path gets them.
   kept the old binary, so the demo needed `make -B -C examples/todo_sqlite`.
 
 **Status:** Fixed. Not done: `nosniff`.
+
+---
+
+## C5 · io_uring failure kills the server
+
+**Date completed.** 2026-09-23.
+
+**Reproduced first** (Docker Desktop on the M3 Pro, Alpine 3.20, kernel 6.8, Docker's **default** seccomp
+profile, the `HEAD` demo):
+
+- With `WORKERS=1`, the process exited at startup:
+  ```
+  io_uring_queue_init failed: -1 (Operation not permitted)
+  event_loop_init: No such file or directory
+  ```
+  The second line was a `perror` with a stale `errno`.
+- With `WORKERS=2`, worker 0 exited with code 1 and was respawned five times in 2 seconds. No request was
+  ever served.
+- `test_connection` could not start (`setup_test_connection: event_loop_init(app) == 0`).
+
+This settles the open question in `concurrency.md`: the default profile does block io_uring, with `EPERM`.
+
+**How it was completed.**
+
+`event_loop.h` was already a backend-neutral API, so the fix is a function-pointer table.
+
+- `lib/event_loop_backend.h` (new, private):
+  - `EventLoopOps` has one entry per `event_loop.h` function, plus `name`. The fields are `close_loop` and
+    `poll_events`, not `close`/`poll`, because epoll-shim `#define`s those names.
+  - `EVENT_LOOP_UNAVAILABLE` (-2) is a backend init's "the kernel mechanism itself was refused, nothing was
+    touched" result.
+- `lib/event_loop_io_uring.c` and `lib/event_loop_epoll.c`:
+  - Every function is now `static` (`uring_*` / `epoll_*`), and each file exports only its table
+    (`io_uring_loop_ops`, `epoll_loop_ops`).
+  - io_uring's init returns `EVENT_LOOP_UNAVAILABLE` with `errno` set when `io_uring_queue_init` fails, and no
+    longer prints anything itself.
+  - A failure after the ring exists (signalfd, timerfd) is still `-1` and final, because epoll would fail the
+    same way.
+- `lib/event_loop_linux.c` (new) implements `event_loop.h` on Linux and on the macOS epoll-shim build:
+  - `event_loop_init` tries io_uring, then epoll on `EVENT_LOOP_UNAVAILABLE`.
+  - The refusal is remembered in a function-local static, so it is logged once per process and later inits
+    skip the failing syscall.
+  - `CEXPRESS_EVENT_LOOP=epoll|io_uring` forces a backend with no fallback. An empty value means automatic,
+    and any other value fails.
+  - Every other function forwards through `App.loop_ops`, which is `NULL` while no loop is open. So
+    `event_loop_is_open` and `event_loop_close` never guess which union member is live.
+- The fallback covers any `io_uring_queue_init` failure, not only the `ENOSYS`/`EPERM` the item named.
+  `ENOMEM` from a small `RLIMIT_MEMLOCK` (kernels before 5.12, whose limit is 64 KiB) is the same situation:
+  the kernel refused the ring, and epoll still works.
+- `event_loop_backend_name(app)` is new and public in `event_loop.h` and `API.md`. kqueue implements it too.
+  The startup line now names the backend: `Listening on port 8080 (epoll)`.
+- `lib/connection.c`: the stale-`errno` `perror` after a failed `event_loop_init` is replaced with
+  `app_listen_worker: no usable event loop backend, exiting`. The failing backend has already said why.
+- `lib/app_types.h`: new `App.loop_ops` field (forward-declared `struct EventLoopOps`). `lib/router.c`'s
+  `app_init` sets it to `NULL`.
+- `Makefile`:
+  - Linux builds `event_loop_linux.c` + `event_loop_io_uring.c` + `event_loop_epoll.c`. `NO_URING=1` builds
+    the dispatcher + epoll only, with `-DCEXPRESS_USE_EPOLL` and no `-luring`.
+  - The test-binary rules used `$(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o)`, which prefixes only the first word of a
+    multi-file list. They now use `$(EVENT_LOOP_OBJS)`.
+  - The epoll-shim targets also link the dispatcher.
+- `scripts/export_framework.sh` generates the same Linux source list and the same `NO_URING=1` option. Tested:
+  the export builds on macOS and on Linux in both modes, and `NO_URING=1` leaves no io_uring symbols.
+- The default stays io_uring. `lib/CLAUDE.md` records epoll as 20–25% faster in the C6 measurements, and
+  `CEXPRESS_EVENT_LOOP=epoll` now selects it without a rebuild. Changing the default is a separate decision.
+
+**Found along the way.** In a process that has torn down an io_uring ring, the next `epoll_wait` can return
+`EINTR` with no signal involved (6.8; kernel task_work from the ring teardown). It showed up only because
+`test_event_loop` ran io_uring and then epoll in one process: the epoll pass failed at its first poll with
+`n=-1 errno=4`. Evidence:
+
+- A forced-epoll process that never created a ring passes: 5 of 5 runs, and every default-seccomp run.
+- The engine already retries `EINTR` in `app_listen_worker`.
+- A serving process never switches backends.
+
+So the test's epoll pass now runs in a forked child, and `event_loop_poll`'s contract in `event_loop.h` now
+says to retry `EINTR`.
+
+**Tests and results.**
+
+- `tests/test_event_loop.c`:
+  - The lifecycle test asserts the union member that matches `event_loop_backend_name` ("none" before init
+    and after close).
+  - New `test_backend_selection_env` covers unknown values, forced epoll, forced io_uring (io_uring or a
+    clean failure, never silently epoll) and an empty value.
+  - `main` runs every backend-contract test on the selected backend. On Linux with io_uring it then runs them
+    all again on epoll, in a forked child.
+- macOS: `make test` (16 suites, kqueue), `make SANITIZE=1 BUILD_DIR=build-asan test`, `make test_epoll`
+  (epoll-shim, which goes through the dispatcher and prints the "no io_uring backend" refusal), `make fuzz`
+  (1,000,000 iterations), `make check-docs` (140 functions) and `make demo` all pass.
+- Linux (Docker, Alpine 3.20, kernel 6.8), every suite built and run separately:
+
+  | Configuration | Backend(s) exercised | Suites passing |
+  |---|---|---|
+  | default seccomp | epoll via fallback (`io_uring unavailable (Operation not permitted), falling back to epoll`) | 15/16 |
+  | `seccomp=unconfined` | io_uring, then epoll in a child | 15/16 |
+  | `NO_URING=1` | epoll only | 15/16 |
+
+  The failing suite is always `test_connection`, at its last test,
+  `test_accept_connections_emfile_frees_a_slot_and_recovers` (`app_count_connections(&app) == 0`). It fails
+  identically on `HEAD` with io_uring (checked with `git archive HEAD`). It was recorded as failing under C1
+  and C6 and is unrelated to C5. Every connection test before it passes on both backends.
+- **MEASURED, live demo in Docker under the default seccomp profile**, `HEAD` vs. this tree:
+
+  | | `WORKERS=1` | `WORKERS=2` |
+  |---|---|---|
+  | Before | exits at startup | worker 0 respawned 5 times in 2 s, nothing served |
+  | After | `Listening on port 8080 (epoll)`, `GET /api/todos` 200 ×3 on keep-alive, clean SIGTERM drain | one fallback line per worker, 200 ×3, `All workers terminated cleanly` |
+
+- Not measured: the cost of the indirect call per `event_loop_*` call on Linux. It is one call through a
+  pointer that is constant for the process's life, next to a syscall or SQE per call. The macOS path
+  (kqueue) is unchanged. ASan on Linux was not run (musl has no ASan runtime).
+
+**Status:** Fixed. Not done: changing the Linux default to epoll, and a Linux CI job (T5).

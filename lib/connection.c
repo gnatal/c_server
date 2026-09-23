@@ -1214,13 +1214,14 @@ void app_listen_worker(App *app, int port) {
         }
     }
     if (event_loop_init(app) != 0) {
-        perror("event_loop_init");
+        /* Not perror: errno may be stale by now. The backend that failed has already said why (C5). */
+        fprintf(stderr, "app_listen_worker: no usable event loop backend, exiting\n");
         exit(EXIT_FAILURE);
     }
     event_loop_watch_read(app, app->server_fd, NULL);
 
     if (!app->accept_via_fd_passing && (!cluster_is_worker() || cluster_worker_id() == 0)) {
-        printf("Listening on port %d\n", port);
+        printf("Listening on port %d (%s)\n", port, event_loop_backend_name(app));
     }
 
     LoopEvent events[MAX_EVENTS];

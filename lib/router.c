@@ -20,11 +20,12 @@ void app_init(App *app) {
     app->worker_init_hook_count = 0;
     app->server_fd = -1;
     app->accept_via_fd_passing = 0;
-#if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
-    app->ring = NULL;
+#if defined(__linux__)
+    app->ring = NULL; /* widest union member; which one is live is decided by loop_ops (C5) */
 #else
     app->loop_fd = -1;
 #endif
+    app->loop_ops = NULL;
     app->poll_regs = NULL;
     app->poll_regs_cap = 0;
     app->timer_idle_fd = -1;

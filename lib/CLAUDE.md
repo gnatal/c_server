@@ -14,15 +14,15 @@ removed for this reason; see `../improvements_progress.md` for the removal recor
 ## Model
 A process runs one single-threaded, non-blocking event loop: kqueue on macOS/BSD, io_uring on Linux
 (readiness only: a one-shot `POLL_ADD` per fd, re-armed after every event to give level-triggered readiness, then ordinary
-`recv`/`write`; needs liburing, kernel 5.13+ tested only on 6.8). An epoll backend (`event_loop_epoll.c`) is kept for `-DCEXPRESS_USE_EPOLL`; the Makefile does not select it
-on Linux, and on macOS it is only built for `make test_epoll` through epoll-shim. `workers != 1` forks N such processes. On
+`recv`/`write`; needs liburing, kernel 5.13+ tested only on 6.8) or epoll, chosen per process at runtime (C5, see "Event loop"
+below); on macOS epoll is only built for `make test_epoll` through epoll-shim. `workers != 1` forks N such processes. On
 Linux, each opens its own listen socket sharing the port via `SO_REUSEPORT` (4-tuple hashing balances them). On macOS/BSD
 (`CEXPRESS_SINGLE_ACCEPTOR` - C4: `SO_REUSEPORT` does not balance there, MEASURED over 90% of load on one worker of four),
 only the master binds and `accept()`s; each accepted fd is handed to a worker over a private socketpair via `SCM_RIGHTS`,
 round-robin (see "Behavior reference, Workers and fork"). Either way, a master respawns any worker that dies, with backoff
 and a restart budget (S7, same section). Handlers run synchronously on the loop: a blocking call (DB,
 sleep) stalls that whole worker, so scale with workers, not threads. State is per process; there is no shared memory.
-If `event_loop_init` fails (for example io_uring is blocked by the runtime), `app_listen_worker` prints the error and exits; there is no runtime fallback to epoll. Docker's default seccomp profile blocks io_uring (`event_loop_init` fails); run containers with `--security-opt seccomp=unconfined` or build with epoll.
+If io_uring is refused (Docker's default seccomp profile does this: `EPERM`), `event_loop_init` logs it once per process and runs on epoll (C5); `app_listen_worker` exits only if no backend can start.
 
 Per request (`connection.c: handle_readable` → `serve_buffered_requests`, which repeats steps 1-6 for every complete request already in `in_buf`, starting at `conn->in_off` - P9 pipelining, see "Behavior reference, Pipelining"):
 1. `recv` into `conn->in_buf` - the worker's shared `App.read_buf` when nothing is buffered for this connection (M2, see Memory model) - then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below (P2) - the body-limit check (S4), `request_head_is_complete` (a chunked scan when the body is chunked, resumed from `conn->chunk_scan` so each body byte is scanned once per request, not once per `recv` - P8), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request before P2).
@@ -47,7 +47,7 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | `middleware.c/h` | pipeline (`chain_next`, `chain_error`, `dispatch`), 404/405/OPTIONS defaults |
 | `response.c/h` | response head assembly, cookies, chunked streaming (`res_write`, buffered), producer streaming (`res_stream`, M5: builds the head and records the producer; `stream_write` frames chunks), file streaming |
 | `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen |
-| `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals) |
+| `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals). On Linux `event_loop_linux.c` implements `event_loop.h` by forwarding through `App.loop_ops` to the static functions behind `io_uring_loop_ops` / `epoll_loop_ops` (`event_loop_backend.h`, private); kqueue implements it directly |
 | `cluster.c/h` | fork workers, respawn (with backoff and a restart budget, S7), drain; on macOS/BSD (`CEXPRESS_SINGLE_ACCEPTOR`, C4) also the single acceptor - binds the one listen socket, `accept()`s, and hands fds to workers round-robin over per-worker socketpairs |
 | `static.c/h` | traversal-safe file serving, with an in-memory cache of recently served files (P1) |
 | `multipart.c/h`, `urlencoded.c/h` | form body parsers (handler-invoked, not automatic) |
@@ -131,6 +131,7 @@ arena at all - see above).
 | `yyjson_mut_write(doc, 0, &len)` result | libc malloc, **whatever allocator the doc uses** | caller, C `free` (forgetting it leaks once per request) |
 | `Route`, `PatriciaNode`; a static mount's `Route.static_root` string (M6: heap, `NULL` on ordinary routes and on every `Router` slot) | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy`; every heap `Route` is dropped through `router.c`'s `route_free` (root + route), including registration failures and duplicates |
 | `app->connections` | `app_init` | `app_destroy` |
+| `App.loop_ops` (C5: the selected Linux backend's static `EventLoopOps` table; decides which member of the `kq`/`epoll_fd`/`ring` union is live) | not allocated: `event_loop_init` points it at `io_uring_loop_ops` or `epoll_loop_ops` on success | nothing to free; `event_loop_close` sets it back to `NULL` after the backend's own close |
 | `App.poll_regs` (C6, io_uring backend only: one `PollRegistration` per fd) | `event_loop_io_uring.c`'s `registration_for`, grown by doubling on the first interest change for an fd past its size | `event_loop_close` |
 | `app->spare_fd` (S3, one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |
 | `cluster.c`'s `listen_fd` (C4, `CEXPRESS_SINGLE_ACCEPTOR` only - the master's one real listen socket, replacing per-worker binds) | `cluster_listen` (`create_server_socket`) | `cluster_listen`, after every worker has drained, at the end of the same function |
@@ -446,6 +447,24 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   the master's stale `control_fd` for that slot is explicitly closed first, or it would leak one fd per respawn) -
   the child closes every *other* slot's inherited master-side `control_fd` right after `fork()` (it must not be able
   to read or write a sibling's fd-handoff channel), keeping only its own.
+- **Backend selection (C5, Linux).** Both Linux backends are always compiled (unless `NO_URING=1`, which builds epoll
+  only, without liburing). `event_loop_init` (`event_loop_linux.c`) tries io_uring first; its init returns
+  `EVENT_LOOP_UNAVAILABLE` (errno set) only when `io_uring_queue_init` itself fails, before anything else is touched -
+  `ENOSYS`, `EPERM` (seccomp, `kernel.io_uring_disabled`), `ENOMEM` (`RLIMIT_MEMLOCK`) alike - and then epoll is tried.
+  Any later io_uring setup failure (signalfd, timerfd) is final, since epoll would fail the same way. The refusal is
+  remembered in a function-local static (`uring_refused`), so the fallback is logged once per process and later inits in
+  that process skip the failing syscall; cluster workers are forked before any loop exists, so each logs once.
+  `CEXPRESS_EVENT_LOOP=epoll|io_uring` forces a backend with no fallback, an empty value means automatic, and anything
+  else fails `event_loop_init` instead of guessing. The choice is `App.loop_ops`; every public `event_loop_*` forwards
+  through it (one indirect call per event-loop operation, the same target for the process's life, so it predicts
+  perfectly), and it is `NULL` whenever no loop is open, so `event_loop_is_open` never reads the union. The
+  startup line names the backend: `Listening on port 8080 (epoll)`. MEASURED (Docker, Alpine, kernel 6.8, default
+  seccomp): `HEAD` before C5 exited at startup (`io_uring_queue_init failed: -1 (Operation not permitted)`), and in
+  cluster mode respawned worker 0 five times in 2 s serving nothing; now it logs the fallback and serves on epoll.
+  **Spurious `EINTR` after a ring is torn down:** once a process has closed an io_uring ring, the kernel may deliver
+  task_work that makes its next `epoll_wait` return `EINTR` (seen on 6.8 when one test process ran io_uring then epoll).
+  `event_loop_poll`'s contract already says to retry `EINTR` (`app_listen_worker` does); a serving process never
+  switches backends, so it cannot hit this.
 - **Event loop.** `Connection.events_watched` mirrors what the loop has registered. `connection.c` assumes **level-triggered**
   readiness from every backend: `read_and_serve` returns after serving and relies on read readiness firing again while
   bytes remain, and the fairness yields (`flush_connection`, `MAX_PIPELINED_PER_EVENT`) arm write interest on a socket
@@ -473,7 +492,8 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   re-watches it (one extra `watch`/`unwatch` pair per response that did not fit the socket buffer in one go, none otherwise).
   **Backend speed on Linux (MEASURED 2026-09-23, Docker on an M3 Pro, kernel 6.8, one worker, `wrk -t8 -c1000`, cookbook
   `/hello`):** epoll served 3.5-3.6 M requests in 12 s, io_uring 2.8-2.9 M - io_uring is 20-25% slower as a pure readiness
-  poller (one SQE and CQE per event on top of the same `recv`/`write`). The Makefile still selects io_uring on Linux.
+  poller (one SQE and CQE per event on top of the same `recv`/`write`). io_uring is still the preferred backend on Linux
+  (C5 kept that default and added the fallback); `CEXPRESS_EVENT_LOOP=epoll` selects the faster one without a rebuild.
 
 ## Hot-path rules (measured; do not undo)
 Per-request CPU cost of the pure path (parse, route, dispatch, response build; no sockets, one core; `make bench`, Apple M3 Pro,

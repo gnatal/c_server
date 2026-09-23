@@ -27,12 +27,18 @@ cat << 'MAKEFILE_EOF' > "${DEST_DIR}/Makefile"
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Linux)
-    # Linux uses io_uring (liburing) for readiness polling: link -luring when you link libcexpress.a.
+    # Linux: io_uring (liburing) with a runtime fallback to epoll: link -luring when you link libcexpress.a.
+    # NO_URING=1 builds epoll only and needs no liburing.
     ifeq ($(origin CC),default)
         CC = gcc
     endif
-    PLATFORM_CFLAGS = -D_GNU_SOURCE
-    EVENT_LOOP_SRC = lib/event_loop_io_uring.c
+    ifeq ($(NO_URING),1)
+        PLATFORM_CFLAGS = -D_GNU_SOURCE -DCEXPRESS_USE_EPOLL
+        EVENT_LOOP_SRC = lib/event_loop_linux.c lib/event_loop_epoll.c
+    else
+        PLATFORM_CFLAGS = -D_GNU_SOURCE
+        EVENT_LOOP_SRC = lib/event_loop_linux.c lib/event_loop_io_uring.c lib/event_loop_epoll.c
+    endif
 else
     ifneq ($(shell which gcc-16 2>/dev/null),)
         CC = gcc-16
@@ -87,7 +93,7 @@ This directory contains the standalone CExpress engine without any application c
 - `lib/API.md`: Public API function reference.
 - `lib/examples/cookbook.c`: Reference recipes for common HTTP patterns.
 - `lib/vendor/`: vendored yyjson (JSON) and picohttpparser (HTTP parsing); nothing else to install.
-- `build/lib/libcexpress.a`: Compiled engine archive built via `make`. Link it with `-luring` on Linux.
+- `build/lib/libcexpress.a`: Compiled engine archive built via `make`. Link it with `-luring` on Linux (not with `NO_URING=1`).
 README_EOF
 
 echo "==> CExpress framework successfully exported to ${DEST_DIR}"

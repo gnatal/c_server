@@ -1,10 +1,17 @@
 UNAME_S := $(shell uname -s)
 
+# Linux (C5): io_uring and epoll are both built; event_loop_linux.c picks one at runtime (io_uring, falling
+# back to epoll when the ring cannot be created). NO_URING=1 builds epoll only and drops the liburing dependency.
 ifeq ($(UNAME_S),Linux)
     CC = gcc
     CFLAGS = -Wall -Wextra -std=c11 -O2 -Ilib -D_GNU_SOURCE
-    LDFLAGS += -luring
-    EVENT_LOOP_SRC = lib/event_loop_io_uring.c
+    ifeq ($(NO_URING),1)
+        CFLAGS += -DCEXPRESS_USE_EPOLL
+        EVENT_LOOP_SRC = lib/event_loop_linux.c lib/event_loop_epoll.c
+    else
+        LDFLAGS += -luring
+        EVENT_LOOP_SRC = lib/event_loop_linux.c lib/event_loop_io_uring.c lib/event_loop_epoll.c
+    endif
 else
     CC = gcc-16
     CFLAGS = -Wall -Wextra -std=c11 -O2 -Ilib
@@ -31,6 +38,7 @@ LIB_SRCS = lib/connection.c $(EVENT_LOOP_SRC) lib/cluster.c lib/http_parser.c li
            lib/multipart.c lib/urlencoded.c lib/static.c lib/arena.c \
            lib/vendor/yyjson/yyjson.c lib/vendor/picohttpparser/picohttpparser.c
 LIB_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(LIB_SRCS))
+EVENT_LOOP_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(EVENT_LOOP_SRC))
 LIB      = $(LIB_DIR)/libcexpress.a
 
 
@@ -97,19 +105,19 @@ $(HTTP_HARDENING_TEST_BIN): $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/p
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(CONNECTION_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_connection.o
+$(CONNECTION_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT_LOOP_OBJS) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_connection.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(PIPELINING_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_pipelining.o
+$(PIPELINING_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT_LOOP_OBJS) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_pipelining.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(READ_BUF_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_read_buf.o
+$(READ_BUF_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT_LOOP_OBJS) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_read_buf.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(STREAM_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_stream.o
+$(STREAM_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT_LOOP_OBJS) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_stream.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -129,11 +137,11 @@ $(STATIC_TEST_BIN): $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(EVENT_LOOP_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_event_loop.o
+$(EVENT_LOOP_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT_LOOP_OBJS) $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_event_loop.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(CLUSTER_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_cluster.o
+$(CLUSTER_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT_LOOP_OBJS) $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_cluster.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -181,6 +189,10 @@ $(OBJ_DIR)/lib/event_loop_epoll_shim.o: lib/event_loop_epoll.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
 
+$(OBJ_DIR)/lib/event_loop_linux_shim.o: lib/event_loop_linux.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+
 $(OBJ_DIR)/tests/test_event_loop_shim.o: tests/test_event_loop.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
@@ -193,11 +205,11 @@ $(OBJ_DIR)/tests/test_connection_shim.o: tests/test_connection.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
 
-$(EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_event_loop_shim.o
+$(EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_event_loop_shim.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
 
-$(CONNECTION_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_connection_shim.o
+$(CONNECTION_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_connection_shim.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
 
@@ -205,7 +217,7 @@ $(OBJ_DIR)/tests/test_pipelining_shim.o: tests/test_pipelining.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
 
-$(PIPELINING_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_pipelining_shim.o
+$(PIPELINING_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_pipelining_shim.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
 
@@ -213,7 +225,7 @@ $(OBJ_DIR)/tests/test_stream_shim.o: tests/test_stream.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
 
-$(STREAM_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_stream_shim.o
+$(STREAM_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_stream_shim.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
 

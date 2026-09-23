@@ -16,6 +16,7 @@
 #include <sys/time.h>
 #include <liburing.h>
 #include "event_loop.h"
+#include "event_loop_backend.h"
 
 #define URING_ENTRIES 1024
 
@@ -29,6 +30,8 @@
 #define UDATA(fd, gen) (((__u64)(gen) << 32) | (__u64)((uint32_t)(fd) + 1))
 #define UDATA_FD(udata) ((int)((uint32_t)(udata) - 1))
 #define UDATA_GEN(udata) ((uint32_t)((udata) >> 32))
+
+static void uring_close(App *app);
 
 /* Grows App.poll_regs (doubling, new slots zeroed = nothing armed) until fd fits. NULL on OOM. */
 static PollRegistration *registration_for(App *app, const int fd) {
@@ -107,7 +110,7 @@ static int update_poll(App *app, const int fd, const uint32_t mask) {
     return mask != 0 ? arm_poll(ring, fd, reg) : 0;
 }
 
-int event_loop_init(App *app) {
+static int uring_init(App *app) {
     if (app == NULL) return -1;
 
     struct io_uring *ring = calloc(1, sizeof(struct io_uring));
@@ -115,9 +118,11 @@ int event_loop_init(App *app) {
 
     int ret = io_uring_queue_init(URING_ENTRIES, ring, 0);
     if (ret < 0) {
-        fprintf(stderr, "io_uring_queue_init failed: %d (%s)\n", ret, strerror(-ret));
+        /* C5: the ring itself was refused (seccomp, io_uring_disabled, memlock, old kernel) and nothing
+         * else was touched yet: tell the dispatcher it may fall back to epoll. */
         free(ring);
-        return -1;
+        errno = -ret;
+        return EVENT_LOOP_UNAVAILABLE;
     }
     app->ring = ring;
 
@@ -131,26 +136,26 @@ int event_loop_init(App *app) {
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) {
-        event_loop_close(app);
+        uring_close(app);
         return -1;
     }
 
     app->signal_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (app->signal_fd < 0) {
         sigprocmask(SIG_UNBLOCK, &mask, NULL);
-        event_loop_close(app);
+        uring_close(app);
         return -1;
     }
 
     if (update_poll(app, app->signal_fd, POLLIN) != 0) {
-        event_loop_close(app);
+        uring_close(app);
         return -1;
     }
 
     /* Idle timer via timerfd */
     app->timer_idle_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (app->timer_idle_fd < 0) {
-        event_loop_close(app);
+        uring_close(app);
         return -1;
     }
 
@@ -159,19 +164,19 @@ int event_loop_init(App *app) {
     its.it_interval.tv_nsec = (long)(IDLE_SWEEP_INTERVAL_MS % 1000) * 1000000L;
     its.it_value = its.it_interval;
     if (timerfd_settime(app->timer_idle_fd, 0, &its, NULL) < 0) {
-        event_loop_close(app);
+        uring_close(app);
         return -1;
     }
 
     if (update_poll(app, app->timer_idle_fd, POLLIN) != 0) {
-        event_loop_close(app);
+        uring_close(app);
         return -1;
     }
     io_uring_submit(ring);
     return 0;
 }
 
-void event_loop_close(App *app) {
+static void uring_close(App *app) {
     if (app == NULL || app->ring == NULL) return;
 
     sigset_t mask;
@@ -195,11 +200,11 @@ void event_loop_close(App *app) {
     app->poll_regs_cap = 0;
 }
 
-int event_loop_is_open(const App *app) {
+static int uring_is_open(const App *app) {
     return app != NULL && app->ring != NULL;
 }
 
-int event_loop_watch_read(App *app, int fd, void *udata) {
+static int uring_watch_read(App *app, int fd, void *udata) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
     Connection *conn = (Connection *)udata;
     if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
@@ -214,7 +219,7 @@ int event_loop_watch_read(App *app, int fd, void *udata) {
     return update_poll(app, fd, mask);
 }
 
-int event_loop_unwatch_read(App *app, int fd) {
+static int uring_unwatch_read(App *app, int fd) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
     Connection *conn = (fd < app->connections_cap && app->connections != NULL) ? app->connections[fd] : NULL;
     uint32_t mask = 0;
@@ -225,7 +230,7 @@ int event_loop_unwatch_read(App *app, int fd) {
     return update_poll(app, fd, mask);
 }
 
-int event_loop_watch_write(App *app, int fd, void *udata) {
+static int uring_watch_write(App *app, int fd, void *udata) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
     Connection *conn = (Connection *)udata;
     if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
@@ -239,7 +244,7 @@ int event_loop_watch_write(App *app, int fd, void *udata) {
     return update_poll(app, fd, mask);
 }
 
-int event_loop_unwatch_write(App *app, int fd, void *udata) {
+static int uring_unwatch_write(App *app, int fd, void *udata) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
     Connection *conn = (Connection *)udata;
     if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
@@ -253,7 +258,7 @@ int event_loop_unwatch_write(App *app, int fd, void *udata) {
     return update_poll(app, fd, mask);
 }
 
-int event_loop_unwatch_all(App *app, int fd) {
+static int uring_unwatch_all(App *app, int fd) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
     if (fd < app->connections_cap && app->connections != NULL && app->connections[fd] != NULL) {
         app->connections[fd]->events_watched = 0;
@@ -261,7 +266,7 @@ int event_loop_unwatch_all(App *app, int fd) {
     return update_poll(app, fd, 0);
 }
 
-int event_loop_arm_shutdown_timer(App *app) {
+static int uring_arm_shutdown_timer(App *app) {
     if (app == NULL || app->ring == NULL) return -1;
     if (app->timer_shutdown_fd < 0) {
         app->timer_shutdown_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -278,7 +283,7 @@ int event_loop_arm_shutdown_timer(App *app) {
     return 0;
 }
 
-int event_loop_poll(App *app, LoopEvent *out_events, int max_events, int timeout_ms) {
+static int uring_poll(App *app, LoopEvent *out_events, int max_events, int timeout_ms) {
     if (app == NULL || app->ring == NULL || out_events == NULL || max_events <= 0) return -1;
 
     struct io_uring *ring = (struct io_uring *)app->ring;
@@ -419,5 +424,20 @@ int event_loop_poll(App *app, LoopEvent *out_events, int max_events, int timeout
 
     return out_count;
 }
+
+/* C5: the only exported symbol; event_loop_linux.c selects it at runtime (event_loop_backend.h). */
+const EventLoopOps io_uring_loop_ops = {
+    .name = "io_uring",
+    .init = uring_init,
+    .is_open = uring_is_open,
+    .close_loop = uring_close,
+    .watch_read = uring_watch_read,
+    .unwatch_read = uring_unwatch_read,
+    .watch_write = uring_watch_write,
+    .unwatch_write = uring_unwatch_write,
+    .unwatch_all = uring_unwatch_all,
+    .arm_shutdown_timer = uring_arm_shutdown_timer,
+    .poll_events = uring_poll,
+};
 
 #endif /* defined(__linux__) && !defined(CEXPRESS_USE_EPOLL) */

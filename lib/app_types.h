@@ -250,6 +250,8 @@ typedef void (*StreamCtxFree)(void *ctx);
 
 /* ---- connection and event loop ---- */
 
+struct EventLoopOps; /* C5: defined in event_loop_backend.h (private to the Linux event loop) */
+
 /*
  * io_uring backend (C6): what event_loop_io_uring.c has registered for one fd. Polls are one-shot and
  * re-armed after every event, which gives the level-triggered readiness the engine assumes everywhere
@@ -601,10 +603,13 @@ typedef struct {
      * of the ring pointer) - use event_loop_is_open (event_loop.h). */
     union {
         int kq;          /* macOS/BSD */
-        int epoll_fd;    /* Linux epoll backend (-DCEXPRESS_USE_EPOLL) */
+        int epoll_fd;    /* Linux epoll backend (io_uring fallback, CEXPRESS_EVENT_LOOP=epoll, or NO_URING=1) */
         void *ring;      /* Linux io_uring (struct io_uring*) */
         int loop_fd;     /* platform-neutral int name */
     };
+    /* C5, Linux (and the macOS epoll-shim build): the backend event_loop_init chose (event_loop_backend.h),
+     * which tells which union member above is live. NULL while no loop is open; kqueue builds leave it NULL. */
+    const struct EventLoopOps *loop_ops;
     /* io_uring backend only (C6): the live poll registration of each fd, indexed by fd, grown on demand
      * by event_loop_io_uring.c and freed by event_loop_close. NULL/0 on the other backends. */
     PollRegistration *poll_regs;

@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <errno.h>
 #include "app_types.h"
 #include "event_loop.h"
@@ -15,19 +16,24 @@ static void test_event_loop_lifecycle(void) {
     App app;
     app_init(&app);
 
+    assert(strcmp(event_loop_backend_name(&app), "none") == 0);
     assert(event_loop_init(&app) == 0);
+    /* C5: which backend is live decides which union member is meaningful. */
+    const char *backend = event_loop_backend_name(&app);
 #if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
-    assert(app.ring != NULL);
+    if (strcmp(backend, "io_uring") == 0) {
+        assert(app.ring != NULL);
+    } else {
+        assert(strcmp(backend, "epoll") == 0 && app.epoll_fd >= 0);
+    }
+#elif defined(__linux__) || defined(CEXPRESS_USE_EPOLL)
+    assert(strcmp(backend, "epoll") == 0 && app.epoll_fd >= 0);
 #else
-    assert(app.loop_fd >= 0);
+    assert(strcmp(backend, "kqueue") == 0 && app.loop_fd >= 0);
 #endif
 
     event_loop_close(&app);
-#if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
-    assert(app.ring == NULL);
-#else
-    assert(app.loop_fd == -1);
-#endif
+    assert(strcmp(event_loop_backend_name(&app), "none") == 0);
 
     /* Idempotent close */
     event_loop_close(&app);
@@ -263,7 +269,44 @@ static void test_event_loop_is_open(void) {
     app_destroy(&app);
 }
 
-int main(void) {
+#if defined(__linux__) || defined(CEXPRESS_USE_EPOLL)
+/* C5: CEXPRESS_EVENT_LOOP selection in event_loop_linux.c. A forced backend never silently becomes
+ * another one, and an unknown value fails instead of guessing. */
+static void test_backend_selection_env(void) {
+    App app;
+    app_init(&app);
+
+    assert(setenv("CEXPRESS_EVENT_LOOP", "kqueue-please", 1) == 0);
+    assert(event_loop_init(&app) == -1);
+    assert(!event_loop_is_open(&app) && strcmp(event_loop_backend_name(&app), "none") == 0);
+
+    assert(setenv("CEXPRESS_EVENT_LOOP", "epoll", 1) == 0);
+    assert(event_loop_init(&app) == 0);
+    assert(event_loop_is_open(&app) && strcmp(event_loop_backend_name(&app), "epoll") == 0);
+    event_loop_close(&app);
+    assert(!event_loop_is_open(&app));
+
+    /* io_uring forced: it is io_uring or nothing (unavailable here, or not built in). */
+    assert(setenv("CEXPRESS_EVENT_LOOP", "io_uring", 1) == 0);
+    if (event_loop_init(&app) == 0) {
+        assert(strcmp(event_loop_backend_name(&app), "io_uring") == 0);
+        event_loop_close(&app);
+    } else {
+        assert(!event_loop_is_open(&app) && strcmp(event_loop_backend_name(&app), "none") == 0);
+    }
+
+    /* Empty means unset: automatic selection. */
+    assert(setenv("CEXPRESS_EVENT_LOOP", "", 1) == 0);
+    assert(event_loop_init(&app) == 0);
+    event_loop_close(&app);
+
+    assert(unsetenv("CEXPRESS_EVENT_LOOP") == 0);
+    app_destroy(&app);
+}
+#endif
+
+/* Every backend-contract test, against whatever event_loop_init selects under the current environment. */
+static void run_contract_tests(void) {
     test_event_loop_lifecycle();
     test_event_loop_watch_read_write();
     test_event_loop_shutdown_timer_arm();
@@ -271,6 +314,49 @@ int main(void) {
     test_readiness_is_level_triggered();
     test_reused_fd_gets_no_stale_events();
     test_event_loop_is_open();
+}
+
+static const char *selected_backend(void) {
+    static App app;
+    app_init(&app);
+    assert(event_loop_init(&app) == 0);
+    static char name[16];
+    snprintf(name, sizeof(name), "%s", event_loop_backend_name(&app));
+    event_loop_close(&app);
+    app_destroy(&app);
+    return name;
+}
+
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0); /* keep progress lines visible if an assert aborts */
+    /* The caller's CEXPRESS_EVENT_LOOP (if any) picks the backend for the first pass. */
+    printf("event loop tests: backend %s\n", selected_backend());
+    run_contract_tests();
+
+#if defined(__linux__) || defined(CEXPRESS_USE_EPOLL)
+    test_backend_selection_env();
+#if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
+    /* C5: epoll is now a runtime fallback on every Linux build, so it gets the whole contract too, even
+     * when io_uring was available for the first pass. */
+    /* In a fresh child: tearing down an io_uring ring queues task_work on the process, which can make its
+     * next blocking syscall - here epoll_wait - return a spurious EINTR (seen on 6.8). The engine retries
+     * EINTR (app_listen_worker), and a real process never runs both backends (the fallback happens only
+     * when no ring could be created), so the epoll pass gets a process that never had a ring. */
+    if (strcmp(selected_backend(), "epoll") != 0) {
+        const pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            assert(setenv("CEXPRESS_EVENT_LOOP", "epoll", 1) == 0);
+            printf("event loop tests: backend %s\n", selected_backend());
+            run_contract_tests();
+            _exit(0);
+        }
+        int status = 0;
+        assert(waitpid(child, &status, 0) == child);
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+#endif
+#endif
 
     printf("all event loop tests passed\n");
     return 0;

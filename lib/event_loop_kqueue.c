@@ -54,6 +54,10 @@ int event_loop_init(App *app) {
     return 0;
 }
 
+const char *event_loop_backend_name(const App *app) {
+    return event_loop_is_open(app) ? "kqueue" : "none";
+}
+
 int event_loop_is_open(const App *app) {
     return app != NULL && app->kq >= 0;
 }
