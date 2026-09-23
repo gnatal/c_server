@@ -22,10 +22,10 @@ static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_shutdown_signo = 0;
 
 /*
- * S7 restart backoff/budget: a slot that keeps exiting abnormally is respawned with an increasing
+ * Restart backoff/budget: a slot that keeps exiting abnormally is respawned with an increasing
  * delay instead of instantly, and after CLUSTER_RESTART_BUDGET failures within
  * CLUSTER_RESTART_WINDOW_MS the master gives up on the whole cluster rather than forking forever -
- * MEASURED (improvements.md, S7) 10,594 respawns and 31,788 log lines in about 4 seconds with
+ * MEASURED (improvements.md) 10,594 respawns and 31,788 log lines in about 4 seconds with
  * WORKERS=2 and the port already taken. Implementation-only constants, never exposed through
  * cluster.h.
  */
@@ -42,7 +42,7 @@ typedef struct {
     long long backoff_until_ms;   /* monotonic time the next respawn attempt for this slot is allowed */
     int consecutive_failures;     /* failures counted within the current restart-budget window */
     long long window_start_ms;    /* when the current window started; 0 = no window yet */
-    /* C4, CEXPRESS_SINGLE_ACCEPTOR only: the master-side end (sv[0]) of this slot's socketpair with
+    /* CEXPRESS_SINGLE_ACCEPTOR only: the master-side end (sv[0]) of this slot's socketpair with
      * its worker, used to hand it accepted client fds via SCM_RIGHTS (dispatch_client_fd). -1 when no
      * worker is currently running in this slot. Unused (always -1) on the non-single-acceptor path. */
     int control_fd;
@@ -128,14 +128,14 @@ static void master_signal_handler(int signo) {
 }
 
 /* Shared by both spawn_worker variants below: the fork()+child-teardown skeleton every worker slot
- * uses. `run_child` does whatever is left to set server_fd up (bind its own SO_REUSEPORT socket, or -
- * C4 - close everything but its own control socket and use that) before app_listen_worker's event
+ * uses. `run_child` does whatever is left to set server_fd up (bind its own SO_REUSEPORT socket, or - single
+ * acceptor - close everything but its own control socket and use that) before app_listen_worker's event
  * loop starts. */
 static pid_t spawn_worker_common(App *app, int worker_id, void (*run_child)(App *app, int port, void *ctx),
                                   int port, void *ctx) {
     /* fork() duplicates the master's stdio buffers as-is: an unflushed line (stdout to a pipe/file is
      * fully buffered, not line-buffered) would otherwise be flushed a second time by the child's own
-     * exit(), printing it twice. Immaterial for one worker at startup, but S7's respawn loop can fork
+     * exit(), printing it twice. Immaterial for one worker at startup, but the respawn loop can fork
      * the same slot many times in quick succession, and duplicated log lines are exactly the kind of
      * noise a crash loop should not add to. */
     fflush(stdout);
@@ -174,7 +174,7 @@ static pid_t spawn_worker_common(App *app, int worker_id, void (*run_child)(App 
 }
 
 #ifdef CEXPRESS_SINGLE_ACCEPTOR
-/* C4: fd-passing context handed through spawn_worker_common to the child branch - everything the
+/* fd-passing context handed through spawn_worker_common to the child branch - everything the
  * child needs to close (fds it inherited via fork() but does not need) and its own control fd. */
 typedef struct {
     int listen_fd;                 /* the master's real listen socket - never needed by a worker */
@@ -203,10 +203,10 @@ static void run_child_fd_passing(App *app, int port, void *ctx_ptr) {
     app_listen_worker_via_control_socket(app, ctx->worker_control_fd);
 }
 
-/* C4: single-acceptor variant. Creates a fresh AF_UNIX socketpair for this slot before forking - the
+/* single-acceptor variant. Creates a fresh AF_UNIX socketpair for this slot before forking - the
  * parent keeps sv[0] (control_fd, used to hand this worker client fds) and the child keeps sv[1]
  * (passed to app_listen_worker_via_control_socket). Called both for the initial spawn and for every
- * respawn (S7): a dead worker's old sv[1] died with its process, so each attempt needs its own pair. */
+ * respawn: a dead worker's old sv[1] died with its process, so each attempt needs its own pair. */
 static pid_t spawn_worker(App *app, int listen_fd, ClusterWorkerSlot *workers, int workers_count, int slot_idx) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -246,7 +246,7 @@ static pid_t spawn_worker(App *app, int listen_fd, ClusterWorkerSlot *workers, i
     return pid;
 }
 
-/* C4: hands one accepted client fd to worker `*next` (or the next active one after it) via
+/* hands one accepted client fd to worker `*next` (or the next active one after it) via
  * SCM_RIGHTS over its control socket, round-robin. A one-byte data payload rides along with the
  * ancillary data - a zero-length SCM_RIGHTS-only message is ill-defined on some AF_UNIX
  * implementations; the worker's recvmsg reads and discards this byte, only the cmsg fd matters.
@@ -303,17 +303,17 @@ void cluster_listen(App *app, int port, int num_workers) {
     }
 
     /*
-     * S7: verify the port is actually usable once, in the master, before forking anyone. Without this,
+     * verify the port is actually usable once, in the master, before forking anyone. Without this,
      * a fatal misconfiguration (port already in use, permission denied on a privileged port, ...) made
      * every one of workers_count children fail create_server_socket's own bind()/listen() identically
      * and immediately, and the old respawn-on-exit loop re-forked each one right away - MEASURED
      * 10,594 respawns in about 4 seconds with WORKERS=2 and the port already taken.
-     * S12: create_server_socket itself just returns -1 on failure now (it no longer exit()s on its
+     * create_server_socket itself just returns -1 on failure now (it no longer exit()s on its
      * own); this call site is the one that decides a preflight failure is fatal and turns it into a
      * single clear message + exit(), which still gives the same "one message, no fork storm" behavior
      * this comment originally described. */
 #ifdef CEXPRESS_SINGLE_ACCEPTOR
-    /* C4: kept open (not closed like the preflight-only check below) - this is the one real listen
+    /* kept open (not closed like the preflight-only check below) - this is the one real listen
      * socket for the whole cluster's lifetime; only the master accepts on it. */
     int listen_fd = create_server_socket(port);
     if (listen_fd < 0) {
@@ -353,7 +353,7 @@ void cluster_listen(App *app, int port, int num_workers) {
     sigaction(SIGCHLD, &sa, NULL);
 
 #ifdef CEXPRESS_SINGLE_ACCEPTOR
-    /* C4: the master now itself writes to worker control sockets (dispatch_client_fd's sendmsg); a
+    /* the master now itself writes to worker control sockets (dispatch_client_fd's sendmsg); a
      * worker that has already closed its end (draining, or dead but not yet reaped) must fail that
      * call with EPIPE, not take down the master with the default SIGPIPE disposition - workers
      * already ignore it themselves (app_listen_worker), the master never had to before this. */
@@ -363,7 +363,7 @@ void cluster_listen(App *app, int port, int num_workers) {
     printf("CExpress cluster master (PID %d) starting %d workers on port %d\n",
            (int)getpid(), workers_count, port);
 #ifdef CEXPRESS_SINGLE_ACCEPTOR
-    /* C4: the master itself owns the one real listen socket now (each worker used to print this
+    /* the master itself owns the one real listen socket now (each worker used to print this
      * line for itself, from inside its own bind - see app_listen_worker's now-suppressed print when
      * accept_via_fd_passing is set). */
     printf("Listening on port %d\n", port);
@@ -467,7 +467,7 @@ void cluster_listen(App *app, int port, int num_workers) {
 
         if (exited_pid <= 0) {
 #ifdef CEXPRESS_SINGLE_ACCEPTOR
-            /* C4: wait on listen_fd instead of an unconditional sleep - poll() returns immediately
+            /* wait on listen_fd instead of an unconditional sleep - poll() returns immediately
              * once a connection is pending, so this adds no latency over the old per-worker accept()
              * path, while still guaranteeing the loop wakes at least every 50ms for the waitpid/
              * backoff scan above, same cadence the plain nanosleep gave it before. */
@@ -475,15 +475,15 @@ void cluster_listen(App *app, int port, int num_workers) {
             int pr = poll(&pfd, 1, 50);
             if (pr > 0 && (pfd.revents & POLLIN)) {
                 while (1) {
-                    const int client_fd = accept_client(listen_fd); /* non-blocking + TCP_NODELAY (P10) */
+                    const int client_fd = accept_client(listen_fd); /* non-blocking + TCP_NODELAY */
                     if (client_fd < 0) {
                         break; /* EAGAIN (drained) or a transient error: stop draining this wake */
                     }
                     if (!dispatch_client_fd(workers, workers_count, &next_worker, client_fd)) {
                         /* No active worker could take it (e.g. mid crash-loop, every slot down).
-                         * Best-effort shed, same philosophy as accept_connections' own S3 overload
+                         * Best-effort shed, same philosophy as accept_connections' own overload
                          * handling - deliberately not duplicating reject_overloaded_connection's
-                         * hand-built 503 here in the master to keep this change scoped to C4. */
+                         * hand-built 503 here in the master to keep the single acceptor simple. */
                         close(client_fd);
                     }
                 }
@@ -572,10 +572,10 @@ void cluster_listen(App *app, int port, int num_workers) {
     printf("All workers terminated cleanly. Master exiting.\n");
 
     if (fatal) {
-        /* S7/S12: cluster_listen is void, with no way to hand a failure back to app_listen/main() - the
+        /* cluster_listen is void, with no way to hand a failure back to app_listen/main() - the
          * restart budget being exhausted is decided and acted on right here rather than propagated as a
          * return code (a real error-code path all the way back to main() is a larger, separate change;
-         * create_server_socket itself no longer forces this - S12 - it now just returns -1 and this file's
+         * create_server_socket itself no longer forces this - it now just returns -1 and this file's
          * callers are the ones that choose to exit()). A non-zero status here is what lets an orchestrator
          * (systemd, Docker, Kubernetes) see the server as failed and act on it, instead of the process
          * quietly running with fewer workers than requested or exiting 0 as if nothing happened. */

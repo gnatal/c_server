@@ -19,7 +19,7 @@ char test_arena_buf[64 * 1024];
 static void handler_ok(const Request *req, Response *res) { (void)req; res_json(res, "{\"ok\":true}"); }
 static void mw_pass(const Request *req, Response *res, MiddlewareChain *chain) { (void)req; (void)res; chain_next(chain); }
 
-/* P3: req_get_cookie/req_get_header (Connection is already read by request_wants_close on every
+/* req_get_cookie/req_get_header (Connection is already read by request_wants_close on every
  * request regardless of handler, see one_request below) are lazy now - a handler that never calls
  * them never pays for the split/materialization. handler_ok above is the common case; this one is
  * the "handler actually reads a cookie and a header" case, run separately below so both ends of that
@@ -58,9 +58,9 @@ static const char *BROWSER_GET_COOKIE_ROUTE =
     "Cookie: session=abcdef0123456789; theme=dark; _ga=GA1.1.123456789.1700000000\r\n"
     "Sec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Dest: empty\r\n\r\n";
 
-/* Same sequence as connection.c: handle_readable (P2: one parse_request_head pass, reused by the
+/* Same sequence as connection.c: handle_readable (one parse_request_head pass, reused by the
  * completeness check and the full parse, instead of request_is_complete and parse_http_request each
- * running their own), and M4's in-place parse (body is a view into raw; its saved byte is restored
+ * running their own), and the in-place parse (body is a view into raw; its saved byte is restored
  * after dispatch, so raw is unchanged for the next iteration - no chunked cases here). */
 static void one_request(const App *app_const, char *raw, const size_t len, Connection *conn) {
     App *app = (App *)app_const;
@@ -84,7 +84,7 @@ static void one_request(const App *app_const, char *raw, const size_t len, Conne
 static void run(const char *label, App *app, const char *raw_const, const int iterations) {
     Connection conn;
     memset(&conn, 0, sizeof(conn));
-    /* M1: Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
+    /* Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
      * now, not one embedded per connection - point it at its own local Arena, same buffer as before. */
     Arena conn_arena;
     arena_init(&conn_arena, test_arena_buf, sizeof(test_arena_buf));

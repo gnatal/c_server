@@ -18,7 +18,7 @@ static void test_event_loop_lifecycle(void) {
 
     assert(strcmp(event_loop_backend_name(&app), "none") == 0);
     assert(event_loop_init(&app) == 0);
-    /* C5: which backend is live decides which union member is meaningful. */
+    /* which backend is live decides which union member is meaningful. */
     const char *backend = event_loop_backend_name(&app);
 #if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
     if (strcmp(backend, "io_uring") == 0) {
@@ -110,7 +110,7 @@ static void test_event_loop_shutdown_timer_arm(void) {
     app_destroy(&app);
 }
 
-/* ---- backend contract the engine relies on (C6: found broken on io_uring only) ---- */
+/* ---- backend contract the engine relies on (found broken on io_uring only) ---- */
 
 /* A Connection registered in app->connections, as accept_connections would, so the backends track
  * events_watched for it. Freed with plain free (no connection_close: nothing else is attached). */
@@ -134,7 +134,7 @@ static int count_events(const LoopEvent *events, const int n, const int fd, cons
     return count;
 }
 
-/* C6 regression: changing interest (what flush_connection / wait_for_writable do around every
+/* Regression: changing interest (what flush_connection / wait_for_writable do around every
  * response) must never surface as LOOP_EVENT_ERROR. On io_uring the removed poll's -ECANCELED
  * completion was reported as an error and connection.c closed the connection. */
 static void test_interest_changes_are_never_errors(void) {
@@ -270,7 +270,7 @@ static void test_event_loop_is_open(void) {
 }
 
 #if defined(__linux__) || defined(CEXPRESS_USE_EPOLL)
-/* C5: CEXPRESS_EVENT_LOOP selection in event_loop_linux.c. A forced backend never silently becomes
+/* CEXPRESS_EVENT_LOOP selection in event_loop_linux.c. A forced backend never silently becomes
  * another one, and an unknown value fails instead of guessing. */
 static void test_backend_selection_env(void) {
     App app;
@@ -336,7 +336,7 @@ int main(void) {
 #if defined(__linux__) || defined(CEXPRESS_USE_EPOLL)
     test_backend_selection_env();
 #if defined(__linux__) && !defined(CEXPRESS_USE_EPOLL)
-    /* C5: epoll is now a runtime fallback on every Linux build, so it gets the whole contract too, even
+    /* epoll is now a runtime fallback on every Linux build, so it gets the whole contract too, even
      * when io_uring was available for the first pass. */
     /* In a fresh child: tearing down an io_uring ring queues task_work on the process, which can make its
      * next blocking syscall - here epoll_wait - return a spurious EINTR (seen on 6.8). The engine retries

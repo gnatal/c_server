@@ -176,11 +176,11 @@ static void test_match_route(void) {
     cleanup_app(&app);
 }
 
-/* P7: children are now kept sorted and found by binary search instead of a linear scan - this
+/* children are now kept sorted and found by binary search instead of a linear scan - this
  * proves that still finds the right sibling regardless of registration order, including segments
  * that are prefixes of one another (e.g. "res1" vs "res10"), where a naive length-then-bytes or
  * bytes-then-length comparator could misorder the array and make binary search miss a match. */
-/* C2: fills req for a GET match_route and returns the matched Route. */
+/* fills req for a GET match_route and returns the matched Route. */
 static const Route *route_get(const App *app, Request *req, const char *path) {
     memset(req, 0, sizeof(*req));
     strncpy(req->method, "GET", sizeof(req->method) - 1);
@@ -188,7 +188,7 @@ static const Route *route_get(const App *app, Request *req, const char *path) {
     return match_route(app, req);
 }
 
-/* C2: parameter names come from the matched route, not from whichever route created the shared
+/* parameter names come from the matched route, not from whichever route created the shared
  * tree node at that position. */
 static void test_match_route_param_names_are_per_route(void) {
     App app;
@@ -211,7 +211,7 @@ static void test_match_route_param_names_are_per_route(void) {
     cleanup_app(&app);
 }
 
-/* C2: a mid-pattern '*' registered first no longer hides a later ':name' at the same position, and
+/* a mid-pattern '*' registered first no longer hides a later ':name' at the same position, and
  * the '*' route itself still captures nothing. */
 static void test_match_route_param_after_mid_wildcard(void) {
     App app;
@@ -231,7 +231,7 @@ static void test_match_route_param_after_mid_wildcard(void) {
     cleanup_app(&app);
 }
 
-/* C2: a literal segment wins over a parameter at the same position, and a backtrack from the
+/* a literal segment wins over a parameter at the same position, and a backtrack from the
  * literal branch into the param branch leaves only the param route's captures. */
 static void test_match_route_literal_beats_param(void) {
     App app;
@@ -447,7 +447,7 @@ static void test_app_add_route_mw_truncates_overflow(void) {
     cleanup_app(&app);
 }
 
-/* S12: fill_route used to strncpy an over-long path into Route.path (256 bytes) and silently
+/* fill_route used to strncpy an over-long path into Route.path (256 bytes) and silently
  * truncate it, registering a different, shorter route than the caller asked for. It must now reject
  * the registration outright instead - nothing should match at the truncated prefix. */
 static void test_app_add_route_rejects_overlong_path(void) {
@@ -869,7 +869,7 @@ static void test_allowed_methods_does_not_touch_request(void) {
     cleanup_app(&app); /* app_init's table; app_destroy lives in connection.c, not linked here */
 }
 
-/* S4: app_use_body_limit / app_body_limit_for_path. */
+/* app_use_body_limit / app_body_limit_for_path. */
 static void test_body_limit_defaults_to_max_body_size(void) {
     App app;
     app_init(&app);
@@ -888,6 +888,16 @@ static void test_body_limit_prefix_scoping(void) {
     assert(app_body_limit_for_path(&app, "/api/uploadsx") != 1024);       /* not a real prefix match */
     assert(app_body_limit_for_path(&app, "/api/uploadsx") == MAX_BODY_SIZE);
     assert(app_body_limit_for_path(&app, "/api/other") == MAX_BODY_SIZE); /* outside the prefix */
+    cleanup_app(&app);
+}
+
+static void test_body_limit_prefix_is_normalized(void) {
+    /* a trailing '/' on the prefix used to make it match no sub-path at all. */
+    App app;
+    app_init(&app);
+    app_use_body_limit(&app, "/upload/", 16);
+    assert(app_body_limit_for_path(&app, "/upload") == 16);
+    assert(app_body_limit_for_path(&app, "/upload/x") == 16);
     cleanup_app(&app);
 }
 
@@ -942,10 +952,10 @@ static void test_body_limit_overflow_is_dropped(void) {
     cleanup_app(&app);
 }
 
-/* M6: static_root is a heap string owned by static mounts only - an ordinary route carries NULL
+/* static_root is a heap string owned by static mounts only - an ordinary route carries NULL
  * (not an inline PATH_MAX buffer), a static mount carries exactly its canonical root, and a rejected
  * duplicate mount frees its root through route_free (ASan/LeakSanitizer catches a miss). The size
- * guard is what the M6 fix bought: an inline PATH_MAX array alone was 4 KB per Route on Linux. */
+ * guard is what sizing the root to fit bought: an inline PATH_MAX array alone was 4 KB per Route on Linux. */
 static void test_static_root_is_heap_owned_by_static_mounts_only(void) {
     assert(sizeof(Route) < 512);
 
@@ -1019,6 +1029,7 @@ int main(void) {
     test_match_route_explicit_head_wins_over_get_fallback();
     test_body_limit_defaults_to_max_body_size();
     test_body_limit_prefix_scoping();
+    test_body_limit_prefix_is_normalized();
     test_body_limit_longest_prefix_wins();
     test_body_limit_unscoped_prefix_applies_everywhere();
     test_body_limit_clamped_to_max_body_size();

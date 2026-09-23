@@ -1,5 +1,5 @@
 /*
- * M5: producer streaming (res_stream / stream_write / app_wake_streams). Pure framing tests against a
+ * producer streaming (res_stream / stream_write / app_wake_streams). Pure framing tests against a
  * hand-built StreamWriter, then the real engine path over socketpair(2): handle_readable dispatches,
  * flush_connection calls the producer turn by turn, handle_writable / close_idle_connections /
  * app_wake_streams drive it the way the event loop does.
@@ -570,7 +570,7 @@ static void test_head_request_through_engine(void) {
     teardown(&app, fds);
 }
 
-/* C3: a producer stream on a bodiless status (here 204) never runs: head only, ctx freed at once. */
+/* a producer stream on a bodiless status (here 204) never runs: head only, ctx freed at once. */
 static void test_res_stream_bodiless_status_frees_ctx_at_once(void) {
     App app;
     int fds[2];

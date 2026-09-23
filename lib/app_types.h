@@ -18,8 +18,8 @@
 #define PATH_MAX 4096
 #endif
 
-/* C4: on macOS/BSD, per-worker SO_REUSEPORT listen sockets do not balance accepted connections across
- * workers the way Linux's 4-tuple hashing does (improvements.md, C4 - MEASURED over 90% of load
+/* on macOS/BSD, per-worker SO_REUSEPORT listen sockets do not balance accepted connections across
+ * workers the way Linux's 4-tuple hashing does (improvements.md - MEASURED over 90% of load
  * landing on one of four workers). Gated to non-Linux only: Linux keeps its existing, unmeasured-but-
  * not-reported-broken per-worker accept path untouched, matching the same "narrow, platform-scoped
  * fix" precedent as the io_uring/kqueue split below. Under this macro, only the master process binds
@@ -33,21 +33,21 @@
 /* ---- limits ---- */
 #define MAX_ROUTER_ROUTES 64          /* per Router (sub-router staging limit) */
 #define MAX_MIDDLEWARES 16            /* app-wide and per Router */
-#define MAX_BODY_LIMITS 16            /* app_use_body_limit prefixes (S4); excess dropped with a stderr warning */
+#define MAX_BODY_LIMITS 16            /* app_use_body_limit prefixes; excess dropped with a stderr warning */
 #define MAX_ROUTE_MIDDLEWARES 8       /* per route */
 #define MAX_PARAMS 8                  /* path params per request (name/value 63 chars) */
 #define MAX_QUERY_PARAMS 16           /* name/value 63 chars, percent- and '+'-decoded */
-#define MAX_HEADERS 32                /* request header VIEWS kept (P3: not copies - name/value point into
+#define MAX_HEADERS 32                /* request header VIEWS kept (not copies - name/value point into
                                         * the connection's in_buf, so there is no per-header size cap left to
                                         * enforce; a header is bounded only by the whole header block fitting
                                         * in BUF_SIZE, same as before) */
-#define MAX_FRAMING_HEADERS 100       /* ParsedHead's phr_parse_request capacity (P2): kept above MAX_HEADERS
+#define MAX_FRAMING_HEADERS 100       /* ParsedHead's phr_parse_request capacity: kept above MAX_HEADERS
                                         * so a request with more headers than the engine stores is diagnosed
                                         * by parse_http_request_from_head's explicit ">MAX_HEADERS" check as
                                         * malformed (400), not mis-reported as "incomplete" by
                                         * request_head_is_complete's header_len == 0 check (which a smaller
                                         * capacity would trip via phr_parse_request's own internal error -
-                                        * see S8's known gap in lib/CLAUDE.md, which this must not widen) */
+                                        * see the malformed-request note in lib/CLAUDE.md, which this must not widen) */
 #define MAX_COOKIES 16                /* request cookies kept (name 63, value 255 chars) */
 #define MAX_FORM_FIELDS 32            /* urlencoded body fields (name 63, value 255 chars) */
 #define MAX_MULTIPART_PARTS 16
@@ -59,19 +59,19 @@
 #define MAX_BOUNDARY_LEN 71           /* RFC 2046: 70 chars + NUL */
 #define MAX_CHUNK_SIZE_LINE_LEN 64    /* a chunk-size line longer than this is malformed */
 #define MAX_EVENTS 64                 /* events fetched per event-loop poll */
-#define MAX_PIPELINED_PER_EVENT 16    /* P9: requests served back to back from one connection's buffer
+#define MAX_PIPELINED_PER_EVENT 16    /* requests served back to back from one connection's buffer
                                         * before yielding to the event loop (fairness across connections) */
 #define BACKLOG 128                   /* listen() backlog floor; create_server_socket takes max(BACKLOG, SOMAXCONN) */
 #define DEFAULT_PORT 8080
 #define DEFAULT_MAX_CONNECTIONS 10000 /* ServerConfig.max_connections default, applied by app_init (see below) */
 
-#define ARENA_SIZE (64 * 1024)        /* App.arena's fixed buffer (M1): one shared per-worker bump allocator, not one
+#define ARENA_SIZE (64 * 1024)        /* App.arena's fixed buffer: one shared per-worker bump allocator, not one
                                         * per connection; reset once per request, falls back to malloc beyond this */
-#define BUF_SIZE 8192                 /* App.read_buf and an owned in_buf's start size (M2); also the request-header limit (431 beyond) */
+#define BUF_SIZE 8192                 /* App.read_buf and an owned in_buf's start size; also the request-header limit (431 beyond) */
 #define MAX_BODY_SIZE (10 * 1024 * 1024)        /* request body (Content-Length or decoded chunked) and streamed response buffer; 413 beyond */
 #define MAX_STATIC_FILE_SIZE (50 * 1024 * 1024) /* static_serve_file refuses larger files with 500 */
 #define STATIC_CACHE_MAX_ENTRIES 256            /* distinct cached files per process (static.c); LRU-by-staleness eviction beyond it */
-#define STATIC_CACHE_MAX_ENTRY_BYTES (256 * 1024)      /* a file bigger than this is served but never cached (P1) */
+#define STATIC_CACHE_MAX_ENTRY_BYTES (256 * 1024)      /* a file bigger than this is served but never cached */
 #define STATIC_CACHE_MAX_TOTAL_BYTES (64 * 1024 * 1024) /* combined cap across all cached entries; evicts the stalest first */
 #define STATIC_CACHE_REVALIDATE_SECONDS 1       /* a cache hit within this long of its last stat skips the filesystem entirely */
 #define STREAM_CHUNK_SIZE (16 * 1024)           /* res_send_file reads this much per write, and a res_stream producer
@@ -115,7 +115,7 @@ typedef struct {
     char query_values[MAX_QUERY_PARAMS][64];
     int query_count;
 
-    /* P3: raw VIEWS into the connection's in_buf, not copies - name/value are not NUL-terminated and
+    /* raw VIEWS into the connection's in_buf, not copies - name/value are not NUL-terminated and
      * are meaningless once in_buf is touched again (never happens before the handler returns; see
      * lib/CLAUDE.md's request lifecycle). A request whose headers nobody reads costs nothing beyond
      * this array (32 * sizeof(struct phr_header) = 1,024 bytes) instead of the old 32 * 1,088-byte
@@ -127,25 +127,25 @@ typedef struct {
 
     /* Cookie splitting stays eager-into-fixed-arrays (unlike headers above): MAX_COOKIES * (64 + 256)
      * is a modest 5 KB regardless, and RFC 6265 cookie-pair syntax has no length limit of its own to
-     * relax the way S5 needed for headers. What *is* lazy (P3) is running the split at all: see
+     * relax the way headers needed. What *is* lazy is running the split at all: see
      * cookies_parsed below - most requests carrying a Cookie header are never asked for one by name. */
     char cookie_names[MAX_COOKIES][64];     /* not decoded; name lookup is case-sensitive */
     char cookie_values[MAX_COOKIES][256];
     int cookie_count;
-    int cookies_parsed;       /* P3: req_get_cookie runs parse_cookies at most once, on its first call,
+    int cookies_parsed;       /* req_get_cookie runs parse_cookies at most once, on its first call,
                                 * instead of parse_http_request_from_head running it for every request
                                 * whether or not a handler ever reads a cookie */
 
     int content_length;      /* body size in bytes (decoded size for chunked); -2 after a failed parse = too large */
 
     /* Never NULL after success, NUL-terminated, may contain NUL bytes: use content_length, not strlen.
-     * On the engine path (parse_http_request_in_place, M4) it points INTO the connection's in_buf - no
+     * On the engine path (parse_http_request_in_place) it points INTO the connection's in_buf - no
      * copy; a chunked body is decoded in place there. parse_http_request / _from_head (tests, tools)
      * copy it into the arena instead. Either way nobody frees it, and handlers must not keep it past
      * their return. */
     char *body;
 
-    /* P3: set by every parse_http_request* to the arena passed in (the one a copied `body` came from). req_get_header
+    /* set by every parse_http_request* to the arena passed in (the one a copied `body` came from). req_get_header
      * and req_get_cookie (on its first call) allocate from it to materialize NUL-terminated strings out
      * of the views above. NULL only for a Request no parse function has ever populated (e.g. a test
      * fixture built and filled by hand without going through parse_http_request*) - req_get_header
@@ -176,9 +176,9 @@ typedef struct {
 } UrlEncodedForm;
 
 /*
- * One phr_parse_request pass over a raw buffer, cached for reuse (P2, http_parser.h). Before this
+ * One phr_parse_request pass over a raw buffer, cached for reuse (http_parser.h). Before this
  * existed, handle_readable's per-request hot path ran up to four independent phr_parse_request /
- * request_framing passes over the same bytes: the body-limit check (S4), the completeness check, and
+ * request_framing passes over the same bytes: the body-limit check, the completeness check, and
  * parse_http_request's own top-level parse plus its internal second request_framing call. Filling one
  * of these once and passing it to parse_http_request_from_head / request_head_is_complete / the body-
  * limit check collapses that to one.
@@ -201,7 +201,7 @@ typedef struct {
 } ParsedHead;
 
 /*
- * Resume point for chunked_body_scan_resume (P8). All offsets are relative to the body start
+ * Resume point for chunked_body_scan_resume. All offsets are relative to the body start
  * (buf + header_len), never pointers, so they survive in_buf being realloc'd between reads.
  * Zero-initialized = "scan from the start of the body". Only ever advanced past chunks that were
  * fully received and validated, so resuming is exactly equivalent to rescanning from zero.
@@ -210,7 +210,7 @@ typedef struct {
  *   trailer_from once pos is at the last-chunk ("0") line: where the search for the trailer's
  *                terminating "\r\n\r\n" resumes (bytes before it are known not to start one)
  *   body_end     set when the scan returns 1: offset just past that "\r\n\r\n", i.e. the chunked
- *                body's full wire length - where a pipelined next request starts (P9)
+ *                body's full wire length - where a pipelined next request starts
  */
 typedef struct {
     size_t pos;
@@ -219,7 +219,7 @@ typedef struct {
     size_t body_end;
 } ChunkScanState;
 
-/* ---- producer streaming (res_stream, M5) ---- */
+/* ---- producer streaming (res_stream) ---- */
 
 /*
  * Where a StreamProducer writes one turn's output: a view over Connection.stream_buf, built by
@@ -250,16 +250,16 @@ typedef void (*StreamCtxFree)(void *ctx);
 
 /* ---- connection and event loop ---- */
 
-struct EventLoopOps; /* C5: defined in event_loop_backend.h (private to the Linux event loop) */
+struct EventLoopOps; /* defined in event_loop_backend.h (private to the Linux event loop) */
 
 /*
- * io_uring backend (C6): what event_loop_io_uring.c has registered for one fd. Polls are one-shot and
+ * io_uring backend: what event_loop_io_uring.c has registered for one fd. Polls are one-shot and
  * re-armed after every event, which gives the level-triggered readiness the engine assumes everywhere
  * (multishot polls fire on wakeups, i.e. edge-triggered). Every arm gets a new `gen`, encoded with the
  * fd in the poll's user_data, so a completion from a poll that has since been removed or replaced
  * (the kernel's -ECANCELED for a removed poll, or readiness it reported just before) is recognized as
  * stale and dropped instead of being reported as an error or delivered to whatever now owns the fd.
- * `mask` is the wanted POLLIN/POLLOUT interest (0 = none); an unchanged mask costs nothing (P4).
+ * `mask` is the wanted POLLIN/POLLOUT interest (0 = none); an unchanged mask costs nothing.
  * `armed` is 1 while a poll for `gen` is in flight.
  */
 typedef struct {
@@ -285,30 +285,30 @@ typedef struct Connection {
 
     /* Set once per request the first time its headers are found complete (any outcome: within
      * limit, over it, or framing not yet knowable) so handle_readable's per-route body-limit check
-     * (S4, app_use_body_limit) runs request_framing at most once per request instead of on every
+     * (app_use_body_limit) runs request_framing at most once per request instead of on every
      * read while a body is still arriving. Cleared with request_started when a keep-alive response
      * is fully queued (flush_connection) so the next request on the same connection is rechecked. */
     int body_limit_checked;
 
-    /* C1: set once "HTTP/1.1 100 Continue" has been attempted for the current request (sent, or
+    /* set once "HTTP/1.1 100 Continue" has been attempted for the current request (sent, or
      * skipped on EAGAIN), so a request whose body arrives over many reads gets at most one. Cleared
      * with body_limit_checked when a keep-alive response is fully queued (flush_connection). */
     int continue_sent;
 
-    /* P8: where handle_readable's completeness check resumes scanning a chunked body on the next read,
+    /* where handle_readable's completeness check resumes scanning a chunked body on the next read,
      * so each body byte is scanned once per request instead of once per recv (was quadratic). Zeroed
      * by connection_create's calloc and again, with body_limit_checked, when a keep-alive response is
      * fully queued. Offsets only (see ChunkScanState), so in_buf growth never invalidates it. */
     ChunkScanState chunk_scan;
 
-    /* Input (M2): NULL (in_cap == 0) whenever nothing is buffered - an idle connection owns no input
+    /* Input: NULL (in_cap == 0) whenever nothing is buffered - an idle connection owns no input
      * memory. handle_readable borrows the worker's shared App.read_buf (BUF_SIZE) for the recv and
      * parses complete requests in place there. Before handle_readable returns with the connection
      * still open, unserved bytes (a partial request, or pipelined requests behind a pending
      * response) are copied into a connection-owned malloc'd BUF_SIZE buffer, so in_buf never points
      * at App.read_buf between event-loop turns. An owned buffer grows by doubling (like the chunked
      * path) up to header_len + content_length + 1 to fit a declared body - never straight to the full
-     * declared size in one step (S4: a client that declares a large Content-Length and sends little
+     * declared size in one step (a client that declares a large Content-Length and sends little
      * of it costs a reservation proportional to what arrived, not to what it claims) - and is freed
      * by flush_connection once nothing is buffered, or by connection_close. in_buf[in_len] is always
      * '\0' while in_buf != NULL. */
@@ -316,7 +316,7 @@ typedef struct Connection {
     size_t in_cap;
     size_t in_len;
 
-    /* P9 (pipelining): in_buf may hold more than one request. in_off is where the request being
+    /* Pipelining: in_buf may hold more than one request. in_off is where the request being
      * served (or next to be served) starts; request_len is the wire length (headers + framed body)
      * of the request just dispatched, set before its flush_connection. When that response is fully
      * queued on a keep-alive connection, in_off advances by request_len instead of in_buf being
@@ -326,11 +326,11 @@ typedef struct Connection {
     size_t in_off;
     size_t request_len;
 
-    /* Output: one response built by res_send / res_json / res_write into memory from `arena` (M1: a
+    /* Output: one response built by res_send / res_json / res_write into memory from `arena` (a
      * pointer to the single shared per-worker arena, not a per-connection one - see `arena` below).
      * out_buf != NULL means a response is pending. For responses built by the response layer,
      * out_buf[out_len] == '\0' (not sent).
-     * Ownership (M1): normally arena-resident (freed implicitly by the next arena_reset, same as
+     * Ownership: normally arena-resident (freed implicitly by the next arena_reset, same as
      * before) - `out_buf_owned` is 0. If a response can't be fully written in one `flush_connection`
      * call (EAGAIN), the unsent tail is copied into a connection-owned `malloc`'d buffer before
      * `flush_connection` returns, since the shared arena would otherwise be reset and reused by
@@ -355,7 +355,7 @@ typedef struct Connection {
     int file_fd;
     size_t file_remaining;
 
-    /* Producer streaming (res_stream, M5): stream_fn != NULL from res_stream until STREAM_END/STREAM_ABORT
+    /* Producer streaming (res_stream): stream_fn != NULL from res_stream until STREAM_END/STREAM_ABORT
      * or close. flush_connection calls stream_fn(writer over stream_buf, stream_ctx) each time out_buf has
      * drained, so memory is one STREAM_CHUNK_SIZE buffer however long the response. stream_paused: the
      * producer returned STREAM_PAUSE and everything it wrote has drained - write interest is dropped and
@@ -367,7 +367,7 @@ typedef struct Connection {
     StreamCtxFree stream_ctx_free;
     int stream_paused;
 
-    /* `stream_buf` (M1, M5) is a lazily malloc'd, connection-owned STREAM_CHUNK_SIZE buffer shared by
+    /* `stream_buf` is a lazily malloc'd, connection-owned STREAM_CHUNK_SIZE buffer shared by
      * both streaming kinds: flush_connection reads each file chunk into it, or has the producer fill it,
      * and reuses it across turns (`out_buf` points at it while streaming) - never the shared arena, since
      * a stream spans many event-loop turns during which other connections would otherwise reuse and
@@ -376,7 +376,7 @@ typedef struct Connection {
 
     int events_watched;     /* EVENT_READ | EVENT_WRITE currently registered with the event loop */
 
-    /* Per-request bump allocator (M1): a pointer to the single arena shared by every connection this
+    /* Per-request bump allocator: a pointer to the single arena shared by every connection this
      * worker process serves (`App.arena`), not one embedded per connection - set once, at
      * connection_create, and never reassigned. Safe because the event loop is single-threaded and
      * non-blocking: at most one connection's handler code runs at a time, and control returns to the
@@ -485,7 +485,7 @@ typedef struct {
     char prefix[128];
 } MiddlewareEntry;
 
-/* app_use_body_limit slot (S4): a declared Content-Length over max_bytes for a request whose path
+/* app_use_body_limit slot: a declared Content-Length over max_bytes for a request whose path
  * falls under prefix (same segment-boundary rule as MiddlewareEntry) is rejected with 413 as soon as
  * headers are complete, before any body buffering. max_bytes is clamped to MAX_BODY_SIZE at
  * registration (it can only tighten the global cap, never loosen it). Chunked bodies are unaffected:
@@ -503,9 +503,9 @@ typedef struct {
     int middleware_count;
     char *static_root;            /* NULL for an ordinary route; for an app_serve_static mount, the malloc'd
                                    * canonical directory, owned by this Route and freed with it (router.c:
-                                   * route_free). Kept out of line (M6): an inline PATH_MAX array made every
+                                   * route_free). Kept out of line: an inline PATH_MAX array made every
                                    * Route, and every Router's Route[MAX_ROUTER_ROUTES], ~4 KB/route bigger on Linux. */
-    int has_params;               /* 1 if path has a ':name' segment (C2: match_route then fills req params
+    int has_params;               /* 1 if path has a ':name' segment (match_route then fills req params
                                    * from THIS pattern, never from the shared tree node's name) */
 } Route;
 
@@ -570,7 +570,7 @@ typedef struct {
      * accept_connections (connection.c) still accept()s the fd - it has to, to say anything at all -
      * but answers 503 + Connection: close immediately and closes it, without allocating a Connection
      * or touching the event loop. app_init sets DEFAULT_MAX_CONNECTIONS; set to 0 to opt out
-     * (uncapped, bounded only by RLIMIT_NOFILE, the pre-S3 behavior). */
+     * (uncapped, bounded only by RLIMIT_NOFILE, the old behavior). */
     int max_connections;
 } ServerConfig;
 
@@ -584,7 +584,7 @@ typedef struct {
     MiddlewareEntry middlewares[MAX_MIDDLEWARES];
     int middleware_count;
 
-    /* app_use_body_limit registrations (S4), checked by connection.c before a declared Content-Length
+    /* app_use_body_limit registrations, checked by connection.c before a declared Content-Length
      * body is buffered. Unrelated to `middlewares` above: looked up directly by path prefix, not run
      * as part of the middleware chain (it has to be checked before a Request even exists). */
     BodyLimitEntry body_limits[MAX_BODY_LIMITS];
@@ -592,7 +592,7 @@ typedef struct {
 
     ErrorHandler error_handler;
     int server_fd;
-    /* C4 (CEXPRESS_SINGLE_ACCEPTOR only): 0 = server_fd is a real listen socket, accept() directly
+    /* CEXPRESS_SINGLE_ACCEPTOR only: 0 = server_fd is a real listen socket, accept() directly
      * (the default, and the only mode on Linux). 1 = server_fd is this worker's control socket (the
      * worker-side end of a socketpair with the cluster master); new connections arrive as passed fds
      * via recvmsg/SCM_RIGHTS (connection.c: accept_passed_connections), never accept()ed by this
@@ -607,10 +607,10 @@ typedef struct {
         void *ring;      /* Linux io_uring (struct io_uring*) */
         int loop_fd;     /* platform-neutral int name */
     };
-    /* C5, Linux (and the macOS epoll-shim build): the backend event_loop_init chose (event_loop_backend.h),
+    /* Linux (and the macOS epoll-shim build): the backend event_loop_init chose (event_loop_backend.h),
      * which tells which union member above is live. NULL while no loop is open; kqueue builds leave it NULL. */
     const struct EventLoopOps *loop_ops;
-    /* io_uring backend only (C6): the live poll registration of each fd, indexed by fd, grown on demand
+    /* io_uring backend only: the live poll registration of each fd, indexed by fd, grown on demand
      * by event_loop_io_uring.c and freed by event_loop_close. NULL/0 on the other backends. */
     PollRegistration *poll_regs;
     int poll_regs_cap;
@@ -624,7 +624,7 @@ typedef struct {
     int connections_cap;
 
     /* Running count of open connections (accepted, not yet connection_close'd), kept in step with
-     * accept_connections (++) and connection_close (--) so the S3 max_connections check in
+     * accept_connections (++) and connection_close (--) so the max_connections check in
      * accept_connections is O(1) instead of rescanning `connections` on every accept - which would
      * turn a connection flood into the same O(n) hot-path problem this check exists to guard
      * against. Precise only across that accept/close pairing (the only one production code uses);
@@ -638,7 +638,7 @@ typedef struct {
      * enough to accept the connection that couldn't otherwise be accepted, answer 503, and close it
      * again - the alternative is accept() failing forever with no way to even say the server is
      * full, since every syscall including a rejection's accept() needs a free descriptor. -1 if the
-     * initial open failed (degrades to the pre-S3 silent behavior on EMFILE, same as before this
+     * initial open failed (degrades to the old silent behavior on EMFILE, same as before this
      * field existed). Opened by app_init, closed by app_destroy. */
     int spare_fd;
 
@@ -647,7 +647,7 @@ typedef struct {
 
     int is_shutting_down;  /* set by app_stop: no new connections, responses carry Connection: close */
 
-    /* Per-request bump allocator, shared by every connection this worker process serves (M1) - not one
+    /* Per-request bump allocator, shared by every connection this worker process serves - not one
      * per connection. `app_init` mallocs its ARENA_SIZE (64 KiB) buffer and calls arena_init; every
      * `Connection.arena` this process creates is simply `&app->arena`. Safe under the single-threaded,
      * non-blocking event loop model (see `Connection.arena`'s own comment for why); freed by
@@ -655,7 +655,7 @@ typedef struct {
      * it mallocs" convention arena.h documents for a hand-built Arena). */
     Arena arena;
 
-    /* M2: the receive buffer (BUF_SIZE) a connection with nothing buffered borrows in handle_readable
+    /* the receive buffer (BUF_SIZE) a connection with nothing buffered borrows in handle_readable
      * - one per worker process, not per connection. Only ever lent for the duration of one
      * handle_readable call (see Connection.in_buf), so a single buffer is enough under the
      * single-threaded event loop. malloc'd by app_init, freed by app_destroy. */

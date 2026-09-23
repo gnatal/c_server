@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include "http_parser.h"
 #include "router.h"
 #include "middleware.h"
 
@@ -10,7 +11,7 @@ void app_init(App *app) {
     app->config.workers = 1;
     app->config.max_connections = DEFAULT_MAX_CONNECTIONS;
     app->open_connections = 0;
-    /* Best effort (S3): a failed open just means EMFILE gets the pre-existing silent behavior -
+    /* Best effort: a failed open just means EMFILE gets the pre-existing silent behavior -
      * see App.spare_fd. */
     app->spare_fd = open("/dev/null", O_RDONLY);
     app->method_tree_count = 0;
@@ -21,7 +22,7 @@ void app_init(App *app) {
     app->server_fd = -1;
     app->accept_via_fd_passing = 0;
 #if defined(__linux__)
-    app->ring = NULL; /* widest union member; which one is live is decided by loop_ops (C5) */
+    app->ring = NULL; /* widest union member; which one is live is decided by loop_ops */
 #else
     app->loop_fd = -1;
 #endif
@@ -45,7 +46,7 @@ void app_init(App *app) {
     }
     app->connections_cap = INITIAL_CONNECTION_TABLE_CAP;
 
-    /* M1: one shared arena for the whole worker process (every Connection.arena it creates just points
+    /* one shared arena for the whole worker process (every Connection.arena it creates just points
      * here), not one per connection - see app_types.h's App.arena and Connection.arena comments. Same
      * failure convention as the calloc above: the server can't run without this either. */
     char *arena_buf = malloc(ARENA_SIZE);
@@ -55,7 +56,7 @@ void app_init(App *app) {
     }
     arena_init(&app->arena, arena_buf, ARENA_SIZE);
 
-    /* M2: the one receive buffer idle connections borrow (App.read_buf), instead of each owning one. */
+    /* the one receive buffer idle connections borrow (App.read_buf), instead of each owning one. */
     app->read_buf = malloc(BUF_SIZE);
     if (app->read_buf == NULL) {
         perror("app_init: malloc (read_buf)");
@@ -66,7 +67,7 @@ void app_init(App *app) {
 /* Shared fill logic for one route slot, used by both app_add_route_mw and
  * router_add_route_mw - an App and a Router register routes identically,
  * they just land in different fixed Route[MAX_ROUTES] arrays.
- * S12: a method/path that doesn't fit its fixed slot is rejected outright (0/-1), not silently
+ * a method/path that doesn't fit its fixed slot is rejected outright (0/-1), not silently
  * truncated by strncpy - a truncated pattern used to register a different, shorter route than the
  * caller asked for with no indication anything was wrong. Returns 0 on success, -1 (route left
  * untouched, nothing registered) if either is too long. */
@@ -315,25 +316,6 @@ void router_use(Router *router, Middleware mw) {
     router->middlewares[router->middleware_count++] = mw;
 }
 
-/* Normalizes a mount-point prefix (app_mount, app_serve_static): "" or "/"
- * alone means an unscoped/root mount - both app_use_prefix and
- * build_mounted_path below treat "" as "no prefix to add/match on". A
- * trailing slash (e.g. "/api/") is stripped so concatenating a route's own
- * leading-slash path doesn't double up ("/api//users"). Shared by both
- * mounting entry points rather than duplicated, since the rule is identical. */
-static void normalize_mount_prefix(const char *prefix, char *out, size_t out_size) {
-    if (prefix == NULL || prefix[0] == '\0' || strcmp(prefix, "/") == 0) {
-        out[0] = '\0';
-        return;
-    }
-    strncpy(out, prefix, out_size - 1);
-    out[out_size - 1] = '\0';
-    const size_t len = strlen(out);
-    if (len > 0 && out[len - 1] == '/') {
-        out[len - 1] = '\0';
-    }
-}
-
 /* Builds the mounted path for one router route: prefix + route->path, except
  * a router route registered at "/" (the router's own root) mounts at the
  * prefix itself rather than "prefix/" - so router_get(router, "/", h) mounted
@@ -349,7 +331,7 @@ static void build_mounted_path(char *out, size_t out_size, const char *prefix, c
 
 void app_mount(App *app, const char *prefix, const Router *router) {
     char normalized_prefix[128];
-    normalize_mount_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
+    path_normalize_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
 
     for (int i = 0; i < router->middleware_count; i++) {
         app_use_prefix(app, normalized_prefix, router->middlewares[i]);
@@ -372,7 +354,7 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
     }
 
     char normalized_prefix[128];
-    normalize_mount_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
+    path_normalize_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
 
     char pattern[256];
     snprintf(pattern, sizeof(pattern), "%s/*", normalized_prefix);
@@ -387,7 +369,7 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
         return;
     }
 
-    /* M6: sized to the canonical root, not PATH_MAX. Owned by the Route from here on - route_free
+    /* sized to the canonical root, not PATH_MAX. Owned by the Route from here on - route_free
      * releases it on every path, including tree_insert's own failures and duplicates. */
     const size_t root_size = strlen(canonical_root) + 1;
     route->static_root = malloc(root_size);
@@ -399,22 +381,6 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
     memcpy(route->static_root, canonical_root, root_size);
 
     app_insert_route_struct(app, route);
-}
-
-/* Same "prefix matches path at a segment boundary" rule as chain_next's app-wide middleware match
- * (middleware.c: middleware_prefix_matches) - kept as its own small copy here rather than shared,
- * since app_body_limit_for_path is looked up directly (no Request yet to hand a shared helper) while
- * middleware_prefix_matches works off one, and the two moved independently is not worth a coupling. */
-static int body_limit_prefix_matches(const char *prefix, const char *path) {
-    if (prefix[0] == '\0' || (prefix[0] == '/' && prefix[1] == '\0')) {
-        return 1;
-    }
-    const size_t prefix_len = strlen(prefix);
-    if (strncmp(path, prefix, prefix_len) != 0) {
-        return 0;
-    }
-    const char next = path[prefix_len];
-    return next == '\0' || next == '/';
 }
 
 void app_use_body_limit(App *app, const char *prefix, size_t max_bytes) {
@@ -431,8 +397,7 @@ void app_use_body_limit(App *app, const char *prefix, size_t max_bytes) {
         max_bytes = MAX_BODY_SIZE;
     }
     BodyLimitEntry *entry = &app->body_limits[app->body_limit_count++];
-    strncpy(entry->prefix, prefix, sizeof(entry->prefix) - 1);
-    entry->prefix[sizeof(entry->prefix) - 1] = '\0';
+    path_normalize_prefix(prefix, entry->prefix, sizeof(entry->prefix));
     entry->max_bytes = max_bytes;
 }
 
@@ -441,7 +406,7 @@ size_t app_body_limit_for_path(const App *app, const char *path) {
     size_t limit = MAX_BODY_SIZE;
     for (int i = 0; i < app->body_limit_count; i++) {
         const BodyLimitEntry *entry = &app->body_limits[i];
-        if (!body_limit_prefix_matches(entry->prefix, path)) {
+        if (!path_prefix_matches(entry->prefix, path)) {
             continue;
         }
         const size_t entry_len = strlen(entry->prefix);
@@ -525,7 +490,7 @@ int match_path(const char *pattern, const char *path, Request *req) {
 
 /* Total order over segment bytes (short-lexicographic: shared prefix compares first, shorter wins
  * ties) so children can be kept sorted and searched with binary search instead of a linear scan
- * (P7: was O(siblings) per segment, 8.4 us at 5,000 siblings). */
+ * (was O(siblings) per segment, 8.4 us at 5,000 siblings). */
 static int compare_seg(const char *a, size_t a_len, const char *b, size_t b_len) {
     size_t min_len = a_len < b_len ? a_len : b_len;
     int c = memcmp(a, b, min_len);
@@ -557,7 +522,7 @@ static int find_child(PatriciaNode *const *children, int child_count, const char
     return 0;
 }
 
-/* S12: returns NULL (nothing partially allocated - a failed prefix malloc frees the node before
+/* returns NULL (nothing partially allocated - a failed prefix malloc frees the node before
  * returning) on either allocation failing, instead of handing the caller a node with a dangling or
  * missing prefix. */
 static PatriciaNode *create_patricia_node(const char *prefix, size_t prefix_len, NodeType type) {
@@ -579,7 +544,7 @@ static PatriciaNode *create_patricia_node(const char *prefix, size_t prefix_len,
     return n;
 }
 
-/* S12: every node allocation and the children realloc are checked; on failure this frees `route` (route_free)
+/* every node allocation and the children realloc are checked; on failure this frees `route` (route_free)
  * (never inserted) and logs, rather than dereferencing a NULL node or leaking `route`. Any tree
  * structure already linked in before the failing allocation is harmless - a PatriciaNode with no
  * route is already a normal, valid internal node, and it's still shared by any other route that
@@ -680,7 +645,7 @@ static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route)
     }
 }
 
-/* C2: the walk only finds the Route; it captures nothing. A param node is shared by every route with a
+/* the walk only finds the Route; it captures nothing. A param node is shared by every route with a
  * parameter (or mid-pattern '*') at that position, so its prefix is only the FIRST registrant's name -
  * naming captures from it returned NULL for "/orders/:oid/notes" registered after "/orders/:id/items".
  * match_route fills names/values afterwards from the matched Route's own pattern (fill_route_params). */
@@ -719,7 +684,7 @@ static const Route *tree_search(const PatriciaNode *node, const char *path) {
     return tree_search_recursive(node, cursor, seg, seg_len);
 }
 
-/* C2: names AND values come from the matched route's own pattern, so every route sees its own ':name's
+/* names AND values come from the matched route's own pattern, so every route sees its own ':name's
  * regardless of what an earlier route called the shared tree position. The tree already proved the
  * match, so match_path cannot fail here; routes without ':' skip the second walk entirely. */
 static const Route *fill_route_params(const Route *route, Request *req) {

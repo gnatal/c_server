@@ -1,25 +1,10 @@
 #include <stdio.h>
 #include <string.h>
+#include "http_parser.h"
 #include "middleware.h"
 #include "response.h"
 #include "router.h"
 #include "static.h"
-
-/* prefix "" or "/" is treated as unscoped (matches every path), same as an
- * app_use() call before prefix-scoping existed. Otherwise path must start
- * with prefix and either end there or be followed by '/', so "/api" matches
- * "/api"/"/api/foo" but not "/apiary". */
-static int middleware_prefix_matches(const char *prefix, const char *path) {
-    if (prefix[0] == '\0' || (prefix[0] == '/' && prefix[1] == '\0')) {
-        return 1;
-    }
-    const size_t prefix_len = strlen(prefix);
-    if (strncmp(path, prefix, prefix_len) != 0) {
-        return 0;
-    }
-    const char next = path[prefix_len];
-    return next == '\0' || next == '/';
-}
 
 /* Checks whether method (e.g. "HEAD") appears as its own comma-separated
  * token in list (e.g. "GET, POST"), not just as a substring - used below to
@@ -48,13 +33,10 @@ void app_use_prefix(App *app, const char *prefix, Middleware mw) {
         fprintf(stderr, "app_use: MAX_MIDDLEWARES exceeded\n");
         return;
     }
-    if (prefix == NULL) {
-        prefix = "";
-    }
     MiddlewareEntry *entry = &app->middlewares[app->middleware_count++];
     entry->fn = mw;
-    strncpy(entry->prefix, prefix, sizeof(entry->prefix) - 1);
-    entry->prefix[sizeof(entry->prefix) - 1] = '\0';
+    /* "/admin/" or "admin" must scope the same as "/admin", not silently match nothing. */
+    path_normalize_prefix(prefix, entry->prefix, sizeof(entry->prefix));
 }
 
 void app_use_error(App *app, ErrorHandler handler) {
@@ -64,7 +46,7 @@ void app_use_error(App *app, ErrorHandler handler) {
 void chain_next(MiddlewareChain *chain) {
     while (chain->index < chain->count) {
         const MiddlewareEntry *entry = &chain->middlewares[chain->index++];
-        if (!middleware_prefix_matches(entry->prefix, chain->req->path)) {
+        if (!path_prefix_matches(entry->prefix, chain->req->path)) {
             continue;
         }
         entry->fn(chain->req, chain->res, chain);

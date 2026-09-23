@@ -10,7 +10,7 @@
  *
  * DON'T (each of these is a real bug pattern, see lib/CLAUDE.md "Ownership"):
  *  1. free() or keep anything reached through `req`: it dies when the handler returns. That covers
- *     req->body (a view into the connection's input buffer since M4) and every pointer from req_get_param / req_get_query /
+ *     req->body (a view into the connection's input buffer) and every pointer from req_get_param / req_get_query /
  *     req_get_header / req_get_cookie.
  *  2. strlen(req->body) for binary bodies: use req->content_length (bodies may hold NUL bytes).
  *  3. keep a string borrowed from a parsed yyjson document (yyjson_get_str) or anything from arena_alloc past the
@@ -376,7 +376,7 @@ static void recipe_stream(const Request *req, Response *res) {
 }
 
 /* ---------------------------------------------------------------------------------------------
- * RECIPE 14 - large or endless responses with res_stream (M5): generated downloads, server-sent events.
+ * RECIPE 14 - large or endless responses with res_stream: generated downloads, server-sent events.
  * res_write (recipe 12) buffers the whole body until the handler returns (at most MAX_BODY_SIZE).
  * res_stream instead hands the engine a producer that the event loop calls each time the previous
  * output has reached the socket, so a connection never holds more than STREAM_CHUNK_SIZE of it.

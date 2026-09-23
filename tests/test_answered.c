@@ -1,5 +1,5 @@
 /*
- * T1: "every input is answered or closed", end to end. Each input is written into a socketpair(2) in
+ * "every input is answered or closed", end to end. Each input is written into a socketpair(2) in
  * pieces (whole, byte by byte, every single cut, or random cuts) and driven through the real
  * handle_readable / handle_writable, then the bytes the engine wrote back are compared with a reference
  * model built only from the pure parser (model_run): the same statuses in the same order, a 100 Continue
@@ -87,7 +87,7 @@ static void put_escaped(const char *s, size_t n) {
 }
 
 static void fail(int line, const char *what, size_t out_len) {
-    fprintf(stderr, "T1 answered-oracle failed at tests/test_answered.c:%d (%s), run %ld\n  input (%zu bytes): \"",
+    fprintf(stderr, "answered-oracle failed at tests/test_answered.c:%d (%s), run %ld\n  input (%zu bytes): \"",
             line, what, runs, cur_len);
     put_escaped(cur_in, cur_len);
     fputs("\"\n  cuts:", stderr);
@@ -135,7 +135,7 @@ static void model_run(const char *in, const size_t len, Model *m) {
         a->is_head = 0;
         a->may_continue = request_head_expects_continue(&h);
 
-        /* S4: a declared Content-Length over the route's limit is refused once the head is in. */
+        /* a declared Content-Length over the route's limit is refused once the head is in. */
         if (h.header_len > 0 && !h.chunked && h.content_length >= 0) {
             char path[256];
             const size_t n = h.path_len < sizeof(path) - 1 ? h.path_len : sizeof(path) - 1;
@@ -312,7 +312,7 @@ static void run_split(const char *in, const size_t len, const size_t *cuts, cons
         const size_t have = c->in_buf != NULL ? c->in_len - c->in_off : 0;
         CHECK(have == len - m->tail_off, out_len);
         CHECK(have == 0 || memcmp(c->in_buf + c->in_off, in + m->tail_off, have) == 0, out_len);
-        if (m->tail_must_continue) CHECK(continued, out_len); /* C1: a body the engine waits on is invited */
+        if (m->tail_must_continue) CHECK(continued, out_len); /* a body the engine waits on is invited */
         connection_close(&app, c);
     }
     close(fds[1]);

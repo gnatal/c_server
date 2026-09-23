@@ -122,7 +122,7 @@ static int put_uint(char *buf, const size_t cap, size_t *off, size_t value) {
     return put_bytes(buf, cap, off, digits + i, sizeof(digits) - i);
 }
 
-/* C3: RFC 9110 6.4.1 / 8.6: a 1xx, 204 or 304 response never has content, and 1xx/204 must not carry
+/* RFC 9110 6.4.1 / 8.6: a 1xx, 204 or 304 response never has content, and 1xx/204 must not carry
  * Content-Length (nor Transfer-Encoding). Such a response ends at its head, so every sending path must
  * also drop body bytes - a body sent without framing would be read as the start of the next response. */
 static int status_has_no_body(const int status) {
@@ -141,7 +141,7 @@ static int body_suppressed(const Response *res) {
  * + "Connection: ..\r\n" + custom headers + Set-Cookie lines + (Trailer: names)
  * + blank line into buf. Returns the head length, or 0 if it does not fit.
  * A custom Content-Type (res_set_header) replaces `content_type` and is emitted once.
- * C3: Date comes from http_date_for's per-second cache (a 29-byte memcpy per response). A 1xx/204/304
+ * Date comes from http_date_for's per-second cache (a 29-byte memcpy per response). A 1xx/204/304
  * gets no framing headers, no Trailer, and no default Content-Type (an explicit one is kept).
  */
 #define CHUNKED_BODY ((size_t)-1)
@@ -236,13 +236,13 @@ static void send_with_content_type(Response *res, const char *content_type, cons
 
     /* Content-Length is always the full body's: a HEAD response reports what GET would
      * (RFC 7231 4.3.2) but sends no body bytes. body == NULL means a file stream (head only).
-     * A 1xx/204/304 sends neither (C3). */
+     * A 1xx/204/304 sends neither. */
     const size_t sent_body_len = (body != NULL && !body_suppressed(res)) ? body_len : 0;
 
     /* A second res_send/res_json in the same request replaces the first response (last wins);
      * the earlier buffer is simply left in the arena to be freed at request end. */
 
-    /* Ownership: managed by the shared per-worker arena (M1), not a per-connection one - reclaimed by
+    /* Ownership: managed by the shared per-worker arena, not a per-connection one - reclaimed by
      * arena_reset once this request's dispatch-and-flush cycle ends (handle_readable/reject_request),
      * unless flush_connection has to copy an unsent tail out to a connection-owned buffer first (see
      * Connection.out_buf_owned) because the response couldn't be fully written in one go. */

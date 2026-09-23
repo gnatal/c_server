@@ -62,7 +62,7 @@ static void teardown_test_connection(App *app, int fds[2], Connection *conn) {
     app_destroy(app);
 }
 
-/* S3 tests need real accept_connections() behavior (accept() itself, EMFILE, the listen backlog),
+/* Overload tests need real accept_connections() behavior (accept() itself, EMFILE, the listen backlog),
  * which socketpair(2) can't exercise - a real loopback TCP listener is required instead. Binds an
  * ephemeral port (port 0) and initializes the event loop, since accept_connections calls
  * event_loop_watch_read for any connection it doesn't reject. */
@@ -116,7 +116,7 @@ static void test_set_nonblocking_and_create(void) {
     int flags = fcntl(p[0], F_GETFL, 0);
     assert(flags & O_NONBLOCK);
 
-    /* M1: connection_create points its arena at App.arena now, so it needs one in scope even for a
+    /* connection_create points its arena at App.arena now, so it needs one in scope even for a
      * connection this test never registers into app.connections (app_destroy below won't touch it). */
     App app;
     app_init(&app);
@@ -124,7 +124,7 @@ static void test_set_nonblocking_and_create(void) {
     Connection *c = connection_create(&app, p[0]);
     assert(c != NULL);
     assert(c->fd == p[0]);
-    assert(c->in_buf == NULL); /* M2: no input memory until a request is partially received */
+    assert(c->in_buf == NULL); /* no input memory until a request is partially received */
     assert(c->in_cap == 0);
     assert(c->out_buf == NULL);
     assert(c->in_len == 0);
@@ -253,7 +253,7 @@ static void test_handle_readable_malformed_400(void) {
 }
 
 static void test_handle_readable_malformed_request_line_400(void) {
-    /* S8: a request line picohttpparser rejects outright (here, no HTTP version) used to leave
+    /* a request line picohttpparser rejects outright (here, no HTTP version) used to leave
      * header_len at 0, indistinguishable from "need more bytes" - request_is_complete reported
      * incomplete forever, so the connection just sat there instead of getting an immediate 400
      * (improvements.md's MEASURED reproduction: no reply, socket stays open). */
@@ -330,12 +330,12 @@ static void test_handle_readable_header_overflow_431(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
-/* P3: unlike the whole-header-block-over-BUF_SIZE case above, this is a single header value that used
- * to be too long for its fixed-size MAX_HEADER_VALUE_LEN slot (S5's -3 -> 431) even though the request
+/* unlike the whole-header-block-over-BUF_SIZE case above, this is a single header value that used
+ * to be too long for its fixed-size MAX_HEADER_VALUE_LEN slot (the old -3 -> 431) even though the request
  * comfortably fits under BUF_SIZE. Now that req->headers holds views into conn->in_buf instead of
  * fixed-size copies, there is no per-header cap left to trip: this exact shape parses successfully and
- * the value round-trips through req_get_header exactly, uncut - the "proper fix" improvements.md's S5
- * entry said P3 would be. */
+ * the value round-trips through req_get_header exactly, uncut - the "proper fix" improvements.md said header views
+ * would be. */
 static void test_handle_readable_long_header_value_is_not_capped(void) {
     App app;
     int fds[2];
@@ -366,7 +366,7 @@ static void test_handle_readable_long_header_value_is_not_capped(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
-/* S6: "%00" in the request-target used to decode into a real NUL, silently truncating req->path for
+/* "%00" in the request-target used to decode into a real NUL, silently truncating req->path for
  * every C-string function reading it afterward - improvements.md measured "GET /static/style.css%00.png"
  * being routed (and served) as "/static/style.css". parse_http_request now rejects this outright (-4)
  * before routing ever runs, so the connection gets an explicit 400 instead of a 200 for the truncated
@@ -445,7 +445,7 @@ static void test_handle_readable_large_body_grows_buffer(void) {
     assert(strstr(resp, "received 20000 bytes") != NULL);
 
     /* Keep-alive connection stays open, and the grown in_buf was freed now that nothing is
-     * buffered (flush_connection, M2: an idle connection owns no input memory). */
+     * buffered (flush_connection, an idle connection owns no input memory). */
     assert(app.connections[fds[0]] == conn);
     assert(conn->in_buf == NULL);
     assert(conn->in_cap == 0);
@@ -483,7 +483,7 @@ static void test_handle_readable_body_too_large_413(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
-/* S4: a declared Content-Length is no longer reserved in one shot (in_cap jumping straight to
+/* a declared Content-Length is no longer reserved in one shot (in_cap jumping straight to
  * header_len + content_length + 1) - in_buf grows by doubling as bytes actually arrive, the same
  * strategy the chunked path already used. Regression for the MEASURED problem in improvements.md
  * (300 connections each declaring a 10 MiB body and sending 9 KB cost +3,000 MB of virtual memory). */
@@ -543,7 +543,7 @@ static void test_handle_readable_content_length_grows_geometrically(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
-/* S4: app_use_body_limit rejects a declared Content-Length over a route's configured limit with 413
+/* app_use_body_limit rejects a declared Content-Length over a route's configured limit with 413
  * as soon as headers are complete, before any body byte is buffered - conn->in_cap must never grow
  * past BUF_SIZE for a request rejected this way. */
 static void test_handle_readable_route_body_limit_413(void) {
@@ -612,7 +612,7 @@ static size_t read_pending(const int fd, char *out, const size_t cap) {
     return got;
 }
 
-/* C1: headers with "Expect: 100-continue" and no body yet get exactly one "100 Continue" before the
+/* headers with "Expect: 100-continue" and no body yet get exactly one "100 Continue" before the
  * body arrives; the body then arrives over several reads without a second one, and the final response
  * follows. A second request on the same keep-alive connection gets its own (continue_sent reset). */
 static void test_handle_readable_expect_continue_sends_100_once(void) {
@@ -649,7 +649,7 @@ static void test_handle_readable_expect_continue_sends_100_once(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
-/* C1: a chunked upload with Expect gets its 100 too. */
+/* a chunked upload with Expect gets its 100 too. */
 static void test_handle_readable_expect_continue_chunked(void) {
     App app;
     int fds[2];
@@ -674,7 +674,7 @@ static void test_handle_readable_expect_continue_chunked(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
-/* C1: no 100 when it is not wanted or not allowed - the body already arrived with the headers, the
+/* no 100 when it is not wanted or not allowed - the body already arrived with the headers, the
  * client is HTTP/1.0, or the declared body is over the route limit (413 instead, body never invited). */
 static void test_handle_readable_expect_continue_not_sent(void) {
     App app;
@@ -756,7 +756,7 @@ static void test_handle_readable_chunked_round_trip(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
-/* P8: a chunked body dribbled in over several reads advances Connection.chunk_scan past each
+/* a chunked body dribbled in over several reads advances Connection.chunk_scan past each
  * completed chunk (so no read rescans the body before it), and a keep-alive response resets it -
  * a second chunked request on the same connection must scan from its own body start, not resume at
  * the first request's offset (which would mis-frame it). */
@@ -860,7 +860,7 @@ static void test_handle_readable_chunked_grows_buffer(void) {
     assert(strstr(resp, expected) != NULL);
 
     /* Keep-alive connection stays open, and the grown in_buf was freed now that nothing is
-     * buffered (flush_connection, M2: an idle connection owns no input memory). */
+     * buffered (flush_connection, an idle connection owns no input memory). */
     assert(app.connections[fds[0]] == conn);
     assert(conn->in_buf == NULL);
     assert(conn->in_cap == 0);
@@ -944,7 +944,7 @@ static void test_handle_readable_chunked_and_content_length_400(void) {
 }
 
 static void test_handle_readable_bare_lf_400(void) {
-    /* S11: picohttpparser tolerates a bare '\n' as a line terminator, a leniency a strict front proxy
+    /* picohttpparser tolerates a bare '\n' as a line terminator, a leniency a strict front proxy
      * would not extend - closing that ambiguity end to end through the real connection path. */
     App app;
     int fds[2];
@@ -966,7 +966,7 @@ static void test_handle_readable_bare_lf_400(void) {
 }
 
 static void test_handle_readable_unsupported_transfer_encoding_501(void) {
-    /* S11: a Transfer-Encoding this engine can't frame (here, "chunked" isn't the value's sole token) is
+    /* a Transfer-Encoding this engine can't frame (here, "chunked" isn't the value's sole token) is
      * rejected with 501 rather than silently mistaken for plain chunked framing via a substring match. */
     App app;
     int fds[2];
@@ -1090,9 +1090,9 @@ static void test_close_idle_connections_408s_stalled_partial_request(void) {
     assert(conn->in_len > 0);
 
     conn->last_activity = time(NULL) - IDLE_TIMEOUT_SECONDS - 1;
-    /* handle_readable already started the S1 request_started clock; back it up past
+    /* handle_readable already started the request_started clock; back it up past
      * IDLE_TIMEOUT_SECONDS too so this exercises the pre-existing "quiet past IDLE_TIMEOUT_SECONDS"
-     * shape (bigger than either S1 deadline) rather than the new, tighter one. */
+     * shape (bigger than either request deadline) rather than the new, tighter one. */
     conn->request_started = time(NULL) - IDLE_TIMEOUT_SECONDS - 1;
     close_idle_connections(&app);
 
@@ -1130,7 +1130,7 @@ static void test_close_idle_connections_skips_pending_write(void) {
 
     /* Simulate a write still in flight that is actively making progress (e.g. a slow but real
      * reader on the response side) - this is a different axis than the read-side idle timeout, and
-     * must not be torn down by close_idle_connections as long as last_write_progress is recent (S2). */
+     * must not be torn down by close_idle_connections as long as last_write_progress is recent. */
     conn->out_buf = malloc(4);
     assert(conn->out_buf != NULL);
     memcpy(conn->out_buf, "ping", 4);
@@ -1146,7 +1146,7 @@ static void test_close_idle_connections_skips_pending_write(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
-/* S2: a client that requests a response and then stops reading (never a byte accepted onto the
+/* a client that requests a response and then stops reading (never a byte accepted onto the
  * socket) used to be exempted from close_idle_connections entirely ("slow readers are not this
  * timeout's job"), pinning the fd, arena and out_buf forever. last_write_progress bounds that. */
 static void test_close_idle_connections_write_stall_closes_connection(void) {
@@ -1173,7 +1173,7 @@ static void test_close_idle_connections_write_stall_closes_connection(void) {
 }
 
 
-/* S1: a client that sends one byte every few seconds keeps refreshing last_activity forever, so the
+/* a client that sends one byte every few seconds keeps refreshing last_activity forever, so the
  * old idle-only check (last_activity vs IDLE_TIMEOUT_SECONDS) never fires. request_started does not
  * reset on each byte, so it bounds total time-to-complete-headers regardless. */
 static void test_close_idle_connections_header_deadline_closes_slow_drip(void) {
@@ -1452,7 +1452,7 @@ static void test_handle_readable_during_shutdown_forces_connection_close(void) {
     app_destroy(&app);
 }
 
-/* S2, end to end through the real flush_connection path (not a manually poked field): a response
+/* Write-stall deadline, end to end through the real flush_connection path (not a manually poked field): a response
  * larger than the socketpair's kernel buffers, with nobody ever reading the peer end, forces a real
  * EAGAIN partway through and proves flush_connection itself arms last_write_progress. Backdating it
  * past WRITE_TIMEOUT_SECONDS and re-running the sweep must then reclaim the stuck connection -
@@ -1567,7 +1567,7 @@ static void test_res_send_file_streams_to_socket(void) {
     app_destroy(&app);
 }
 
-/* Finds "\r\n\r\n" in a buffer that isn't NUL-terminated (or safe to strstr - the M1 test below streams
+/* Finds "\r\n\r\n" in a buffer that isn't NUL-terminated (or safe to strstr - the shared-arena test below streams
  * binary content that legitimately contains NUL bytes) and returns a pointer just past it, or NULL. */
 static const char *skip_response_head(const char *buf, size_t len) {
     for (size_t i = 0; i + 3 < len; i++) {
@@ -1578,7 +1578,7 @@ static const char *skip_response_head(const char *buf, size_t len) {
     return NULL;
 }
 
-/* M1 regression: Connection.arena became a pointer to one Arena shared by every connection a worker
+/* Shared-arena regression: Connection.arena became a pointer to one Arena shared by every connection a worker
  * serves, instead of one embedded per connection - the risk improvements.md called out for this fix
  * is exactly the scenario built here. A file well over STREAM_CHUNK_SIZE is streamed to conn1 over a
  * socketpair (small enough buffers that flush_connection's own 4*STREAM_CHUNK_SIZE fairness-yield
@@ -1672,7 +1672,7 @@ static void test_flush_connection_file_stream_survives_another_connections_dispa
     }
     assert(app.connections[fds1[0]] == NULL);
     /* If this is 0, the file was too small (or max_flush_bytes/STREAM_CHUNK_SIZE changed) for the
-     * fairness-yield to ever fire, and the test below would pass without exercising M1 at all. */
+     * fairness-yield to ever fire, and the test below would pass without exercising the shared arena at all. */
     assert(interleaved > 0);
 
     const char *body = skip_response_head(received, received_len);
@@ -1689,7 +1689,7 @@ static void test_flush_connection_file_stream_survives_another_connections_dispa
     app_destroy(&app);
 }
 
-/* P10: accept_client is a single accept/accept4 call with no per-connection fcntl/setsockopt; the fd
+/* accept_client is a single accept/accept4 call with no per-connection fcntl/setsockopt; the fd
  * it returns must still be non-blocking with TCP_NODELAY (inherited from create_server_socket's
  * listener on BSD/macOS; accept4 flags + listener inheritance on Linux, where FD_CLOEXEC comes free
  * too). Fails if a platform stops inheriting either, instead of Nagle or blocking I/O coming back
@@ -1748,7 +1748,7 @@ static void test_accept_client_socket_options(void) {
     app_destroy(&app);
 }
 
-/* S3: accept_connections used to accept without limit, bounded only by RLIMIT_NOFILE - a flood of
+/* accept_connections used to accept without limit, bounded only by RLIMIT_NOFILE - a flood of
  * connections had no graceful degradation, just an eventual, silent EMFILE. max_connections caps
  * concurrently open connections per worker; past it, accept_connections still accept()s (it has to,
  * to answer at all) but sends 503 + Connection: close and closes immediately, without registering a
@@ -1775,7 +1775,7 @@ static void test_accept_connections_enforces_max_connections(void) {
     assert(n > 0);
     assert(strstr(resp, "HTTP/1.1 503 Service Unavailable") != NULL);
     assert(strstr(resp, "Connection: close") != NULL);
-    assert(strstr(resp, "\r\nDate: ") != NULL && strstr(resp, " GMT\r\n") != NULL); /* C3 */
+    assert(strstr(resp, "\r\nDate: ") != NULL && strstr(resp, " GMT\r\n") != NULL); /* Date header */
 
     for (int i = 0; i < 3; i++) {
         close(clients[i]);
@@ -1783,7 +1783,7 @@ static void test_accept_connections_enforces_max_connections(void) {
     app_destroy(&app);
 }
 
-/* max_connections == 0 is a deliberate opt-out (uncapped, the pre-S3 default): the accept path must
+/* max_connections == 0 is a deliberate opt-out (uncapped, the old default): the accept path must
  * not treat "unset" as "zero capacity". */
 static void test_accept_connections_max_connections_zero_is_unlimited(void) {
     App app;
@@ -1807,7 +1807,7 @@ static void test_accept_connections_max_connections_zero_is_unlimited(void) {
 }
 
 /*
- * S3, EMFILE recovery. Simulates the process being genuinely out of file descriptors (not just past
+ * EMFILE recovery. Simulates the process being genuinely out of file descriptors (not just past
  * the configured max_connections) by lowering RLIMIT_NOFILE to exactly the number of descriptors
  * currently in use, so the very next fd allocation - accept()'s own - is guaranteed to fail with
  * EMFILE.

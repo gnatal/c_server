@@ -23,7 +23,8 @@
 void app_use(App *app, Middleware mw);
 
 /* App-wide middleware only for paths under `prefix` at a segment boundary: "/api" matches "/api"
- * and "/api/x", not "/apiary". Prefix "" or "/" matches everything. */
+ * and "/api/x", not "/apiary". Prefix "" or "/" matches everything. The prefix is normalized
+ * (path_normalize_prefix) and req->path is canonical, so "//api/x" is covered too. */
 void app_use_prefix(App *app, const char *prefix, Middleware mw);
 
 /* Sets the one app-wide error handler that receives every chain_error(). The last call wins.

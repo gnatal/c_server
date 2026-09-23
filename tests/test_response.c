@@ -11,7 +11,7 @@
 
 static Connection *make_conn(void) {
     Connection *conn = calloc(1, sizeof(Connection));
-    /* M1: Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
+    /* Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
      * now, not one embedded per connection - malloc a standalone Arena for this fixture to point at. */
     Arena *arena = malloc(sizeof(Arena));
     arena_init(arena, malloc(64 * 1024), 64 * 1024);
@@ -21,7 +21,7 @@ static Connection *make_conn(void) {
     return conn;
 }
 
-/* C3: every head carries "Date: <IMF-fixdate>\r\n" right after the status line. Asserts that, then returns a
+/* every head carries "Date: <IMF-fixdate>\r\n" right after the status line. Asserts that, then returns a
  * malloc'd copy of the response without that line (caller frees), so exact-byte checks stay clock-independent. */
 static char *without_date(const char *resp, size_t len, size_t *out_len) {
     const char *status_end = memchr(resp, '\n', len);
@@ -556,7 +556,7 @@ static void test_trailer_injection_is_refused(void) {
     free_conn(conn);
 }
 
-/* C3: every head carries a Date line, and the engine owns it (res_set_header refuses a custom one). */
+/* every head carries a Date line, and the engine owns it (res_set_header refuses a custom one). */
 static void test_date_header_present_and_reserved(void) {
     Connection *conn = make_conn();
     Response res;
@@ -571,7 +571,7 @@ static void test_date_header_present_and_reserved(void) {
     free_conn(conn);
 }
 
-/* C3: 1xx/204/304 are bodiless - no Content-Length / Transfer-Encoding / default Content-Type, no body
+/* 1xx/204/304 are bodiless - no Content-Length / Transfer-Encoding / default Content-Type, no body
  * bytes - on every sending path, so a keep-alive client never reads stray bytes as the next response. */
 static void test_bodiless_statuses_send_head_only(void) {
     const int statuses[] = { 204, 304, 103 };

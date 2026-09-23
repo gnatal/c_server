@@ -1,6 +1,6 @@
 UNAME_S := $(shell uname -s)
 
-# Linux (C5): io_uring and epoll are both built; event_loop_linux.c picks one at runtime (io_uring, falling
+# Linux: io_uring and epoll are both built; event_loop_linux.c picks one at runtime (io_uring, falling
 # back to epoll when the ring cannot be created). NO_URING=1 builds epoll only and drops the liburing dependency.
 ifeq ($(UNAME_S),Linux)
     CC = gcc
@@ -172,7 +172,7 @@ bench: $(BENCH_BIN)
 check-docs:
 	./scripts/check_docs.sh
 
-# Mutation fuzzing of the request parser under ASan + UBSan (see tests/fuzz_parser.c), then T1's end-to-end
+# Mutation fuzzing of the request parser under ASan + UBSan (see tests/fuzz_parser.c), then the end-to-end
 # "every input is answered or closed" oracle over real sockets (tests/test_answered.c) with
 # FUZZ_ANSWERED_ITERS random inputs. FUZZ_SEED varies both runs' inputs (0 = the default stream).
 FUZZ_ITERS ?= 1000000

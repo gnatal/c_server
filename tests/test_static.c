@@ -8,7 +8,7 @@
 #include "static.h"
 #include "response.h"
 
-/* ---- static_serve_file's in-memory cache (P1) ---- */
+/* ---- static_serve_file's in-memory cache ---- */
 
 static void sleep_past_revalidate_window(void) {
     /* STATIC_CACHE_REVALIDATE_SECONDS is 1 (app_types.h); comfortably clear it. */
@@ -80,7 +80,7 @@ static void test_mime_type_defaults_to_octet_stream(void) {
 
 static Connection *make_conn(void) {
     Connection *conn = calloc(1, sizeof(Connection));
-    /* M1: Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
+    /* Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
      * now, not one embedded per connection - malloc a standalone Arena for this fixture to point at. */
     Arena *arena = malloc(sizeof(Arena));
     arena_init(arena, malloc(64 * 1024), 64 * 1024);

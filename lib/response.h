@@ -9,7 +9,7 @@
  *   res_send / res_json / res_send_bytes / res_redirect   (whole body at once)
  *   res_write ... res_end                                  (chunked streaming)
  *   res_send_file                                          (file streamed from disk)
- *   res_stream                                             (producer called by the event loop, M5)
+ *   res_stream                                             (producer called by the event loop)
  * Order: res_status and res_set_header / res_set_cookie first, then the sending call.
  * Nothing here touches the socket: the bytes are built into conn->out_buf and written later by the
  * event loop (flush_connection). A second res_send in the same request replaces the first.
@@ -20,7 +20,7 @@
  * The engine calls this before every dispatch; unit tests may call it instead of memset. */
 void res_init(Response *res, Connection *conn);
 
-/* Sets the status code (default 200). C3: a 1xx, 204 or 304 status makes the response bodiless - every
+/* Sets the status code (default 200). a 1xx, 204 or 304 status makes the response bodiless - every
  * sending call then emits the head only (no Content-Length / Transfer-Encoding, no default Content-Type,
  * no body bytes, no trailers), whatever body it was given. */
 void res_status(Response *res, int status);
@@ -81,7 +81,7 @@ void res_end(Response *res);
 int res_send_file(Response *res, const char *content_type, const char *filepath);
 
 /*
- * Producer streaming (M5) for bodies too large or too slow to build inside the handler: large generated
+ * Producer streaming for bodies too large or too slow to build inside the handler: large generated
  * downloads, server-sent events, long-poll. Commits the status line and headers (Transfer-Encoding:
  * chunked; set Content-Type etc. first) and returns; the event loop then calls
  * `producer(writer, ctx)` every time the previous output has drained to the socket, so memory stays at

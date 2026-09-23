@@ -1,5 +1,5 @@
 /*
- * M2: input memory is borrowed per read from the worker's shared App.read_buf, not owned by every
+ * input memory is borrowed per read from the worker's shared App.read_buf, not owned by every
  * connection. An idle connection holds no input buffer; a complete request is parsed in place in
  * App.read_buf; only unserved bytes (a partial request, or requests pipelined behind a pending
  * response) are copied into a connection-owned buffer, which is freed once nothing is buffered.
@@ -27,7 +27,7 @@ static void echo_path_handler(const Request *req, Response *res) {
     res_send(res, req->path);
 }
 
-/* Echoes the X-Tag header and body length: both are read from in_buf (header views, P3). */
+/* Echoes the X-Tag header and body length: both are read from in_buf (header views). */
 static void echo_upload_handler(const Request *req, Response *res) {
     const char *tag = req_get_header(req, "X-Tag");
     char body[128];
@@ -48,7 +48,7 @@ static void big_handler(const Request *req, Response *res) {
     free(body); /* res_send_bytes copied it into the arena */
 }
 
-/* M4: reports whether req->body is a view into the connection's input buffer (not an arena copy). */
+/* reports whether req->body is a view into the connection's input buffer (not an arena copy). */
 static void body_location_handler(const Request *req, Response *res) {
     const Connection *c = res->conn;
     const int in_input = req->body >= c->in_buf && req->body + req->content_length < c->in_buf + c->in_cap;
@@ -139,8 +139,8 @@ static void test_idle_connection_owns_no_input_buffer(void) {
     app_destroy(&app);
 }
 
-/* The core M2 hazard: connection A's partial request must survive connection B being served out of
- * the same App.read_buf in between. A's header (a view into in_buf, P3) and body bytes are checked
+/* The core shared-receive-buffer hazard: connection A's partial request must survive connection B being served out of
+ * the same App.read_buf in between. A's header (a view into in_buf) and body bytes are checked
  * in its eventual response. */
 static void test_partial_request_survives_another_connections_read(void) {
     App app;
@@ -291,7 +291,7 @@ static void test_rejection_from_read_buf_keeps_shared_buffer(void) {
     read_available(fds_bad[1], out, sizeof(out));
     assert(strstr(out, "400") != NULL);
 
-    /* Headers over BUF_SIZE with no terminator: 431 straight from the borrowed buffer, as before M2. */
+    /* Headers over BUF_SIZE with no terminator: 431 straight from the borrowed buffer, as before the shared receive buffer. */
     int fds_huge[2];
     Connection *huge = add_connection(&app, fds_huge);
     char big_headers[BUF_SIZE + 64];
@@ -336,7 +336,7 @@ static void test_idle_sweep_408_with_owned_partial_buffer(void) {
     app_destroy(&app);
 }
 
-/* M4: the handler's req->body is a view into in_buf - the borrowed App.read_buf for a small body, the
+/* the handler's req->body is a view into in_buf - the borrowed App.read_buf for a small body, the
  * grown owned buffer for a large one, decoded in place for chunked - never an arena copy. A request
  * pipelined right behind a Content-Length body (its first byte held the body's NUL) is still served. */
 static void test_body_is_a_view_into_the_input_buffer(void) {

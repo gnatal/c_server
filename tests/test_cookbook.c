@@ -18,7 +18,7 @@ char test_arena_buf[64 * 1024];
 static char *fetch(App *app, const char *raw, const size_t raw_len) {
     Connection conn;
     memset(&conn, 0, sizeof(conn));
-    /* M1: Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
+    /* Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
      * now, not one embedded per connection - point it at its own local Arena, same buffer as before. */
     Arena conn_arena;
     arena_init(&conn_arena, test_arena_buf, sizeof(test_arena_buf));
@@ -96,6 +96,16 @@ static void expect_header(App *app, const char *request, const char *needle) {
     free(resp);
 }
 
+/* Asserts the parser refuses `request` (the engine answers such a request 400 and closes). */
+static void expect_rejected(App *app, const char *request) {
+    char *resp = get(app, request);
+    if (strcmp(resp, "PARSE_ERROR") != 0) {
+        fprintf(stderr, "request: %s\nexpected a parse error, got:\n%s\n", request, resp);
+        assert(0);
+    }
+    free(resp);
+}
+
 static void test_basic_recipes(App *app) {
     expect(app, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 200 OK", "Hello, world");
     expect(app, "GET /square/7 HTTP/1.1\r\n\r\n", "HTTP/1.1 200 OK", "{\"n\":7,\"square\":49}");
@@ -141,6 +151,15 @@ static void test_middleware_recipes(App *app) {
            "{\"error\":\"missing or invalid X-Token\"}");
     expect(app, "GET /admin/stats HTTP/1.1\r\nx-token: secret\r\n\r\n", "HTTP/1.1 200 OK", "{\"users\":3}");
     expect(app, "GET /hello HTTP/1.1\r\n\r\n", "HTTP/1.1 200 OK", "Hello, world"); /* not under /admin */
+    /* the router treats "//admin" as "/admin", so the guard must too; an encoded '/' or a dot
+     * segment is refused (400) rather than routed. */
+    expect(app, "GET //admin/stats HTTP/1.1\r\n\r\n", "HTTP/1.1 401 Unauthorized",
+           "{\"error\":\"missing or invalid X-Token\"}");
+    expect(app, "GET /admin//stats HTTP/1.1\r\n\r\n", "HTTP/1.1 401 Unauthorized",
+           "{\"error\":\"missing or invalid X-Token\"}");
+    expect_rejected(app, "GET /%2Fadmin/stats HTTP/1.1\r\n\r\n");
+    expect_rejected(app, "GET /x/../admin/stats HTTP/1.1\r\n\r\n");
+    expect_rejected(app, "GET admin/stats HTTP/1.1\r\n\r\n");
 
     /* 6b: per-route guard protects POST /items only. */
     expect(app, "POST /items HTTP/1.1\r\n\r\n", "HTTP/1.1 401 Unauthorized",
@@ -231,7 +250,7 @@ static void test_redirect_status_and_stream_recipes(App *app) {
 
     resp = get(app, "DELETE /things/5 HTTP/1.1\r\n\r\n");
     assert(starts_with(resp, "HTTP/1.1 204 No Content"));
-    /* C3: a 204 carries no framing headers (RFC 9110 8.6) and no default Content-Type. */
+    /* a 204 carries no framing headers (RFC 9110 8.6) and no default Content-Type. */
     assert(strstr(resp, "Content-Length") == NULL);
     assert(strstr(resp, "Content-Type") == NULL);
     assert(strcmp(body_of(resp), "") == 0);

@@ -21,7 +21,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 
 | ID | Problem | Impact | Effort | Evidence |
 |---|---|---|---|---|
-| **S1** | Prefix middleware (auth) is bypassed with `//admin/...` or `/%2Fadmin/...` | **High** | S | MEASURED |
+| **S1** | ~~Prefix middleware (auth) is bypassed with `//admin/...` or `/%2Fadmin/...`~~ **FIXED 2026-09-23** | **High** | S | MEASURED |
 | **M1** | macOS cluster master never closes the fds it hands to workers | **High** (cluster stops accepting; no FIN) | S | MEASURED |
 | **S2** | `app_use_body_limit` is bypassed by a query string, encoding, `//`, or chunked encoding | High | S | MEASURED |
 | **M2** | Large static files: whole file read and copied twice; slow readers pin the full size each | High (memory DoS) | S | MEASURED |
@@ -242,6 +242,10 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
 ## S — Security
 
 ### S1 · Prefix middleware is bypassed with an empty or encoded path segment
+- **Status: FIXED 2026-09-23.** `path_canonicalize` / `path_normalize_prefix` / `path_prefix_matches`
+  (`lib/http_parser.c`); `%2F`, dot segments and non-origin-form targets → 400. Verified with the probe: all three
+  curls above now give 401 / 401 / 400. Tests: `test_http_hardening.c`, `test_cookbook.c`, `test_middleware.c`,
+  `test_router.c`. S2's raw-target body-limit lookup is still open.
 - **Impact:** **High**. An auth bypass for the documented pattern: `app_use_prefix(app, "/admin", auth)` (the
   cookbook's own recipe at `lib/examples/cookbook.c:523`, `DOC.md:213`, `README.md:137`), and `router_use`
   middleware on a mounted router (`app_mount` turns it into `app_use_prefix`).

@@ -38,7 +38,7 @@ static void test_cluster_worker_identification(void) {
 }
 
 /* Raw OS-level check only: two sockets CAN share a port via SO_REUSEPORT, independent of what the
- * cluster module actually does with that capability. On macOS/BSD (CEXPRESS_SINGLE_ACCEPTOR, C4),
+ * cluster module actually does with that capability. On macOS/BSD (CEXPRESS_SINGLE_ACCEPTOR),
  * cluster_listen no longer relies on the kernel balancing across such sockets - only the master binds
  * one and hands fds to workers itself - so this test's pass/fail is unrelated to worker balance;
  * see test_cluster_balances_across_workers for that. Left in place: it's still a valid, useful check
@@ -231,7 +231,7 @@ static int request_worker_id(int port) {
     return atoi(body + 4);
 }
 
-/* C4: MEASURED (improvements.md) that per-worker SO_REUSEPORT listen sockets on macOS do not balance
+/* MEASURED (improvements.md) that per-worker SO_REUSEPORT listen sockets on macOS do not balance
  * accepted connections across workers - over 90% of load landed on a single worker of four. This is
  * the direct regression test: a real 4-worker cluster must actually spread sequential, independently
  * connected requests across more than just one worker id. */
@@ -288,9 +288,9 @@ static void test_cluster_balances_across_workers(void) {
     assert(distinct > 1);
 }
 
-/* S7: before this fix, a fatal, permanent misconfiguration (the port already taken) made every one of
+/* before this fix, a fatal, permanent misconfiguration (the port already taken) made every one of
  * WORKERS children fail create_server_socket's own bind() identically, and the master respawned each
- * one instantly forever - MEASURED (improvements.md, S7) 10,594 respawns in about 4 seconds with
+ * one instantly forever - MEASURED (improvements.md) 10,594 respawns in about 4 seconds with
  * WORKERS=2. cluster_listen now verifies the port itself, once, before forking anyone. */
 static void test_cluster_master_exits_fast_when_port_is_taken(void) {
     int blocker_port = get_ephemeral_port();
@@ -351,7 +351,7 @@ static void crash_immediately_hook(void) {
     exit(7);
 }
 
-/* S7: the restart budget - a worker that keeps failing must not be respawned forever. With
+/* the restart budget - a worker that keeps failing must not be respawned forever. With
  * CLUSTER_RESTART_BUDGET failures exhausted, the master gives up and exits non-zero instead of
  * looping (with increasing backoff) indefinitely. */
 static void test_cluster_master_exits_after_restart_budget_exceeded(void) {

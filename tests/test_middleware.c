@@ -11,7 +11,7 @@
 
 static Connection *make_conn(void) {
     Connection *conn = calloc(1, sizeof(Connection));
-    /* M1: Connection.arena is now a pointer to a shared per-worker Arena (App.arena in the real
+    /* Connection.arena is now a pointer to a shared per-worker Arena (App.arena in the real
      * engine) rather than one embedded per connection - this fixture mallocs its own standalone
      * Arena to point at, same as it always mallocked its own 64 KiB buffer. */
     Arena *arena = malloc(sizeof(Arena));
@@ -550,6 +550,35 @@ static void test_dispatch_explicit_options_route_wins_over_auto(void) {
     cleanup_app(&app);
 }
 
+static void test_prefixed_middleware_prefix_is_normalized(void) {
+    /* "/api/" used to match no sub-path at all (the byte after it is never '/' or NUL). */
+    const char *prefixes[] = { "/api/", "api", "//api//" };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        g_order_len = 0;
+        g_handler_called = 0;
+
+        App app;
+        app_init(&app);
+        app_use_prefix(&app, prefixes[i], mw_prefixed);
+        assert(strcmp(app.middlewares[0].prefix, "/api") == 0);
+
+        Route route = { "GET", "/api/users", handler_ok, { 0 }, 0, NULL, 0 };
+        Request req;
+        memset(&req, 0, sizeof(req));
+        strncpy(req.path, "/api/users", sizeof(req.path) - 1);
+        Connection *conn = make_conn();
+        Response res = { .conn = conn, .status = 0 };
+
+        dispatch(&app, &route, &req, &res);
+
+        assert(g_order_len == 2);
+        assert(g_order[0] == 5 && g_order[1] == 3);
+
+        free_conn(conn);
+        cleanup_app(&app);
+    }
+}
+
 int main(void) {
     test_middlewares_run_in_order_then_handler();
     test_middleware_can_short_circuit();
@@ -564,6 +593,7 @@ int main(void) {
     test_prefixed_middleware_runs_when_path_matches();
     test_prefixed_middleware_skipped_when_path_does_not_match();
     test_prefixed_middleware_does_not_match_similar_sibling_path();
+    test_prefixed_middleware_prefix_is_normalized();
     test_dispatch_auto_options_lists_allowed_methods();
     test_dispatch_auto_options_without_get_omits_head();
     test_dispatch_options_still_404s_unknown_path();

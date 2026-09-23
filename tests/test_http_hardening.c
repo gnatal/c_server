@@ -90,7 +90,7 @@ static void test_request_framing(void) {
     assert(request_framing(no_headers, strlen(no_headers), &header_len, &chunked, NULL, NULL) == 0);
     assert(header_len == strlen(no_headers));
 
-    /* S11: "gzip, chunked" is no longer accepted as chunked framing - this engine implements exactly one
+    /* "gzip, chunked" is no longer accepted as chunked framing - this engine implements exactly one
      * transfer-coding ("chunked", named alone), and layering an unimplemented coding like gzip on top
      * used to be silently accepted via a bare substring search for "chunked" in the header value. Now
      * rejected (-3, -> 501) - see test_transfer_encoding_token_matching for the full matrix. */
@@ -99,7 +99,7 @@ static void test_request_framing(void) {
     assert(chunked == 0 && header_len == strlen(te));
 }
 
-/* request_framing's optional path_out/path_len_out (S4: app_use_body_limit needs the request path
+/* request_framing's optional path_out/path_len_out (app_use_body_limit needs the request path
  * before a Request struct exists). NULL for either stays valid (every other caller above passes
  * NULL, NULL); when given, they point into the caller's own buffer, not a copy. */
 static void test_request_framing_path_out(void) {
@@ -216,7 +216,7 @@ static void test_header_value_whitespace_and_limits(void) {
     assert(strcmp(req_get_header(&req, "C"), "x y  z") == 0);
     arena_reset(&test_arena);
 
-    /* P3: parse_headers stores views into header_block now, the same as the live request path
+    /* parse_headers stores views into header_block now, the same as the live request path
      * (parse_http_request_from_head) - there is no fixed-size slot left to truncate into, so a header
      * name or value far past the old 255/1024-byte caps round-trips through req_get_header exactly,
      * uncut. header_block must outlive the req_get_header call below (it does: it's a local array). */
@@ -241,9 +241,9 @@ static void test_header_value_whitespace_and_limits(void) {
     arena_reset(&test_arena);
 }
 
-/* P3: parse_http_request stores header views into `raw`, not fixed-size copies, so there is no per-
- * header length left to overflow - the "proper fix" improvements.md's S5 entry predicted ("S5 is solved
- * properly only by P3"). A header name or value of any length that fits within a complete request round-
+/* parse_http_request stores header views into `raw`, not fixed-size copies, so there is no per-
+ * header length left to overflow - the "proper fix" improvements.md predicted (solved properly only by
+ * storing views). A header name or value of any length that fits within a complete request round-
  * trips through req_get_header exactly; parse_http_request no longer returns -3 for this (that return
  * code is retired, see http_parser.h). */
 static void test_parse_http_request_header_views_are_not_capped(void) {
@@ -327,7 +327,7 @@ static void test_embedded_nul_rejected(void) {
     assert(strcmp(dst, "style.css") == 0);
 
     /* parse_query_string: a %00 in either the name or the value of a pair is rejected (-1), not just
-     * silently decoded - improvements.md's S6 names query names/values alongside the path. */
+     * silently decoded - improvements.md names query names/values alongside the path. */
     Request req;
     memset(&req, 0, sizeof(req));
     assert(parse_query_string("a=1&b=x%00y", &req) == -1);
@@ -354,7 +354,7 @@ static void test_embedded_nul_rejected(void) {
     arena_reset(&test_arena);
 }
 
-/* S8: a request line picohttpparser rejects outright (no HTTP version, an unsupported version, plain
+/* a request line picohttpparser rejects outright (no HTTP version, an unsupported version, plain
  * garbage) used to leave header_len at 0 - the same value a genuinely incomplete request line leaves it
  * at - so request_is_complete reported "need more bytes" forever instead of surfacing the malformed
  * request. request_head_is_complete now tells the two apart via content_length (set to -1 only on the
@@ -391,10 +391,10 @@ static void test_malformed_request_line_rejected(void) {
     assert(header_len == 0);
 }
 
-/* S11: picohttpparser accepts a bare '\n' as a line terminator anywhere one is expected - a leniency a
+/* picohttpparser accepts a bare '\n' as a line terminator anywhere one is expected - a leniency a
  * strict front proxy would not extend, letting the two disagree about request boundaries (smuggling
  * ambiguity). request_framing now rejects any request whose request line or header block contains a bare
- * '\n' (malformed, same shape as S8's -1: header_len == 0, request_is_complete reports "complete" so the
+ * '\n' (malformed, same shape as a malformed request line's -1: header_len == 0, request_is_complete reports "complete" so the
  * rejection surfaces immediately instead of waiting for more bytes that would just repeat the problem). */
 static void test_bare_lf_rejected(void) {
     const char *bare_lf_lines[] = {
@@ -423,7 +423,7 @@ static void test_bare_lf_rejected(void) {
     arena_reset(&test_arena);
 }
 
-/* S11: Transfer-Encoding is matched token-exact, not by substring. Only a value that reduces (after
+/* Transfer-Encoding is matched token-exact, not by substring. Only a value that reduces (after
  * splitting on commas and trimming OWS) to exactly one token, "chunked" (case-insensitive), is accepted -
  * this engine implements no other transfer-coding, so anything else (a substring lookalike, "chunked"
  * accompanied by any other coding regardless of order, or an unsupported coding alone) is rejected with
@@ -438,7 +438,7 @@ static void test_transfer_encoding_token_matching(void) {
         {"Transfer-Encoding: chunked\r\n", 1, 0},
         {"Transfer-Encoding: CHUNKED\r\n", 1, 0},
         {"Transfer-Encoding:   chunked  \r\n", 1, 0},       /* OWS around the token */
-        {"Transfer-Encoding: xchunked\r\n", 0, -3},          /* substring, not a token - closed by S11 */
+        {"Transfer-Encoding: xchunked\r\n", 0, -3},          /* substring, not a token - rejected */
         {"Transfer-Encoding: chunkedx\r\n", 0, -3},
         {"Transfer-Encoding: gzip\r\n", 0, -3},              /* unsupported coding, alone */
         {"Transfer-Encoding: gzip, chunked\r\n", 0, -3},     /* chunked present, but not alone */
@@ -449,7 +449,7 @@ static void test_transfer_encoding_token_matching(void) {
         char req_buf[256];
         snprintf(req_buf, sizeof(req_buf), "POST /a HTTP/1.1\r\n%sContent-Length: 0\r\n\r\n",
                  cases[i].expect_code == 0 ? "" : cases[i].header_line);
-        /* Cases expected to be accepted as chunked must not also carry Content-Length (S3/smuggling
+        /* Cases expected to be accepted as chunked must not also carry Content-Length (smuggling
          * shape: chunked + Content-Length together is its own -1, unrelated to what's being tested
          * here), so build those without one. */
         if (cases[i].expect_code == 0) {
@@ -474,7 +474,7 @@ static void test_transfer_encoding_token_matching(void) {
     assert(request_framing(split, strlen(split), &header_len, &chunked, NULL, NULL) == -3);
 
     /* End to end: parse_http_request surfaces -3 as -1 (malformed) with req.content_length == -3, the
-     * same generic "content_length < 0" plumbing S4/S8 already use for their own sentinels. */
+     * same generic "content_length < 0" plumbing the body-limit and malformed-line checks already use for their own sentinels. */
     const char *gzip_only = "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip\r\nContent-Length: 0\r\n\r\n";
     Request req;
     assert(parse_http_request(gzip_only, strlen(gzip_only), &req, &test_arena) == -1);
@@ -482,10 +482,10 @@ static void test_transfer_encoding_token_matching(void) {
     arena_reset(&test_arena);
 }
 
-/* T1: picohttpparser's parse_http_version asks for 9 bytes before it looks at any, so a version token
+/* picohttpparser's parse_http_version asks for 9 bytes before it looks at any, so a version token
  * shorter than "HTTP/1.x" plus a line end made a finished head read as "incomplete" - forever, since the
- * client has nothing left to send - and the request went unanswered until the S1 deadline (408). Found by
- * fuzz_parser.c's T1 oracle. A head is malformed once a blank line has arrived without it parsing. */
+ * client has nothing left to send - and the request went unanswered until the request header deadline (408). Found by
+ * fuzz_parser.c's answered-or-closed oracle. A head is malformed once a blank line has arrived without it parsing. */
 static void test_short_version_token_rejected(void) {
     const char *malformed[] = {
         "GET / X\r\n\r\n",
@@ -549,7 +549,7 @@ static int answer_for(const char *buf, const size_t len) {
     return answer;
 }
 
-/* T1: "every input is answered or closed", at the parser level, for every prefix of each input (every
+/* "every input is answered or closed", at the parser level, for every prefix of each input (every
  * point a recv() could stop at): request_is_complete says "wait" only before any blank line or while a
  * well-framed head's body is genuinely short; once it says "complete" it keeps saying so; the
  * incremental path connection.c takes (head re-parsed per read, chunk_scan carried) agrees at every
@@ -605,6 +605,85 @@ static void test_every_prefix_is_answered_or_waits_for_bytes(void) {
     }
 }
 
+static void check_canonical(const char *in, const int rc, const char *out) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", in);
+    assert(path_canonicalize(buf) == rc);
+    if (rc == 0) {
+        assert(strcmp(buf, out) == 0);
+    }
+}
+
+static void test_path_canonicalize(void) {
+    /* the router skips empty segments, so the prefix-middleware check must see the same shape. */
+    check_canonical("/", 0, "/");
+    check_canonical("//", 0, "/");
+    check_canonical("/admin/secret", 0, "/admin/secret");
+    check_canonical("//admin/secret", 0, "/admin/secret");
+    check_canonical("/admin//secret//", 0, "/admin/secret/");
+    check_canonical("///a///b", 0, "/a/b");
+    check_canonical("*", 0, "*");
+    check_canonical("/.well-known/x", 0, "/.well-known/x"); /* a dot-prefixed name is not a dot segment */
+    check_canonical("/a/..b/c.", 0, "/a/..b/c.");
+    /* Dot segments and non-origin-form targets are refused, not resolved. */
+    check_canonical("/./admin", -1, NULL);
+    check_canonical("/x/../admin", -1, NULL);
+    check_canonical("/admin/.", -1, NULL);
+    check_canonical("/admin/..", -1, NULL);
+    check_canonical("admin/secret", -1, NULL);
+    check_canonical("http://x/admin", -1, NULL);
+    check_canonical("", -1, NULL);
+}
+
+static void test_path_prefix_helpers(void) {
+    char out[128];
+    path_normalize_prefix("/admin", out, sizeof(out));
+    assert(strcmp(out, "/admin") == 0);
+    path_normalize_prefix("/admin/", out, sizeof(out)); /* used to match no sub-path at all */
+    assert(strcmp(out, "/admin") == 0);
+    path_normalize_prefix("admin", out, sizeof(out));
+    assert(strcmp(out, "/admin") == 0);
+    path_normalize_prefix("//a//b/", out, sizeof(out));
+    assert(strcmp(out, "/a/b") == 0);
+    path_normalize_prefix("/", out, sizeof(out));
+    assert(strcmp(out, "") == 0);
+    path_normalize_prefix(NULL, out, sizeof(out));
+    assert(strcmp(out, "") == 0);
+    char small[8];
+    path_normalize_prefix("/abc/defgh", small, sizeof(small)); /* truncates at a segment boundary */
+    assert(strcmp(small, "/abc") == 0);
+
+    assert(path_prefix_matches("", "/anything") == 1);
+    assert(path_prefix_matches("/admin", "/admin") == 1);
+    assert(path_prefix_matches("/admin", "/admin/") == 1);
+    assert(path_prefix_matches("/admin", "/admin/x") == 1);
+    assert(path_prefix_matches("/admin", "/adminx") == 0);
+    assert(path_prefix_matches("/admin", "/") == 0);
+}
+
+static void test_request_path_is_canonical(void) {
+    Request req;
+    const char *doubled = "GET //admin//secret HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(parse_http_request(doubled, strlen(doubled), &req, &test_arena) == 0);
+    assert(strcmp(req.path, "/admin/secret") == 0);
+    arena_reset(&test_arena);
+
+    const char *rejected[] = {
+        "GET /%2Fadmin/secret HTTP/1.1\r\nHost: x\r\n\r\n",  /* encoded '/' would create a segment */
+        "GET /%2fadmin/secret HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET /admin%2Fsecret HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET /x/../admin/secret HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET /x/%2e%2e/admin/secret HTTP/1.1\r\nHost: x\r\n\r\n", /* dot segment after decoding */
+        "GET /./admin/secret HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET admin/secret HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET http://x/admin/secret HTTP/1.1\r\nHost: x\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        assert(parse_http_request(rejected[i], strlen(rejected[i]), &req, &test_arena) == -4);
+        arena_reset(&test_arena);
+    }
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_framing_is_line_anchored();
@@ -623,6 +702,9 @@ int main(void) {
     test_transfer_encoding_token_matching();
     test_short_version_token_rejected();
     test_every_prefix_is_answered_or_waits_for_bytes();
+    test_path_canonicalize();
+    test_path_prefix_helpers();
+    test_request_path_is_canonical();
     printf("all http hardening tests passed\n");
     return 0;
 }

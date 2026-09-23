@@ -1,5 +1,5 @@
 /*
- * P9: HTTP/1.1 pipelining - several requests arriving in one buffer are each answered, in order, on
+ * HTTP/1.1 pipelining - several requests arriving in one buffer are each answered, in order, on
  * the same connection. Split from test_connection.c (already past the 1,000-line cap) but driven the
  * same way: a socketpair(2) peer, handle_readable/handle_writable called directly, no real listener.
  */
@@ -121,7 +121,7 @@ static void test_two_gets_in_one_write_both_answered_in_order(void) {
 
     assert(app.connections[fds[0]] == conn);
     assert(conn->in_len == 0 && conn->in_off == 0 && conn->request_len == 0);
-    assert(conn->request_started == 0); /* nothing left buffered: idle between requests (S1) */
+    assert(conn->request_started == 0); /* nothing left buffered: idle between requests */
 
     teardown(&app, fds);
 }
@@ -171,7 +171,7 @@ static void test_chunked_body_then_get(void) {
     teardown(&app, fds);
 }
 
-/* One full request plus half of the next: the half is kept (moved to the front of in_buf, its S1
+/* One full request plus half of the next: the half is kept (moved to the front of in_buf, its request
  * clock started) and completed by the next read. */
 static void test_partial_second_request_is_kept_and_completed(void) {
     App app;
@@ -224,7 +224,7 @@ static void test_per_event_cap_yields_then_resumes(void) {
     char out[16384];
     read_available(fds[1], out, sizeof(out));
     assert(count_occurrences(out, "pong") == MAX_PIPELINED_PER_EVENT);
-    /* M2: the 4 unserved requests were moved off the borrowed App.read_buf into an owned buffer,
+    /* the 4 unserved requests were moved off the borrowed App.read_buf into an owned buffer,
      * compacted to offset 0, before handle_readable returned. */
     assert(conn->in_buf != NULL && conn->in_buf != app.read_buf);
     assert(conn->in_off == 0 && conn->in_len == 4 * strlen("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"));
@@ -235,7 +235,7 @@ static void test_per_event_cap_yields_then_resumes(void) {
     read_available(fds[1], out, sizeof(out));
     assert(count_occurrences(out, "pong") == 4);
     assert(conn->in_len == 0 && conn->in_off == 0);
-    assert(conn->in_buf == NULL); /* M2: owned leftover buffer freed once drained */
+    assert(conn->in_buf == NULL); /* owned leftover buffer freed once drained */
     assert(!(conn->events_watched & EVENT_WRITE));
     assert(conn->events_watched & EVENT_READ);
 
@@ -283,7 +283,7 @@ static void test_malformed_second_request_gets_400_after_first_answer(void) {
 }
 
 /* A response too large to write in one go leaves requests pipelined behind it untouched: reads stop
- * (no second dispatch over the pending response, which is what happened before P9 when a request
+ * (no second dispatch over the pending response, which is what happened before pipelining support when a request
  * arrived mid-write), and handle_writable serves them once the big response has fully drained. */
 static void test_pending_response_holds_pipeline_until_drained(void) {
     App app;

@@ -1087,17 +1087,17 @@
           revisions and were <strong>not</strong> re-run, and no competitor was re-measured. The 5,000-connection runs
           show intermittent <code>wrk</code> read errors of unidentified cause.
           <br><strong>Refreshed again (23 Sep 2026):</strong> the <em>Memory</em> tab and the 1,000-connection
-          <code>/ping</code> card were re-measured after M1 (one arena per worker) and M2 (one receive buffer per
-          worker), same method and machine as before.
+          <code>/ping</code> card were re-measured after the switch to one arena per worker and one receive buffer per
+          worker, same method and machine as before.
         </div>
 
-        <!-- Spotlight: idle-connection memory after M1 + M2 -->
+        <!-- Spotlight: idle-connection memory after the shared arena and receive buffer -->
         <div class="bench-highlight">
           <div class="bench-highlight-header">
             <div class="bench-highlight-title">
               <span>🧠 Idle Connections Cost Almost Nothing</span>
             </div>
-            <span class="bench-highlight-badge">23 Sep 2026 · M1 + M2</span>
+            <span class="bench-highlight-badge">23 Sep 2026</span>
           </div>
           <p style="margin-bottom: 1.25rem; font-size: 0.92rem;">
             A keep-alive connection that is waiting for its next request no longer owns a request arena or an input
@@ -1484,7 +1484,7 @@
           <p>
             Resident set size (RSS) was measured with <code>ps</code> across the master and all 4 workers after opening N keep-alive
             connections from a script and sending one <code>GET /ping</code> on each (macOS). The 21 Sep column is the
-            engine before M1 and M2; the 23 Sep columns are the current one, measured the same way.
+            engine before the shared arena and receive buffer; the 23 Sep columns are the current one, measured the same way.
           </p>
           <div class="table-container">
             <table>
@@ -1531,8 +1531,8 @@
           </div>
           <div class="alert alert-note">
             <strong>Where the 25 KB went:</strong> it used to be a 64 KiB arena per connection (the touched part) plus
-            an 8 KiB input buffer per connection. Now each worker has one shared arena (M1) and one shared 8 KiB receive
-            buffer (M2). A connection copies bytes into a buffer of its own only while a request is half-received, and
+            an 8 KiB input buffer per connection. Now each worker has one shared arena and one shared 8 KiB receive
+            buffer. A connection copies bytes into a buffer of its own only while a request is half-received, and
             frees it once the request is answered. A more precise single-worker run (5,000 connections) measured
             <strong>239 B</strong> per idle keep-alive connection and <strong>216 B</strong> for one that never sent a
             byte. <code>/ping</code> throughput did not change. Kernel socket buffers are not part of RSS.

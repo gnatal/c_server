@@ -18,7 +18,7 @@ static void handler_ping(const Request *req, Response *res) {
 static char *fetch(App *app, const char *raw) {
     Connection conn;
     memset(&conn, 0, sizeof(conn));
-    /* M1: Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
+    /* Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
      * now, not one embedded per connection - point it at its own local Arena, same buffer as before. */
     Arena conn_arena;
     arena_init(&conn_arena, test_arena_buf, sizeof(test_arena_buf));
@@ -47,7 +47,7 @@ int main(void) {
     app_get(&app, "/ping", handler_ping);
 
     char *resp = fetch(&app, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
-    /* C3: a Date line (fixed width) sits between the status line and Content-Type. */
+    /* a Date line (fixed width) sits between the status line and Content-Type. */
     const char *date = resp + strlen("HTTP/1.1 200 OK\r\n");
     assert(strncmp(resp, "HTTP/1.1 200 OK\r\nDate: ", strlen("HTTP/1.1 200 OK\r\nDate: ")) == 0);
     assert(strcmp(date + strlen("Date: ") + HTTP_DATE_LEN,

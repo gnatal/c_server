@@ -21,7 +21,7 @@
 #define URING_ENTRIES 1024
 
 /*
- * C6: a poll's user_data is (generation << 32) | (fd + 1). 0 is reserved for completions nobody reads
+ * a poll's user_data is (generation << 32) | (fd + 1). 0 is reserved for completions nobody reads
  * (poll removals). The generation is App.poll_regs[fd].gen when the poll was armed, bumped on every arm,
  * so a completion carrying an older one belongs to a poll that was removed or replaced - most
  * importantly the kernel's -ECANCELED for a removed poll, which used to be reported as
@@ -79,7 +79,7 @@ static int arm_poll(struct io_uring *ring, const int fd, PollRegistration *reg) 
 }
 
 /*
- * Makes `mask` (POLLIN/POLLOUT, 0 = nothing) fd's interest. An unchanged mask costs nothing (P4:
+ * Makes `mask` (POLLIN/POLLOUT, 0 = nothing) fd's interest. An unchanged mask costs nothing (
  * flush_connection drops write interest after every keep-alive response, usually never set): the
  * one-shot poll in flight already covers it, and event_loop_poll re-arms after each event. Otherwise
  * the in-flight poll is removed (its completion then carries a stale generation) and a new one armed.
@@ -118,7 +118,7 @@ static int uring_init(App *app) {
 
     int ret = io_uring_queue_init(URING_ENTRIES, ring, 0);
     if (ret < 0) {
-        /* C5: the ring itself was refused (seccomp, io_uring_disabled, memlock, old kernel) and nothing
+        /* the ring itself was refused (seccomp, io_uring_disabled, memlock, old kernel) and nothing
          * else was touched yet: tell the dispatcher it may fall back to epoll. */
         free(ring);
         errno = -ret;
@@ -333,7 +333,7 @@ static int uring_poll(App *app, LoopEvent *out_events, int max_events, int timeo
         int res = cqe->res;
         PollRegistration *reg = (fd >= 0 && fd < app->poll_regs_cap) ? &app->poll_regs[fd] : NULL;
         if (reg == NULL || !reg->armed || UDATA_GEN(udata) != reg->gen) {
-            /* C6: from a poll that has since been removed or replaced - its -ECANCELED farewell, or
+            /* from a poll that has since been removed or replaced - its -ECANCELED farewell, or
              * readiness it reported just before. Not an event for whoever owns this fd now (a newer
              * interest, or a new connection on a reused fd number). */
             continue;
@@ -425,7 +425,7 @@ static int uring_poll(App *app, LoopEvent *out_events, int max_events, int timeo
     return out_count;
 }
 
-/* C5: the only exported symbol; event_loop_linux.c selects it at runtime (event_loop_backend.h). */
+/* the only exported symbol; event_loop_linux.c selects it at runtime (event_loop_backend.h). */
 const EventLoopOps io_uring_loop_ops = {
     .name = "io_uring",
     .init = uring_init,

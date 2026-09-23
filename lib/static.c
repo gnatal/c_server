@@ -137,9 +137,9 @@ static int resolve_and_stat(const char *root, const char *candidate, char *resol
 }
 
 /*
- * P1 fix: a small in-memory cache of recently served static files, so the common case (a handful of
+ * A small in-memory cache of recently served static files, so the common case (a handful of
  * assets requested repeatedly) skips realpath()/stat()/fopen()/fread()/malloc()/free() on every request
- * instead of paying for all of it every time - MEASURED (improvements.md, P1) at 6.6x slower than an
+ * instead of paying for all of it every time - MEASURED (improvements.md) at 6.6x slower than an
  * equivalent in-memory response for a 52-byte file. Keyed by the *candidate* path (static_root + the
  * already-sanitized subpath) rather than the realpath()-resolved one: that is what lets a hit within
  * STATIC_CACHE_REVALIDATE_SECONDS of its last check skip realpath()/stat() too, not just the read - see

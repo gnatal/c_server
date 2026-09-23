@@ -52,7 +52,7 @@ const char *static_mime_type(const char *path);
  * Called from chain_next's final fallback (lib/middleware.c) in place of a
  * Handler - a static route has none, see Route.static_root (app_types.h).
  *
- * P1 (performance): files up to STATIC_CACHE_MAX_ENTRY_BYTES (app_types.h) are cached in memory after
+ * Performance: files up to STATIC_CACHE_MAX_ENTRY_BYTES (app_types.h) are cached in memory after
  * their first successful read. A request within STATIC_CACHE_REVALIDATE_SECONDS of the last check for
  * the same path is served straight from the cache with no filesystem call at all (not even realpath or
  * stat); past that window, one stat confirms the file is unchanged (by size and mtime) before either

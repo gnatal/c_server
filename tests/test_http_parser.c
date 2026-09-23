@@ -188,7 +188,7 @@ static void test_parse_http_request(void) {
     arena_reset(&test_arena);
 
     /* No Cookie header at all -> zero parsed cookies, not a parse error. Cookie splitting is lazy
-     * (P3): req.cookie_count reads 0 immediately after parsing regardless (nothing has run yet), so
+     *: req.cookie_count reads 0 immediately after parsing regardless (nothing has run yet), so
      * force the lazy parse via req_get_cookie first to actually exercise the "absent Cookie header"
      * path through parse_cookies, not just an unparsed default. */
     const char *raw_no_cookies = "GET /profile HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -376,7 +376,7 @@ static void test_chunked_body_scan(void) {
     assert(chunked_body_scan(cumulative_too_big, strlen(cumulative_too_big), 6, &decoded_len) == -2);
 }
 
-/* P8: feeding a body one byte at a time through chunked_body_scan_resume (one state, carried across
+/* feeding a body one byte at a time through chunked_body_scan_resume (one state, carried across
  * calls, like Connection.chunk_scan across recvs) must give the same verdict and decoded length as a
  * from-scratch chunked_body_scan of the same prefix, for every prefix - including a trailer's
  * terminating "\r\n\r\n" split across calls, malformed framing, and the size cap. */
@@ -435,7 +435,7 @@ static void test_chunked_body_scan_resume(void) {
     assert(decoded_len == 0);
 }
 
-/* P9: request_wire_len is where a pipelined next request starts - headers plus the framed body,
+/* request_wire_len is where a pipelined next request starts - headers plus the framed body,
  * never anything after it. */
 static void test_request_wire_len(void) {
     const char *next = "GET /next HTTP/1.1\r\n\r\n";
@@ -758,7 +758,7 @@ static void test_parse_query_string(void) {
     assert(req.query_count == MAX_QUERY_PARAMS);
 }
 
-/* M4: parse_http_request_in_place gives the same Request as the copying parser, but req->body points
+/* parse_http_request_in_place gives the same Request as the copying parser, but req->body points
  * into the caller's buffer (no copy); a chunked body is decoded over its own framing. The byte its
  * NUL replaced is handed back, and restoring it leaves the bytes after the body unchanged. */
 static void check_in_place_matches_copy(const char *wire, const size_t request_len) {
@@ -844,7 +844,7 @@ static void test_parse_http_request_in_place(void) {
     assert(strcmp(bad_buf, bad) == 0 && saved == 'q');
 }
 
-/* C1: which heads ask for "100 Continue". Pure over a buffer: parse_request_head then the predicate. */
+/* which heads ask for "100 Continue". Pure over a buffer: parse_request_head then the predicate. */
 static int expects_continue(const char *raw) {
     ParsedHead head;
     parse_request_head(raw, strlen(raw), &head);
@@ -874,7 +874,7 @@ static void test_request_head_expects_continue(void) {
     assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n") == 0);
 }
 
-/* C3: IMF-fixdate formatting, against reference values from Python's email.utils.formatdate(usegmt=True). */
+/* IMF-fixdate formatting, against reference values from Python's email.utils.formatdate(usegmt=True). */
 static void test_format_http_date(void) {
     char out[HTTP_DATE_LEN + 1];
     memset(out, 'x', sizeof(out));
@@ -897,7 +897,7 @@ static void test_format_http_date(void) {
     assert(strcmp(out, "Thu, 01 Jan 1970 00:00:00 GMT") == 0); /* pre-epoch clamps */
 }
 
-/* C3: the cache hands back one stable buffer, reformatted only when the second changes. */
+/* the cache hands back one stable buffer, reformatted only when the second changes. */
 static void test_http_date_for_caches_per_second(void) {
     const char *a = http_date_for(784111777);
     assert(strcmp(a, "Sun, 06 Nov 1994 08:49:37 GMT") == 0);

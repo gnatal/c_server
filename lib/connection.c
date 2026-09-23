@@ -38,7 +38,7 @@ int set_nonblocking(int fd) {
     return 0;
 }
 
-/* S12: returns -1 on any failure (socket already closed first) instead of perror()+exit() - a
+/* returns -1 on any failure (socket already closed first) instead of perror()+exit() - a
  * library function shouldn't unilaterally kill the process it's linked into. The two library-side
  * callers (app_listen_worker below, cluster_listen in cluster.c) are the ones that decide a failure
  * here is fatal and exit() themselves, same convention event_loop_init already uses (see lib/CLAUDE.md,
@@ -64,7 +64,7 @@ int create_server_socket(int port) {
     }
 #endif
 
-    /* P10: set once here instead of once per accepted connection - accepted sockets inherit it from
+    /* set once here instead of once per accepted connection - accepted sockets inherit it from
      * the listener (MEASURED on macOS 26 and Linux 6.8; asserted by test_connection.c's
      * test_accept_client_socket_options so a platform that stops inheriting it fails a test instead
      * of silently turning Nagle back on). */
@@ -86,7 +86,7 @@ int create_server_socket(int port) {
         return -1;
     }
 
-    /* S3: take whichever is larger - BACKLOG is a floor, not a cap. No-op on a system whose
+    /* take whichever is larger - BACKLOG is a floor, not a cap. No-op on a system whose
      * SOMAXCONN is already <= BACKLOG (e.g. macOS, where kern.ipc.somaxconn is 128, same as
      * BACKLOG); on a Linux whose SOMAXCONN is raised, this actually widens the pending-accept
      * queue instead of the kernel silently dropping SYNs past 128. */
@@ -122,15 +122,15 @@ Connection *connection_create(App *app, int fd) {
     if (conn == NULL) {
         return NULL;
     }
-    /* M2: in_buf stays NULL (calloc) - input memory is borrowed from App.read_buf per read and only
+    /* in_buf stays NULL (calloc) - input memory is borrowed from App.read_buf per read and only
      * owned while a request is partially received (see Connection.in_buf). */
     conn->fd = fd;
     conn->file_fd = -1;
     conn->last_activity = time(NULL);
     /* request_started stays 0 (calloc) until a request actually starts arriving: a freshly accepted,
-     * otherwise-silent connection is bounded by IDLE_TIMEOUT_SECONDS below, same as before (S1 targets
+     * otherwise-silent connection is bounded by IDLE_TIMEOUT_SECONDS below, same as before (targets
      * a request that is under way but moving too slowly, not one that never starts). */
-    conn->arena = &app->arena; /* M1: shared per-worker arena, not one allocated per connection */
+    conn->arena = &app->arena; /* shared per-worker arena, not one allocated per connection */
     return conn;
 }
 
@@ -143,9 +143,9 @@ void connection_close(App *app, Connection *conn) {
         if (app->connections != NULL && conn->fd >= 0 && conn->fd < app->connections_cap) {
             app->connections[conn->fd] = NULL;
         }
-        app->open_connections--; /* paired with accept_connections' ++ (S3) */
+        app->open_connections--; /* paired with accept_connections' ++ */
         if (app->spare_fd < 0) {
-            /* Opportunistic re-arm (S3): this connection closing just freed a descriptor, the
+            /* Opportunistic re-arm: this connection closing just freed a descriptor, the
              * cheapest possible moment to try reclaiming the reserve - waiting for the next
              * accept_connections call could be a long time if the listen socket is the thing
              * that's starved. Best effort: still -1 on failure, tried again next close. */
@@ -157,8 +157,8 @@ void connection_close(App *app, Connection *conn) {
         close(conn->file_fd);
         conn->file_fd = -1;
     }
-    stream_release(conn); /* M5: a producer stream cut short (peer gone, write error, shutdown) frees its ctx here */
-    /* M1: stream_buf and a still-owned malloc'd out_buf tail-copy are connection-owned, unlike the
+    stream_release(conn); /* a producer stream cut short (peer gone, write error, shutdown) frees its ctx here */
+    /* stream_buf and a still-owned malloc'd out_buf tail-copy are connection-owned, unlike the
      * (shared, App-owned) arena a normal out_buf lives in - free them here regardless of which exit
      * path got the connection closed (a hard write/read error mid-response, not just the ordinary
      * "response fully sent, not keeping this connection alive" case). out_buf can equal stream_buf
@@ -177,7 +177,7 @@ void connection_close(App *app, Connection *conn) {
         conn->fd = -1;
     }
     if (app == NULL || conn->in_buf != app->read_buf) {
-        free(conn->in_buf); /* M2: owned (or NULL); App.read_buf is only ever borrowed, app_destroy frees it */
+        free(conn->in_buf); /* owned (or NULL); App.read_buf is only ever borrowed, app_destroy frees it */
     }
     conn->in_buf = NULL;
     conn->out_buf = NULL;
@@ -205,12 +205,12 @@ void app_destroy(App *app) {
         close(app->spare_fd);
         app->spare_fd = -1;
     }
-    /* M1: the one shared arena every Connection.arena pointed at. Every connection above was already
+    /* the one shared arena every Connection.arena pointed at. Every connection above was already
      * closed (connection_close no longer touches app->arena itself), so nothing still references it. */
     arena_destroy(&app->arena);
     free(app->arena.buf);
     app->arena.buf = NULL;
-    free(app->read_buf); /* M2: no connection is left to have borrowed it */
+    free(app->read_buf); /* no connection is left to have borrowed it */
     app->read_buf = NULL;
     free(app->connections);
     app->connections = NULL;
@@ -230,7 +230,7 @@ int app_count_connections(const App *app) {
     return count;
 }
 
-/* P9: whether a response is still being written (built but not fully queued on the socket). M5: a
+/* whether a response is still being written (built but not fully queued on the socket). a
  * producer stream counts for its whole life, paused or not - it has not sent its last chunk yet. */
 static int response_pending(const Connection *conn) {
     return conn->out_buf != NULL || conn->file_fd >= 0 || conn->stream_fn != NULL;
@@ -305,7 +305,7 @@ static int ensure_connection_capacity(App *app, int fd) {
 }
 
 /*
- * S3 overload shedding: writes a minimal, hand-built 503 (no Connection/arena/Response - this
+ * Overload shedding: writes a minimal, hand-built 503 (no Connection/arena/Response - this
  * happens before any of that would normally exist) to a freshly accepted fd, then closes it.
  * Best-effort and one nonblocking attempt only: a client that won't read even this gets no more
  * consideration than one that was never told anything, which is fine - the point is to answer
@@ -320,7 +320,7 @@ static void reject_overloaded_connection(int client_fd) {
                              "Connection: close\r\n\r\n",
                              body, http_date_for(time(NULL)), strlen(body));
     /* client_fd is already non-blocking: accept_client, or a master's accept_client before an
-     * SCM_RIGHTS handoff (P10 - this used to cost its own two fcntl calls). */
+     * SCM_RIGHTS handoff (this used to cost its own two fcntl calls). */
     if (head_len > 0 && (size_t)head_len < sizeof(head)) {
         ssize_t n = write(client_fd, head, (size_t)head_len);
         if (n == head_len) {
@@ -332,15 +332,15 @@ static void reject_overloaded_connection(int client_fd) {
 
 /*
  * Shared tail of admitting one already-obtained client fd (via accept() or, under
- * CEXPRESS_SINGLE_ACCEPTOR, a passed fd received over a control socket - C4): S3's overload check,
+ * CEXPRESS_SINGLE_ACCEPTOR, a passed fd received over a control socket): the overload check,
  * table growth and Connection setup. Expects O_NONBLOCK/TCP_NODELAY to be in effect already: an fd
- * from accept_client has both (P10: accept4 / inheritance from the listener, no per-fd syscalls); a
+ * from accept_client has both (accept4 / inheritance from the listener, no per-fd syscalls); a
  * passed fd was accept_client'ed by the master and keeps both (POSIX: file status flags and socket
  * options are properties of the underlying open file description, not the fd number, so they carry
  * over across an SCM_RIGHTS handoff same as across dup()/fork()).
  */
 static void admit_connection(App *app, int client_fd) {
-    /* S3: shed load past the configured cap instead of accumulating connections (and their
+    /* shed load past the configured cap instead of accumulating connections (and their
      * arenas) without bound. Checked before ensure_connection_capacity/connection_create so an
      * overloaded server doesn't pay for either. open_connections is O(1) (see App.open_connections)
      * - this runs once per accepted connection, including every one we're about to reject, so it
@@ -365,7 +365,7 @@ static void admit_connection(App *app, int client_fd) {
         return;
     }
     app->connections[client_fd] = conn;
-    app->open_connections++; /* paired with connection_close's -- (S3) */
+    app->open_connections++; /* paired with connection_close's -- */
 
     event_loop_watch_read(app, client_fd, conn);
 }
@@ -376,7 +376,7 @@ void accept_connections(App *app) {
         if (client_fd < 0) {
             /* Out of descriptors process- or system-wide: without a free slot, accept() keeps
              * failing this way forever (nothing here releases one on its own), silently starving
-             * every future connection - the pre-S3 behavior. MEASURED (macOS/BSD): the connection
+             * every future connection - the old behavior. MEASURED (macOS/BSD): the connection
              * that triggered *this* failure is already gone by the time we see the error - accept()
              * dequeues it off the listen backlog and destroys it when it can't allocate an fd,
              * rather than leaving it there for a retry, so there is nobody left here to answer with
@@ -401,7 +401,7 @@ void accept_connections(App *app) {
 
 #ifdef CEXPRESS_SINGLE_ACCEPTOR
 /*
- * C4: this worker's server_fd is a control socket (the worker-side end of a socketpair with the
+ * this worker's server_fd is a control socket (the worker-side end of a socketpair with the
  * cluster master), not a listen socket - accept_via_fd_passing is set. New connections arrive as fds
  * passed over it via SCM_RIGHTS (cluster.c: dispatch_client_fd), never accept()ed by this process.
  * Drains every pending message until EAGAIN, same loop shape as accept_connections.
@@ -442,7 +442,7 @@ void accept_passed_connections(App *app) {
 #endif
 
 /*
- * P9: a response could not be fully written this turn. Ask for write readiness and stop reading
+ * a response could not be fully written this turn. Ask for write readiness and stop reading
  * until it drains: in_buf may already hold the next pipelined request, and serving it now would
  * build a new response over the one still pending. Level-triggered read readiness would otherwise
  * keep firing for bytes handle_readable must not consume yet. flush_connection's keep-alive branch
@@ -456,7 +456,7 @@ static void wait_for_writable(App *app, Connection *conn) {
 }
 
 /*
- * M5: a producer returned STREAM_PAUSE and its output has drained. Stop asking for writability (the
+ * a producer returned STREAM_PAUSE and its output has drained. Stop asking for writability (the
  * socket is writable, so a level-triggered write watch would call the producer in a busy loop) and keep
  * read interest only so read_and_serve can notice the peer hanging up (watch_stream_peer) while
  * nothing is being written. app_wake_streams / close_idle_connections resume it (resume_stream).
@@ -469,15 +469,15 @@ static int park_stream(App *app, Connection *conn) {
     return FLUSH_PENDING;
 }
 
-/* M5: un-parks a paused producer stream: its next call happens on the next write-readiness event. The
- * S2 stall clock restarts now - time spent paused is the producer's choice, not a stalled reader. */
+/* un-parks a paused producer stream: its next call happens on the next write-readiness event. The
+ * write-stall clock restarts now - time spent paused is the producer's choice, not a stalled reader. */
 static void resume_stream(App *app, Connection *conn) {
     conn->stream_paused = 0;
     conn->last_write_progress = time(NULL);
     event_loop_watch_write(app, conn->fd, conn);
 }
 
-/* M2: nothing is buffered any more - drop the input memory so an idle connection holds none. An
+/* nothing is buffered any more - drop the input memory so an idle connection holds none. An
  * owned buffer is freed; a borrowed App.read_buf is just handed back. */
 static void release_in_buf(const App *app, Connection *conn) {
     if (conn->in_buf != app->read_buf) {
@@ -494,7 +494,7 @@ int flush_connection(App *app, Connection *conn) {
     const size_t max_flush_bytes = 4 * STREAM_CHUNK_SIZE;
 
     if (conn->last_write_progress == 0) {
-        /* First time flush_connection runs for this response: start the S2 stall clock now, even
+        /* First time flush_connection runs for this response: start the write-stall clock now, even
          * before the first byte actually goes out (a response that gets EAGAIN on every attempt is
          * exactly the "made no progress" case the deadline exists for). */
         conn->last_write_progress = time(NULL);
@@ -505,7 +505,7 @@ int flush_connection(App *app, Connection *conn) {
             ssize_t n = conn_write(conn, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* M1: out_buf is shared-arena-resident unless it's already a connection-owned
+                    /* out_buf is shared-arena-resident unless it's already a connection-owned
                      * copy (out_buf_owned) or the file-streaming chunk buffer (out_buf == stream_buf,
                      * never arena to begin with - see stream_buf's own comment). Returning to the event
                      * loop now would let another connection's dispatch reset and reuse the shared
@@ -532,7 +532,7 @@ int flush_connection(App *app, Connection *conn) {
             }
             conn->out_sent += (size_t)n;
             conn->last_activity = time(NULL);
-            conn->last_write_progress = conn->last_activity; /* S2: only advances on actual bytes written */
+            conn->last_write_progress = conn->last_activity; /* only advances on actual bytes written */
             bytes_written_this_flush += (size_t)n;
         }
 
@@ -548,7 +548,7 @@ int flush_connection(App *app, Connection *conn) {
                 size_t to_read = conn->file_remaining < STREAM_CHUNK_SIZE
                                      ? conn->file_remaining
                                      : STREAM_CHUNK_SIZE;
-                /* M1: a connection-owned buffer, malloc'd once and reused chunk to chunk - never the
+                /* a connection-owned buffer, malloc'd once and reused chunk to chunk - never the
                  * shared arena, since a large file spans many event-loop turns during which other
                  * connections would otherwise reuse and overwrite it (see Connection.stream_buf). A
                  * still-owned malloc'd tail-copy from the response head (above) is done with once we
@@ -586,7 +586,7 @@ int flush_connection(App *app, Connection *conn) {
             }
         }
 
-        /* M5: a producer stream - the previous turn's output has drained, ask for the next one. */
+        /* a producer stream - the previous turn's output has drained, ask for the next one. */
         if (conn->stream_fn != NULL) {
             if (conn->stream_paused) {
                 return park_stream(app, conn);
@@ -633,14 +633,14 @@ int flush_connection(App *app, Connection *conn) {
 
     /* Whatever is left in out_buf now has been fully drained (the inner loop only exits via that, or
      * the streaming branch above, which never leaves it non-NULL and un-freed). A connection-owned
-     * tail-copy (M1) needs freeing here; an arena-resident buffer does not (the caller - handle_readable
+     * tail-copy needs freeing here; an arena-resident buffer does not (the caller - handle_readable
      * or reject_request - resets the shared arena once this whole dispatch-and-flush cycle is done). */
     if (conn->out_buf_owned) {
         free(conn->out_buf);
         conn->out_buf_owned = 0;
     }
     if (conn->stream_buf != NULL) {
-        /* M5: a producer stream just ended (its last chunk is what drained): release the turn buffer */
+        /* a producer stream just ended (its last chunk is what drained): release the turn buffer */
         if (conn->out_buf == conn->stream_buf) {
             conn->out_buf = NULL;
         }
@@ -649,7 +649,7 @@ int flush_connection(App *app, Connection *conn) {
     }
 
     if (conn->keep_alive) {
-        /* Drop write registration from a partial write above, and resume reading (P9: reads pause
+        /* Drop write registration from a partial write above, and resume reading (reads pause
          * while a response is pending - see wait_for_writable). */
         event_loop_unwatch_write(app, conn->fd, conn);
         if (!(conn->events_watched & EVENT_READ)) {
@@ -659,9 +659,9 @@ int flush_connection(App *app, Connection *conn) {
         conn->out_len = 0;
         conn->out_sent = 0;
         conn->out_cap = 0;
-        /* P9: keep whatever follows the request just answered (a pipelined next request, whole or
+        /* keep whatever follows the request just answered (a pipelined next request, whole or
          * partial) instead of discarding the buffer. request_len == 0 means nobody recorded how long
-         * the request was (a direct flush_connection call): drop everything, the pre-P9 behavior. */
+         * the request was (a direct flush_connection call): drop everything, the old behavior. */
         const size_t consumed = conn->request_len;
         conn->request_len = 0;
         if (consumed == 0 || conn->in_off + consumed >= conn->in_len) {
@@ -670,17 +670,17 @@ int flush_connection(App *app, Connection *conn) {
         } else {
             conn->in_off += consumed;
         }
-        /* Back to idle between requests (S1) - unless pipelined bytes are already waiting, which
+        /* Back to idle between requests - unless pipelined bytes are already waiting, which
          * start the next request's clock now. */
         conn->request_started = conn->in_len > 0 ? time(NULL) : 0;
-        conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying (S2) */
-        conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check (S4) */
-        conn->continue_sent = 0; /* ... and its own 100 Continue (C1) */
-        conn->chunk_scan = (ChunkScanState){0}; /* next request's chunked body scans from its own start (P8) */
+        conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying */
+        conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check */
+        conn->continue_sent = 0; /* ... and its own 100 Continue */
+        conn->chunk_scan = (ChunkScanState){0}; /* next request's chunked body scans from its own start */
 
-        /* M2: nothing buffered - free the input buffer (however far it grew for a large body) or hand
+        /* nothing buffered - free the input buffer (however far it grew for a large body) or hand
          * App.read_buf back, so an idle keep-alive connection owns no input memory. Pipelined
-         * leftovers (P9) keep the buffer as it is. */
+         * leftovers keep the buffer as it is. */
         if (conn->in_len == 0) {
             release_in_buf(app, conn);
         }
@@ -698,17 +698,17 @@ static void reject_request(App *app, Connection *conn, const int status) {
     res_status(&res, status);
     res_send(&res, status_text(status));
     flush_connection(app, conn);
-    /* M1: conn may already be freed (flush_connection always closes here, keep_alive is forced off
+    /* conn may already be freed (flush_connection always closes here, keep_alive is forced off
      * above) - reset the shared arena through app, never conn, once this dispatch-and-flush cycle
      * that just used it is over. */
     arena_reset(&app->arena);
 }
 
 /*
- * in_buf is full with headers complete: grow it to fit the body (M2: a borrowed App.read_buf is
+ * in_buf is full with headers complete: grow it to fit the body (a borrowed App.read_buf is
  * copied into a new owned buffer instead of realloc'd). Returns 1 grown (keep reading),
  * 0 realloc failed (-> 500), -1 chunked raw-size cap hit (-> 413).
- * Both Content-Length and chunked grow the same way (S4): doubling, capped at the known target size
+ * Both Content-Length and chunked grow the same way: doubling, capped at the known target size
  * (header_len + content_length + 1, or header_len + MAX_BODY_SIZE for chunked's raw wire size) - never
  * one realloc straight to the full size a client merely *declared*. A client that sends a 10 MiB
  * Content-Length and then only a few KB of body costs a reservation proportional to what actually
@@ -738,7 +738,7 @@ static int grow_in_buf(const App *app, Connection *conn, const size_t header_len
     }
     char *grown;
     if (conn->in_buf == app->read_buf) {
-        /* M2: a borrowed App.read_buf is never realloc'd - move to an owned buffer of the grown size. */
+        /* a borrowed App.read_buf is never realloc'd - move to an owned buffer of the grown size. */
         grown = malloc(needed);
         if (grown == NULL) {
             return 0;
@@ -756,12 +756,12 @@ static int grow_in_buf(const App *app, Connection *conn, const size_t header_len
 }
 
 /*
- * S4: as soon as a request's headers are complete, reject a declared Content-Length that exceeds
+ * as soon as a request's headers are complete, reject a declared Content-Length that exceeds
  * the effective app_use_body_limit for its path with 413 - before any body buffering happens, not
  * just before in_buf is grown to fit it. Runs at most once per request (conn->body_limit_checked).
  * Only Content-Length is covered: chunked bodies stay governed by the global MAX_BODY_SIZE raw-wire
  * cap in grow_in_buf/chunked_body_scan (see app_use_body_limit's header comment for why).
- * Takes an already-parsed head (P2) instead of running its own request_framing pass over conn->in_buf.
+ * Takes an already-parsed head instead of running its own request_framing pass over conn->in_buf.
  * Returns 1 if the request was rejected (caller must not touch conn again), 0 otherwise.
  */
 static int reject_if_over_body_limit(App *app, Connection *conn, const ParsedHead *head) {
@@ -787,13 +787,13 @@ static int reject_if_over_body_limit(App *app, Connection *conn, const ParsedHea
 }
 
 /*
- * C1: the request's headers are complete, its body is not, and it carries "Expect: 100-continue"
+ * the request's headers are complete, its body is not, and it carries "Expect: 100-continue"
  * (request_head_expects_continue): write "HTTP/1.1 100 Continue" once so the client sends the body now
  * instead of after its own fallback timeout (curl: 1 s). Runs after reject_if_over_body_limit, so a
  * body over the route or global limit gets its 413 instead and the body is never invited. Written
  * straight to the socket, not through out_buf: serve_buffered_requests only gets here with no response
  * pending, so nothing can be queued ahead of it. EAGAIN (nothing written) is harmless - the client falls
- * back to its timeout, as before C1. A short write would leave half a status line ahead of the final
+ * back to its timeout, as before 100-continue support. A short write would leave half a status line ahead of the final
  * response, so it closes the connection like a hard write error.
  * Returns 0 (conn open), or -1 once conn has been closed (freed).
  */
@@ -812,12 +812,12 @@ static int send_continue_if_expected(App *app, Connection *conn, const ParsedHea
     return -1;
 }
 
-/* serve_buffered_requests results (P9). */
+/* serve_buffered_requests results. */
 #define SERVE_NEED_MORE 0
 #define SERVE_WAIT 1
 #define SERVE_CLOSED -1
 
-/* P9: moves the unserved tail of in_buf (from in_off) to the front. Called only when more input has
+/* moves the unserved tail of in_buf (from in_off) to the front. Called only when more input has
  * to be read after it (serve_buffered_requests' SERVE_NEED_MORE), so every byte moves at most once. */
 static void compact_in_buf(Connection *conn) {
     if (conn->in_off == 0) {
@@ -831,7 +831,7 @@ static void compact_in_buf(Connection *conn) {
 }
 
 /*
- * P9: serves every complete request buffered in in_buf[in_off..in_len), in order, one response each,
+ * serves every complete request buffered in in_buf[in_off..in_len), in order, one response each,
  * up to MAX_PIPELINED_PER_EVENT per call; *served_out = how many were dispatched. Returns:
  *   SERVE_NEED_MORE  no complete request left (in_buf compacted: any partial request now starts at 0)
  *   SERVE_WAIT       a response is pending (write readiness resumes it) or the per-call cap was hit
@@ -850,8 +850,8 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
         const size_t req_avail = conn->in_len - conn->in_off;
 
         /* One phr_parse_request pass, reused below by the body-limit check, the completeness check
-         * and the full parse (P2) - these used to each run their own independent pass over the same
-         * bytes, up to four per request after S4 added the body-limit check's own. */
+         * and the full parse - these used to each run their own independent pass over the same
+         * bytes, up to four per request once the body-limit check added its own. */
         ParsedHead head;
         parse_request_head(req_start, req_avail, &head);
 
@@ -868,19 +868,19 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
         }
 
         Request req;
-        /* M4: req.body is a view into in_buf (no copy); body_saved is the byte its NUL replaced. */
+        /* req.body is a view into in_buf (no copy); body_saved is the byte its NUL replaced. */
         char body_saved = '\0';
         const int parse_status = parse_http_request_in_place(req_start, req_avail, &head, &req, conn->arena,
                                                              &body_saved);
         if (parse_status != 0) {
-            /* -2: path too long (414). -3 (S5) is retired (P3): req->headers holds views now, so
+            /* -2: path too long (414). -3 is retired: req->headers holds views now, so
              * there is no fixed-size copy left to overflow - parse_http_request_from_head never
              * returns it any more (this is parse_status's own -3; req.content_length's -3 below is
              * an unrelated sentinel in a different code space). -4: a percent-decoded path/query
-             * name/query value contained an embedded NUL, never silently truncated (400, S6) - falls
+             * name/query value contained an embedded NUL, never silently truncated (400) - falls
              * into "anything else" below along with -1 (malformed), since both are already 400.
              * req.content_length == -2: body over MAX_BODY_SIZE (413), for both Content-Length and
-             * chunked framing. req.content_length == -3 (S11): Transfer-Encoding names a coding this
+             * chunked framing. req.content_length == -3: Transfer-Encoding names a coding this
              * engine doesn't implement, or "chunked" isn't its sole token (501, "Not Implemented" -
              * the server understood the request but can't process that transfer-coding). Anything
              * else: 400. */
@@ -901,13 +901,13 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
         res.is_head_request = strcmp(req.method, "HEAD") == 0;
         const Route *route = match_route(app, &req);
         dispatch(app, route, &req, &res);
-        /* M4: the body's NUL may sit on the first byte of a pipelined next request - put it back now
+        /* the body's NUL may sit on the first byte of a pipelined next request - put it back now
          * that the handler is done (res_* copied anything it sent), before flush_connection can free
          * in_buf or the next iteration parses from it. */
         req.body[req.content_length] = body_saved;
 
         const int flushed = flush_connection(app, conn);
-        /* M1: conn may already be freed by flush_connection (a non-keep-alive response, or a
+        /* conn may already be freed by flush_connection (a non-keep-alive response, or a
          * hard write error) - reset the shared arena through app, never conn, once this
          * dispatch-and-flush cycle that just used it is over (flush_connection has already
          * copied out anywhere it returned early with a still-pending response, so nothing any
@@ -933,7 +933,7 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
 }
 
 /*
- * M2: handle_readable is returning with conn still open. If in_buf is the borrowed App.read_buf,
+ * handle_readable is returning with conn still open. If in_buf is the borrowed App.read_buf,
  * either hand it back (nothing left to serve) or copy the unserved bytes - a partial request, or
  * requests pipelined behind a pending response - into an owned BUF_SIZE buffer, compacted to offset
  * 0 (request_len and chunk_scan are relative to in_off, so they stay valid). The leftover always
@@ -941,7 +941,7 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
  */
 static int stop_borrowing_read_buf(App *app, Connection *conn) {
     if (response_pending(conn) && conn->request_len > 0 && conn->in_off + conn->request_len >= conn->in_len) {
-        /* M5: the request behind the pending response has been dispatched (its views died with the
+        /* the request behind the pending response has been dispatched (its views died with the
          * handler) and nothing is pipelined after it, so its bytes are dead. Drop them now rather than
          * hold a BUF_SIZE copy for the response's whole life - a res_stream subscriber can stay open
          * for hours. request_len = 0 makes the keep-alive reset treat the buffer as fully consumed. */
@@ -972,7 +972,7 @@ static int stop_borrowing_read_buf(App *app, Connection *conn) {
 }
 
 /*
- * M5: read readiness while a producer stream is live (normally parked - see park_stream). Peeks one
+ * read readiness while a producer stream is live (normally parked - see park_stream). Peeks one
  * byte without consuming it: EOF or a hard error means the peer is gone, so close now (freeing the
  * producer's ctx) instead of holding the stream until its next write fails. Real bytes are a pipelined
  * request that must wait for the stream to end: drop read interest so level-triggered readiness does
@@ -994,7 +994,7 @@ static int watch_stream_peer(App *app, Connection *conn) {
 /* handle_readable's body. Returns 0 with conn still open, -1 once conn has been closed (freed). */
 static int read_and_serve(App *app, Connection *conn) {
     if (response_pending(conn) || conn->in_off > 0) {
-        /* P9: a response is still draining (reads are normally unwatched meanwhile, see
+        /* a response is still draining (reads are normally unwatched meanwhile, see
          * wait_for_writable - this guards a readiness event already queued in the same batch), or
          * buffered pipelined requests are waiting for their handle_writable turn. Reading now would
          * append behind them; they are served first, in order. */
@@ -1009,7 +1009,7 @@ static int read_and_serve(App *app, Connection *conn) {
     }
 
     if (conn->in_buf == NULL) {
-        /* M2: nothing buffered - read into the worker's shared buffer; stop_borrowing_read_buf
+        /* nothing buffered - read into the worker's shared buffer; stop_borrowing_read_buf
          * (handle_readable) moves any unserved bytes into an owned buffer before returning. */
         conn->in_buf = app->read_buf;
         conn->in_cap = BUF_SIZE;
@@ -1032,7 +1032,7 @@ static int read_and_serve(App *app, Connection *conn) {
         }
 
         if (conn->request_started == 0) {
-            /* First byte of a fresh request after an idle keep-alive gap: (re)start the deadline clock (S1). */
+            /* First byte of a fresh request after an idle keep-alive gap: (re)start the deadline clock. */
             conn->request_started = time(NULL);
         }
         conn->in_len += (size_t)n;
@@ -1077,7 +1077,7 @@ static int read_and_serve(App *app, Connection *conn) {
 
 void handle_readable(App *app, Connection *conn) {
     if (read_and_serve(app, conn) == 0) {
-        stop_borrowing_read_buf(app, conn); /* M2: App.read_buf is never held across event-loop turns */
+        stop_borrowing_read_buf(app, conn); /* App.read_buf is never held across event-loop turns */
     }
 }
 
@@ -1107,13 +1107,13 @@ void close_idle_connections(App *app) {
 
         /* A write still in flight is a slow-reader-on-the-response problem, not the
          * slow-sender-of-a-request problem the checks below target, so it is bounded separately here
-         * (S2): a pending response that hasn't accepted a single byte onto the socket in
+         *: a pending response that hasn't accepted a single byte onto the socket in
          * WRITE_TIMEOUT_SECONDS is a client that stopped reading, not a slow one - close it rather
          * than hold the fd, arena and out_buf forever. Still-progressing writes (however slowly) are
          * left for flush_connection()/EVFILT_WRITE to keep draining. */
         if (response_pending(conn)) {
             if (conn->stream_paused) {
-                /* M5: a parked producer stream is idle by its own choice, not stalled: poll it again
+                /* a parked producer stream is idle by its own choice, not stalled: poll it again
                  * (at most once a second) instead of applying the write-stall deadline. */
                 resume_stream(app, conn);
                 continue;
@@ -1126,14 +1126,14 @@ void close_idle_connections(App *app) {
 
         /* A request in flight is bounded by request_started, independent of how often a byte arrives -
          * closes the slow-drip case (one byte every N < 60s) that never goes "idle" under last_activity
-         * alone (S1). Headers incomplete: header deadline; headers already complete (body still
+         * alone. Headers incomplete: header deadline; headers already complete (body still
          * pending): the more generous body deadline. request_framing is cheap and this only runs once
          * per sweep second per connection, not on the per-byte hot path. */
         if (conn->request_started != 0) {
             size_t header_len = 0;
             int chunked = 0;
             if (conn->in_len > conn->in_off) {
-                /* P9: from in_off - bytes before it belong to a request already answered. */
+                /* from in_off - bytes before it belong to a request already answered. */
                 request_framing(conn->in_buf + conn->in_off, conn->in_len - conn->in_off, &header_len, &chunked,
                                 NULL, NULL);
             }
@@ -1201,7 +1201,7 @@ void app_listen_worker(App *app, int port) {
 
     run_worker_init_hooks(app);
 
-    /* C4 (CEXPRESS_SINGLE_ACCEPTOR only): a worker running under the single-acceptor cluster model
+    /* CEXPRESS_SINGLE_ACCEPTOR only: a worker running under the single-acceptor cluster model
      * arrives here with server_fd already set to its control socket by
      * app_listen_worker_via_control_socket, and must not clobber it with a real listen socket of its
      * own - it never accept()s directly. Every other caller (standalone, or a Linux cluster worker)
@@ -1214,7 +1214,7 @@ void app_listen_worker(App *app, int port) {
         }
     }
     if (event_loop_init(app) != 0) {
-        /* Not perror: errno may be stale by now. The backend that failed has already said why (C5). */
+        /* Not perror: errno may be stale by now. The backend that failed has already said why. */
         fprintf(stderr, "app_listen_worker: no usable event loop backend, exiting\n");
         exit(EXIT_FAILURE);
     }

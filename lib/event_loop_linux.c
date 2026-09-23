@@ -8,7 +8,7 @@
 #include "event_loop_backend.h"
 
 /*
- * C5: runtime backend selection. io_uring is preferred; when the kernel or the container runtime refuses
+ * runtime backend selection. io_uring is preferred; when the kernel or the container runtime refuses
  * to create a ring (EVENT_LOOP_UNAVAILABLE), the worker logs why and runs on epoll instead of exiting.
  * CEXPRESS_EVENT_LOOP=epoll|io_uring forces one (no fallback when forced); any other non-empty value is
  * refused. Built with CEXPRESS_USE_EPOLL (Linux NO_URING=1, or macOS epoll-shim), epoll is the only one.

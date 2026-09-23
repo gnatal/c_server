@@ -4,7 +4,7 @@
  * bytes, truncates, and hands the parser an exact-size heap buffer (no NUL, no slack) so any
  * out-of-bounds read is caught. Exit 0 = no finding. Run it after touching lib/http_parser.c or
  * lib/router.c.
- * T1: beyond memory safety it asserts check_answered's oracle on every input - the parser never makes the
+ * beyond memory safety it asserts check_answered's oracle on every input - the parser never makes the
  * engine wait on bytes that already hold a whole head (only a genuinely short body may be waited for), the
  * head ends exactly at the first blank line, and the verdict does not depend on how recv() split the bytes.
  * tests/fuzz_connection.c checks the same promise end to end through handle_readable.
@@ -22,7 +22,7 @@ char fuzz_conn_buf[64 * 1024];
 static void h(const Request *r, Response *s) { (void)r; res_send(s, "x"); }
 static unsigned long long rng = 88172645463325252ULL;
 static unsigned r32(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (unsigned)(rng >> 16); }
-/* T1: offset just past the first blank line ('\n' followed by "\n" or "\r\n": every line ending
+/* offset just past the first blank line ('\n' followed by "\n" or "\r\n": every line ending
  * picohttpparser accepts), or 0 when there is none. Deliberately parser-independent. */
 static size_t first_blank_line_end(const char *buf, size_t len) {
   for (size_t i = 0; i + 1 < len; i++) {
@@ -33,7 +33,7 @@ static size_t first_blank_line_end(const char *buf, size_t len) {
   return 0;
 }
 
-/* T1: the status connection.c answers a failed parse with (same mapping as serve_buffered_requests),
+/* the status connection.c answers a failed parse with (same mapping as serve_buffered_requests),
  * 0 for a parse that dispatches. Aborts on a status the engine has no answer for. */
 static int answer_for(int parse_status, const Request *req) {
   if (parse_status == 0) return 0;
@@ -50,10 +50,10 @@ static int answer_for_bytes(const char *buf, size_t len) {
 }
 
 /*
- * T1 oracle ("every input is answered or closed"), for buf[0..len) as the engine's whole buffer:
+ * answered-or-closed oracle ("every input is answered or closed"), for buf[0..len) as the engine's whole buffer:
  *  1. request_is_complete == 0 only while a WELL-FRAMED head waits for a body that is genuinely short
  *     (Content-Length not all there, or a chunked scan that needs more), or while no blank line has
- *     arrived at all (the 431 cap and the S1 deadline bound that case in connection.c). Terminated
+ *     arrived at all (the 431 cap and the request header deadline bound that case in connection.c). Terminated
  *     garbage is always "complete", so it is answered at once instead of held until the timeout.
  *  2. A parsed head ends exactly at the first blank line, on "\r\n\r\n" (a head that reached past it
  *     would disagree with a strict proxy about where the request ends).
@@ -62,9 +62,9 @@ static int answer_for_bytes(const char *buf, size_t len) {
  *     from-scratch scan; once complete, every longer prefix is complete too; and the answer chosen at
  *     that first prefix is the one the whole buffer gets.
  */
-/* T1: an oracle failure names its line and prints the input escaped, so it can become a regression test. */
+/* an oracle failure names its line and prints the input escaped, so it can become a regression test. */
 static void oracle_fail(int line, const char *buf, size_t len) {
-  fprintf(stderr, "T1 oracle failed at tests/fuzz_parser.c:%d on %zu bytes: \"", line, len);
+  fprintf(stderr, "answered-or-closed oracle failed at tests/fuzz_parser.c:%d on %zu bytes: \"", line, len);
   for (size_t i = 0; i < len; i++) {
     const unsigned char c = (unsigned char)buf[i];
     if (c == '\r') fputs("\\r", stderr); else if (c == '\n') fputs("\\n", stderr);
@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
     (void)request_framing(buf, len, &hl, &ch, &fpath, &fpath_len);
     if (request_is_complete(buf, len)) complete++;
     if (ch && hl > 0) {
-      /* P8: resuming across a random split point must agree with one from-scratch scan. */
+      /* resuming across a random split point must agree with one from-scratch scan. */
       const size_t body_len = len - hl, cut = body_len ? r32() % (body_len + 1) : 0;
       ChunkScanState st = {0}; size_t d_scratch = 0, d_resume = 0;
       const int first = chunked_body_scan_resume(buf + hl, cut, MAX_BODY_SIZE, &st, &d_resume);
@@ -171,12 +171,12 @@ int main(int argc, char **argv) {
     Request req;
     const int copy_status = parse_http_request(buf, len, &req, &test_arena);
     {
-      /* M4: the in-place parser must agree with the copying one - same status, same body bytes - and
+      /* the in-place parser must agree with the copying one - same status, same body bytes - and
        * after its saved byte is restored, nothing past the body may differ (all of it, for a
        * Content-Length body). The one extra byte is the writable raw[raw_len] slot it may NUL. */
       char *mut = malloc(len + 1); memcpy(mut, buf, len); mut[len] = '\0';
       ParsedHead head; parse_request_head(mut, len, &head);
-      /* C1: never true for a head the engine would not wait on (incomplete, malformed, 1.0, no body). */
+      /* never true for a head the engine would not wait on (incomplete, malformed, 1.0, no body). */
       if (request_head_expects_continue(&head) &&
           (head.header_len == 0 || head.minor_version < 1 || head.content_length < 0 ||
            (!head.chunked && head.content_length == 0))) abort();

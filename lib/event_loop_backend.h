@@ -4,7 +4,7 @@
 #include "app_types.h"
 
 /*
- * Private to the Linux event loop (C5): event_loop_linux.c implements the public event_loop.h API by
+ * Private to the Linux event loop: event_loop_linux.c implements the public event_loop.h API by
  * forwarding to one of these tables, chosen at runtime by event_loop_init and stored in App.loop_ops.
  * Each backend's functions are static; its table is the only symbol it exports. kqueue (macOS/BSD) is
  * the only backend there and implements event_loop.h directly, without a table.

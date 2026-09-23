@@ -422,7 +422,7 @@ static int epoll_poll(App *app, LoopEvent *out_events, int max_events, int timeo
     return out_count;
 }
 
-/* C5: the only exported symbol; event_loop_linux.c selects it at runtime (event_loop_backend.h). */
+/* the only exported symbol; event_loop_linux.c selects it at runtime (event_loop_backend.h). */
 const EventLoopOps epoll_loop_ops = {
     .name = "epoll",
     .init = epoll_init,
