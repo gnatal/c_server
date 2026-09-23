@@ -255,8 +255,9 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   would still have matched), except exactly `*`. Dot segments are refused rather than resolved: clients already
   remove them (RFC 3986) and the static mount's own `..` check stays as defense in depth. Invariant: after a
   successful parse `req->path` is canonical, and every prefix consumer (middleware, body limits, mounts) matches it
-  with `path_prefix_matches` against a prefix normalized by `path_normalize_prefix`. Not yet applied: the body-limit
-  check in `connection.c` still passes the raw request-target, not `req->path` (in `improvements.md`).
+  with `path_prefix_matches` against a prefix normalized by `path_normalize_prefix`. The target-to-path step
+  (query dropped, `%2F` refused, decoded, canonicalized) is one pure function, `request_target_path`, used both by
+  `parse_request_fields` and by the body-limit check, which runs before a `Request` exists.
   **Embedded NUL.** The path and query names/values are percent-decoded (`decode_bounded`/`url_decode`); a decoded byte
   that is NUL (`%00`, or a raw NUL byte already in the request line) is rejected with 400 (`parse_http_request`'s `-4`)
   rather than silently truncating everything downstream that reads `req->path`/`req_get_query` as a C string - MEASURED
@@ -377,12 +378,17 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   `handle_readable` already computed for this `recv` (it does not run its own `request_framing` pass -
   `Connection.body_limit_checked` still guards it running its actual check more than once per request, cleared
   with `request_started` in `flush_connection`'s keep-alive branch) and, as soon as headers are complete,
-  compares a declared `Content-Length` against `app_body_limit_for_path` (longest matching prefix wins,
-  independent of registration order; `MAX_BODY_SIZE` if nothing matches) - over it is 413, sent before a single
-  body byte is buffered or `in_buf` is grown. Only `Content-Length` is covered; chunked bodies stay governed by
-  the global `MAX_BODY_SIZE` raw-wire cap in `grow_in_buf`/`chunked_body_scan` only (a deliberate scope decision,
-  not a gap: chunked's raw-cap doubling was already proportional to bytes received, which is what the body-limit check was chiefly
-  about for `Content-Length`).
+  looks up the limit with `app_body_limit_for_target` - the raw request-target through `request_target_path`, so the
+  prefix sees the same canonical path as routing and middleware (a query string, `//` or `%75pload` no longer falls
+  back to `MAX_BODY_SIZE`; a target the parser will refuse gets `MAX_BODY_SIZE` and its own 400/414 later). Longest
+  matching prefix wins, independent of registration order; `MAX_BODY_SIZE` if nothing matches. The result is kept in
+  `Connection.body_limit` for the rest of the request. A declared `Content-Length` over it is 413, sent before a
+  single body byte is buffered or `in_buf` is grown. A chunked body is held to the same number two ways:
+  `reject_if_chunked_over_body_limit` runs right after every `request_head_is_complete` and answers 413 once
+  `chunk_scan.decoded_len` (validated chunks only) passes it, complete or not; and `grow_in_buf`'s raw-wire cap is
+  `header_len + body_limit` instead of `+ MAX_BODY_SIZE`, which bounds a chunk declared huge that never finishes
+  (raw bytes are never fewer than decoded ones). That raw cap only matters once `in_buf` outgrows `BUF_SIZE`, so a
+  small limit still accepts a body of exactly its size framed in many tiny chunks.
 - **Timeouts.** `last_activity` advances on received bytes only. Sweep every second; ≥ 60 s silent → close (408 first if a
   request was half-received). A connection with a response pending (`out_buf != NULL` or `file_fd >= 0`) is exempt from
   this particular check — that axis is bounded separately, below.

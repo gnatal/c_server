@@ -29,7 +29,7 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `router_add_route(Router *, method, path, Handler)`, `router_add_route_mw(...)` — generic forms.
 - `app_mount(App *, prefix, const Router *)` — copy a router's routes and middleware into the app under a prefix.
 - `app_serve_static(App *, prefix, root_dir)` — serve files from a directory (traversal-safe; the root is resolved against the working directory).
-- `app_use_body_limit(App *, prefix, max_bytes)` — reject a declared `Content-Length` over `max_bytes` for paths under `prefix` with 413, before buffering the body (clamped to `MAX_BODY_SIZE`; chunked bodies unaffected). `app_body_limit_for_path(const App *, path)` — the effective cap for a path (engine/tests).
+- `app_use_body_limit(App *, prefix, max_bytes)` — 413 for a body over `max_bytes` on paths under `prefix` (matched on the canonical path, so `?query`, `//` and `%XX` don't dodge it; clamped to `MAX_BODY_SIZE`). A declared `Content-Length` is refused before buffering; a chunked body once its chunks decode past the limit. `app_body_limit_for_path(const App *, path)` / `app_body_limit_for_target(const App *, target, len)` — the effective cap for a canonical path / a raw request-target (engine/tests).
 - `match_route(const App *, Request *)`, `match_path(pattern, path, Request *)`, `match_route_allowed_methods(...)` — matching (engine/tests).
 - `app_free_routes(App *)` — free the route trees (engine: `app_destroy` calls it).
 - Path rules that surprise: a literal segment beats `:name` beats `*` regardless of registration order; use the same `:name` at the same position in every route (`lib/CLAUDE.md`, "Known gaps").
@@ -47,6 +47,7 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `req_get_cookie(req, name)` — cookie value, case-sensitive name. Splits the `Cookie` header on its first call per request, not eagerly for every request.
 - Also on `Request`: `method`, `path`, `version`, `query` (raw), `body` (NUL-terminated; binary-safe with `content_length`; lives in the connection arena, never free it), `content_length`.
 - `url_decode(src, dst, dst_size, decode_plus)` — percent-decode a string.
+- `request_target_path(target, len, out, out_size)` — raw request-target to canonical path (query dropped, decoded, `path_canonicalize`d; -2 too long, -4 invalid): the one step the parser and the body-limit check share.
 - `path_canonicalize(path)` (in place, collapses repeated `/`; -1 for a `.`/`..` segment or a target not starting with `/`), `path_normalize_prefix(prefix, out, out_size)` (`""` or `/seg[/seg]`), `path_prefix_matches(prefix, path)` (segment-boundary match) — the one path shape shared by routing, prefix middleware, body limits and mounts. `req->path` is always canonical: the parser refuses (400) `%2F`, dot segments and non-origin-form targets.
 
 ## Build the response (`response.h`)

@@ -23,7 +23,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 |---|---|---|---|---|
 | **S1** | ~~Prefix middleware (auth) is bypassed with `//admin/...` or `/%2Fadmin/...`~~ **FIXED 2026-09-23** | **High** | S | MEASURED |
 | **M1** | ~~macOS cluster master never closes the fds it hands to workers~~ **FIXED 2026-09-23** | **High** (cluster stops accepting; no FIN) | S | MEASURED |
-| **S2** | `app_use_body_limit` is bypassed by a query string, encoding, `//`, or chunked encoding | High | S | MEASURED |
+| **S2** | ~~`app_use_body_limit` is bypassed by a query string, encoding, `//`, or chunked encoding~~ **FIXED 2026-09-23** | High | S | MEASURED |
 | **M2** | Large static files: whole file read and copied twice; slow readers pin the full size each | High (memory DoS) | S | MEASURED |
 | **S3** | Chunk-size parsing accepts `0x5`, `+5` and ` 5` (request smuggling behind a proxy) | Medium | S | MEASURED |
 | **S4** | Static mounts serve dotfiles (`.env`, `.git/config`) | Medium | S | MEASURED |
@@ -249,7 +249,7 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
 - **Status: FIXED 2026-09-23.** `path_canonicalize` / `path_normalize_prefix` / `path_prefix_matches`
   (`lib/http_parser.c`); `%2F`, dot segments and non-origin-form targets → 400. Verified with the probe: all three
   curls above now give 401 / 401 / 400. Tests: `test_http_hardening.c`, `test_cookbook.c`, `test_middleware.c`,
-  `test_router.c`. S2's raw-target body-limit lookup is still open.
+  `test_router.c`. S2's raw-target body-limit lookup was fixed separately (see S2).
 - **Impact:** **High**. An auth bypass for the documented pattern: `app_use_prefix(app, "/admin", auth)` (the
   cookbook's own recipe at `lib/examples/cookbook.c:523`, `DOC.md:213`, `README.md:137`), and `router_use`
   middleware on a mounted router (`app_mount` turns it into `app_use_prefix`).
@@ -279,6 +279,13 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   Routing, middleware and limits then all see the same path.
 
 ### S2 · `app_use_body_limit` is bypassed four ways
+- **Status: FIXED 2026-09-23.** The limit is looked up on the canonical path: `request_target_path`
+  (`lib/http_parser.c`, shared with `parse_request_fields`) via `app_body_limit_for_target` (`lib/router.c`), kept in
+  `Connection.body_limit`. Chunked bodies get 413 once their validated chunks decode past it
+  (`reject_if_chunked_over_body_limit`), and `grow_in_buf`'s chunked raw cap is `header_len + body_limit`. Tests:
+  `tests/test_body_limit.c` (all four shapes → 413, the same shapes within the limit → 200, an unfinished huge chunk
+  → 413 from the raw cap, the limit re-checked per keep-alive request) and five new `test_answered.c` seeds. Each
+  half of the fix was reverted in turn and both suites failed.
 - **Impact:** High. The per-route limit is the documented way to keep, for example, a JSON endpoint to 16 KiB.
   Every bypass falls back to the global 10 MiB.
 - **Effort:** S

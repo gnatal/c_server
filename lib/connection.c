@@ -709,7 +709,7 @@ static void reject_request(App *app, Connection *conn, const int status) {
  * copied into a new owned buffer instead of realloc'd). Returns 1 grown (keep reading),
  * 0 realloc failed (-> 500), -1 chunked raw-size cap hit (-> 413).
  * Both Content-Length and chunked grow the same way: doubling, capped at the known target size
- * (header_len + content_length + 1, or header_len + MAX_BODY_SIZE for chunked's raw wire size) - never
+ * (header_len + content_length + 1, or header_len + the route's body limit for chunked's raw wire size) - never
  * one realloc straight to the full size a client merely *declared*. A client that sends a 10 MiB
  * Content-Length and then only a few KB of body costs a reservation proportional to what actually
  * arrived (doubling from BUF_SIZE), not the declared 10 MiB up front; the full target is only reached
@@ -722,7 +722,8 @@ static int grow_in_buf(const App *app, Connection *conn, const size_t header_len
                        const int content_length) {
     size_t needed;
     if (chunked) {
-        const size_t raw_cap = header_len + MAX_BODY_SIZE;
+        /* the route's own limit, not MAX_BODY_SIZE: raw wire bytes are never fewer than decoded ones */
+        const size_t raw_cap = header_len + (conn->body_limit_checked ? conn->body_limit : MAX_BODY_SIZE);
         if (conn->in_cap >= raw_cap) {
             return -1;
         }
@@ -756,11 +757,11 @@ static int grow_in_buf(const App *app, Connection *conn, const size_t header_len
 }
 
 /*
- * as soon as a request's headers are complete, reject a declared Content-Length that exceeds
- * the effective app_use_body_limit for its path with 413 - before any body buffering happens, not
- * just before in_buf is grown to fit it. Runs at most once per request (conn->body_limit_checked).
- * Only Content-Length is covered: chunked bodies stay governed by the global MAX_BODY_SIZE raw-wire
- * cap in grow_in_buf/chunked_body_scan (see app_use_body_limit's header comment for why).
+ * as soon as a request's headers are complete, look up its app_use_body_limit (on the canonical
+ * path - request_target_path - so a query string, "//" or percent-encoding cannot dodge the prefix)
+ * into conn->body_limit, and reject a declared Content-Length over it with 413 - before any body
+ * buffering happens. Runs at most once per request (conn->body_limit_checked). A chunked body is
+ * held to the same limit by reject_if_chunked_over_body_limit and grow_in_buf.
  * Takes an already-parsed head instead of running its own request_framing pass over conn->in_buf.
  * Returns 1 if the request was rejected (caller must not touch conn again), 0 otherwise.
  */
@@ -772,18 +773,29 @@ static int reject_if_over_body_limit(App *app, Connection *conn, const ParsedHea
         return 0; /* headers still incomplete: nothing to check yet, try again next read */
     }
     conn->body_limit_checked = 1;
-    if (head->chunked || head->content_length < 0) {
-        return 0; /* not this check's job: chunked, absent, or already malformed/oversized globally */
+    conn->body_limit = MAX_BODY_SIZE;
+    if (head->content_length < 0) {
+        return 0; /* malformed or already oversized globally: the full parse answers it */
     }
-    char path_buf[256];
-    const size_t n = head->path_len < sizeof(path_buf) - 1 ? head->path_len : sizeof(path_buf) - 1;
-    memcpy(path_buf, head->path, n);
-    path_buf[n] = '\0';
-    if ((size_t)head->content_length > app_body_limit_for_path(app, path_buf)) {
+    conn->body_limit = app_body_limit_for_target(app, head->path, head->path_len);
+    if (!head->chunked && (size_t)head->content_length > conn->body_limit) {
         reject_request(app, conn, 413);
         return 1;
     }
     return 0;
+}
+
+/*
+ * a chunked body whose validated chunks (conn->chunk_scan, just advanced by
+ * request_head_is_complete) already decode past the request's body limit gets 413 - whether or not
+ * the rest of the body has arrived. Returns 1 if rejected (conn closed), 0 otherwise.
+ */
+static int reject_if_chunked_over_body_limit(App *app, Connection *conn, const ParsedHead *head) {
+    if (!head->chunked || !conn->body_limit_checked || conn->chunk_scan.decoded_len <= conn->body_limit) {
+        return 0;
+    }
+    reject_request(app, conn, 413);
+    return 1;
 }
 
 /*
@@ -859,7 +871,11 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
             return SERVE_CLOSED;
         }
 
-        if (!request_head_is_complete(&head, req_start, req_avail, &conn->chunk_scan)) {
+        const int complete = request_head_is_complete(&head, req_start, req_avail, &conn->chunk_scan);
+        if (reject_if_chunked_over_body_limit(app, conn, &head)) {
+            return SERVE_CLOSED;
+        }
+        if (!complete) {
             if (send_continue_if_expected(app, conn, &head) != 0) {
                 return SERVE_CLOSED;
             }

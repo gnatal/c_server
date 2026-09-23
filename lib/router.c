@@ -418,6 +418,14 @@ size_t app_body_limit_for_path(const App *app, const char *path) {
     return limit;
 }
 
+size_t app_body_limit_for_target(const App *app, const char *target, const size_t target_len) {
+    char path[sizeof(((Request *)0)->path)];
+    if (request_target_path(target, target_len, path, sizeof(path)) != 0) {
+        return MAX_BODY_SIZE; /* the full parse rejects this target (400/414) - no route to scope to */
+    }
+    return app_body_limit_for_path(app, path);
+}
+
 /* Advances *cursor past '/' separators and returns the next path segment
  * (pointer + length), or NULL at the end. Empty segments are skipped, so
  * "/a//b/" has the segments "a" and "b". Allocation-free and read-only. */

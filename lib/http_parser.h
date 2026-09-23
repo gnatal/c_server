@@ -135,8 +135,8 @@ int parse_http_request_in_place(char *raw, size_t raw_len, const ParsedHead *hea
  *     count).
  *   *path_out / *path_len_out (both optional, pass NULL to skip) = the raw (not percent-decoded)
  *     request-target and its length, pointing into `buf`; valid only when the return value's
- *     caller can confirm *header_len_out > 0 (undefined content otherwise). Used by connection.c's
- *     body-limit lookup to find a route/prefix before the body itself has to be parsed.
+ *     caller can confirm *header_len_out > 0 (undefined content otherwise). Raw: pass it through
+ *     request_target_path before matching it against anything.
  *   Returns the Content-Length code: 0 absent/zero, >0 value, -1 malformed / conflicting
  *   duplicates / chunked+Content-Length, -2 above MAX_BODY_SIZE, -3 Transfer-Encoding names
  *   anything other than exactly the single token "chunked" -> caller sends 501.
@@ -215,6 +215,12 @@ int url_decode(const char *src, char *dst, size_t dst_size, int decode_plus);
  * collapses repeated '/', keeps at most one trailing '/'. Returns -1 (caller answers 400) for a path
  * not starting with '/' (other than exactly "*"), or containing a "." or ".." segment. Never grows. */
 int path_canonicalize(char *path);
+
+/* request-target -> the canonical path every matcher sees (routing, middleware prefixes, body
+ * limits): query string dropped, percent-decoded, then path_canonicalize. Pure; writes out (NUL-
+ * terminated) even on failure. Returns 0 ok, -2 path part (before '?') does not fit out_size (414),
+ * -4 an encoded '/' ("%2F"), a decoded NUL, a "."/".." segment or no leading '/' (400). */
+int request_target_path(const char *target, size_t target_len, char *out, size_t out_size);
 
 /* canonical registration form of a middleware/body-limit/mount prefix: "" (matches everything) or
  * "/seg[/seg...]" - leading '/' added, repeated and trailing '/' removed, so "admin/", "/admin/" and

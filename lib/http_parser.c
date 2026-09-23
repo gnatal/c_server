@@ -138,6 +138,26 @@ void path_normalize_prefix(const char *prefix, char *out, const size_t out_size)
     out[len] = '\0';
 }
 
+int request_target_path(const char *target, const size_t target_len, char *out, const size_t out_size) {
+    const char *qmark = memchr(target, '?', target_len);
+    const size_t p_len = qmark ? (size_t)(qmark - target) : target_len;
+    if (p_len >= out_size) return -2;
+
+    /* an encoded '/' would decode into a segment boundary the raw bytes never had. */
+    if (has_encoded_slash(target, p_len)) return -4;
+
+    /* "%00" (or a raw NUL byte) decoded into the middle of the path - a filter that checks the
+     * path's suffix/extension before using it (e.g. a static-file extension check) would see only
+     * the bytes up to the NUL, so "/style.css%00.png" would look like "/style.css". Rejected
+     * outright rather than routed on a silently truncated path. */
+    if (decode_bounded(out, out_size, target, p_len, 0) != 0) return -4;
+
+    /* the router skips empty segments, so "//admin/x" and "/admin/x" reach the same route; every
+     * prefix match (middleware, body limits) must see the same shape or it is bypassed. */
+    if (path_canonicalize(out) != 0) return -4;
+    return 0;
+}
+
 int path_prefix_matches(const char *prefix, const char *path) {
     if (prefix[0] == '\0') {
         return 1;
@@ -520,26 +540,12 @@ static int parse_request_fields(const ParsedHead *head, Request *req, Arena *are
     copy_bounded(req->method, sizeof(req->method), head->method, head->method_len);
     snprintf(req->version, sizeof(req->version), "HTTP/1.%d", head->minor_version);
 
+    const int path_status = request_target_path(head->path, head->path_len, req->path, sizeof(req->path));
+    if (path_status != 0) return path_status;
+
     const char *qmark = memchr(head->path, '?', head->path_len);
-    size_t p_len = qmark ? (size_t)(qmark - head->path) : head->path_len;
-    if (p_len >= sizeof(req->path)) return -2;
-
-    /* an encoded '/' would decode into a segment boundary the raw bytes never had. */
-    if (has_encoded_slash(head->path, p_len)) return -4;
-
-    copy_bounded(req->path, sizeof(req->path), head->path, p_len);
-    if (url_decode(req->path, req->path, sizeof(req->path), 0) != 0) {
-        /* "%00" (or a raw NUL byte) decoded into the middle of the path - a filter that checks
-         * req->path's suffix/extension before using it (e.g. a static-file extension check) would see
-         * only the bytes up to the NUL, so "/style.css%00.png" would look like "/style.css". Reject
-         * outright (400) rather than route on a silently truncated path. */
-        return -4;
-    }
-    /* the router skips empty segments, so "//admin/x" and "/admin/x" reach the same route; the
-     * middleware prefix match must see the same shape or it is bypassed. */
-    if (path_canonicalize(req->path) != 0) return -4;
-
     if (qmark) {
+        const size_t p_len = (size_t)(qmark - head->path);
         size_t q_len = head->path_len - p_len - 1;
         copy_bounded(req->query, sizeof(req->query), qmark + 1, q_len);
     }

@@ -116,15 +116,23 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir);
  * proportional to what the client merely claims it will send. `max_bytes` is clamped down to
  * MAX_BODY_SIZE if given a larger value (it can only tighten the global cap, never loosen it); NULL
  * or "" for prefix matches every path. The most specific (longest) matching prefix wins, independent
- * of registration order. Only Content-Length bodies are covered; chunked bodies remain governed by
- * the global MAX_BODY_SIZE raw-wire cap only. Limit: MAX_BODY_LIMITS (16) prefixes; excess is
- * dropped with a stderr warning.
+ * of registration order. The prefix is matched against the canonical path (request_target_path:
+ * query dropped, percent-decoded, repeated '/' collapsed), so "/upload?x=1", "//upload" and
+ * "/%75pload" are all covered. Chunked bodies are covered too: the request gets 413 as soon as its
+ * validated chunks decode to more than `max_bytes`, or its raw chunked bytes outgrow `max_bytes`
+ * past the first BUF_SIZE read buffer. Limit: MAX_BODY_LIMITS (16) prefixes; excess is dropped with
+ * a stderr warning.
  */
 void app_use_body_limit(App *app, const char *prefix, size_t max_bytes);
 
 /* The effective body-size cap for `path`: the longest app_use_body_limit prefix that matches it, or
  * MAX_BODY_SIZE if none do. Exposed for the engine (connection.c) and tests. */
 size_t app_body_limit_for_path(const App *app, const char *path);
+
+/* app_body_limit_for_path for a raw request-target (still percent-encoded, may carry a query):
+ * canonicalized with request_target_path first. A target the parser would reject (400/414) gets
+ * MAX_BODY_SIZE - that request is answered with its own error once framed. */
+size_t app_body_limit_for_target(const App *app, const char *target, size_t target_len);
 
 /* Frees dynamically allocated route tree memory. Called by app_destroy. */
 void app_free_routes(App *app);

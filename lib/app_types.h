@@ -290,6 +290,12 @@ typedef struct Connection {
      * is fully queued (flush_connection) so the next request on the same connection is rechecked. */
     int body_limit_checked;
 
+    /* the current request's app_use_body_limit cap (app_body_limit_for_target on its canonical
+     * path), set with body_limit_checked and meaningful only while that is set. A Content-Length
+     * over it is refused at once; a chunked body is refused once its validated chunks decode past it
+     * (chunk_scan.decoded_len) or its raw bytes outgrow it (grow_in_buf). */
+    size_t body_limit;
+
     /* set once "HTTP/1.1 100 Continue" has been attempted for the current request (sent, or
      * skipped on EAGAIN), so a request whose body arrives over many reads gets at most one. Cleared
      * with body_limit_checked when a keep-alive response is fully queued (flush_connection). */
@@ -485,11 +491,11 @@ typedef struct {
     char prefix[128];
 } MiddlewareEntry;
 
-/* app_use_body_limit slot: a declared Content-Length over max_bytes for a request whose path
+/* app_use_body_limit slot: a body over max_bytes for a request whose canonical path
  * falls under prefix (same segment-boundary rule as MiddlewareEntry) is rejected with 413 as soon as
  * headers are complete, before any body buffering. max_bytes is clamped to MAX_BODY_SIZE at
- * registration (it can only tighten the global cap, never loosen it). Chunked bodies are unaffected:
- * they stay governed by the global MAX_BODY_SIZE raw-wire cap only. */
+ * registration (it can only tighten the global cap, never loosen it). Chunked bodies are held to it
+ * too (Connection.body_limit). */
 typedef struct {
     char prefix[128];
     size_t max_bytes;

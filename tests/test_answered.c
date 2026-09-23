@@ -135,13 +135,13 @@ static void model_run(const char *in, const size_t len, Model *m) {
         a->is_head = 0;
         a->may_continue = request_head_expects_continue(&h);
 
-        /* a declared Content-Length over the route's limit is refused once the head is in. */
+        /* the route's limit comes from the canonical path; a declared Content-Length over it is
+         * refused once the head is in. */
+        const size_t limit = h.header_len > 0 && h.content_length >= 0
+                                 ? app_body_limit_for_target(&app, h.path, h.path_len)
+                                 : MAX_BODY_SIZE;
         if (h.header_len > 0 && !h.chunked && h.content_length >= 0) {
-            char path[256];
-            const size_t n = h.path_len < sizeof(path) - 1 ? h.path_len : sizeof(path) - 1;
-            memcpy(path, h.path, n);
-            path[n] = '\0';
-            if ((size_t)h.content_length > app_body_limit_for_path(&app, path)) {
+            if ((size_t)h.content_length > limit) {
                 a->status = 413;
                 a->may_continue = 0;
                 m->count++;
@@ -152,7 +152,18 @@ static void model_run(const char *in, const size_t len, Model *m) {
         }
 
         ChunkScanState cs = {0};
-        if (!request_head_is_complete(&h, p, avail, &cs)) {
+        const int complete = request_head_is_complete(&h, p, avail, &cs);
+        /* a chunked body whose validated chunks already decode past the limit is refused, complete
+         * or not. */
+        if (h.header_len > 0 && h.chunked && cs.decoded_len > limit) {
+            a->status = 413;
+            a->may_continue = 0;
+            m->count++;
+            m->closes = 1;
+            free(p);
+            return;
+        }
+        if (!complete) {
             /* The model trusts the parser's "wait" only where waiting is right: no head end yet, or a
              * well-framed head whose body is genuinely short. Anything else would be held unanswered. */
             if (h.header_len == 0) {
@@ -369,6 +380,12 @@ static const char *seeds[] = {
     "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\n\r\n",
     "POST /limited HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789",
     "POST /limited HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nok",
+    /* body-limit bypass shapes: the limit applies to the canonical path and to chunked bodies. */
+    "POST /limited?x=1 HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789",
+    "POST //limited HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789",
+    "POST /%6cimited HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789",
+    "POST /limited HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n12345\r\n4\r\n6789\r\n0\r\n\r\n",
+    "POST /limited HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n0\r\n\r\n",
     "GET /items/42?a=1&b=%41 HTTP/1.1\r\nCookie: a=1\r\n\r\n",
     "GET /nope HTTP/1.1\r\n\r\n",
     "DELETE /ping HTTP/1.1\r\n\r\n",
