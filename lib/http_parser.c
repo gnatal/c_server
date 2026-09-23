@@ -154,8 +154,8 @@ int parse_request_head(const char *buf, const size_t len, ParsedHead *head) {
     if (res == -2) return 0; // Incomplete: header_len stays 0
     if (res == -1) {
         /* Malformed request line: header_len stays 0 too, distinguished from "incomplete" only by this
-         * return value - mirrors request_framing's pre-existing contract, including its S8 known gap
-         * (request_head_is_complete checks header_len == 0 before this). */
+         * return value - content_length is set to -1 here (rather than left at its 0 default) precisely
+         * so request_head_is_complete (S8) can tell the two apart despite both having header_len == 0. */
         head->content_length = -1;
         return -1;
     }
@@ -262,8 +262,13 @@ int request_wants_close(const Request *req) {
 
 
 int request_head_is_complete(const ParsedHead *head, const char *buf, const size_t len) {
-    if (head->header_len == 0) return 0;
+    /* S8: a malformed request line (picohttpparser's -1) leaves header_len at 0, the same as a genuinely
+     * incomplete request - checking content_length < 0 first tells them apart, since parse_request_head
+     * sets content_length to -1 only on the malformed path (an incomplete parse leaves it at its 0
+     * default). Reporting "complete" here lets the malformed request reach parse_http_request_from_head
+     * for an immediate 400, instead of waiting forever for headers that will never arrive. */
     if (head->content_length < 0) return 1;
+    if (head->header_len == 0) return 0;
 
     const size_t body_have = len - head->header_len;
     if (head->chunked) {
@@ -303,11 +308,18 @@ int parse_http_request_from_head(const char *raw, const size_t raw_len, const Pa
                                  Request *req, Arena *arena) {
     reset_request(req, arena);
 
+    /* S8: header_len == 0 here means picohttpparser rejected the request line outright (malformed) -
+     * request_head_is_complete only calls this once content_length < 0 has told it apart from a
+     * genuinely incomplete parse (which never reaches this function at all). head->method/path are NULL
+     * in this case, so this must be checked before either is touched. */
+    if (head->header_len == 0) {
+        return -1;
+    }
+
     /* S5/"33rd header": parse_request_head's own phr_parse_request runs with a larger header-array
      * capacity (MAX_FRAMING_HEADERS) than the engine stores (MAX_HEADERS) precisely so a request with
      * more headers than the engine keeps is diagnosed here as malformed, not mis-reported as
-     * "incomplete" by request_head_is_complete's header_len == 0 check (S8's known gap - this must not
-     * widen it). Checked before anything else is copied, so a rejected request leaves req exactly as
+     * "incomplete". Checked before anything else is copied, so a rejected request leaves req exactly as
      * reset above, same as when phr_parse_request itself used to fail outright on this (its own
      * capacity was MAX_HEADERS before this split). */
     if (head->num_headers > MAX_HEADERS) {

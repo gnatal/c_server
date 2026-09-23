@@ -1706,3 +1706,100 @@ doing less than advertised:
 **Status:** Fixed for the measured problem on its stated platform (macOS/BSD). Linux is untouched by
 design, confirmed with the user before implementation - not a gap, the deliberate scope. No 503 path
 for the master's own "no worker available" edge case, per the scoping above.
+
+---
+
+## S8 · A malformed request line gets no response
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+By the time this was picked up, `improvements.md`'s own problem description was already partly stale:
+P2 had since split the old `request_is_complete`/`parse_http_request` duplication into `parse_request_head`
+(one `phr_parse_request` pass, filling a `ParsedHead`) plus `request_head_is_complete` (the completeness
+check against that already-parsed head). The bug itself hadn't moved, just its address - `request_head_is_complete`
+(`lib/http_parser.c`) checked `header_len == 0` before `content_length < 0`, so a request line
+picohttpparser rejects outright (`GET /\r\n\r\n` with no HTTP version, `HTTP/2.0`, plain garbage) - which
+leaves `header_len` at 0, indistinguishable at that field alone from a request that's merely still
+arriving - was reported "need more bytes" forever instead of "done, and it's bad." The connection just sat
+there: no reply until the 8 KiB buffer filled (431) or a timeout fired (408, or nothing at all until S1/S2
+existed).
+
+- **`lib/http_parser.c`: `request_head_is_complete`.** Swapped the two checks: `content_length < 0` is now
+  tested before `header_len == 0`. This is safe specifically because `parse_request_head` (the function that
+  fills `ParsedHead`) already arranges for the two `header_len == 0` cases to be distinguishable through
+  `content_length`: on `phr_parse_request`'s `-2` (genuinely incomplete), `content_length` is left at its `0`
+  default and the function returns immediately; on `-1` (malformed), `content_length` is explicitly set to
+  `-1` before returning. So checking `content_length < 0` first catches exactly the malformed case and lets
+  a truly incomplete request fall through to the unchanged `header_len == 0` → "need more bytes" branch
+  right after it - the fix does not widen "malformed" to swallow "incomplete anywhere near this", it only
+  reorders two comparisons that were already computing the right values.
+- **`lib/http_parser.c`: `parse_http_request_from_head`.** Once `request_head_is_complete` starts reporting
+  "complete" for a malformed request line, `connection.c`'s `handle_readable` calls this function with a
+  `head` whose `header_len` is `0` and whose `method`/`path` are `NULL` (set that way at the top of
+  `parse_request_head`, never overwritten on the `-1` path) - previously unreachable, since the only caller
+  that fed this function a possibly-incomplete-or-malformed head guarded on completeness first, and
+  completeness used to imply `header_len > 0`. Added a check at the very top, right after `reset_request`:
+  `if (head->header_len == 0) return -1;`, before either `head->method` or `head->path` is touched by
+  `copy_bounded`/`memchr` - the standalone wrapper `parse_http_request` already had an equivalent guard of
+  its own (pre-existing, for a different reason: defending itself against being called directly on an
+  incomplete buffer), but `parse_http_request_from_head` is what `connection.c`'s real per-request path
+  calls directly, bypassing that wrapper entirely, so it needed the same guard added explicitly.
+- **Comments only, no behavior change:** three stale comments describing this as an open, deliberately-not-widened
+  gap (`parse_request_head`'s `res == -1` branch, `parse_http_request_from_head`'s `MAX_HEADERS` check, and
+  `lib/http_parser.h`'s doc comments for `parse_http_request_from_head` and `request_is_complete`) were
+  updated to describe the fixed contract instead of the gap. `lib/CLAUDE.md`'s "Known gaps" bullet for this
+  was removed and its "Return conventions" / "Behavior reference, Request parsing" sections updated to match.
+
+**Deliberately not done:** `improvements.md`'s own fix sketch ("check `content_length < 0` before
+`header_len == 0`, two lines") undersold the actual change by one function - the `request_head_is_complete`
+reorder alone would have made `handle_readable` call `parse_http_request_from_head` with a `NULL`
+`head->method`/`head->path`, and `copy_bounded(dst, dst_size, NULL, 0)` (`len < dst_size` since both are 0)
+is a `memcpy` with a `NULL` source pointer at length 0 - technically undefined behavior per the C standard
+regardless of the zero length (some UBSan builds flag a `nonnull`-attributed libc function called with a
+null pointer even at size 0), not merely a hypothetical: this project already runs `make SANITIZE=1
+BUILD_DIR=build-asan test` as a matter of course, so shipping that risk untested wasn't acceptable. The
+second guard closes it structurally instead of relying on `memcpy`'s size-0 case being harmless in practice
+on this toolchain.
+
+**Tests and results.**
+
+- Unit test added to `tests/test_http_hardening.c` (registered in `main`):
+  `test_malformed_request_line_rejected` - three shapes (no HTTP version, `HTTP/2.0`, plain garbage) each
+  asserted through `request_framing` (`-1`, `header_len == 0`, unchanged), `request_is_complete` (now `1`,
+  the actual regression - was `0` before this fix), and `parse_http_request` (`-1`, unchanged, since its own
+  pre-existing guard already covered the wrapper). Also asserts a genuinely incomplete request line (`GET /
+  HTTP/1.1\r\n`, no terminator yet) still reports `request_is_complete() == 0` and
+  `request_framing() == 0` - the fix must not widen "malformed" to cover this, and this is the regression
+  test for that.
+- Unit test added to `tests/test_connection.c` (registered in `main`):
+  `test_handle_readable_malformed_request_line_400` - the actual, previously-unreachable code path:
+  `GET /\r\n\r\n` through the real `handle_readable` gets an explicit `400 Bad Request` and the connection is
+  closed immediately, rather than the pre-fix behavior of no reply and an open socket
+  (`improvements.md`'s own MEASURED reproduction of exactly this).
+- `make test`: all 13 suites pass (test_http_hardening: 1 new case; test_connection: 1 new case).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan - the specific
+  concern the second guard (above) exists to rule out.
+- `make fuzz` (1,000,000 iterations): clean. Note the "complete" count jumped from roughly 145,303/1,000,000
+  (a prior run recorded elsewhere in this document, different code state) to 783,750/1,000,000 here - this is
+  the fix working as intended, not a regression: `request_is_complete` now correctly reports "complete" for
+  every malformed mutation the fuzzer generates, not just well-framed ones, so a much larger share of its
+  random byte-flips (which land on "unparseable garbage" far more often than "a valid request with a
+  slightly-off Content-Length") now short-circuit to `parsed_ok`'s `parse_http_request` call instead of being
+  silently skipped as "incomplete" forever. The fuzzer's own oracle is unchanged (memory safety only; it does
+  not assert that every input is answered - `improvements.md`'s T1 - so it does not comment on this jump on
+  its own, but nothing about the run indicates a memory-safety finding).
+- `make check-docs`: passes (126 engine functions - no public API changed, only internal function bodies and
+  doc comments).
+- Compiled `lib/http_parser.c` directly with the project's `-Wall -Wextra -std=c11 -O2` flags: no new
+  warnings.
+- Live verification via a standalone probe program linking `lib/http_parser.c` directly (not part of the
+  shipped diff): confirmed `request_framing`/`request_is_complete` return `(-1, header_len=0, complete=1)`
+  for all three malformed shapes and `(0, header_len=0, complete=0)` for a genuinely incomplete request line,
+  matching the unit tests above.
+
+**Status:** Fixed. No hot-path cost (the change reorders two existing comparisons and adds one branch that
+only ever executes on a request already destined for rejection); `make bench` was not re-run since neither
+changed function is on the path any well-formed request takes.
+

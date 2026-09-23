@@ -350,6 +350,43 @@ static void test_embedded_nul_rejected(void) {
     arena_reset(&test_arena);
 }
 
+/* S8: a request line picohttpparser rejects outright (no HTTP version, an unsupported version, plain
+ * garbage) used to leave header_len at 0 - the same value a genuinely incomplete request line leaves it
+ * at - so request_is_complete reported "need more bytes" forever instead of surfacing the malformed
+ * request. request_head_is_complete now tells the two apart via content_length (set to -1 only on the
+ * malformed path), so all three shapes below are reported complete and parse_http_request rejects them
+ * with -1, the same code any other malformed request already got. */
+static void test_malformed_request_line_rejected(void) {
+    const char *no_version = "GET /\r\n\r\n";
+    const char *bad_version = "GET / HTTP/2.0\r\n\r\n";
+    const char *garbage = "this is not a request\r\n\r\n";
+    const char *malformed[] = {no_version, bad_version, garbage};
+
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+        const char *line = malformed[i];
+        size_t header_len = 99;
+        int chunked = 99;
+        assert(request_framing(line, strlen(line), &header_len, &chunked, NULL, NULL) == -1);
+        assert(header_len == 0);
+
+        /* The fix: request_is_complete now says "complete" (stop waiting) instead of "need more". */
+        assert(request_is_complete(line, strlen(line)) == 1);
+
+        Request req;
+        assert(parse_http_request(line, strlen(line), &req, &test_arena) == -1);
+        arena_reset(&test_arena);
+    }
+
+    /* A genuinely incomplete request line (no terminator yet) must still report "need more bytes" -
+     * the fix must not widen "malformed" to cover this. */
+    const char *incomplete = "GET / HTTP/1.1\r\n";
+    assert(request_is_complete(incomplete, strlen(incomplete)) == 0);
+    size_t header_len;
+    int chunked;
+    assert(request_framing(incomplete, strlen(incomplete), &header_len, &chunked, NULL, NULL) == 0);
+    assert(header_len == 0);
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_framing_is_line_anchored();
@@ -363,6 +400,7 @@ int main(void) {
     test_header_value_whitespace_and_limits();
     test_percent_decoding_at_boundaries();
     test_embedded_nul_rejected();
+    test_malformed_request_line_rejected();
     printf("all http hardening tests passed\n");
     return 0;
 }

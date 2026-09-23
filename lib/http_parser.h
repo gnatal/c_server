@@ -70,9 +70,12 @@ int request_head_is_complete(const ParsedHead *head, const char *buf, size_t len
 /*
  * parse_http_request_from_head: the population half of parse_http_request, given an already-parsed
  * head (parse_request_head) instead of re-running phr_parse_request/request_framing on the same bytes
- * (P2). head->header_len must be > 0 (the caller already confirmed headers are complete, e.g. via
- * request_head_is_complete). Same return codes, ownership and limits as parse_http_request, which is
- * now a thin wrapper: parse_request_head + this.
+ * (P2). The caller must already have confirmed the request is ready to parse via request_head_is_complete
+ * (true for both a genuinely complete head and a malformed request line, S8 - never call this while it
+ * still returns false). head->header_len == 0 then means the request line itself was malformed (not
+ * "incomplete" - that case never reaches here): returns -1 immediately, before touching head->method/path,
+ * which are NULL in that case. Same return codes, ownership and limits as parse_http_request otherwise,
+ * which is now a thin wrapper: parse_request_head + this.
  */
 int parse_http_request_from_head(const char *raw, size_t raw_len, const ParsedHead *head, Request *req,
                                  Arena *arena);
@@ -93,11 +96,10 @@ int request_framing(const char *buf, size_t len, size_t *header_len_out, int *ch
                     const char **path_out, size_t *path_len_out);
 
 /*
- * request_is_complete: 1 when buf[0..len) holds a full request (headers + framed body), or
- * when framing is invalid/oversized (stop buffering, parse_http_request reports it).
- * 0 means "read more bytes". Called after every recv().
- * Known gap: a request line or header block that picohttpparser rejects (no HTTP version, "HTTP/2.0", garbage)
- * also returns 0, so the connection waits for more bytes instead of getting a 400 (lib/CLAUDE.md, "Known gaps").
+ * request_is_complete: 1 when buf[0..len) holds a full request (headers + framed body), when framing is
+ * invalid/oversized, or when the request line/header block itself is malformed - "HTTP/2.0", garbage, no
+ * HTTP version - in every one of those cases parse_http_request reports the specific error (S8).
+ * 0 means "read more bytes" (the only remaining case). Called after every recv().
  */
 int request_is_complete(const char *buf, size_t len);
 

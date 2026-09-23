@@ -251,6 +251,34 @@ static void test_handle_readable_malformed_400(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+static void test_handle_readable_malformed_request_line_400(void) {
+    /* S8: a request line picohttpparser rejects outright (here, no HTTP version) used to leave
+     * header_len at 0, indistinguishable from "need more bytes" - request_is_complete reported
+     * incomplete forever, so the connection just sat there instead of getting an immediate 400
+     * (improvements.md's MEASURED reproduction: no reply, socket stays open). */
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    const char *bad_req = "GET /\r\n\r\n";
+    assert(write(fds[1], bad_req, strlen(bad_req)) == (ssize_t)strlen(bad_req));
+
+    int client_fd = fds[0];
+    handle_readable(&app, conn);
+
+    char resp[512];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 400 Bad Request") != NULL);
+
+    /* Connection closed immediately, not left open waiting for headers that will never complete. */
+    assert(app.connections[client_fd] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_unmatched_route_404(void) {
     App app;
     int fds[2];
@@ -1580,6 +1608,7 @@ int main(void) {
     test_handle_readable_keep_alive_multiple_requests();
     test_handle_readable_partial_read();
     test_handle_readable_malformed_400();
+    test_handle_readable_malformed_request_line_400();
     test_handle_readable_unmatched_route_404();
     test_handle_readable_header_overflow_431();
     test_handle_readable_long_header_value_is_not_capped();

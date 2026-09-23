@@ -121,9 +121,8 @@ arena at all - see above).
 `0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
 `parse_http_request` / `parse_http_request_from_head`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` retired (P3: used to mean "a header name/value too long to store", impossible now that headers are views, not fixed-size copies - never returned, kept reserved rather than reused), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413).
 `url_decode` / `parse_query_string`: `0` ok, `-1` a decoded byte was NUL (S6) - the destination is still fully written and NUL-terminated, but the caller must treat it as invalid input rather than use it.
-`request_is_complete` / `request_head_is_complete`: `1` for a complete request and also for invalid `Content-Length` / chunked+`Content-Length` framing (stop reading, let the parser report it);
-`0` while more bytes are needed, **and also (known gap, below) when the request line or headers are malformed**. `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
-`parse_request_head`: same codes as `request_framing` (`0` absent/zero-length or incomplete, `>0` value, `-1` malformed/conflicting, `-2` oversized) - check `ParsedHead.header_len == 0` to tell "incomplete" apart from "malformed" (both return via this same ambiguity, P2, matching `request_framing`'s pre-existing contract).
+`request_is_complete` / `request_head_is_complete`: `1` for a complete request, for invalid `Content-Length` / chunked+`Content-Length` framing, and for a request line or header block picohttpparser rejects outright (S8: stop reading in every one of these cases, let the parser report the specific error - malformed used to be indistinguishable from "need more bytes", since both leave `header_len == 0`; told apart via `ParsedHead.content_length`, `-1` only on the malformed path). `0` only while more bytes are genuinely needed. `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
+`parse_request_head`: same codes as `request_framing` (`0` absent/zero-length or incomplete, `>0` value, `-1` malformed/conflicting, `-2` oversized) - check `ParsedHead.header_len == 0` to tell "incomplete" apart from "malformed" at this layer (both still return via that ambiguity, P2; `request_head_is_complete`, above, is what resolves it before handing off to the rest of the pipeline).
 yyjson: read functions return `NULL` on failure; `yyjson_mut_*_add_*` return `false` on failure (the cookbook and demo do not check them).
 Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `errno` for logic outside the socket layer.
 
@@ -173,7 +172,9 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   arrays themselves are fixed-size once triggered); headers are not copied at all. More than 32 headers → 400 (checked
   explicitly against `MAX_HEADERS` in `parse_http_request_from_head`, since P2 raised the underlying `phr_parse_request`
   capacity itself to `MAX_FRAMING_HEADERS`, above `MAX_HEADERS`, precisely so this case is diagnosed as malformed rather
-  than mis-reported as "incomplete" - see "Hot-path rules" and S8's known gap, which this must not widen).
+  than mis-reported as "incomplete" - see "Hot-path rules"). A request line or header block picohttpparser rejects
+  outright is likewise 400, immediately (S8, fixed 2026-09-23 - see "Return conventions" above and `improvements_progress.md`),
+  not left open waiting for headers that will never arrive.
   **Header storage (P3).** `req->headers` holds `struct phr_header` VIEWS (`name`/`value` point into `in_buf`, not
   NUL-terminated) instead of copies into fixed-size arrays, so there is no per-header length cap left to enforce - a
   header of any length that fits within the whole header block (`BUF_SIZE`, 8 KiB, unrelated to this) is accepted.
@@ -359,10 +360,6 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
 `http_parser.c`, `router.c`, `response.c` or `arena.c`. The Makefile tracks header dependencies (`-MMD`).
 
 ## Known gaps (verified, not fixed)
-- **A malformed request line gets no response.** `request_framing` returns `-1` with `header_len == 0` when picohttpparser rejects the
-  request (`GET /\r\n\r\n`, `HTTP/2.0`, garbage), and `request_is_complete` checks `header_len == 0` before it checks the code, so it answers
-  "need more". Observed on a live server: no reply and the socket stays open until 8 KiB arrive (431) or 60 s pass (408). Well-formed requests with bad `Content-Length`,
-  too many headers, or a too-long path are answered correctly (400 / 400 / 414). Likely fix: test `content_length < 0` before `header_len == 0` in `request_is_complete`.
 - **Path parameter names are per tree position, not per route.** Routes `/orders/:id/items` and `/orders/:oid/notes` share one parameter node named after
   the first registration, so `req_get_param(req, "oid")` returns `NULL` (the value is under `id`). A route registered after a mid-pattern `*` at the same position
   (`/x/*/y`, then `/x/:id/z`) captures nothing. Use the same `:name` at the same position across routes.

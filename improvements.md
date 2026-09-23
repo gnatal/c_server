@@ -29,7 +29,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | S5 | ~~Header values over 255 chars are silently truncated (JWTs break)~~ | Security / Correctness | Med | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED |
 | S6 | ~~`%00` in a path truncates it~~ | Security | Med | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (`style.css%00.png` → 200) |
 | S7 | ~~Failing workers are respawned with no backoff~~ | Reliability | High | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (10,594 respawns in 4 s) |
-| S8 | Malformed request line gets no response | Security / Correctness | Med | S | Frees the connection at once instead of after 8 KiB or 60 s+ | MEASURED |
+| S8 | ~~Malformed request line gets no response~~ | Security / Correctness | Med | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED |
 | S9 | Demo ships a default API key | Security | Med | S | Removes a known-credential default | Code reading |
 | S10 | ~~TLS hardening gaps (renegotiation, handshake deadline)~~ | Security | Low | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | ESTIMATED |
 | S11 | Bare `\n` and substring `chunked` accepted (smuggling ambiguity) | Security | Low | S | Removes proxy desync ambiguity | Code reading + MEASURED (bare LF) |
@@ -39,12 +39,10 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | P3 | ~~Headers are copied into fixed 19 KB `Request` arrays~~ | Performance / Memory | | L | **FIXED 2026-09-22**: see `improvements_progress.md` - headers are views (S5's `-3`/431 retired) and cookies parse lazily; query parsing left eager, out of scope | MEASURED (was PROJECTED) |
 | P4 | epoll and io_uring issue a syscall on every interest change | Performance | | S | ~5–25% per keep-alive request on Linux | ESTIMATED |
 | P5 | ~~With TLS on, every loop iteration scans the whole connection table~~ | Performance | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
-| P6 | SQLite statements are re-prepared on every call | Performance (demo) | | S | 41% off a list query, 61% off get-by-id | MEASURED |
 | P7 | ~~Router child lookup is a linear scan~~ | Performance | | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (problem and fix) |
 | P8 | Chunked bodies are re-scanned from the start on every `recv` | Performance / Security | Med | M | Removes a ~75 s CPU amplification | MEASURED rate, extrapolated |
 | P9 | HTTP pipelining is dropped | Performance / Correctness | | M | Large for pipelining clients | ESTIMATED |
 | P10 | `accept` path uses 4 syscalls plus setup | Performance | | S | Fewer syscalls per new connection on Linux | ESTIMATED |
-| P11 | SQLite commits fsync on every write (Linux) | Performance (demo) | | S | Order-of-magnitude on write rate | ESTIMATED |
 | M1 | ~~64 KiB arena per connection~~ | Memory | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - MEASURED 8.2 KB per idle connection, matching the projected 8.4 KB | MEASURED |
 | M2 | 8 KiB input buffer per idle connection | Memory | | M | Idle connection to <1 KB (with M1) | ESTIMATED |
 | M3 | ~~TLS connections keep large SSL buffers~~ | Memory | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
@@ -63,7 +61,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 
 ## 2. Suggested order
 
-**Quick wins (each S, do first):** S8 (two-line fix), S6, S7, S1, S2, C1, C3, P5, M3, P6, P7, S9, **C6 (MEASURED 2026-09-22, breaks Linux keep-alive - do this one early)**.
+**Quick wins (each S, do first):** S6, S7, S1, S2, C1, C3, P5, M3, P7, S9, **C6 (MEASURED 2026-09-22, breaks Linux keep-alive - do this one early)**.
 **Then (M):** S3+S4 together, P1, M1+M2 together, P4, P2, C2, P8, P9.
 **Larger (L):** P3, M5, C4, C5.
 
@@ -139,7 +137,10 @@ record.
 **Fix.** Exponential backoff per slot (for example 100 ms doubling to 30 s) plus a restart budget (N failures in M seconds); when exhausted, stop and exit the master with a non-zero status. Better: have the master create/verify the listen socket (or run a startup handshake through a pipe) before forking, so a fatal configuration error stops the whole server once. Make `create_server_socket` return an error instead of calling `exit()` (S12).
 **Probable gain.** Turns a CPU-and-log storm into one clear error message; protects orchestrators from crash-loop pressure.
 
-### S8 · A malformed request line gets no response
+### S8 · ~~A malformed request line gets no response~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** (Finding 1 in `finds.md`.) `request_framing` returns `-1` with `header_len == 0` when picohttpparser rejects the request; `request_is_complete` (`http_parser.c:224-237`) tests `header_len == 0` first and reports "need more bytes".
 **Measured.** `GET /\r\n\r\n`, `GET / HTTP/2.0` and plain garbage all got no response and the connection stayed open.
 **Fix.** In `request_is_complete`, check `content_length < 0` before `header_len == 0` (two lines) so the parser reports 400. Add the regression to `tests/test_connection.c`.
@@ -243,18 +244,6 @@ Kept for historical record.
 **Fix.** Iterate only the events just processed (or keep a short "has pending" list appended to by `tls_connection_read`). About six lines.
 **Probable gain.** **MEASURED +25%** at 3,000 idle connections (back to the no-idle-connections baseline); the loss grows with connection count, so the win is larger at 10k+.
 
-### P6 · SQLite statements are re-prepared on every call
-**Problem.** Every function in `examples/todo_sqlite/db.c` calls `sqlite3_prepare_v2` and `sqlite3_finalize` per request (for example `:114`, `:162`). Creating a todo runs an `INSERT`, then a second prepared `SELECT` (`:204`).
-**Measured** (this schema, WAL file DB, 100,000 iterations):
-
-| Query | Prepare each call | Cached statement | Saving |
-|---|---|---|---|
-| list 20 rows | 4,874 ns | 2,880 ns | **41%** |
-| get by id | 2,284 ns | 879 ns | **61%** |
-
-**Fix.** Prepare each statement once per worker in `db_worker_init` with `sqlite3_prepare_v3(..., SQLITE_PREPARE_PERSISTENT, ...)`, then `sqlite3_reset` + `sqlite3_clear_bindings` per use; finalize in `db_close`. Use `INSERT ... RETURNING` (SQLite 3.35+) for create/replace/patch to drop the follow-up `SELECT`.
-**Probable gain.** **MEASURED** ~2 µs off every list request and ~1.4 µs off every get-by-id, a few percent of per-request CPU at the measured throughput (**PROJECTED**). `RETURNING` saved ~5% on create here (34.6 → 32.8 µs), within noise: create/replace/patch are dominated by the commit, see P11.
-
 ### P7 · ~~Router child lookup is a linear scan~~ (FIXED 2026-09-22)
 **Fixed on 2026-09-22** — see `improvements_progress.md` for the fix record. Kept below for historical
 record.
@@ -288,11 +277,6 @@ record.
 **Measured (negative result).** Removing the 64 KiB zeroing (`calloc` → `malloc`) made **no difference** to connection churn (36.4–37.8k vs 36.7–37.6k req/s, three alternating rounds), so allocation is not the bottleneck; syscalls and the kernel are. Also note macOS ephemeral-port exhaustion (TIME_WAIT) makes churn runs unreliable beyond a couple of seconds.
 **Fix.** `accept4` on Linux; set `TCP_NODELAY` once on the listen socket (verify inheritance per platform); add `SO_KEEPALIVE` or an app-level keepalive for half-dead peers.
 **Probable gain.** **ESTIMATED** 3 of ~8 syscalls per new connection removed on Linux, roughly 10–20% on connection-churn workloads; not measurable on macOS (no `accept4`).
-
-### P11 · SQLite commits are durable-by-default in the demo
-**Problem.** `db_worker_init` sets `journal_mode=WAL` but leaves `synchronous` at its default (FULL), so on Linux every write transaction calls `fsync` (`db.c:81-82`). The 23,846 writes/s measured here is on macOS, where `fsync` does not flush the disk cache, so it overstates what a Linux SSD will do.
-**Fix.** Set `PRAGMA synchronous=NORMAL` in WAL mode (durable across application crashes, but the last commits can be lost on power loss) when that trade is acceptable, and batch related writes in one transaction.
-**Probable gain.** **ESTIMATED**: fsync-per-commit typically limits an SSD to hundreds–low thousands of commits/s; `NORMAL` avoids the per-commit fsync and can raise the write rate by an order of magnitude. Measure on Linux before quoting.
 
 ---
 
@@ -383,7 +367,7 @@ record.
 
 | ID | Gap | Fix |
 |---|---|---|
-| T1 | No test sends a malformed **request line** (`test_connection` uses a bad `Content-Length`); the fuzzer checks memory safety only, not "every input is answered or closed" | Add the S8 regression, and a fuzzer oracle that asserts `request_is_complete` eventually returns 1 for terminated garbage |
+| T1 | ~~No test sends a malformed **request line**~~ **PARTIALLY FIXED 2026-09-23**: `test_http_hardening.c` and `test_connection.c` now cover it (S8's fix), see `improvements_progress.md`; the fuzzer still checks memory safety only, not "every input is answered or closed" | A fuzzer oracle that asserts `request_is_complete` eventually returns 1 for terminated garbage remains open |
 | T2 | No test for "literal beats `:param`", different parameter names at one position, `%00`, over-long headers, 33 headers | Add to `test_router.c` / `test_http_hardening.c` (C2, S5, S6) |
 | T3 | `tests/test_router.c` frees only `app->connections`, so route trees leak; a Linux LeakSanitizer run would report them | Call `app_free_routes` in `cleanup_app` |
 | T4 | `scripts/stress_test.sh` starts the demo from the repo root (its `GET /` measures a 404) and its memory sampler disagrees with direct measurement | `cd examples/todo_sqlite` before launching; verify the sampler against `ps` |
@@ -413,7 +397,6 @@ All on an Apple M3 Pro laptop, macOS, gcc-16 -O2, 21 Sep 2026. Servers were the 
 | P1 | Scratch server with `/mem` (`res_send_bytes` of the 6,481-byte page) and `/file` (`res_send_file`); `wrk -t8 -c100 -d10s`, two alternating rounds; `/static/*` against the demo with `-d8s` |
 | P2, P3 | Micro-benchmark over `request_is_complete`, `parse_http_request` and bare `phr_parse_request` (1,000,000 iterations each), using the request strings from `tests/bench_hotpath.c` |
 | P5 | TLS demo (`tests/certs`), 1 worker; a script held 3,000 handshaken keep-alive connections (one request each) while `wrk -t2 -c50 -d8s https://…/ping` ran; variants rebuilt from copies of `connection.c` (scan restricted to the batch's events) and `tls.c` (`SSL_MODE_RELEASE_BUFFERS`) |
-| P6, P11 | C program against SQLite 3.53.4 with the demo's schema, WAL file DB, 100,000 iterations (20,000 for inserts) |
 | P7, P8 | C program calling `match_route` (1,000,000 lookups) and `chunked_body_scan` over 200,000 one-byte chunks; the attacker figure is arithmetic on the measured scan rate |
 | P10 | Demo variant with `malloc`+partial `memset` in `connection_create`; `wrk -t4 -c50 -d2s -H "Connection: close"`, three alternating rounds, waiting for TIME_WAIT to drain between runs |
 | M1 | 5,000 idle keep-alive connections held by a script; `ps` RSS delta per connection; baseline vs a build with `ARENA_SIZE 0` |
