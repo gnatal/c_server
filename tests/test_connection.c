@@ -602,6 +602,121 @@ static void test_handle_readable_route_body_limit_allows_within_limit(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+#define CONTINUE_LINE "HTTP/1.1 100 Continue\r\n\r\n"
+
+/* Reads whatever the server has written so far (fds[1] is non-blocking), NUL-terminated; 0 if nothing. */
+static size_t read_pending(const int fd, char *out, const size_t cap) {
+    const ssize_t n = read(fd, out, cap - 1);
+    const size_t got = n > 0 ? (size_t)n : 0;
+    out[got] = '\0';
+    return got;
+}
+
+/* C1: headers with "Expect: 100-continue" and no body yet get exactly one "100 Continue" before the
+ * body arrives; the body then arrives over several reads without a second one, and the final response
+ * follows. A second request on the same keep-alive connection gets its own (continue_sent reset). */
+static void test_handle_readable_expect_continue_sends_100_once(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+    app_post(&app, "/upload", echo_len_handler);
+
+    for (int round = 0; round < 2; round++) {
+        const char *head = "POST /upload HTTP/1.1\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n";
+        assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+        handle_readable(&app, conn);
+
+        char resp[256];
+        read_pending(fds[1], resp, sizeof(resp));
+        assert(strcmp(resp, CONTINUE_LINE) == 0);
+        assert(conn->continue_sent == 1);
+
+        assert(write(fds[1], "hello", 5) == 5);
+        handle_readable(&app, conn);
+        assert(read_pending(fds[1], resp, sizeof(resp)) == 0); /* no second 100, no response yet */
+
+        assert(write(fds[1], "world", 5) == 5);
+        handle_readable(&app, conn);
+        read_pending(fds[1], resp, sizeof(resp));
+        assert(strncmp(resp, "HTTP/1.1 200 OK", 15) == 0);
+        assert(strstr(resp, "received 10 bytes") != NULL);
+        assert(strstr(resp, "100 Continue") == NULL);
+        assert(app.connections[fds[0]] == conn);
+        assert(conn->continue_sent == 0);
+    }
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+/* C1: a chunked upload with Expect gets its 100 too. */
+static void test_handle_readable_expect_continue_chunked(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+    app_post(&app, "/upload", echo_len_handler);
+
+    const char *head = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    handle_readable(&app, conn);
+    char resp[256];
+    read_pending(fds[1], resp, sizeof(resp));
+    assert(strcmp(resp, CONTINUE_LINE) == 0);
+
+    const char *body = "5\r\nHello\r\n0\r\n\r\n";
+    assert(write(fds[1], body, strlen(body)) == (ssize_t)strlen(body));
+    handle_readable(&app, conn);
+    read_pending(fds[1], resp, sizeof(resp));
+    assert(strncmp(resp, "HTTP/1.1 200 OK", 15) == 0);
+    assert(strstr(resp, "received 5 bytes") != NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+/* C1: no 100 when it is not wanted or not allowed - the body already arrived with the headers, the
+ * client is HTTP/1.0, or the declared body is over the route limit (413 instead, body never invited). */
+static void test_handle_readable_expect_continue_not_sent(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+    app_post(&app, "/upload", echo_len_handler);
+    app_post(&app, "/api/uploads/avatar", echo_len_handler);
+    app_use_body_limit(&app, "/api/uploads", 1024);
+
+    /* Body sent without waiting: the request is complete, answered directly. */
+    const char *whole = "POST /upload HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello";
+    assert(write(fds[1], whole, strlen(whole)) == (ssize_t)strlen(whole));
+    handle_readable(&app, conn);
+    char resp[256];
+    read_pending(fds[1], resp, sizeof(resp));
+    assert(strncmp(resp, "HTTP/1.1 200 OK", 15) == 0);
+    assert(strstr(resp, "100 Continue") == NULL);
+
+    /* HTTP/1.0 (keep-alive so the connection survives for the next case). */
+    const char *v10 = "POST /upload HTTP/1.0\r\nConnection: keep-alive\r\nContent-Length: 5\r\n"
+                      "Expect: 100-continue\r\n\r\n";
+    assert(write(fds[1], v10, strlen(v10)) == (ssize_t)strlen(v10));
+    handle_readable(&app, conn);
+    assert(read_pending(fds[1], resp, sizeof(resp)) == 0);
+    assert(write(fds[1], "hello", 5) == 5);
+    handle_readable(&app, conn);
+    read_pending(fds[1], resp, sizeof(resp));
+    assert(strstr(resp, "200 OK") != NULL && strstr(resp, "100 Continue") == NULL);
+    assert(app.connections[fds[0]] == conn);
+
+    /* Over the route limit: 413, and the connection closes without a 100. */
+    const char *big = "POST /api/uploads/avatar HTTP/1.1\r\nContent-Length: 2048\r\nExpect: 100-continue\r\n\r\n";
+    assert(write(fds[1], big, strlen(big)) == (ssize_t)strlen(big));
+    handle_readable(&app, conn);
+    read_pending(fds[1], resp, sizeof(resp));
+    assert(strncmp(resp, "HTTP/1.1 413 Payload Too Large", 30) == 0);
+    assert(app.connections[fds[0]] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_chunked_round_trip(void) {
     App app;
     int fds[2];
@@ -1777,6 +1892,9 @@ int main(void) {
     test_handle_readable_content_length_grows_geometrically();
     test_handle_readable_route_body_limit_413();
     test_handle_readable_route_body_limit_allows_within_limit();
+    test_handle_readable_expect_continue_sends_100_once();
+    test_handle_readable_expect_continue_chunked();
+    test_handle_readable_expect_continue_not_sent();
     test_handle_readable_chunked_round_trip();
     test_handle_readable_chunked_scan_resumes_and_resets();
     test_handle_readable_chunked_grows_buffer();

@@ -79,6 +79,15 @@ int parse_request_head(const char *buf, size_t len, ParsedHead *head);
 int request_head_is_complete(const ParsedHead *head, const char *buf, size_t len, ChunkScanState *chunk_scan);
 
 /*
+ * request_head_expects_continue (C1): 1 when a complete head asks for "100 Continue" before its body -
+ * an "Expect" header whose value is "100-continue" (case-insensitive, OWS-trimmed), on an HTTP/1.1+
+ * request with a valid framing that has a body to wait for (Content-Length > 0, or chunked). 0 for
+ * anything else, including HTTP/1.0 (a 1xx must not be sent to it) and an incomplete or malformed head.
+ * Other expectations are ignored (no 417). Pure: reads head only.
+ */
+int request_head_expects_continue(const ParsedHead *head);
+
+/*
  * request_wire_len (P9): bytes the request occupies on the wire - headers plus its framed body, so
  * buf + request_wire_len is where a pipelined next request starts. Valid only after
  * request_head_is_complete returned 1 for a head with header_len > 0 and content_length >= 0 (a

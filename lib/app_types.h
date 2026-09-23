@@ -288,6 +288,11 @@ typedef struct Connection {
      * is fully queued (flush_connection) so the next request on the same connection is rechecked. */
     int body_limit_checked;
 
+    /* C1: set once "HTTP/1.1 100 Continue" has been attempted for the current request (sent, or
+     * skipped on EAGAIN), so a request whose body arrives over many reads gets at most one. Cleared
+     * with body_limit_checked when a keep-alive response is fully queued (flush_connection). */
+    int continue_sent;
+
     /* P8: where handle_readable's completeness check resumes scanning a chunked body on the next read,
      * so each body byte is scanned once per request instead of once per recv (was quadratic). Zeroed
      * by connection_create's calloc and again, with body_limit_checked, when a keep-alive response is

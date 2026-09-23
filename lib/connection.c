@@ -675,6 +675,7 @@ int flush_connection(App *app, Connection *conn) {
         conn->request_started = conn->in_len > 0 ? time(NULL) : 0;
         conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying (S2) */
         conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check (S4) */
+        conn->continue_sent = 0; /* ... and its own 100 Continue (C1) */
         conn->chunk_scan = (ChunkScanState){0}; /* next request's chunked body scans from its own start (P8) */
 
         /* M2: nothing buffered - free the input buffer (however far it grew for a large body) or hand
@@ -785,6 +786,32 @@ static int reject_if_over_body_limit(App *app, Connection *conn, const ParsedHea
     return 0;
 }
 
+/*
+ * C1: the request's headers are complete, its body is not, and it carries "Expect: 100-continue"
+ * (request_head_expects_continue): write "HTTP/1.1 100 Continue" once so the client sends the body now
+ * instead of after its own fallback timeout (curl: 1 s). Runs after reject_if_over_body_limit, so a
+ * body over the route or global limit gets its 413 instead and the body is never invited. Written
+ * straight to the socket, not through out_buf: serve_buffered_requests only gets here with no response
+ * pending, so nothing can be queued ahead of it. EAGAIN (nothing written) is harmless - the client falls
+ * back to its timeout, as before C1. A short write would leave half a status line ahead of the final
+ * response, so it closes the connection like a hard write error.
+ * Returns 0 (conn open), or -1 once conn has been closed (freed).
+ */
+static int send_continue_if_expected(App *app, Connection *conn, const ParsedHead *head) {
+    if (conn->continue_sent || !request_head_expects_continue(head)) {
+        return 0;
+    }
+    conn->continue_sent = 1;
+    static const char CONTINUE_LINE[] = "HTTP/1.1 100 Continue\r\n\r\n";
+    const size_t len = sizeof(CONTINUE_LINE) - 1;
+    const ssize_t n = conn_write(conn, CONTINUE_LINE, len);
+    if (n == (ssize_t)len || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))) {
+        return 0;
+    }
+    connection_close(app, conn);
+    return -1;
+}
+
 /* serve_buffered_requests results (P9). */
 #define SERVE_NEED_MORE 0
 #define SERVE_WAIT 1
@@ -833,6 +860,9 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
         }
 
         if (!request_head_is_complete(&head, req_start, req_avail, &conn->chunk_scan)) {
+            if (send_continue_if_expected(app, conn, &head) != 0) {
+                return SERVE_CLOSED;
+            }
             compact_in_buf(conn);
             return SERVE_NEED_MORE;
         }

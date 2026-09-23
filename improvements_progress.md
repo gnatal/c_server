@@ -2687,3 +2687,76 @@ Done as `improvements.md` suggested: `Route.static_root` is now a `char *` inste
 
 **Status:** Fixed.
 
+---
+
+## C1 · `Expect: 100-continue` is ignored
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+Done as `improvements.md` suggested, with two scope decisions (below): no route validation before the 100,
+and no `417`.
+
+- **New pure `request_head_expects_continue(const ParsedHead *)`** (`http_parser.c/h`). It returns 1 only
+  when all of these hold:
+  - the head is complete and the request is HTTP/1.1 or later (RFC 9110 §15.2: never send a 1xx to an
+    HTTP/1.0 client);
+  - the framing is valid and there is a body to wait for (`Content-Length > 0`, or chunked);
+  - an `Expect` header's value is exactly `100-continue` (case-insensitive, OWS-trimmed).
+- **`connection.c`: `send_continue_if_expected`**, called in `serve_buffered_requests` when the head is
+  complete but the body is not, before `compact_in_buf`. It writes `HTTP/1.1 100 Continue\r\n\r\n` straight
+  to the socket, once per request.
+  - `Connection.continue_sent` (new) guards against a second 100 while the body arrives over many reads. It
+    is cleared with `body_limit_checked` in `flush_connection`'s keep-alive reset.
+  - The 100 never goes through `out_buf`. The loop only reaches this point with no response pending, so a
+    pipelined request's 100 always follows the previous response.
+  - `EAGAIN` on this write is ignored: the client falls back to its own timeout, which is the pre-C1
+    behavior. A short write or a hard error closes the connection, because half a status line ahead of the
+    final response would corrupt the stream.
+- **Validation before the 100.** It runs after `reject_if_over_body_limit` (S4), so a `Content-Length` over
+  the route or global limit gets `413` and the body is never invited. Malformed framing and a global
+  over-`MAX_BODY_SIZE` length already count as "complete" and are answered before this point.
+- **Not done, by choice:**
+  - The route is not matched before the 100, so a 404/405 still arrives after the body. This matches Node's
+    default behavior. Matching would need a `Request` built before the body exists.
+  - Other `Expect` values are ignored rather than answered with `417`. RFC 9110 says a server MAY send 417
+    for them; ignoring them is also allowed and cannot break an unusual client.
+
+**Tests and results.**
+
+- `test_http_parser.c`: `test_request_head_expects_continue`. Positive cases: the plain form, case and
+  whitespace variants, and chunked. Negative cases: HTTP/1.0, no body, `Content-Length: 0`, no `Expect`, a
+  different expectation, `100-continuex`, an `X-Expect` header, conflicting `Content-Length`s, and an
+  incomplete head.
+- `test_connection.c` (socketpair):
+  - `test_handle_readable_expect_continue_sends_100_once`: the head alone gets exactly `100 Continue`. A
+    body split over two reads gets no second 100, and the final 200 follows. It is repeated on the same
+    keep-alive connection to check the reset.
+  - `test_handle_readable_expect_continue_chunked`: a chunked upload gets its 100.
+  - `test_handle_readable_expect_continue_not_sent`: no 100 when the body arrived with the head, when the
+    client is HTTP/1.0, or when the body is over the route limit (413 instead).
+- `fuzz_parser.c`: an invariant that the predicate is never true for an incomplete, malformed, HTTP/1.0 or
+  bodiless head. Clean at 1,000,000 iterations.
+- macOS: `make test` (16 suites), ASan + UBSan, `make test_epoll` and `make check-docs` (137 functions) all
+  pass.
+- Linux (Alpine container, io_uring, `seccomp=unconfined`): `test_http_parser` passes. `test_connection`
+  passes every test up to its last one, including the three new ones. The last one,
+  `test_accept_connections_emfile_frees_a_slot_and_recovers`, fails as it did before this change (see C6).
+- **MEASURED, curl 8.7.1 on macOS**, 2 MiB POST to a one-route server (`POST /upload` echoing the body
+  length). The same program was linked against a library built from `HEAD` and against this tree. Five runs
+  each (three for chunked):
+
+  | Upload | Before | After |
+  |---|---|---|
+  | `Content-Length`, curl's default `Expect: 100-continue` | 1.003–1.010 s | **1.0–2.2 ms** |
+  | chunked (`Transfer-Encoding: chunked`, which curl also sends with `Expect`) | 1.003–1.008 s | **2.2–3.0 ms** |
+  | `Content-Length`, `Expect:` suppressed (control) | 1.5–2.1 ms | 1.3–1.8 ms |
+
+  With `Expect`, a request is now as fast as the control. curl `-v` shows `HTTP/1.1 100 Continue` followed
+  by `HTTP/1.1 200 OK`; before the fix it showed "Done waiting for 100-continue". The cost is one 25-byte
+  `write` per such request. Requests without `Expect` pay only for the predicate, and only on reads that
+  leave a request incomplete.
+
+**Status:** Fixed. Not done: route matching before the 100, `417`, and a Linux curl timing run.
+

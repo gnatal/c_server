@@ -338,6 +338,18 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   reopens it the moment anything closes (the cheapest point to retry, rather than waiting for the next accept batch).
   Unrelated to either: `create_server_socket`'s `listen()` backlog is `max(BACKLOG, SOMAXCONN)`, not the bare
   `BACKLOG` constant.
+- **`Expect: 100-continue` (C1).** When `serve_buffered_requests` finds a request's head complete but its body not,
+  `send_continue_if_expected` (`connection.c`) writes `HTTP/1.1 100 Continue\r\n\r\n` straight to the socket, at
+  most once per request (`Connection.continue_sent`, cleared with `body_limit_checked` in `flush_connection`'s
+  keep-alive branch). The decision is the pure `request_head_expects_continue` (`http_parser.c`): HTTP/1.1+ only
+  (never a 1xx to 1.0), a body to wait for (`Content-Length > 0` or chunked), valid framing, and an `Expect` value
+  of exactly `100-continue`. Ordering: it runs after `reject_if_over_body_limit`, so an over-limit
+  `Content-Length` gets `413` and the body is never invited; a head whose body already arrived is complete and never
+  gets a 100. It is never queued in `out_buf`: the loop only reaches it with no response pending, so a pipelined
+  request's 100 always follows the previous response. `EAGAIN` on that write is ignored (the client falls back to
+  its own timeout, the pre-C1 behavior); a short write or hard error closes the connection, since half a status line
+  would corrupt the stream. The route is not matched first: a 404/405 is still sent after the body, as Node does by
+  default.
 - **Body limits (S4).** `app_use_body_limit(app, prefix, max_bytes)` (`router.c`) registers a `BodyLimitEntry` in
   `App.body_limits` (same segment-boundary prefix match as app-wide middleware; `max_bytes` clamped down to
   `MAX_BODY_SIZE`, never loosened past it). `connection.c`'s `reject_if_over_body_limit`, called from
@@ -531,7 +543,7 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
 - **wrk against Linux in Docker reports "timeout" counts close to the connection count** (for example 900-1650 at
   `-c1000`), on epoll and io_uring alike, with max latency in milliseconds and none on macOS/kqueue. Same size either
   backend, so not an engine-backend defect; not explained (see `improvements.md` T6).
-- No HTTP/2, `Expect: 100-continue`, compression, `Range`, or WebSocket.
+- No HTTP/2, compression, `Range`, or WebSocket. `Expect` values other than `100-continue` are ignored (no `417`).
 - **`res_send_file` and large (uncached) static files are still not optimized** (`improvements.md`, P1's other sub-items,
   not addressed by the static-file cache above): the response head and the file body still go out as separate `write`
   calls (no single buffer / `writev`), and large files are read with plain `read`/`write` in `STREAM_CHUNK_SIZE` pieces

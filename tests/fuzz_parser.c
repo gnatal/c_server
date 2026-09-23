@@ -71,6 +71,10 @@ int main(int argc, char **argv) {
        * Content-Length body). The one extra byte is the writable raw[raw_len] slot it may NUL. */
       char *mut = malloc(len + 1); memcpy(mut, buf, len); mut[len] = '\0';
       ParsedHead head; parse_request_head(mut, len, &head);
+      /* C1: never true for a head the engine would not wait on (incomplete, malformed, 1.0, no body). */
+      if (request_head_expects_continue(&head) &&
+          (head.header_len == 0 || head.minor_version < 1 || head.content_length < 0 ||
+           (!head.chunked && head.content_length == 0))) abort();
       Request ip; char saved = 0;
       /* Only a request the engine would parse: parse_http_request also accepts an incomplete one
        * (a short body is clamped), the connection path never hands it one. */

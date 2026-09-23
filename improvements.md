@@ -48,7 +48,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | M4 | ~~Request bodies are copied twice~~ | Memory | | M | **FIXED 2026-09-23**: see `improvements_progress.md` - body is a view into the input buffer (chunked decoded in place); MEASURED peak RSS for a 9.5 MiB upload 41.7 → 32.1 MB (−23%, not the projected −50%: `realloc` growth dominates what's left) | MEASURED |
 | M5 | ~~"Streaming" responses are fully buffered~~ | Memory / Feature | | L | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (38 MB → 1.6 MB RSS for an 8.4 MB body) |
 | M6 | ~~`Route` embeds a `PATH_MAX` buffer~~ | Memory | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (`sizeof(Route)` 1,368 → 352 B on macOS; 4,440 → 352 B on Linux) |
-| C1 | `Expect: 100-continue` is ignored | Correctness | | S | **1.007 s → 2.4 ms** per large upload | MEASURED |
+| C1 | ~~`Expect: 100-continue` is ignored~~ | Correctness | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (2 MiB curl upload 1.007 s → 1–2 ms, Content-Length and chunked) |
 | C2 | Path parameter names are stored per tree position | Correctness | | S | Removes a silent `NULL` | MEASURED |
 | C3 | No `Date` header; 204 carries `Content-Length` | Correctness | | S | RFC compliance | MEASURED |
 | C4 | ~~macOS `SO_REUSEPORT` does not balance workers~~ | Reliability | | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (imbalance, and the fix) |
@@ -342,7 +342,10 @@ record.
 
 ## 6. Correctness and compatibility
 
-### C1 · `Expect: 100-continue` is ignored
+### C1 · ~~`Expect: 100-continue` is ignored~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** The server never sends `100 Continue`. Clients such as `curl` (bodies over about 1 MB) and several HTTP libraries send `Expect: 100-continue` and wait for it before sending the body; when nothing arrives they wait a fixed timeout and then send anyway.
 **Measured.** A 2 MB POST with `Expect: 100-continue`: **1.007 s**; the same request with `Expect:` suppressed: **2.4 ms** (about 420× faster).
 **Fix.** When the headers are complete, the body is pending and `Expect: 100-continue` is present, validate the method/path/limits (send `413`/`417` on failure), then write `HTTP/1.1 100 Continue\r\n\r\n` once and continue reading.

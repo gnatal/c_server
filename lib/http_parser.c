@@ -339,6 +339,29 @@ size_t request_wire_len(const ParsedHead *head, const ChunkScanState *chunk_scan
     return head->header_len + (size_t)head->content_length;
 }
 
+int request_head_expects_continue(const ParsedHead *head) {
+    if (head->header_len == 0 || head->minor_version < 1) {
+        return 0; /* incomplete/malformed, or HTTP/1.0: RFC 9110 §15.2 - never send a 1xx to a 1.0 client */
+    }
+    if (head->content_length < 0 || (!head->chunked && head->content_length == 0)) {
+        return 0; /* no body to wait for, or framing already invalid (answered without reading a body) */
+    }
+    for (size_t i = 0; i < head->num_headers; i++) {
+        const struct phr_header *h = &head->headers[i];
+        if (h->name == NULL || h->name_len != 6 || strncasecmp(h->name, "Expect", 6) != 0) {
+            continue;
+        }
+        const char *v = h->value;
+        const char *end = h->value + h->value_len;
+        while (v < end && is_ows(*v)) v++;
+        while (end > v && is_ows(end[-1])) end--;
+        if ((size_t)(end - v) == 12 && strncasecmp(v, "100-continue", 12) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int request_is_complete(const char *buf, const size_t len) {
     ParsedHead head;
     parse_request_head(buf, len, &head);

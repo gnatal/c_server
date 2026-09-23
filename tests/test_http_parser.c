@@ -844,11 +844,42 @@ static void test_parse_http_request_in_place(void) {
     assert(strcmp(bad_buf, bad) == 0 && saved == 'q');
 }
 
+/* C1: which heads ask for "100 Continue". Pure over a buffer: parse_request_head then the predicate. */
+static int expects_continue(const char *raw) {
+    ParsedHead head;
+    parse_request_head(raw, strlen(raw), &head);
+    return request_head_expects_continue(&head);
+}
+
+static void test_request_head_expects_continue(void) {
+    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n") == 1);
+    /* Name and value are case-insensitive; surrounding whitespace is not part of the value. */
+    assert(expects_continue("POST /u HTTP/1.1\r\nexpect:   100-Continue  \r\nContent-Length: 5\r\n\r\n") == 1);
+    /* Chunked has a body to wait for, even with no Content-Length. */
+    assert(expects_continue("POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n") == 1);
+    /* HTTP/1.0: a 1xx must never be sent. */
+    assert(expects_continue("POST /u HTTP/1.0\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n") == 0);
+    /* No body to wait for. */
+    assert(expects_continue("POST /u HTTP/1.1\r\nExpect: 100-continue\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n") == 0);
+    /* No Expect, another expectation, or a value that merely contains the token. */
+    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: something-else\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continuex\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nX-Expect: 100-continue\r\n\r\n") == 0);
+    /* Invalid framing is answered (400) without inviting a body. */
+    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n"
+                            "Expect: 100-continue\r\n\r\n") == 0);
+    /* Incomplete head: nothing known yet. */
+    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n") == 0);
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_extract_content_length();
     test_request_is_complete();
     test_request_wants_close();
+    test_request_head_expects_continue();
     test_parse_http_request();
     test_request_has_chunked_encoding();
     test_chunked_body_scan();
