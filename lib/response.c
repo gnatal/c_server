@@ -200,6 +200,7 @@ static void send_with_content_type(Response *res, const char *content_type, cons
         conn->file_fd = -1;
         conn->file_remaining = 0;
     }
+    stream_release(conn); /* last wins: a producer stream set earlier in this handler is dropped */
 
     const size_t head_len = build_response_head(res, content_type, body_len, head, sizeof(head));
     if (head_len == 0) {
@@ -388,6 +389,7 @@ static int commit_chunked_headers(Response *res) {
         conn->file_fd = -1;
         conn->file_remaining = 0;
     }
+    stream_release(conn); /* last wins: a producer stream set earlier in this handler is dropped */
     if (res->status == 0) {
         res->status = 200;
     }
@@ -537,5 +539,69 @@ int res_send_file(Response *res, const char *content_type, const char *filepath)
         res->conn->file_fd = fd;
         res->conn->file_remaining = (size_t)st.st_size;
     }
+    return 0;
+}
+
+void stream_release(Connection *conn) {
+    if (conn == NULL || conn->stream_fn == NULL) {
+        return;
+    }
+    const StreamCtxFree ctx_free = conn->stream_ctx_free;
+    void *const ctx = conn->stream_ctx;
+    conn->stream_fn = NULL;
+    conn->stream_ctx = NULL;
+    conn->stream_ctx_free = NULL;
+    conn->stream_paused = 0;
+    if (ctx_free != NULL) {
+        ctx_free(ctx);
+    }
+}
+
+int res_stream(Response *res, StreamProducer producer, void *ctx, StreamCtxFree ctx_free) {
+    if (res == NULL || res->conn == NULL || producer == NULL || res->headers_sent) {
+        return -1;
+    }
+    if (res->trailer_count > 0) {
+        fprintf(stderr, "res_stream: trailers are not supported on a producer stream, dropped\n");
+        res->trailer_count = 0;
+    }
+    if (commit_chunked_headers(res) != 0) {
+        return -1;
+    }
+    res->stream_ended = 1; /* res_write / res_end are no-ops from here on: the producer owns the body */
+    if (res->is_head_request) {
+        if (ctx_free != NULL) {
+            ctx_free(ctx);
+        }
+        return 0;
+    }
+    Connection *conn = res->conn;
+    conn->stream_fn = producer;
+    conn->stream_ctx = ctx;
+    conn->stream_ctx_free = ctx_free;
+    conn->stream_paused = 0;
+    return 0;
+}
+
+int stream_write(StreamWriter *out, const void *data, size_t len) {
+    if (out == NULL || (data == NULL && len > 0)) {
+        return -1;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    char chunk_hdr[24];
+    const int n = snprintf(chunk_hdr, sizeof(chunk_hdr), "%zx\r\n", len);
+    if (n <= 0) {
+        return -1;
+    }
+    const size_t framed = (size_t)n + len + 2;
+    if (len > out->cap || framed > out->cap - out->len) {
+        return -1;
+    }
+    memcpy(out->buf + out->len, chunk_hdr, (size_t)n);
+    memcpy(out->buf + out->len + (size_t)n, data, len);
+    memcpy(out->buf + out->len + (size_t)n + len, "\r\n", 2);
+    out->len += framed;
     return 0;
 }

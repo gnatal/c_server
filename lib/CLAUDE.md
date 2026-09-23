@@ -30,7 +30,7 @@ Per request (`connection.c: handle_readable` → `serve_buffered_requests`, whic
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
 4. `match_route` (per-method Patricia tree, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
-5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf` (allocated from the arena).
+5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf` (allocated from the arena). `res_stream` (M5) builds only the head there and records a producer on the `Connection`; the body is produced later, by `flush_connection` (see "Behavior reference, Producer streaming").
 6. `flush_connection` writes. Keep-alive: `arena_reset`, advance `in_off` past this request's `request_len` (or `in_len = 0` when nothing follows it - P9), zero `chunk_scan` (P8), free `in_buf` (or hand back the borrowed `App.read_buf`) when nothing is buffered (M2). Otherwise `connection_close`, dropping anything pipelined behind it.
 
 Only `connection.c`, `event_loop_*.c`, `cluster.c` do I/O. Parsing, routing, dispatch and
@@ -45,7 +45,7 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text`. One `parse_request_head` pass feeds the body-limit check, completeness check and full parse (P2); `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers kept for existing callers. Headers are stored as views into the input buffer and cookies are split lazily, on first access (P3) |
 | `router.c/h` | route registration, one Patricia (segment-radix) tree per method, `app_mount`, `app_serve_static`, `app_free_routes` |
 | `middleware.c/h` | pipeline (`chain_next`, `chain_error`, `dispatch`), 404/405/OPTIONS defaults |
-| `response.c/h` | response head assembly, cookies, chunked streaming, file streaming |
+| `response.c/h` | response head assembly, cookies, chunked streaming (`res_write`, buffered), producer streaming (`res_stream`, M5: builds the head and records the producer; `stream_write` frames chunks), file streaming |
 | `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen |
 | `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals) |
 | `cluster.c/h` | fork workers, respawn (with backoff and a restart budget, S7), drain; on macOS/BSD (`CEXPRESS_SINGLE_ACCEPTOR`, C4) also the single acceptor - binds the one listen socket, `accept()`s, and hands fds to workers round-robin over per-worker socketpairs |
@@ -64,7 +64,7 @@ cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 2
 body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 ·
 form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB each, 64 MiB total, 1 s revalidation
 (`STATIC_CACHE_*`, `static.c`; a file over the per-entry cap is served but never cached; see "Static" below - P1) ·
-idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
+producer stream output 16 KiB per producer call (`STREAM_CHUNK_SIZE`; one `stream_write` ≤ `STREAM_WRITE_MAX`) and no total cap · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
 pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
 worker init hooks 4 · cluster workers 128 · arena 64 KiB, one per worker process, not per connection (M1; see below; exceeding it falls back to malloc, it is not a limit) ·
 max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped) ·
@@ -81,7 +81,7 @@ be freed by then) exactly once, right after each dispatch-and-flush cycle they r
 `flush_connection` has already copied any still-unsent response tail out to a connection-owned buffer if it
 couldn't fully drain in that same cycle (see `Connection.out_buf_owned`), so nothing any connection still needs
 is ever left in the shared arena when another connection's turn begins. File streaming (`res_send_file`) never
-touches the shared arena at all: each chunk is read into `Connection.file_buf`, a connection-owned buffer
+touches the shared arena at all: each chunk is read into `Connection.stream_buf` (named `file_buf` before M5, which made `res_stream` producers share it), a connection-owned buffer
 malloc'd lazily on first use and reused turn to turn, precisely because a large file spans many event-loop turns
 during which other connections' dispatches would otherwise reuse and overwrite an arena-resident chunk buffer.
 Measured on macOS, 5,000 idle keep-alive connections on one worker now take about 8.2 KB RSS per connection (about
@@ -120,7 +120,8 @@ arena at all - see above).
 | `conn->in_buf` (M2: NULL while nothing is buffered) | not allocated while it borrows `App.read_buf` (during one `handle_readable`); owned copy: `stop_borrowing_read_buf` (unserved bytes left at the end of `handle_readable`) or `grow_in_buf` (a body past `BUF_SIZE`; realloc on further growth) | the owned copy: `flush_connection`'s keep-alive reset once nothing is buffered, or `connection_close`. The borrowed `App.read_buf`: never through `conn` |
 | `App.read_buf` (M2, `BUF_SIZE`, one per worker process) | `app_init` | `app_destroy` |
 | `conn->arena` | not allocated - always `&app->arena`, set once at `connection_create` | nobody frees it through `conn`; `app_destroy` frees the one underlying `App.arena` after every connection is already closed |
-| `conn->file_buf` (M1: a connection-owned file-streaming chunk buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
+| `conn->stream_buf` (M1, M5: a connection-owned `STREAM_CHUNK_SIZE` turn buffer, lazily malloc'd, reused chunk to chunk - never the shared arena; `file_buf` before M5) | `flush_connection`, on the first chunk of a `res_send_file` response or the first producer call of a `res_stream` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
+| `conn->stream_ctx` (M5: the application's producer state, handed over by `res_stream`) | the handler (application code), before `res_stream` | `stream_release` (`response.c`) calls `stream_ctx_free(ctx)` exactly once: after `STREAM_END` (in `flush_connection`), on `STREAM_ABORT` or any close (`connection_close`), when a later `res_*` in the same handler replaces the stream, or inside `res_stream` for HEAD. If `res_stream` returns -1 the caller still owns it |
 | Arena fallback blocks | `arena_alloc` when the buffer is full | `arena_reset` (each dispatch-and-flush cycle, in `handle_readable`/`reject_request`) or `arena_destroy` (`app_destroy`) |
 | `Request.body` | engine path (`parse_http_request_in_place`, M4): not allocated - a view into `conn->in_buf`; `parse_http_request`/`_from_head` (tests, tools): copied into the arena. Always non-NULL after success | nobody: the input buffer's own lifecycle (M2) or the arena. Handlers never free it or keep it |
 | `req_get_*` results, `MultipartPart.data` | point inside the Request / body | nobody; valid until the handler returns |
@@ -280,6 +281,33 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   with `Connection: close` (including every response during shutdown) closes the connection; whatever was pipelined
   behind it is dropped unanswered, as RFC 9112 allows. `request_started` (S1) restarts when leftover bytes remain
   after a response, so a partial pipelined request is still bounded by the header/body deadlines.
+- **Producer streaming (M5, `res_stream`).** The handler sets headers and calls `res_stream(res, producer, ctx, ctx_free)`:
+  the chunked head goes into `out_buf` as for `res_write`, `res->stream_ended` is set (later `res_write`/`res_end` are
+  no-ops) and `Connection.stream_fn/stream_ctx/stream_ctx_free` record the producer. The handler returns; the producer is
+  never called inside it. `flush_connection`, each time `out_buf` has fully drained and `stream_fn` is set, frees an
+  owned head tail-copy, lazily mallocs `stream_buf` and calls the producer with a `StreamWriter` over it
+  (`cap = STREAM_CHUNK_SIZE - 5`, so the last chunk always fits). `stream_write` appends one framed chunk or refuses the
+  whole write (-1). Then: `STREAM_MORE` sends and loops (same 4 × `STREAM_CHUNK_SIZE` per-flush fairness yield as file
+  streaming); `STREAM_PAUSE` - or `STREAM_MORE` with nothing written, to rule out a busy loop - sets `stream_paused`,
+  sends what was written, then `park_stream`: write interest dropped (a writable socket would otherwise call the producer
+  in a tight loop), read interest (re)armed and `FLUSH_PENDING` returned; `STREAM_END` appends `0\r\n\r\n`,
+  `stream_release`s (ctx freed), drains, frees `stream_buf`, and finishes like any response (keep-alive reset or close);
+  `STREAM_ABORT` or any other value → `connection_close` without the last chunk, so the client sees a truncated body,
+  never a clean end. `response_pending` includes `stream_fn != NULL`, so a paused stream still holds pipelined requests,
+  counts as in flight for `app_stop` (`keep_alive = 0`, it may finish within the drain deadline), and is never treated
+  as idle. Resuming (`resume_stream`: clear `stream_paused`, restart `last_write_progress`, watch write) happens from
+  `app_wake_streams` and from `close_idle_connections`, which resumes every parked stream on each sweep instead of
+  applying `WRITE_TIMEOUT_SECONDS` to it (the stall deadline still applies while a resumed stream has unsent bytes).
+  Neither calls the producer directly: it runs on the next write-readiness event, so `app_wake_streams` is safe from
+  inside another connection's handler. Read readiness on a live stream goes to `watch_stream_peer`: `recv(MSG_PEEK)` of
+  one byte, EOF/error → close (frees the ctx immediately); real bytes (a pipelined request) → drop read interest and
+  leave them in the socket until the stream ends. `stop_borrowing_read_buf` drops the already-dispatched request's
+  bytes while a response is pending when nothing is pipelined behind it (`request_len = 0` then means "fully
+  consumed"), so a long-lived subscriber holds no input buffer (the same applies to any pending response).
+  Memory per streaming connection: one `STREAM_CHUNK_SIZE` buffer plus the application's ctx. MEASURED on macOS (one
+  worker, `curl --limit-rate 2M`): the same 8.4 MB CSV took the server from about 1.5 MB to 38 MB RSS through
+  `res_write` (and was truncated, see Known gaps), and stayed at 1.6 MB through `res_stream`. A 63 MB export also
+  stayed at 1.6 MB.
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length` and `Connection` are engine-owned.
   `CookieOptions` zero value = session cookie; `max_age > 0` seconds, `< 0` expire now.
@@ -474,7 +502,10 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
   is a small, session-eager array (S6 requires validating every value for an embedded NUL at parse time regardless of
   whether a handler ever reads it, so there is no CPU to save by deferring the copy, only Request's overall size - and
   query/param storage together are under 3 KB, a small fraction of what headers used to cost).
-- **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model).
+- **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model). For large bodies use `res_stream` (M5), which never touches the arena past the head.
+- **`res_write` silently truncates at its cap** (MEASURED 2026-09-23 while measuring M5): `append_to_out_buf` refuses anything past `MAX_BODY_SIZE + 8 KiB` of *wire* bytes, chunk framing included, and `res_write` ignores the failure. A CSV of 450,000 short lines (8,426,423 body bytes, about 11 MB framed) went out as 7,947,523 bytes with status 200 and no error anywhere. The handler cannot tell. `res_stream` has no such cap.
+- **A parked `res_stream` producer whose client vanished silently is only noticed on its next write** (M5). A FIN/RST is caught at once (`watch_stream_peer`), but once a pipelined request has arrived behind the stream, read interest is dropped and only a write can fail. A producer that parks indefinitely without ever writing holds its connection and ctx until shutdown; long-lived streams should write a heartbeat (an SSE comment line, `:\n\n`) every so often - the idle sweep calls them about once a second, so they can check the time.
+- **`app_wake_streams` is O(connection table) and wakes every paused stream on the worker**, not a channel's subscribers; producers with nothing new just park again. It is per process: in a cluster, a publish reaches only the worker that handled it.
 - The io_uring backend is used only as a readiness poller; sockets are still read and written with `recv` / `write`.
 - **The io_uring backend closes every keep-alive connection after its first request (C6, MEASURED on real Linux via Docker,
   2026-09-22 - not fixed).** `event_loop_io_uring.c`'s `update_poll` (called by all four `watch_*`/`unwatch_*` functions)
@@ -497,7 +528,7 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
   rather than `sendfile(2)`. No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.
 
 ## Where to change what
-Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`. Add a parser feature → `http_parser.c/h` +
+Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`. Change producer streaming (`res_stream`, parking, waking) → `response.c` + `connection.c` (`flush_connection`, `park_stream`/`resume_stream`, `watch_stream_peer`) + `tests/test_stream.c`. Add a parser feature → `http_parser.c/h` +
 `tests/test_http_parser.c` (or `test_http_hardening.c` for a bug regression) + a case in `tests/fuzz_parser.c` seeds. Add a route feature → `router.c/h` + `tests/test_router.c`.
 Add middleware behavior → `middleware.c` + `tests/test_middleware.c`. New public function → declare it in the header and list it in
 `API.md` (`make check-docs` enforces this). New recipe → `examples/cookbook.c` + `tests/test_cookbook.c`. Anything allocated per request → the arena.

@@ -53,8 +53,12 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `res_send(res, text)`, `res_json(res, json_text)`, `res_send_bytes(res, type, data, len)` — send a whole body (copied).
 - `res_redirect(res, status, location)` — 3xx + Location (status 0 = 302).
 - `res_set_cookie(res, name, value, const CookieOptions *)`, `res_clear_cookie(res, name, path)` — cookies.
-- `res_write(res, data, len)`, `res_end(res)`, `res_set_trailer(res, name, value)` — chunked streaming.
+- `res_write(res, data, len)`, `res_end(res)`, `res_set_trailer(res, name, value)` — chunked response, buffered until the handler returns (at most `MAX_BODY_SIZE`, silently truncated past it); for big bodies use `res_stream`.
 - `res_send_file(res, content_type, path)` — stream a file; `0` ok, `-1` nothing sent.
+- `res_stream(res, StreamProducer, ctx, StreamCtxFree)` — large or endless body (downloads, server-sent events): the event loop calls the producer each time the previous output has drained, so a connection holds at most `STREAM_CHUNK_SIZE`; it returns `STREAM_MORE` / `STREAM_PAUSE` / `STREAM_END` / `STREAM_ABORT`. On `0` the engine owns `ctx` and frees it exactly once; on `-1` you still own it. The producer must not touch `req`, `res` or the arena.
+- `stream_write(StreamWriter *, data, len)` — inside a producer: append one chunk; `-1` (nothing written) when this turn is full: return `STREAM_MORE` and retry. At most `STREAM_WRITE_MAX` per call.
+- `app_wake_streams(App *)` (`connection.h`) — resume every paused producer on this worker (e.g. from a publishing handler); paused producers are also resumed about once a second.
+- `stream_release(Connection *)` — engine: detach a producer stream and free its ctx.
 - `res_init(res, conn)` — engine/tests: prepare a Response.
 
 ## Per-request memory (`arena.h`)

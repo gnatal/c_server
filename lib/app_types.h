@@ -73,7 +73,10 @@
 #define STATIC_CACHE_MAX_ENTRY_BYTES (256 * 1024)      /* a file bigger than this is served but never cached (P1) */
 #define STATIC_CACHE_MAX_TOTAL_BYTES (64 * 1024 * 1024) /* combined cap across all cached entries; evicts the stalest first */
 #define STATIC_CACHE_REVALIDATE_SECONDS 1       /* a cache hit within this long of its last stat skips the filesystem entirely */
-#define STREAM_CHUNK_SIZE (16 * 1024)           /* res_send_file reads this much per write; 4 chunks per event-loop turn */
+#define STREAM_CHUNK_SIZE (16 * 1024)           /* res_send_file reads this much per write, and a res_stream producer
+                                                 * fills at most this much per call; 4 chunks per event-loop turn */
+#define STREAM_WRITE_MAX (STREAM_CHUNK_SIZE - 16) /* largest single stream_write that always fits an empty
+                                                   * turn buffer (chunk framing + the last-chunk reserve) */
 #define IDLE_TIMEOUT_SECONDS 60       /* no bytes received for this long: close (408 if mid-request) */
 #define REQUEST_HEADER_TIMEOUT_SECONDS 10  /* deadline from the first byte of a request to a complete header
                                              * block, regardless of how often the client sends a byte: closes
@@ -215,6 +218,35 @@ typedef struct {
     size_t body_end;
 } ChunkScanState;
 
+/* ---- producer streaming (res_stream, M5) ---- */
+
+/*
+ * Where a StreamProducer writes one turn's output: a view over Connection.stream_buf, built by
+ * flush_connection on the stack for each producer call. Fill it only through stream_write
+ * (response.h), which adds the chunked framing. `len` bytes are used of `cap`; `cap` already
+ * excludes the reserve for the terminating "0\r\n\r\n", so STREAM_END always fits.
+ */
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} StreamWriter;
+
+/* StreamProducer return values. */
+#define STREAM_MORE 0    /* call again as soon as this turn's output has drained to the socket */
+#define STREAM_PAUSE 1   /* nothing more for now: park until app_wake_streams or the next idle sweep (~1 s) */
+#define STREAM_END 2     /* finished: the engine sends the last chunk and the connection continues (keep-alive) */
+#define STREAM_ABORT (-1) /* failed mid-response: close without the last chunk, so the client sees a truncated body */
+
+/* Called by the event loop, never inside the handler, whenever the previous output has drained:
+ * write at most one buffer (STREAM_CHUNK_SIZE) of chunks with stream_write, then return a STREAM_*
+ * value. `ctx` is what res_stream was given. STREAM_MORE with nothing written counts as STREAM_PAUSE. */
+typedef int (*StreamProducer)(StreamWriter *out, void *ctx);
+
+/* Frees a res_stream ctx. The engine calls it exactly once: after STREAM_END or STREAM_ABORT, when the
+ * connection closes for any other reason, when a later res_* replaces the stream, or at once for HEAD. */
+typedef void (*StreamCtxFree)(void *ctx);
+
 /* ---- connection and event loop ---- */
 
 /* Per-connection state, one per accepted fd, owned by App.connections[fd]. Freed only by connection_close. */
@@ -279,15 +311,15 @@ typedef struct Connection {
      * call (EAGAIN), the unsent tail is copied into a connection-owned `malloc`'d buffer before
      * `flush_connection` returns, since the shared arena would otherwise be reset and reused by
      * another connection before this one's write finishes; `out_buf_owned` becomes 1 and that copy
-     * is `free`'d once fully drained or on close. File streaming never touches `out_buf_owned` - see
-     * `file_buf` below. */
+     * is `free`'d once fully drained or on close. File and producer streaming never touch
+     * `out_buf_owned` - see `stream_buf` below. */
     char *out_buf;
     size_t out_len;
     size_t out_sent;
     size_t out_cap;
     int out_buf_owned;
 
-    /* Non-zero while a response is pending (out_buf != NULL or file_fd >= 0): set by flush_connection
+    /* Non-zero while a response is pending (out_buf != NULL, file_fd >= 0 or stream_fn != NULL): set by flush_connection
      * the first time it runs for this response, and advanced only when a write() actually accepts
      * bytes onto the socket - never merely because flush_connection ran. Lets
      * close_idle_connections bound "made no progress at all" separately from "still slowly draining"
@@ -295,14 +327,28 @@ typedef struct Connection {
      * its arena and out_buf forever. Reset to 0 once a keep-alive response is fully queued. */
     time_t last_write_progress;
 
-    /* File streaming (res_send_file): >= 0 while flush_connection streams file_remaining bytes from disk.
-     * `file_buf` (M1) is a lazily malloc'd, connection-owned STREAM_CHUNK_SIZE buffer flush_connection
-     * reads each chunk into and reuses across turns (`out_buf` points at it while streaming) - never the
-     * shared arena, since a large file spans many event-loop turns during which other connections would
-     * otherwise reuse and overwrite it. Freed when streaming ends (success or error) or on connection_close. */
+    /* File streaming (res_send_file): >= 0 while flush_connection streams file_remaining bytes from disk. */
     int file_fd;
     size_t file_remaining;
-    char *file_buf;
+
+    /* Producer streaming (res_stream, M5): stream_fn != NULL from res_stream until STREAM_END/STREAM_ABORT
+     * or close. flush_connection calls stream_fn(writer over stream_buf, stream_ctx) each time out_buf has
+     * drained, so memory is one STREAM_CHUNK_SIZE buffer however long the response. stream_paused: the
+     * producer returned STREAM_PAUSE and everything it wrote has drained - write interest is dropped and
+     * read interest kept (only to notice the peer closing) until app_wake_streams or close_idle_connections
+     * re-arms write interest. stream_ctx is released through stream_ctx_free exactly once (stream_release,
+     * response.c). File and producer streaming are mutually exclusive: a response is at most one of them. */
+    StreamProducer stream_fn;
+    void *stream_ctx;
+    StreamCtxFree stream_ctx_free;
+    int stream_paused;
+
+    /* `stream_buf` (M1, M5) is a lazily malloc'd, connection-owned STREAM_CHUNK_SIZE buffer shared by
+     * both streaming kinds: flush_connection reads each file chunk into it, or has the producer fill it,
+     * and reuses it across turns (`out_buf` points at it while streaming) - never the shared arena, since
+     * a stream spans many event-loop turns during which other connections would otherwise reuse and
+     * overwrite it. Freed when streaming ends (success or error) or on connection_close. */
+    char *stream_buf;
 
     int events_watched;     /* EVENT_READ | EVENT_WRITE currently registered with the event loop */
 

@@ -55,6 +55,13 @@ void app_stop(App *app);
 /* Number of open client connections. */
 int app_count_connections(const App *app);
 
+/* M5: resumes every res_stream producer on this worker that returned STREAM_PAUSE; each is called
+ * again on its next write-readiness event (never from inside this call, so it is safe from a handler,
+ * e.g. a POST that publishes to server-sent-event subscribers). Paused producers are also resumed by
+ * the idle sweep about once a second without this. Only this process's connections: workers share
+ * nothing, so a cluster needs its own cross-worker signal. */
+void app_wake_streams(App *app);
+
 /*
  * Engine internals (called from the event loop; exposed for tests).
  *
@@ -71,14 +78,17 @@ int app_count_connections(const App *app);
  * handle_writable: the LOOP_EVENT_WRITE handler (P9). Continues a pending response via
  *   flush_connection; once none is pending, serves any pipelined requests still buffered (also the
  *   wakeup used when handle_readable hit MAX_PIPELINED_PER_EVENT).
- * flush_connection: non-blocking write of conn->out_buf (and a streamed file, 64 KB per turn).
+ * flush_connection: non-blocking write of conn->out_buf (and a streamed file or res_stream producer
+ *   output, 64 KB per turn; a producer that returns STREAM_PAUSE is parked: FLUSH_PENDING with write
+ *   interest dropped, read interest kept only to notice the peer closing).
  *   On EAGAIN it waits for writability and stops reading. When done: keep-alive resets the connection
  *   for the next request (advancing conn->in_off past conn->request_len bytes, or discarding in_buf
  *   when request_len is 0), otherwise it closes. Returns FLUSH_DONE (fully queued, connection kept),
  *   FLUSH_PENDING (waiting for write readiness) or FLUSH_CLOSED (conn has been freed: don't touch it).
  * close_idle_connections: run once per second; a connection with no received bytes for
  *   IDLE_TIMEOUT_SECONDS (60) is closed (408 first if a request was half-received). A connection
- *   with a response still being written is left alone.
+ *   with a response still being written is closed only if it made no write progress for
+ *   WRITE_TIMEOUT_SECONDS; a parked res_stream producer is resumed instead (M5).
  * accept_connections: accepts every pending client (accept_client: non-blocking, TCP_NODELAY) and registers it.
  * accept_passed_connections (C4, CEXPRESS_SINGLE_ACCEPTOR only): the fd-passing counterpart - drains
  *   every fd the cluster master has handed this worker over its control socket (server_fd) via

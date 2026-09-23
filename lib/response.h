@@ -9,6 +9,7 @@
  *   res_send / res_json / res_send_bytes / res_redirect   (whole body at once)
  *   res_write ... res_end                                  (chunked streaming)
  *   res_send_file                                          (file streamed from disk)
+ *   res_stream                                             (producer called by the event loop, M5)
  * Order: res_status and res_set_header / res_set_cookie first, then the sending call.
  * Nothing here touches the socket: the bytes are built into conn->out_buf and written later by the
  * event loop (flush_connection). A second res_send in the same request replaces the first.
@@ -60,8 +61,8 @@ void res_clear_cookie(Response *res, const char *name, const char *path);
 /*
  * Chunked streaming for bodies of unknown size. The first res_write (or res_end) commits the status
  * line and headers with Transfer-Encoding: chunked, so set headers and trailers-to-declare first.
- * Chunks accumulate in conn->out_buf (limit MAX_BODY_SIZE + header); the handler never blocks on
- * the socket. HEAD requests get the headers only. res_end writes the last chunk plus any trailers.
+ * Chunks accumulate in conn->out_buf (limit MAX_BODY_SIZE + header) and nothing is sent until the
+ * handler returns; the handler never blocks on the socket. For large or unbounded bodies use res_stream. HEAD requests get the headers only. res_end writes the last chunk plus any trailers.
  * res_set_trailer: same-name overwrites; Transfer-Encoding, Content-Length and Trailer are rejected;
  * MAX_RESPONSE_TRAILERS.
  */
@@ -76,5 +77,30 @@ void res_end(Response *res);
  * (this does no traversal checking; use app_serve_static for untrusted paths).
  */
 int res_send_file(Response *res, const char *content_type, const char *filepath);
+
+/*
+ * Producer streaming (M5) for bodies too large or too slow to build inside the handler: large generated
+ * downloads, server-sent events, long-poll. Commits the status line and headers (Transfer-Encoding:
+ * chunked; set Content-Type etc. first) and returns; the event loop then calls
+ * `producer(writer, ctx)` every time the previous output has drained to the socket, so memory stays at
+ * one STREAM_CHUNK_SIZE buffer per connection however long the stream runs. See StreamProducer and the
+ * STREAM_* return values in app_types.h. The producer runs outside the handler: it must not touch the
+ * Request, Response or arena, only `ctx`. Trailers are not supported here (dropped, logged).
+ * Ownership: on 0 the engine owns ctx and calls ctx_free(ctx) exactly once (ctx_free may be NULL);
+ * a HEAD request gets the headers only and ctx_free runs before this returns. On -1 (headers already
+ * sent, NULL producer, or the head did not fit) nothing was taken: the caller still owns ctx.
+ */
+int res_stream(Response *res, StreamProducer producer, void *ctx, StreamCtxFree ctx_free);
+
+/*
+ * For use inside a StreamProducer: appends `len` bytes as one chunk. Returns 0, or -1 with nothing
+ * written when this turn's buffer is full (keep the data and return STREAM_MORE: you are called again
+ * once it drains). A single write up to STREAM_WRITE_MAX always fits an empty buffer; a larger one
+ * never fits, split it. len == 0 is a no-op (it would otherwise end the body).
+ */
+int stream_write(StreamWriter *out, const void *data, size_t len);
+
+/* Engine-internal: detaches a producer stream from conn and calls its ctx_free once. No-op if none. */
+void stream_release(Connection *conn);
 
 #endif /* RESPONSE_H */

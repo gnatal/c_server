@@ -5,7 +5,7 @@
  *     static void name(const Request *req, Response *res);
  *
  * and must produce exactly one response with res_send / res_json / res_send_bytes / res_redirect /
- * res_send_file (or res_write ... res_end). Handlers are terminal: they cannot call chain_next or
+ * res_send_file (or res_write ... res_end, or res_stream for large/endless bodies - recipe 14). Handlers are terminal: they cannot call chain_next or
  * chain_error (only Middleware can). A second res_send in the same request replaces the first.
  *
  * DON'T (each of these is a real bug pattern, see lib/CLAUDE.md "Ownership"):
@@ -376,6 +376,130 @@ static void recipe_stream(const Request *req, Response *res) {
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * RECIPE 14 - large or endless responses with res_stream (M5): generated downloads, server-sent events.
+ * res_write (recipe 12) buffers the whole body until the handler returns (at most MAX_BODY_SIZE).
+ * res_stream instead hands the engine a producer that the event loop calls each time the previous
+ * output has reached the socket, so a connection never holds more than STREAM_CHUNK_SIZE of it.
+ * The producer runs AFTER the handler has returned: keep everything it needs in a malloc'd ctx (never
+ * req, res or arena memory) and give res_stream the free function; the engine calls it exactly once.
+ * Return STREAM_MORE (call me again), STREAM_PAUSE (nothing now: wait for app_wake_streams or the
+ * ~1 s sweep), STREAM_END, or STREAM_ABORT (closes, the client sees a truncated body).
+ *   GET /export?rows=3 -> CSV "id,square\n0,0\n1,1\n2,4\n", generated a turn at a time
+ *   GET /events        -> text/event-stream; POST /events (body = message) publishes to every subscriber
+ * ------------------------------------------------------------------------------------------- */
+typedef struct {
+    int header_written;
+    long next_row;
+    long rows;
+} ExportCtx;
+
+static int export_producer(StreamWriter *out, void *ctx_ptr) {
+    ExportCtx *ctx = ctx_ptr;
+    if (!ctx->header_written) {
+        if (stream_write(out, "id,square\n", 10) != 0) {
+            return STREAM_MORE;
+        }
+        ctx->header_written = 1;
+    }
+    while (ctx->next_row < ctx->rows) {
+        char line[64];
+        const int n = snprintf(line, sizeof(line), "%ld,%ld\n", ctx->next_row, ctx->next_row * ctx->next_row);
+        if (stream_write(out, line, (size_t)n) != 0) {
+            return STREAM_MORE; /* this turn's buffer is full: the same row is written next call */
+        }
+        ctx->next_row++;
+    }
+    return STREAM_END;
+}
+
+static void recipe_export(const Request *req, Response *res) {
+    const char *rows_text = req_get_query(req, "rows");
+    char *end = NULL;
+    const long rows = rows_text != NULL ? strtol(rows_text, &end, 10) : 1000;
+    if (rows_text != NULL && (end == rows_text || *end != '\0' || rows < 0 || rows > 10000000)) {
+        res_status(res, 400);
+        res_send(res, "rows must be 0..10000000");
+        return;
+    }
+    ExportCtx *ctx = malloc(sizeof(*ctx)); /* freed by the engine through the free() passed below */
+    if (ctx == NULL) {
+        res_status(res, 500);
+        res_send(res, "out of memory");
+        return;
+    }
+    ctx->header_written = 0;
+    ctx->next_row = 0;
+    ctx->rows = rows;
+    res_set_header(res, "Content-Type", "text/csv");
+    res_set_header(res, "Content-Disposition", "attachment; filename=\"squares.csv\"");
+    if (res_stream(res, export_producer, ctx, free) != 0) {
+        free(ctx); /* -1: nothing was taken, the ctx is still ours */
+    }
+}
+
+/* Server-sent events: a per-worker message log (workers share nothing: publish in a cluster reaches
+ * only the worker that received the POST), each subscriber's ctx remembers how far it has read. */
+#define EVENT_LOG_SIZE 16
+static char g_event_log[EVENT_LOG_SIZE][128];
+static long g_event_count;   /* total ever published; the log keeps the last EVENT_LOG_SIZE */
+static App *g_cookbook_app;  /* for app_wake_streams from a handler */
+
+typedef struct {
+    long next_event;
+} SubscriberCtx;
+
+static int events_producer(StreamWriter *out, void *ctx_ptr) {
+    SubscriberCtx *ctx = ctx_ptr;
+    if (g_event_count - ctx->next_event > EVENT_LOG_SIZE) {
+        ctx->next_event = g_event_count - EVENT_LOG_SIZE; /* fell behind: skip what the log dropped */
+    }
+    while (ctx->next_event < g_event_count) {
+        char frame[160];
+        const int n = snprintf(frame, sizeof(frame), "data: %s\n\n", g_event_log[ctx->next_event % EVENT_LOG_SIZE]);
+        if (stream_write(out, frame, (size_t)n) != 0) {
+            return STREAM_MORE;
+        }
+        ctx->next_event++;
+    }
+    return STREAM_PAUSE; /* woken by app_wake_streams (publish) or the ~1 s sweep */
+}
+
+static void recipe_events_subscribe(const Request *req, Response *res) {
+    (void)req;
+    SubscriberCtx *ctx = malloc(sizeof(*ctx));
+    if (ctx == NULL) {
+        res_status(res, 500);
+        res_send(res, "out of memory");
+        return;
+    }
+    ctx->next_event = g_event_count > EVENT_LOG_SIZE ? g_event_count - EVENT_LOG_SIZE : 0; /* replay the log */
+    res_set_header(res, "Content-Type", "text/event-stream");
+    res_set_header(res, "Cache-Control", "no-cache");
+    if (res_stream(res, events_producer, ctx, free) != 0) {
+        free(ctx);
+    }
+}
+
+static void recipe_events_publish(const Request *req, Response *res) {
+    /* One SSE "data:" line: refuse line breaks rather than let a message forge extra events. */
+    if (req->content_length == 0 || req->content_length >= (int)sizeof(g_event_log[0]) ||
+        memchr(req->body, '\n', (size_t)req->content_length) != NULL ||
+        memchr(req->body, '\r', (size_t)req->content_length) != NULL ||
+        memchr(req->body, '\0', (size_t)req->content_length) != NULL) {
+        res_status(res, 400);
+        res_send(res, "message must be 1..127 bytes on one line");
+        return;
+    }
+    char *slot = g_event_log[g_event_count % EVENT_LOG_SIZE];
+    memcpy(slot, req->body, (size_t)req->content_length);
+    slot[req->content_length] = '\0';
+    g_event_count++;
+    app_wake_streams(g_cookbook_app); /* subscribers run on their next write turn, not inside this call */
+    res_status(res, 204);
+    res_send(res, "");
+}
+
+/* ---------------------------------------------------------------------------------------------
  * RECIPE 13 - per-worker resource (database, cache, anything with OS-level state).
  * fork() copies main()'s memory into every cluster worker, so never open such a resource before
  * app_listen. Validate and migrate in main(), close it, and open the real one in a hook:
@@ -423,6 +547,10 @@ void cookbook_register(App *app) {
     app_delete(app, "/things/:id", recipe_delete_thing);
     app_post(app, "/things", recipe_created);
     app_get(app, "/stream", recipe_stream);
+    g_cookbook_app = app;
+    app_get(app, "/export", recipe_export);
+    app_get(app, "/events", recipe_events_subscribe);
+    app_post(app, "/events", recipe_events_publish);
 }
 
 /* Exposed for tests/test_cookbook.c only. */

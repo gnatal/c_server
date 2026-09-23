@@ -2432,3 +2432,88 @@ the entry's own fallback: one byte is saved and restored around the NUL terminat
   bench` (small JSON body) is unchanged within noise.
 
 **Status:** Fixed. Not done: reducing `realloc`'s transient peak (above), and a Linux run.
+
+---
+
+## M5 · "Streaming" responses are buffered in full
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+A pull-based producer API. The handler hands the engine a callback. The event loop calls it each time the
+previous output has reached the socket, so a streamed response costs one fixed buffer, whatever its length.
+`res_write`/`res_end` are unchanged (still buffered, still capped); the new path sits beside them.
+
+- **API** (`response.h`, `connection.h`, types in `app_types.h`):
+  - `res_stream(res, producer, ctx, ctx_free)` commits the chunked head and records the producer on the
+    `Connection`. On `0` the engine owns `ctx` and calls `ctx_free` exactly once. On `-1` the caller still
+    owns it.
+  - `int producer(StreamWriter *out, void *ctx)` returns `STREAM_MORE`, `STREAM_PAUSE`, `STREAM_END` or
+    `STREAM_ABORT`.
+  - `stream_write(out, data, len)` appends one chunk, or refuses the whole write when this turn is full.
+  - `app_wake_streams(app)` resumes paused producers.
+- **Where the producer runs.** `flush_connection` calls it once `out_buf` has drained. It writes into
+  `Connection.stream_buf`, the `STREAM_CHUNK_SIZE` buffer file streaming already used (renamed from
+  `file_buf`). Output per turn and the fairness yield match file streaming. The producer never runs inside
+  the handler, and the shared arena is not touched past the head.
+- **Pausing (server-sent events, long-poll).** `STREAM_PAUSE` parks the stream after its bytes drain:
+  write interest is dropped, because a writable socket would otherwise call the producer in a busy loop.
+  Read interest is kept only so `watch_stream_peer` (`recv(MSG_PEEK)`) can close a hung-up client at once
+  and free its ctx. `app_wake_streams` and the one-second idle sweep resume a parked stream by arming write
+  interest. Neither calls the producer directly, so waking from inside another connection's handler is
+  safe. A parked stream is exempt from the S2 write-stall deadline, and the stall clock restarts on resume.
+- **Lifecycle.** `response_pending` now includes an open stream:
+  - pipelined requests wait behind it;
+  - `app_stop` lets it finish within the drain deadline;
+  - `connection_close` frees the ctx (`stream_release`);
+  - a later `res_*` in the same handler replaces the stream and frees the ctx (last wins, as for `res_send`).
+- **Found while testing.** The dispatched request's bytes were copied into an owned 8 KiB `in_buf` and kept
+  for as long as its response stayed pending (P9 advances `in_off` only when the response completes). For a
+  subscriber that stays open for hours, that brings back the cost M2 removed.
+  `stop_borrowing_read_buf` now drops those bytes when nothing is pipelined behind them. This applies to
+  every pending response, not only streams.
+- **Cookbook recipe 14:** a CSV export (`GET /export?rows=N`) and SSE (`GET /events` subscribes;
+  `POST /events` publishes and calls `app_wake_streams`). A message containing a line break is refused, so
+  it cannot forge a second event.
+
+**Tests and results.**
+
+- New suite `tests/test_stream.c`, 13 tests. It also runs against epoll through `make test_epoll`. Covers:
+  - framing and bounds;
+  - ctx ownership on success, replacement and HEAD;
+  - a 12 MiB stream, past `MAX_BODY_SIZE`: byte-exact, never more than one turn buffered, with a pipelined
+    request answered after it on the same connection;
+  - park and wake;
+  - the sweep resuming a stream instead of stall-closing it;
+  - peer hang-up while parked;
+  - pipelined bytes while parked (not read, read interest dropped, served afterwards);
+  - `STREAM_ABORT` truncating the response;
+  - `app_stop` during a stream;
+  - HEAD.
+- `test_cookbook.c`: recipe 14 is driven turn by turn: exact chunk bytes, the 400 case, and SSE publish
+  and replay, including the refused forged event.
+- macOS: `make test` (16 suites), ASan + UBSan, `make test_epoll` and `make check-docs` (135 functions)
+  all pass.
+- **MEASURED, real server** (macOS, kqueue, one worker, cookbook recipes, `curl`):
+
+  | Scenario | Result |
+  |---|---|
+  | Same 8.4 MB CSV, client limited to 2 MB/s, RSS mid-transfer | `res_write`: about 1.5 → **38 MB**. `res_stream`: **1.6 MB** |
+  | 63 MB export (3,000,000 rows) | 0.41 s, RSS 1.5 → 1.6 MB |
+  | 19 MB export at 2 MB/s | RSS flat at 1.6 MB throughout; no fd left afterwards |
+  | SSE: 3 publishes | subscriber got all 3 events at once; fd released when the client left |
+  | Client killed mid-export | connection closed; no fd or memory left |
+
+- **Pre-existing bug found by the comparison, not fixed.** The `res_write` version of that CSV sent only
+  7,947,523 of 8,426,423 body bytes, with status 200. `append_to_out_buf` caps *wire* bytes, chunk framing
+  included, at `MAX_BODY_SIZE + 8 KiB`, and `res_write` ignores the failure. This is recorded under
+  `lib/CLAUDE.md` "Known gaps". Ways to fix it: return an error from `res_write`, or abort the connection
+  instead of truncating.
+
+**Status:** Fixed. Not done:
+- a per-channel wake (`app_wake_streams` scans the connection table and wakes every paused stream);
+- cross-worker publish;
+- trailers on producer streams;
+- a Linux or io_uring run. C6's re-arm bug affects `watch`/`unwatch` there generally, and park and resume
+  toggle interest more often than a normal response does.

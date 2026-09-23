@@ -157,19 +157,20 @@ void connection_close(App *app, Connection *conn) {
         close(conn->file_fd);
         conn->file_fd = -1;
     }
-    /* M1: file_buf and a still-owned malloc'd out_buf tail-copy are connection-owned, unlike the
+    stream_release(conn); /* M5: a producer stream cut short (peer gone, write error, shutdown) frees its ctx here */
+    /* M1: stream_buf and a still-owned malloc'd out_buf tail-copy are connection-owned, unlike the
      * (shared, App-owned) arena a normal out_buf lives in - free them here regardless of which exit
      * path got the connection closed (a hard write/read error mid-response, not just the ordinary
-     * "response fully sent, not keeping this connection alive" case). out_buf can equal file_buf
-     * (streaming's out_buf just points at it) - free it once, via file_buf, never both. */
-    if (conn->out_buf == conn->file_buf) {
+     * "response fully sent, not keeping this connection alive" case). out_buf can equal stream_buf
+     * (streaming's out_buf just points at it) - free it once, via stream_buf, never both. */
+    if (conn->out_buf == conn->stream_buf) {
         conn->out_buf = NULL;
     } else if (conn->out_buf_owned) {
         free(conn->out_buf);
         conn->out_buf = NULL;
     }
-    free(conn->file_buf);
-    conn->file_buf = NULL;
+    free(conn->stream_buf);
+    conn->stream_buf = NULL;
 
     if (conn->fd >= 0) {
         close(conn->fd);
@@ -229,6 +230,12 @@ int app_count_connections(const App *app) {
     return count;
 }
 
+/* P9: whether a response is still being written (built but not fully queued on the socket). M5: a
+ * producer stream counts for its whole life, paused or not - it has not sent its last chunk yet. */
+static int response_pending(const Connection *conn) {
+    return conn->out_buf != NULL || conn->file_fd >= 0 || conn->stream_fn != NULL;
+}
+
 void app_stop(App *app) {
     if (app == NULL || app->is_shutting_down) {
         return;
@@ -254,7 +261,7 @@ void app_stop(App *app) {
             if (conn == NULL) {
                 continue;
             }
-            if (conn->in_len == 0 && conn->out_buf == NULL && conn->file_fd < 0) {
+            if (conn->in_len == 0 && !response_pending(conn)) {
                 connection_close(app, conn);
             } else {
                 conn->keep_alive = 0;
@@ -448,6 +455,28 @@ static void wait_for_writable(App *app, Connection *conn) {
     }
 }
 
+/*
+ * M5: a producer returned STREAM_PAUSE and its output has drained. Stop asking for writability (the
+ * socket is writable, so a level-triggered write watch would call the producer in a busy loop) and keep
+ * read interest only so read_and_serve can notice the peer hanging up (watch_stream_peer) while
+ * nothing is being written. app_wake_streams / close_idle_connections resume it (resume_stream).
+ */
+static int park_stream(App *app, Connection *conn) {
+    event_loop_unwatch_write(app, conn->fd, conn);
+    if (!(conn->events_watched & EVENT_READ)) {
+        event_loop_watch_read(app, conn->fd, conn);
+    }
+    return FLUSH_PENDING;
+}
+
+/* M5: un-parks a paused producer stream: its next call happens on the next write-readiness event. The
+ * S2 stall clock restarts now - time spent paused is the producer's choice, not a stalled reader. */
+static void resume_stream(App *app, Connection *conn) {
+    conn->stream_paused = 0;
+    conn->last_write_progress = time(NULL);
+    event_loop_watch_write(app, conn->fd, conn);
+}
+
 /* M2: nothing is buffered any more - drop the input memory so an idle connection holds none. An
  * owned buffer is freed; a borrowed App.read_buf is just handed back. */
 static void release_in_buf(const App *app, Connection *conn) {
@@ -477,11 +506,11 @@ int flush_connection(App *app, Connection *conn) {
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     /* M1: out_buf is shared-arena-resident unless it's already a connection-owned
-                     * copy (out_buf_owned) or the file-streaming chunk buffer (out_buf == file_buf,
-                     * never arena to begin with - see file_buf's own comment). Returning to the event
+                     * copy (out_buf_owned) or the file-streaming chunk buffer (out_buf == stream_buf,
+                     * never arena to begin with - see stream_buf's own comment). Returning to the event
                      * loop now would let another connection's dispatch reset and reuse the shared
                      * arena before this response finishes draining, so copy what's left out first. */
-                    if (!conn->out_buf_owned && conn->out_buf != conn->file_buf) {
+                    if (!conn->out_buf_owned && conn->out_buf != conn->stream_buf) {
                         size_t remaining = conn->out_len - conn->out_sent;
                         char *tail = malloc(remaining);
                         if (tail == NULL) {
@@ -521,22 +550,22 @@ int flush_connection(App *app, Connection *conn) {
                                      : STREAM_CHUNK_SIZE;
                 /* M1: a connection-owned buffer, malloc'd once and reused chunk to chunk - never the
                  * shared arena, since a large file spans many event-loop turns during which other
-                 * connections would otherwise reuse and overwrite it (see Connection.file_buf). A
+                 * connections would otherwise reuse and overwrite it (see Connection.stream_buf). A
                  * still-owned malloc'd tail-copy from the response head (above) is done with once we
-                 * get here (the inner loop just fully drained it) and isn't file_buf, so free it now
-                 * rather than leak it when out_buf moves on to file_buf below. */
+                 * get here (the inner loop just fully drained it) and isn't stream_buf, so free it now
+                 * rather than leak it when out_buf moves on to stream_buf below. */
                 if (conn->out_buf_owned) {
                     free(conn->out_buf);
                     conn->out_buf_owned = 0;
                 }
-                if (conn->file_buf == NULL) {
-                    conn->file_buf = malloc(STREAM_CHUNK_SIZE);
-                    if (conn->file_buf == NULL) {
+                if (conn->stream_buf == NULL) {
+                    conn->stream_buf = malloc(STREAM_CHUNK_SIZE);
+                    if (conn->stream_buf == NULL) {
                         connection_close(app, conn);
                         return FLUSH_CLOSED;
                     }
                 }
-                conn->out_buf = conn->file_buf;
+                conn->out_buf = conn->stream_buf;
                 ssize_t r = read(conn->file_fd, conn->out_buf, to_read);
                 if (r <= 0) {
                     connection_close(app, conn);
@@ -550,11 +579,53 @@ int flush_connection(App *app, Connection *conn) {
             } else {
                 close(conn->file_fd);
                 conn->file_fd = -1;
-                free(conn->file_buf);
-                conn->file_buf = NULL;
+                free(conn->stream_buf);
+                conn->stream_buf = NULL;
                 conn->out_buf = NULL;
                 conn->out_cap = 0;
             }
+        }
+
+        /* M5: a producer stream - the previous turn's output has drained, ask for the next one. */
+        if (conn->stream_fn != NULL) {
+            if (conn->stream_paused) {
+                return park_stream(app, conn);
+            }
+            if (bytes_written_this_flush >= max_flush_bytes) {
+                wait_for_writable(app, conn); /* same fairness yield as file streaming */
+                return FLUSH_PENDING;
+            }
+            if (conn->out_buf_owned) {
+                /* the response head's tail-copy (see the file branch above): drained, done with */
+                free(conn->out_buf);
+                conn->out_buf_owned = 0;
+            }
+            if (conn->stream_buf == NULL) {
+                conn->stream_buf = malloc(STREAM_CHUNK_SIZE);
+                if (conn->stream_buf == NULL) {
+                    connection_close(app, conn);
+                    return FLUSH_CLOSED;
+                }
+            }
+            /* cap leaves room for the 5-byte last chunk, so STREAM_END below never overflows */
+            StreamWriter writer = { conn->stream_buf, 0, STREAM_CHUNK_SIZE - 5 };
+            const int step = conn->stream_fn(&writer, conn->stream_ctx);
+            if (step != STREAM_MORE && step != STREAM_PAUSE && step != STREAM_END) {
+                connection_close(app, conn); /* STREAM_ABORT (or garbage): truncate, never fake an ending */
+                return FLUSH_CLOSED;
+            }
+            if (step == STREAM_END) {
+                memcpy(writer.buf + writer.len, "0\r\n\r\n", 5);
+                writer.len += 5;
+                stream_release(conn); /* ctx freed now; the loop drains the tail and finishes below */
+            } else if (step == STREAM_PAUSE || writer.len == 0) {
+                conn->stream_paused = 1; /* parked once this turn's bytes (if any) have drained */
+            }
+            conn->out_buf = conn->stream_buf;
+            conn->out_len = writer.len;
+            conn->out_sent = 0;
+            conn->out_cap = STREAM_CHUNK_SIZE;
+            continue;
         }
 
         break;
@@ -567,6 +638,14 @@ int flush_connection(App *app, Connection *conn) {
     if (conn->out_buf_owned) {
         free(conn->out_buf);
         conn->out_buf_owned = 0;
+    }
+    if (conn->stream_buf != NULL) {
+        /* M5: a producer stream just ended (its last chunk is what drained): release the turn buffer */
+        if (conn->out_buf == conn->stream_buf) {
+            conn->out_buf = NULL;
+        }
+        free(conn->stream_buf);
+        conn->stream_buf = NULL;
     }
 
     if (conn->keep_alive) {
@@ -711,11 +790,6 @@ static int reject_if_over_body_limit(App *app, Connection *conn, const ParsedHea
 #define SERVE_WAIT 1
 #define SERVE_CLOSED -1
 
-/* P9: whether a response is still being written (built but not fully queued on the socket). */
-static int response_pending(const Connection *conn) {
-    return conn->out_buf != NULL || conn->file_fd >= 0;
-}
-
 /* P9: moves the unserved tail of in_buf (from in_off) to the front. Called only when more input has
  * to be read after it (serve_buffered_requests' SERVE_NEED_MORE), so every byte moves at most once. */
 static void compact_in_buf(Connection *conn) {
@@ -836,6 +910,15 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
  * fits: it came out of a BUF_SIZE buffer. Returns 0, or -1 (malloc failed, conn closed).
  */
 static int stop_borrowing_read_buf(App *app, Connection *conn) {
+    if (response_pending(conn) && conn->request_len > 0 && conn->in_off + conn->request_len >= conn->in_len) {
+        /* M5: the request behind the pending response has been dispatched (its views died with the
+         * handler) and nothing is pipelined after it, so its bytes are dead. Drop them now rather than
+         * hold a BUF_SIZE copy for the response's whole life - a res_stream subscriber can stay open
+         * for hours. request_len = 0 makes the keep-alive reset treat the buffer as fully consumed. */
+        release_in_buf(app, conn);
+        conn->request_len = 0;
+        return 0;
+    }
     if (conn->in_buf != app->read_buf) {
         return 0;
     }
@@ -858,6 +941,26 @@ static int stop_borrowing_read_buf(App *app, Connection *conn) {
     return 0;
 }
 
+/*
+ * M5: read readiness while a producer stream is live (normally parked - see park_stream). Peeks one
+ * byte without consuming it: EOF or a hard error means the peer is gone, so close now (freeing the
+ * producer's ctx) instead of holding the stream until its next write fails. Real bytes are a pipelined
+ * request that must wait for the stream to end: drop read interest so level-triggered readiness does
+ * not spin; a disconnect is then noticed on the next write. Returns 0 (open) or -1 (closed).
+ */
+static int watch_stream_peer(App *app, Connection *conn) {
+    char probe;
+    const ssize_t n = recv(conn->fd, &probe, 1, MSG_PEEK);
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+        connection_close(app, conn);
+        return -1;
+    }
+    if (n > 0 && (conn->events_watched & EVENT_READ)) {
+        event_loop_unwatch_read(app, conn->fd);
+    }
+    return 0;
+}
+
 /* handle_readable's body. Returns 0 with conn still open, -1 once conn has been closed (freed). */
 static int read_and_serve(App *app, Connection *conn) {
     if (response_pending(conn) || conn->in_off > 0) {
@@ -866,7 +969,7 @@ static int read_and_serve(App *app, Connection *conn) {
          * buffered pipelined requests are waiting for their handle_writable turn. Reading now would
          * append behind them; they are served first, in order. */
         if (response_pending(conn)) {
-            return 0;
+            return conn->stream_fn != NULL ? watch_stream_peer(app, conn) : 0;
         }
         int served;
         const int status = serve_buffered_requests(app, conn, &served);
@@ -978,7 +1081,13 @@ void close_idle_connections(App *app) {
          * WRITE_TIMEOUT_SECONDS is a client that stopped reading, not a slow one - close it rather
          * than hold the fd, arena and out_buf forever. Still-progressing writes (however slowly) are
          * left for flush_connection()/EVFILT_WRITE to keep draining. */
-        if (conn->out_buf != NULL || conn->file_fd >= 0) {
+        if (response_pending(conn)) {
+            if (conn->stream_paused) {
+                /* M5: a parked producer stream is idle by its own choice, not stalled: poll it again
+                 * (at most once a second) instead of applying the write-stall deadline. */
+                resume_stream(app, conn);
+                continue;
+            }
             if (now - conn->last_write_progress >= WRITE_TIMEOUT_SECONDS) {
                 connection_close(app, conn); /* a response is already mid-flight: nothing left to say */
             }
@@ -1019,6 +1128,18 @@ void close_idle_connections(App *app) {
             reject_request(app, conn, 408); /* went quiet mid-request: say why, then close */
         } else {
             connection_close(app, conn); /* idle keep-alive: nothing to answer */
+        }
+    }
+}
+
+void app_wake_streams(App *app) {
+    if (app == NULL || app->connections == NULL) {
+        return;
+    }
+    for (int fd = 0; fd < app->connections_cap; fd++) {
+        Connection *conn = app->connections[fd];
+        if (conn != NULL && conn->stream_fn != NULL && conn->stream_paused) {
+            resume_stream(app, conn);
         }
     }
 }
