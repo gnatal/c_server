@@ -313,7 +313,7 @@ int request_wants_close(const Request *req) {
 }
 
 
-int request_head_is_complete(const ParsedHead *head, const char *buf, const size_t len) {
+int request_head_is_complete(const ParsedHead *head, const char *buf, const size_t len, ChunkScanState *chunk_scan) {
     /* S8: a malformed request line (picohttpparser's -1) leaves header_len at 0, the same as a genuinely
      * incomplete request - checking content_length < 0 first tells them apart, since parse_request_head
      * sets content_length to -1 only on the malformed path (an incomplete parse leaves it at its 0
@@ -325,7 +325,9 @@ int request_head_is_complete(const ParsedHead *head, const char *buf, const size
     const size_t body_have = len - head->header_len;
     if (head->chunked) {
         size_t decoded_len;
-        return chunked_body_scan(buf + head->header_len, body_have, MAX_BODY_SIZE, &decoded_len) != 0;
+        ChunkScanState from_scratch = {0, 0, 0};
+        ChunkScanState *state = chunk_scan != NULL ? chunk_scan : &from_scratch;
+        return chunked_body_scan_resume(buf + head->header_len, body_have, MAX_BODY_SIZE, state, &decoded_len) != 0;
     }
     return body_have >= (size_t)head->content_length;
 }
@@ -333,7 +335,7 @@ int request_head_is_complete(const ParsedHead *head, const char *buf, const size
 int request_is_complete(const char *buf, const size_t len) {
     ParsedHead head;
     parse_request_head(buf, len, &head);
-    return request_head_is_complete(&head, buf, len);
+    return request_head_is_complete(&head, buf, len, NULL);
 }
 
 /* ---- request parsing ---- */
@@ -611,11 +613,18 @@ static const char *find_double_crlf(const char *buf, const size_t len) {
 
 int chunked_body_scan(const char *body_start, const size_t available, const size_t max_decoded_len,
                       size_t *decoded_len_out) {
-    size_t pos = 0;
-    size_t decoded_len = 0;
+    ChunkScanState state = {0, 0, 0};
+    return chunked_body_scan_resume(body_start, available, max_decoded_len, &state, decoded_len_out);
+}
 
+int chunked_body_scan_resume(const char *body_start, const size_t available, const size_t max_decoded_len,
+                             ChunkScanState *state, size_t *decoded_len_out) {
+    /* P8: state->pos only ever moves past chunks that were fully received and validated, so every
+     * return below leaves it at the start of a size line that has to be looked at again next time
+     * (at most MAX_CHUNK_SIZE_LINE_LEN bytes re-read, never the body before it). */
     for (;;) {
-        *decoded_len_out = decoded_len;
+        const size_t pos = state->pos;
+        *decoded_len_out = state->decoded_len;
         if (pos >= available) {
             return 0;
         }
@@ -651,26 +660,35 @@ int chunked_body_scan(const char *body_start, const size_t available, const size
         }
 
         if (chunk_size == 0) {
-            /* Last chunk: complete once the trailer-part's terminating blank line is here. */
-            return find_double_crlf(line_start, available - pos) != NULL ? 1 : 0;
+            /* Last chunk: complete once the trailer-part's terminating blank line is here. The search
+             * resumes where the previous one gave up (minus 3 bytes, so a "\r\n\r\n" split across
+             * reads is still found) - a slow-dripped trailer is scanned once, not once per recv. */
+            const size_t from = state->trailer_from > pos ? state->trailer_from : pos;
+            if (find_double_crlf(body_start + from, available - from) != NULL) {
+                return 1;
+            }
+            if (available - from > 3) {
+                state->trailer_from = available - 3;
+            }
+            return 0;
         }
 
         /* Checked against the *declared* size before its data arrives; decoded_len
          * never exceeds max_decoded_len, so the subtraction cannot underflow. */
-        if (chunk_size > max_decoded_len - decoded_len) {
+        if (chunk_size > max_decoded_len - state->decoded_len) {
             return -2;
         }
 
-        pos += line_len + 2;
-        if (pos + chunk_size + 2 > available) {
+        const size_t data_pos = pos + line_len + 2;
+        if (data_pos + chunk_size + 2 > available) {
             return 0; /* this chunk's data / trailing CRLF has not fully arrived */
         }
-        if (body_start[pos + chunk_size] != '\r' || body_start[pos + chunk_size + 1] != '\n') {
+        if (body_start[data_pos + chunk_size] != '\r' || body_start[data_pos + chunk_size + 1] != '\n') {
             return -1; /* size does not match data: every later boundary would desync */
         }
 
-        decoded_len += chunk_size;
-        pos += chunk_size + 2;
+        state->decoded_len += chunk_size;
+        state->pos = data_pos + chunk_size + 2;
     }
 }
 

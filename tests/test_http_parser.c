@@ -376,6 +376,65 @@ static void test_chunked_body_scan(void) {
     assert(chunked_body_scan(cumulative_too_big, strlen(cumulative_too_big), 6, &decoded_len) == -2);
 }
 
+/* P8: feeding a body one byte at a time through chunked_body_scan_resume (one state, carried across
+ * calls, like Connection.chunk_scan across recvs) must give the same verdict and decoded length as a
+ * from-scratch chunked_body_scan of the same prefix, for every prefix - including a trailer's
+ * terminating "\r\n\r\n" split across calls, malformed framing, and the size cap. */
+static void assert_resume_matches_scratch(const char *body, const size_t max_decoded_len) {
+    const size_t len = strlen(body);
+    ChunkScanState state = {0, 0, 0};
+    for (size_t avail = 0; avail <= len; avail++) {
+        size_t scratch_len = 0;
+        size_t resume_len = 0;
+        const int scratch = chunked_body_scan(body, avail, max_decoded_len, &scratch_len);
+        const int resumed = chunked_body_scan_resume(body, avail, max_decoded_len, &state, &resume_len);
+        assert(scratch == resumed);
+        assert(scratch_len == resume_len);
+        assert(state.pos <= avail);
+        if (resumed != 0) {
+            return; /* a caller stops reading at the first non-zero verdict */
+        }
+    }
+}
+
+static void test_chunked_body_scan_resume(void) {
+    assert_resume_matches_scratch("4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n", MAX_BODY_SIZE);
+    assert_resume_matches_scratch("4;ext=1\r\nWiki\r\n0\r\nExpires: never\r\nX-A: b\r\n\r\n", MAX_BODY_SIZE);
+    assert_resume_matches_scratch("1\r\na\r\n1\r\nb\r\n1\r\nc\r\n0\r\n\r\n", MAX_BODY_SIZE);
+    assert_resume_matches_scratch("4\r\nWikiXX0\r\n\r\n", MAX_BODY_SIZE);       /* bad data CRLF */
+    assert_resume_matches_scratch("4\r\nWiki\r\nZZ\r\nWiki\r\n0\r\n\r\n", MAX_BODY_SIZE); /* bad hex later */
+    assert_resume_matches_scratch("4\r\nWiki\r\n4\r\npedi\r\n0\r\n\r\n", 6);        /* cumulative cap */
+
+    /* The state only moves past fully validated chunks: after the first chunk and half of the
+     * second, pos sits at the second chunk's size line and decoded_len counts the first alone. */
+    const char *body = "4\r\nWiki\r\n5\r\nped";
+    ChunkScanState state = {0, 0, 0};
+    size_t decoded_len = 0;
+    assert(chunked_body_scan_resume(body, strlen(body), MAX_BODY_SIZE, &state, &decoded_len) == 0);
+    assert(state.pos == 9);
+    assert(state.decoded_len == 4);
+    assert(decoded_len == 4);
+
+    /* Resuming from a state that is already past a chunk does not re-read it: poisoning the bytes
+     * before state.pos changes nothing (proves the scan really starts at state.pos). */
+    char poisoned[] = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    ChunkScanState mid = {0, 0, 0};
+    assert(chunked_body_scan_resume(poisoned, 12, MAX_BODY_SIZE, &mid, &decoded_len) == 0);
+    assert(mid.pos == 9);
+    memset(poisoned, 'Z', mid.pos);
+    assert(chunked_body_scan_resume(poisoned, strlen(poisoned), MAX_BODY_SIZE, &mid, &decoded_len) == 1);
+    assert(decoded_len == 9);
+
+    /* Trailer search resumes too: a long trailer dripped in pieces moves trailer_from forward. */
+    const char *trailer = "0\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n";
+    ChunkScanState t = {0, 0, 0};
+    assert(chunked_body_scan_resume(trailer, 20, MAX_BODY_SIZE, &t, &decoded_len) == 0);
+    assert(t.pos == 0);
+    assert(t.trailer_from == 17);
+    assert(chunked_body_scan_resume(trailer, strlen(trailer), MAX_BODY_SIZE, &t, &decoded_len) == 1);
+    assert(decoded_len == 0);
+}
+
 static void test_chunked_body_decode(void) {
     const char *two_chunks = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
     char out[16] = { 0 };
@@ -677,6 +736,7 @@ int main(void) {
     test_parse_http_request();
     test_request_has_chunked_encoding();
     test_chunked_body_scan();
+    test_chunked_body_scan_resume();
     test_chunked_body_decode();
     test_request_is_complete_chunked();
     test_parse_http_request_chunked();

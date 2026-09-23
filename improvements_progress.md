@@ -2037,3 +2037,74 @@ route pattern is rejected rather than silently registering a different, shorter 
 call it (`app_listen_worker`, `cluster_listen`) make that call themselves, at the same points and with the
 same externally observable outcome as before.
 
+---
+
+## P8 · Chunked bodies are re-scanned from the start on every `recv`
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+The fix `improvements.md` suggested: keep the scan position and decoded length per connection, and resume
+from there.
+
+- **`lib/app_types.h`: new `ChunkScanState`** `{pos, decoded_len, trailer_from}`. All three are offsets from
+  the body start, not pointers, so they stay valid when `grow_in_buf` reallocs `in_buf` between reads.
+  Zeroed means "start of body".
+- **`lib/http_parser.c`: new `chunked_body_scan_resume(body, available, max, state, &decoded_len)`.** Same
+  loop and same result codes as before. `state->pos` moves forward only past a chunk whose size line, data
+  and trailing CRLF have all arrived and been checked, so every `0` (need more) return leaves it at a size
+  line that must be read again (at most `MAX_CHUNK_SIZE_LINE_LEN` bytes), never at body already scanned.
+  After the last-chunk (`0`) line, the search for the trailer's `\r\n\r\n` restarts at `trailer_from`,
+  which is set to 3 bytes before where the last search stopped. The 3 bytes catch a terminator split
+  across two reads. Without this, a slowly sent trailer would still be scanned in quadratic time.
+  `chunked_body_scan` is now a wrapper that runs the resume version from a zeroed state, so there is one
+  scanner.
+- **`request_head_is_complete` has a 4th parameter, `ChunkScanState *`.** `NULL` means scan from scratch,
+  which `request_is_complete` and `tests/bench_hotpath.c` use.
+- **`lib/connection.c`:** `handle_readable` passes `&conn->chunk_scan`. `Connection.chunk_scan` is zeroed
+  by `connection_create`'s `calloc`, and `flush_connection` zeroes it in its keep-alive reset (next to
+  `body_limit_checked`). A second request on the same connection therefore starts at its own body start.
+- **Not changed:** when the request completes, `parse_http_request_from_head` still runs one from-scratch
+  scan and then decodes. That is linear and happens once per request. It could reuse `decoded_len` from
+  the state, but P8 did not need that. The separate cap on chunk count or framing overhead that
+  `improvements.md` also mentioned was **not** added. With a linear scan, the worst case under the existing
+  10 MiB raw wire cap costs about 14 ms of CPU. This is now noted in `lib/CLAUDE.md`'s known gaps.
+
+**Tests and results.**
+
+- `tests/test_http_parser.c` `test_chunked_body_scan_resume`: sends several bodies one byte at a time
+  through one carried state. For each prefix it asserts the same verdict and `decoded_len` as a from-scratch
+  `chunked_body_scan`. The bodies cover multiple chunks, extensions plus a multi-line trailer, many 1-byte
+  chunks, a bad data CRLF, bad hex after a good chunk, and the cumulative size cap. It also checks that
+  `pos`/`decoded_len` stop at the right chunk boundary. Two more checks: overwriting the bytes before `pos`
+  with junk does not change the result, which shows the resume really skips them; and `trailer_from`
+  advances while a long trailer is sent in pieces.
+- `tests/test_connection.c` `test_handle_readable_chunked_scan_resumes_and_resets`: sends a chunked body
+  over socketpair reads that split chunk data. It asserts that `conn->chunk_scan` advances only at chunk
+  boundaries and that the response is `received 11 bytes`. It asserts that the state is zeroed after the
+  keep-alive response. Then a second, shorter chunked request on the same connection must return
+  `received 3 bytes`. A stale `pos` would point past that request's whole body, and it would never
+  complete.
+- `tests/fuzz_parser.c`: for every mutated input that frames as chunked, the fuzzer scans the body in two
+  steps split at a random offset, carrying the state between them. It aborts if the result differs from a
+  single from-scratch scan.
+- `make test`: all 13 suites pass. `make SANITIZE=1 BUILD_DIR=build-asan test`: all pass with ASan and
+  UBSan. `make fuzz`: 1,000,000 iterations clean. `make check-docs`: ok (127 engine functions;
+  `chunked_body_scan_resume` added to `lib/API.md`).
+- **Benchmark** (scratch program outside the repo, Apple M3 Pro, gcc-16 -O2). It matches `improvements.md`'s
+  attack: 1-byte chunks (`1\r\nx\r\n`) delivered 1 KiB per simulated `recv`, and it runs
+  `parse_request_head` plus `request_head_is_complete` per read, as `handle_readable` does.
+  "Scratch" passes `NULL`, which is the old behavior. "Resume" passes a carried state.
+
+  | Raw body | Reads | Scratch (old) | Resume (P8) |
+  |---|---|---|---|
+  | 1 MiB | 1,026 | 709.5 ms | 1.4 ms |
+  | 2 MiB | 2,050 | 2,762.0 ms | 2.8 ms |
+  | 10 MiB | 10,242 | ~71 s (extrapolated: 3.9x per doubling, so quadratic) | 14.2 ms |
+
+  **MEASURED:** the 10 MiB worst case drops from about 71 s of one worker's CPU (`improvements.md`
+  extrapolated about 75 s) to 14.2 ms. `improvements.md` PROJECTED about 15 ms. The resume column includes
+  the per-read header parse.
+
+**Status:** Fixed as scoped. The optional cap on chunk count or framing overhead is still open (see above).

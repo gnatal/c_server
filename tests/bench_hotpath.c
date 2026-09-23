@@ -67,7 +67,7 @@ static void one_request(const App *app_const, const char *raw, const size_t len,
     req.body = NULL;
     ParsedHead head;
     parse_request_head(raw, len, &head);
-    if (request_head_is_complete(&head, raw, len) &&
+    if (request_head_is_complete(&head, raw, len, NULL) &&
         parse_http_request_from_head(raw, len, &head, &req, &test_arena) == 0) {
         Response res;
         res_init(&res, conn);

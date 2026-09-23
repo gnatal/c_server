@@ -72,8 +72,11 @@ int parse_request_head(const char *buf, size_t len, ParsedHead *head);
  * request_head_is_complete: the request_is_complete logic against an already-parsed head instead of
  * re-parsing (P2). head must come from parse_request_head over buf[0..len). Same return convention as
  * request_is_complete.
+ * chunk_scan (P8, may be NULL): resume state for a chunked body, carried across calls for the SAME
+ * request as buf grows (zeroed before its first call, e.g. Connection.chunk_scan) - each body byte is
+ * then scanned once in total instead of once per call. NULL scans from the body start every time.
  */
-int request_head_is_complete(const ParsedHead *head, const char *buf, size_t len);
+int request_head_is_complete(const ParsedHead *head, const char *buf, size_t len, ChunkScanState *chunk_scan);
 
 /*
  * parse_http_request_from_head: the population half of parse_http_request, given an already-parsed
@@ -133,8 +136,15 @@ int request_wants_close(const Request *req);
  *  -1 malformed framing, -2 decoded size would exceed max_decoded_len.
  * chunked_body_decode requires a prior scan result of 1 on the same input; `out` needs
  * decoded_len bytes; returns bytes written (binary-safe: never strlen the result).
+ * chunked_body_scan_resume (P8): same result codes, but continues from *state (zeroed = body start)
+ * and advances it past every fully validated chunk, so calling it again after more bytes are
+ * appended to the same body costs only the new bytes (plus one re-read size line). body_start and
+ * the bytes already scanned must be unchanged between calls (offsets, so a realloc'd copy is fine).
+ * chunked_body_scan is the from-scratch wrapper.
  */
 int chunked_body_scan(const char *body_start, size_t available, size_t max_decoded_len, size_t *decoded_len_out);
+int chunked_body_scan_resume(const char *body_start, size_t available, size_t max_decoded_len,
+                             ChunkScanState *state, size_t *decoded_len_out);
 size_t chunked_body_decode(const char *body_start, size_t available, char *out);
 
 /* Component parsers (called by parse_http_request; exposed for tests). Each resets its own *_count.

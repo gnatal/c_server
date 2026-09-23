@@ -639,6 +639,59 @@ static void test_handle_readable_chunked_round_trip(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+/* P8: a chunked body dribbled in over several reads advances Connection.chunk_scan past each
+ * completed chunk (so no read rescans the body before it), and a keep-alive response resets it -
+ * a second chunked request on the same connection must scan from its own body start, not resume at
+ * the first request's offset (which would mis-frame it). */
+static void test_handle_readable_chunked_scan_resumes_and_resets(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_post(&app, "/upload", echo_len_handler);
+
+    const char *head = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const char *pieces[] = {"5\r\nHel", "lo\r\n6\r\n World\r\n", "0\r\n", "\r\n"};
+    assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
+    handle_readable(&app, conn);
+    assert(conn->chunk_scan.pos == 0);
+
+    assert(write(fds[1], pieces[0], strlen(pieces[0])) == (ssize_t)strlen(pieces[0]));
+    handle_readable(&app, conn);
+    assert(conn->chunk_scan.pos == 0); /* first chunk's data still incomplete */
+
+    assert(write(fds[1], pieces[1], strlen(pieces[1])) == (ssize_t)strlen(pieces[1]));
+    handle_readable(&app, conn);
+    assert(conn->chunk_scan.pos == strlen("5\r\nHello\r\n6\r\n World\r\n"));
+    assert(conn->chunk_scan.decoded_len == 11);
+
+    assert(write(fds[1], pieces[2], strlen(pieces[2])) == (ssize_t)strlen(pieces[2]));
+    handle_readable(&app, conn);
+    assert(write(fds[1], pieces[3], strlen(pieces[3])) == (ssize_t)strlen(pieces[3]));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    assert(read(fds[1], resp, sizeof(resp) - 1) > 0);
+    assert(strstr(resp, "received 11 bytes") != NULL);
+    assert(app.connections[fds[0]] == conn);
+    assert(conn->chunk_scan.pos == 0);
+    assert(conn->chunk_scan.decoded_len == 0);
+    assert(conn->chunk_scan.trailer_from == 0);
+
+    /* Second request, shorter body: a stale pos (22) would point past its whole body. */
+    const char *second = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                         "3\r\nabc\r\n0\r\n\r\n";
+    assert(write(fds[1], second, strlen(second)) == (ssize_t)strlen(second));
+    handle_readable(&app, conn);
+    memset(resp, 0, sizeof(resp));
+    assert(read(fds[1], resp, sizeof(resp) - 1) > 0);
+    assert(strstr(resp, "received 3 bytes") != NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_chunked_grows_buffer(void) {
     App app;
     int fds[2];
@@ -1663,6 +1716,7 @@ int main(void) {
     test_handle_readable_route_body_limit_413();
     test_handle_readable_route_body_limit_allows_within_limit();
     test_handle_readable_chunked_round_trip();
+    test_handle_readable_chunked_scan_resumes_and_resets();
     test_handle_readable_chunked_grows_buffer();
     test_handle_readable_chunked_too_large_413();
     test_handle_readable_chunked_malformed_400();

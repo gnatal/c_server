@@ -39,7 +39,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | P4 | epoll and io_uring issue a syscall on every interest change | Performance | | S | ~5–25% per keep-alive request on Linux | ESTIMATED |
 | P5 | ~~With TLS on, every loop iteration scans the whole connection table~~ | Performance | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
 | P7 | ~~Router child lookup is a linear scan~~ | Performance | | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (problem and fix) |
-| P8 | Chunked bodies are re-scanned from the start on every `recv` | Performance / Security | Med | M | Removes a ~75 s CPU amplification | MEASURED rate, extrapolated |
+| P8 | ~~Chunked bodies are re-scanned from the start on every `recv`~~ | Performance / Security | Med | M | **FIXED 2026-09-23**: see `improvements_progress.md` - MEASURED 10 MiB worst case in 14 ms (was ~71 s extrapolated) | MEASURED |
 | P9 | HTTP pipelining is dropped | Performance / Correctness | | M | Large for pipelining clients | ESTIMATED |
 | P10 | `accept` path uses 4 syscalls plus setup | Performance | | S | Fewer syscalls per new connection on Linux | ESTIMATED |
 | M1 | ~~64 KiB arena per connection~~ | Memory | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - MEASURED 8.2 KB per idle connection, matching the projected 8.4 KB | MEASURED |
@@ -261,7 +261,9 @@ record.
 **Fix.** Keep children sorted by segment and binary-search, or hash small segments (or index by first byte). Static routes rarely exceed dozens of siblings, so this matters only for large route tables; parameterized routes are unaffected.
 **Probable gain.** **PROJECTED** ~0.1 µs regardless of fan-out (≈ 80× at 5,000 siblings; ≈ 2–3× at 100). Irrelevant for a 20-route app; worth it if routes are generated.
 
-### P8 · Chunked bodies are re-scanned from the start on every `recv`
+### P8 · ~~Chunked bodies are re-scanned from the start on every `recv`~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical record.
+
 **Problem.** `request_is_complete` → `chunked_body_scan` restarts at byte 0 of the body each time new data arrives (`http_parser.c:232-234`, `:451-514`). Cost is quadratic in the number of `recv`s.
 **Measured.** `chunked_body_scan` runs at ~714 MB/s. A 10 MiB body of 1-byte chunks (raw cap `header_len + MAX_BODY_SIZE`) delivered in 1 KiB pieces is ~10,240 rescans ≈ 54 GB scanned, extrapolated to **~75 s of one worker's CPU** per attacker connection.
 **Fix.** Keep the scan position, decoded length and chunk state per connection (`ChunkScanState`) and resume. Also cap the number of chunks or the framing-overhead ratio.

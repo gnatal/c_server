@@ -52,6 +52,17 @@ int main(int argc, char **argv) {
     size_t hl; int ch; const char *fpath; size_t fpath_len;
     (void)request_framing(buf, len, &hl, &ch, &fpath, &fpath_len);
     if (request_is_complete(buf, len)) complete++;
+    if (ch && hl > 0) {
+      /* P8: resuming across a random split point must agree with one from-scratch scan. */
+      const size_t body_len = len - hl, cut = body_len ? r32() % (body_len + 1) : 0;
+      ChunkScanState st = {0, 0, 0}; size_t d_scratch = 0, d_resume = 0;
+      const int first = chunked_body_scan_resume(buf + hl, cut, MAX_BODY_SIZE, &st, &d_resume);
+      const int scratch = chunked_body_scan(buf + hl, body_len, MAX_BODY_SIZE, &d_scratch);
+      if (first == 0) {
+        const int resumed = chunked_body_scan_resume(buf + hl, body_len, MAX_BODY_SIZE, &st, &d_resume);
+        if (resumed != scratch || d_resume != d_scratch) abort();
+      }
+    }
     Request req;
     if (parse_http_request(buf, len, &req, &test_arena) == 0) {
       parsed_ok++;

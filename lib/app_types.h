@@ -192,6 +192,22 @@ typedef struct {
     int chunked;
 } ParsedHead;
 
+/*
+ * Resume point for chunked_body_scan_resume (P8). All offsets are relative to the body start
+ * (buf + header_len), never pointers, so they survive in_buf being realloc'd between reads.
+ * Zero-initialized = "scan from the start of the body". Only ever advanced past chunks that were
+ * fully received and validated, so resuming is exactly equivalent to rescanning from zero.
+ *   pos          start of the first chunk-size line not yet fully consumed
+ *   decoded_len  sum of the chunk sizes before pos
+ *   trailer_from once pos is at the last-chunk ("0") line: where the search for the trailer's
+ *                terminating "\r\n\r\n" resumes (bytes before it are known not to start one)
+ */
+typedef struct {
+    size_t pos;
+    size_t decoded_len;
+    size_t trailer_from;
+} ChunkScanState;
+
 /* ---- connection and event loop ---- */
 
 /* Per-connection state, one per accepted fd, owned by App.connections[fd]. Freed only by connection_close. */
@@ -215,6 +231,12 @@ typedef struct Connection {
      * read while a body is still arriving. Cleared with request_started when a keep-alive response
      * is fully queued (flush_connection) so the next request on the same connection is rechecked. */
     int body_limit_checked;
+
+    /* P8: where handle_readable's completeness check resumes scanning a chunked body on the next read,
+     * so each body byte is scanned once per request instead of once per recv (was quadratic). Zeroed
+     * by connection_create's calloc and again, with body_limit_checked, when a keep-alive response is
+     * fully queued. Offsets only (see ChunkScanState), so in_buf growth never invalidates it. */
+    ChunkScanState chunk_scan;
 
     /* Input: malloc'd at BUF_SIZE, grown by doubling (like the chunked path) up to header_len +
      * content_length + 1 to fit a declared body - never reallocated straight to the full declared

@@ -536,6 +536,7 @@ void flush_connection(App *app, Connection *conn) {
         conn->request_started = 0; /* back to idle between requests: only IDLE_TIMEOUT_SECONDS applies (S1) */
         conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying (S2) */
         conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check (S4) */
+        conn->chunk_scan = (ChunkScanState){0, 0, 0}; /* next request's chunked body scans from its own start (P8) */
 
         /* If handle_readable grew in_buf to fit a large body (in_cap >
          * BUF_SIZE), shrink it back down now that the connection is idle -
@@ -673,7 +674,7 @@ void handle_readable(App *app, Connection *conn) {
             return;
         }
 
-        if (request_head_is_complete(&head, conn->in_buf, conn->in_len)) {
+        if (request_head_is_complete(&head, conn->in_buf, conn->in_len, &conn->chunk_scan)) {
             Request req;
             const int parse_status = parse_http_request_from_head(conn->in_buf, conn->in_len, &head, &req, conn->arena);
             if (parse_status != 0) {
