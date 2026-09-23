@@ -43,7 +43,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | P9 | ~~HTTP pipelining is dropped~~ | Performance / Correctness | | M | **FIXED 2026-09-23**: see `improvements_progress.md` - MEASURED 16/16 pipelined requests answered (was 1/16); depth-16 `/ping` at 1.7x the non-pipelined rate, non-pipelined unchanged | MEASURED |
 | P10 | ~~`accept` path uses 4 syscalls plus setup~~ | Performance | | S | **FIXED 2026-09-23**: see `improvements_progress.md` - accept is 1 syscall on Linux and macOS; MEASURED on Linux 10.0 → 7.0 syscalls per `Connection: close` request | MEASURED |
 | M1 | ~~64 KiB arena per connection~~ | Memory | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - MEASURED 8.2 KB per idle connection, matching the projected 8.4 KB | MEASURED |
-| M2 | 8 KiB input buffer per idle connection | Memory | | M | Idle connection to <1 KB (with M1) | ESTIMATED |
+| M2 | ~~8 KiB input buffer per idle connection~~ | Memory | | M | **FIXED 2026-09-23**: see `improvements_progress.md` - MEASURED 8,457 → 239 B per idle keep-alive connection (5,000 connections: 41 MB → 1.2 MB), throughput unchanged | MEASURED |
 | M3 | ~~TLS connections keep large SSL buffers~~ | Memory | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
 | M4 | Request bodies are copied twice | Memory | | M | Peak upload memory halved | PROJECTED |
 | M5 | "Streaming" responses are fully buffered | Memory / Feature | | L | Bounded memory; enables SSE and large streams | Code reading |
@@ -297,7 +297,9 @@ record.
 **Fix.** One arena per **worker** (reset after each request), not per connection. `Connection.arena` can stay as a pointer to the shared arena so `res->conn->arena` (used in the cookbook and demo) keeps working. When a response is only partly written (`EAGAIN`), copy the unsent tail into a connection-owned buffer, and free it when drained; file-streaming chunk buffers become per-connection and lazy.
 **Probable gain.** **MEASURED −16.5 KB per connection**: 10,000 idle connections ~250 MB → ~84 MB; better cache locality because requests reuse the same hot 64 KiB. Risk: any code that keeps `out_buf` across events must copy it (audit `flush_connection` and `res_send_file`).
 
-### M2 · Every idle connection owns an 8 KiB input buffer
+### M2 · ~~Every idle connection owns an 8 KiB input buffer~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical record.
+
 **Problem.** `in_buf` is allocated at accept and lives for the connection's lifetime, growing and shrinking around it (`connection.c:95`, `:362-368`). Idle keep-alive connections, by far the common case at scale, hold it for nothing.
 **Fix.** Read into a per-worker scratch buffer (16–64 KiB). If the request is complete after the read, parse it in place and never touch a per-connection buffer; only when a request is incomplete, copy the received bytes into a connection-owned buffer (allocated then, freed when the request completes).
 **Probable gain.** **ESTIMATED**: together with M1 an idle connection needs only the `Connection` struct (152 B) plus its table slot, roughly **<1 KB** instead of 25 KB, so 100,000 idle connections fit in ~100 MB of application memory (kernel socket buffers are separate and not in RSS). Cost: one extra copy for requests that span several reads.

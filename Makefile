@@ -51,11 +51,13 @@ COOKBOOK_TEST_BIN    = $(BIN_DIR)/test_cookbook
 BENCH_BIN            = $(BIN_DIR)/bench_hotpath
 PING_TEST_BIN        = $(BIN_DIR)/test_ping
 PIPELINING_TEST_BIN  = $(BIN_DIR)/test_pipelining
+READ_BUF_TEST_BIN    = $(BIN_DIR)/test_read_buf
 
 TEST_BINS = $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
             $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN) $(URLENCODED_TEST_BIN) \
             $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) \
-            $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN) $(PIPELINING_TEST_BIN)
+            $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN) $(PIPELINING_TEST_BIN) \
+            $(READ_BUF_TEST_BIN)
 
 .PHONY: all demo test clean test_epoll bench fuzz check-docs
 
@@ -99,6 +101,10 @@ $(CONNECTION_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(O
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(PIPELINING_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_pipelining.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(READ_BUF_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_read_buf.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -218,6 +224,7 @@ test: $(TEST_BINS)
 	./$(HTTP_HARDENING_TEST_BIN)
 	./$(PING_TEST_BIN)
 	./$(PIPELINING_TEST_BIN)
+	./$(READ_BUF_TEST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer

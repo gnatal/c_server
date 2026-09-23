@@ -1053,19 +1053,19 @@
             <div class="stat-label">Average Latency (100 conns)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #a855f7;">11.5 MB</div>
-            <div class="stat-label">Cluster Idle RAM (5 processes)</div>
+            <div class="stat-val" style="color: #a855f7;">~0.3 KB</div>
+            <div class="stat-label">RAM per Idle Keep-Alive Connection (was 25 KB)</div>
           </div>
           <div class="stat-card">
             <div class="stat-val" style="color: #fb923c;">208 ns</div>
             <div class="stat-label">Hotpath CPU Cycle (make bench)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #10b981;">14 / 14</div>
+            <div class="stat-val" style="color: #10b981;">15 / 15</div>
             <div class="stat-label">Passing Test Suites (ASan/UBSan)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #ec4899;">128</div>
+            <div class="stat-val" style="color: #ec4899;">130</div>
             <div class="stat-label">Audited Engine Functions (Zero Drift)</div>
           </div>
         </div>
@@ -1086,6 +1086,42 @@
           framework comparison chart, the SQLite/static/churn tabs and the other throughput tables come from earlier
           revisions and were <strong>not</strong> re-run, and no competitor was re-measured. The 5,000-connection runs
           show intermittent <code>wrk</code> read errors of unidentified cause.
+          <br><strong>Refreshed again (23 Sep 2026):</strong> the <em>Memory</em> tab and the 1,000-connection
+          <code>/ping</code> card were re-measured after M1 (one arena per worker) and M2 (one receive buffer per
+          worker), same method and machine as before.
+        </div>
+
+        <!-- Spotlight: idle-connection memory after M1 + M2 -->
+        <div class="bench-highlight">
+          <div class="bench-highlight-header">
+            <div class="bench-highlight-title">
+              <span>🧠 Idle Connections Cost Almost Nothing</span>
+            </div>
+            <span class="bench-highlight-badge">23 Sep 2026 · M1 + M2</span>
+          </div>
+          <p style="margin-bottom: 1.25rem; font-size: 0.92rem;">
+            A keep-alive connection that is waiting for its next request no longer owns a request arena or an input
+            buffer. Each worker has one 64 KiB arena and one 8 KiB receive buffer that every connection shares. A
+            connection only gets its own buffer while a request is half-received, and gives it back as soon as that
+            request is answered. Throughput is unchanged.
+          </p>
+          <div class="bench-highlight-grid">
+            <div class="bench-metric-card">
+              <div class="bench-metric-val" style="color: var(--primary);">239 <span
+                  style="font-size: 1rem; font-weight: 600;">B / conn</span></div>
+              <div class="bench-metric-sub">Idle keep-alive, after one request · <strong>was ~25 KB</strong> (−99%)</div>
+            </div>
+            <div class="bench-metric-card">
+              <div class="bench-metric-val" style="color: #34d399;">+1.4 <span
+                  style="font-size: 1rem; font-weight: 600;">MB</span></div>
+              <div class="bench-metric-sub">5,000 connections on a 4-worker cluster · <strong>was +122 MB</strong></div>
+            </div>
+            <div class="bench-metric-card">
+              <div class="bench-metric-val" style="color: #a855f7;">~24 <span
+                  style="font-size: 1rem; font-weight: 600;">MB</span></div>
+              <div class="bench-metric-sub">100,000 idle connections, projected from 239 B each · <strong>was ~2.5 GB</strong> (kernel socket buffers not included)</div>
+            </div>
+          </div>
         </div>
 
         <!-- Spotlight: wrk /ping running against 4-worker cluster -->
@@ -1107,9 +1143,9 @@
               <div class="bench-metric-sub"><strong>100 connections</strong> · 392.95 µs avg latency · 21.94 MB/s</div>
             </div>
             <div class="bench-metric-card">
-              <div class="bench-metric-val" style="color: #34d399;">207,903 <span
+              <div class="bench-metric-val" style="color: #34d399;">256,864 <span
                   style="font-size: 1rem; font-weight: 600;">req/s</span></div>
-              <div class="bench-metric-sub"><strong>1,000 connections</strong> · 4.81 ms avg latency · 18.24 MB/s</div>
+              <div class="bench-metric-sub"><strong>1,000 connections</strong> · 3.79 ms avg latency · 22.54 MB/s · 0 errors · best of 3 on 23 Sep (206k–257k)</div>
             </div>
             <div class="bench-metric-card">
               <div class="bench-metric-val" style="color: #a855f7;">238,859 <span
@@ -1257,7 +1293,8 @@
           <div class="alert alert-note">
             <strong>Engine Architecture:</strong> Non-blocking sockets driven by <code>kqueue</code> (macOS/BSD) or
             <code>io_uring</code> readiness polling (Linux), one event loop per worker process, requests parsed with
-            picohttpparser and served from a 64 KiB per-connection arena; responses are written with plain
+            picohttpparser straight out of one 8 KiB receive buffer per worker and served from one 64 KiB arena per worker
+            (not per connection); responses are written with plain
             <code>write()</code> calls.
           </div>
         </div>
@@ -1446,56 +1483,64 @@
         <div id="tab-memory" class="bench-pane">
           <p>
             Resident set size (RSS) was measured with <code>ps</code> across the master and all 4 workers after opening N keep-alive
-            connections from a script and sending one <code>GET /ping</code> on each (macOS, 21 Sep 2026).
+            connections from a script and sending one <code>GET /ping</code> on each (macOS). The 21 Sep column is the
+            engine before M1 and M2; the 23 Sep columns are the current one, measured the same way.
           </p>
           <div class="table-container">
             <table>
               <thead>
                 <tr>
                   <th>Execution Phase</th>
-                  <th>Total Cluster RSS (5 Procs)</th>
-                  <th>Largest Single Worker</th>
-                  <th>Avg RSS per Process</th>
-                  <th>Memory Scaling Behavior</th>
+                  <th>Total Cluster RSS, 21 Sep</th>
+                  <th>Total Cluster RSS, 23 Sep</th>
+                  <th>Largest Single Worker, 23 Sep</th>
+                  <th>Memory Scaling Behavior (23 Sep)</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
                   <td><strong>Idle (boot)</strong></td>
                   <td>11.5 MB</td>
-                  <td>2.8 MB</td>
-                  <td>2.3 MB</td>
+                  <td>11.3 MB</td>
+                  <td>2.2 MB</td>
                   <td>Master + 4 pre-forked workers</td>
                 </tr>
                 <tr>
                   <td><strong>100 keep-alive conns</strong></td>
                   <td>17.1 MB</td>
-                  <td>7.7 MB</td>
-                  <td>3.4 MB</td>
-                  <td>Connections were not spread evenly: one worker held most of them</td>
+                  <td><strong style="color: var(--primary);">11.8 MB</strong></td>
+                  <td>2.3 MB</td>
+                  <td>Connections now spread evenly across workers</td>
                 </tr>
                 <tr>
                   <td><strong>1,000 keep-alive conns</strong></td>
                   <td>38.5 MB</td>
-                  <td>29.1 MB</td>
-                  <td>7.7 MB</td>
-                  <td>About 27 KB per connection</td>
+                  <td><strong style="color: var(--primary);">11.9 MB</strong></td>
+                  <td>2.3 MB</td>
+                  <td>Growth is within rounding</td>
                 </tr>
                 <tr>
                   <td><strong>5,000 keep-alive conns</strong></td>
                   <td>133.7 MB</td>
-                  <td>124.3 MB</td>
-                  <td>26.7 MB</td>
-                  <td>About 25 KB per connection: 8 KiB input buffer plus the touched part of the 64 KiB arena</td>
+                  <td><strong style="color: var(--primary);">12.7 MB</strong></td>
+                  <td>2.5 MB</td>
+                  <td>About 0.3 KB per connection, down from about 25 KB</td>
                 </tr>
               </tbody>
             </table>
           </div>
+          <div class="alert alert-note">
+            <strong>Where the 25 KB went:</strong> it used to be a 64 KiB arena per connection (the touched part) plus
+            an 8 KiB input buffer per connection. Now each worker has one shared arena (M1) and one shared 8 KiB receive
+            buffer (M2). A connection copies bytes into a buffer of its own only while a request is half-received, and
+            frees it once the request is answered. A more precise single-worker run (5,000 connections) measured
+            <strong>239 B</strong> per idle keep-alive connection and <strong>216 B</strong> for one that never sent a
+            byte. <code>/ping</code> throughput did not change. Kernel socket buffers are not part of RSS.
+          </div>
           <div class="alert alert-tip">
-            <strong>Memory safety:</strong> all 14 suites pass under AddressSanitizer and UndefinedBehaviorSanitizer and a
-            200,000-iteration mutation fuzz run finished clean. LeakSanitizer is not available on macOS, so no leak check has
-            been run on this platform. On macOS the 4 workers did <strong>not</strong> share the connections evenly in this
-            test (one process held about 93% of the resident memory).
+            <strong>Memory safety:</strong> all 15 suites pass under AddressSanitizer and UndefinedBehaviorSanitizer and a
+            300,000-iteration mutation fuzz run finished clean. LeakSanitizer is not available on macOS, so no leak check has
+            been run on this platform.
           </div>
         </div>
 
@@ -1585,17 +1630,17 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
         <h2>🛡️ Reliability, Hardening & Test Matrix</h2>
         <p>
           High throughput is meaningless without correctness and rock-solid memory safety. CExpress is rigorously
-          verified across 14 dedicated automated test suites, AddressSanitizer and UndefinedBehaviorSanitizer
+          verified across 15 dedicated automated test suites, AddressSanitizer and UndefinedBehaviorSanitizer
           instrumentation, continuous mutation fuzzing, and automated API documentation audits.
         </p>
 
         <div class="stats-grid" style="margin-bottom: 2rem;">
           <div class="stat-card">
-            <div class="stat-val" style="color: #10b981;">14 / 14</div>
+            <div class="stat-val" style="color: #10b981;">15 / 15</div>
             <div class="stat-label">Automated Test Suites Passing</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #38bdf8;">128 / 128</div>
+            <div class="stat-val" style="color: #38bdf8;">130 / 130</div>
             <div class="stat-label">Public APIs Audited (check_docs.sh)</div>
           </div>
           <div class="stat-card">

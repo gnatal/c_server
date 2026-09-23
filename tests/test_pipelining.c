@@ -224,7 +224,10 @@ static void test_per_event_cap_yields_then_resumes(void) {
     char out[16384];
     read_available(fds[1], out, sizeof(out));
     assert(count_occurrences(out, "pong") == MAX_PIPELINED_PER_EVENT);
-    assert(conn->in_off > 0 && conn->in_off < conn->in_len);
+    /* M2: the 4 unserved requests were moved off the borrowed App.read_buf into an owned buffer,
+     * compacted to offset 0, before handle_readable returned. */
+    assert(conn->in_buf != NULL && conn->in_buf != app.read_buf);
+    assert(conn->in_off == 0 && conn->in_len == 4 * strlen("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"));
     assert(conn->events_watched & EVENT_WRITE);
 
     /* The armed write-readiness wakeup: serves the rest with no new input. */
@@ -232,6 +235,7 @@ static void test_per_event_cap_yields_then_resumes(void) {
     read_available(fds[1], out, sizeof(out));
     assert(count_occurrences(out, "pong") == 4);
     assert(conn->in_len == 0 && conn->in_off == 0);
+    assert(conn->in_buf == NULL); /* M2: owned leftover buffer freed once drained */
     assert(!(conn->events_watched & EVENT_WRITE));
     assert(conn->events_watched & EVENT_READ);
 

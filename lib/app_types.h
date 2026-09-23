@@ -66,7 +66,7 @@
 
 #define ARENA_SIZE (64 * 1024)        /* App.arena's fixed buffer (M1): one shared per-worker bump allocator, not one
                                         * per connection; reset once per request, falls back to malloc beyond this */
-#define BUF_SIZE 8192                 /* connection input buffer start size; also the request-header limit (431 beyond) */
+#define BUF_SIZE 8192                 /* App.read_buf and an owned in_buf's start size (M2); also the request-header limit (431 beyond) */
 #define MAX_BODY_SIZE (10 * 1024 * 1024)        /* request body (Content-Length or decoded chunked) and streamed response buffer; 413 beyond */
 #define MAX_STATIC_FILE_SIZE (50 * 1024 * 1024) /* static_serve_file refuses larger files with 500 */
 #define STATIC_CACHE_MAX_ENTRIES 256            /* distinct cached files per process (static.c); LRU-by-staleness eviction beyond it */
@@ -243,11 +243,17 @@ typedef struct Connection {
      * fully queued. Offsets only (see ChunkScanState), so in_buf growth never invalidates it. */
     ChunkScanState chunk_scan;
 
-    /* Input: malloc'd at BUF_SIZE, grown by doubling (like the chunked path) up to header_len +
-     * content_length + 1 to fit a declared body - never reallocated straight to the full declared
-     * size in one step (S4: a client that declares a large Content-Length and sends little of it no
-     * longer costs a reservation proportional to what it claims, only to what actually arrived).
-     * Shrunk back to BUF_SIZE when the connection goes idle. in_buf[in_len] is always '\0'. */
+    /* Input (M2): NULL (in_cap == 0) whenever nothing is buffered - an idle connection owns no input
+     * memory. handle_readable borrows the worker's shared App.read_buf (BUF_SIZE) for the recv and
+     * parses complete requests in place there. Before handle_readable returns with the connection
+     * still open, unserved bytes (a partial request, or pipelined requests behind a pending
+     * response) are copied into a connection-owned malloc'd BUF_SIZE buffer, so in_buf never points
+     * at App.read_buf between event-loop turns. An owned buffer grows by doubling (like the chunked
+     * path) up to header_len + content_length + 1 to fit a declared body - never straight to the full
+     * declared size in one step (S4: a client that declares a large Content-Length and sends little
+     * of it costs a reservation proportional to what arrived, not to what it claims) - and is freed
+     * by flush_connection once nothing is buffered, or by connection_close. in_buf[in_len] is always
+     * '\0' while in_buf != NULL. */
     char *in_buf;
     size_t in_cap;
     size_t in_len;
@@ -562,6 +568,12 @@ typedef struct {
      * `app_destroy` (`arena_destroy` plus a `free` of the buffer itself, the same "test/owner frees what
      * it mallocs" convention arena.h documents for a hand-built Arena). */
     Arena arena;
+
+    /* M2: the receive buffer (BUF_SIZE) a connection with nothing buffered borrows in handle_readable
+     * - one per worker process, not per connection. Only ever lent for the duration of one
+     * handle_readable call (see Connection.in_buf), so a single buffer is enough under the
+     * single-threaded event loop. malloc'd by app_init, freed by app_destroy. */
+    char *read_buf;
 } App;
 
 #endif /* APP_TYPES_H */

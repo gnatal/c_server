@@ -124,13 +124,12 @@ static void test_set_nonblocking_and_create(void) {
     Connection *c = connection_create(&app, p[0]);
     assert(c != NULL);
     assert(c->fd == p[0]);
-    assert(c->in_buf != NULL);
-    assert(c->in_cap == BUF_SIZE);
+    assert(c->in_buf == NULL); /* M2: no input memory until a request is partially received */
+    assert(c->in_cap == 0);
     assert(c->out_buf == NULL);
     assert(c->in_len == 0);
     assert(c->out_len == 0);
 
-    free(c->in_buf);
     free(c);
     close(p[0]);
     close(p[1]);
@@ -445,10 +444,11 @@ static void test_handle_readable_large_body_grows_buffer(void) {
     assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(resp, "received 20000 bytes") != NULL);
 
-    /* Keep-alive connection stays open, and in_buf was shrunk back down to
-     * BUF_SIZE now that it's idle again (flush_connection). */
+    /* Keep-alive connection stays open, and the grown in_buf was freed now that nothing is
+     * buffered (flush_connection, M2: an idle connection owns no input memory). */
     assert(app.connections[fds[0]] == conn);
-    assert(conn->in_cap == BUF_SIZE);
+    assert(conn->in_buf == NULL);
+    assert(conn->in_cap == 0);
 
     free(body);
     teardown_test_connection(&app, fds, conn);
@@ -744,10 +744,11 @@ static void test_handle_readable_chunked_grows_buffer(void) {
     snprintf(expected, sizeof(expected), "received %d bytes", (int)(chunk_payload_len * (size_t)num_chunks));
     assert(strstr(resp, expected) != NULL);
 
-    /* Keep-alive connection stays open, and in_buf was shrunk back down to
-     * BUF_SIZE now that it's idle again (flush_connection). */
+    /* Keep-alive connection stays open, and the grown in_buf was freed now that nothing is
+     * buffered (flush_connection, M2: an idle connection owns no input memory). */
     assert(app.connections[fds[0]] == conn);
-    assert(conn->in_cap == BUF_SIZE);
+    assert(conn->in_buf == NULL);
+    assert(conn->in_cap == 0);
 
     free(payload);
     teardown_test_connection(&app, fds, conn);

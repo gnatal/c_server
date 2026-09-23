@@ -58,13 +58,15 @@ int app_count_connections(const App *app);
 /*
  * Engine internals (called from the event loop; exposed for tests).
  *
- * handle_readable: recv() into conn->in_buf until EAGAIN. After each recv it serves every complete
+ * handle_readable: recv() into conn->in_buf until EAGAIN (M2: into the worker's shared App.read_buf
+ *   when nothing is buffered; unserved bytes are copied into a connection-owned buffer before it
+ *   returns, so an idle connection owns no input memory). After each recv it serves every complete
  *   request in the buffer, in order (P9: pipelining - parse, route, dispatch, flush_connection, then
  *   the next one from conn->in_off), up to MAX_PIPELINED_PER_EVENT per event. Rejects with 431 (headers
  *   over BUF_SIZE), 414 (path over 255), 413 (body over MAX_BODY_SIZE or an app_use_body_limit prefix -
  *   S4), 400 (malformed), 501 (unsupported Transfer-Encoding), 500 (OOM growing the buffer); each
  *   rejection closes the connection, dropping anything pipelined behind it. in_buf grows to fit a
- *   declared body and shrinks back to BUF_SIZE once the connection is idle. While a response is
+ *   declared body and is freed once nothing is buffered. While a response is
  *   pending it reads nothing (read interest is dropped until the response drains).
  * handle_writable: the LOOP_EVENT_WRITE handler (P9). Continues a pending response via
  *   flush_connection; once none is pending, serves any pipelined requests still buffered (also the

@@ -51,6 +51,13 @@ void app_init(App *app) {
         exit(EXIT_FAILURE);
     }
     arena_init(&app->arena, arena_buf, ARENA_SIZE);
+
+    /* M2: the one receive buffer idle connections borrow (App.read_buf), instead of each owning one. */
+    app->read_buf = malloc(BUF_SIZE);
+    if (app->read_buf == NULL) {
+        perror("app_init: malloc (read_buf)");
+        exit(EXIT_FAILURE);
+    }
 }
 
 /* Shared fill logic for one route slot, used by both app_add_route_mw and

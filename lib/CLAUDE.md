@@ -25,13 +25,13 @@ sleep) stalls that whole worker, so scale with workers, not threads. State is pe
 If `event_loop_init` fails (for example io_uring is blocked by the runtime), `app_listen_worker` prints the error and exits; there is no runtime fallback to epoll.
 
 Per request (`connection.c: handle_readable` → `serve_buffered_requests`, which repeats steps 1-6 for every complete request already in `in_buf`, starting at `conn->in_off` - P9 pipelining, see "Behavior reference, Pipelining"):
-1. `recv` into `conn->in_buf`, then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below (P2) - the body-limit check (S4), `request_head_is_complete` (a chunked scan when the body is chunked, resumed from `conn->chunk_scan` so each body byte is scanned once per request, not once per `recv` - P8), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request before P2).
+1. `recv` into `conn->in_buf` - the worker's shared `App.read_buf` when nothing is buffered for this connection (M2, see Memory model) - then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below (P2) - the body-limit check (S4), `request_head_is_complete` (a chunked scan when the body is chunked, resumed from `conn->chunk_scan` so each body byte is scanned once per request, not once per `recv` - P8), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request before P2).
 2. `parse_http_request_from_head(in_buf, in_len, &head, &req, conn->arena)` → `Request` on the stack (copies method/path/query into its fixed arrays; headers are stored as VIEWS into `in_buf`, not copies, and the body is copied into the shared arena - P3, M1). Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request`/`request_is_complete`/`request_framing` remain as thin, unchanged-behavior wrappers over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
 4. `match_route` (per-method Patricia tree, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
 5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf` (allocated from the arena).
-6. `flush_connection` writes. Keep-alive: `arena_reset`, advance `in_off` past this request's `request_len` (or `in_len = 0` when nothing follows it - P9), zero `chunk_scan` (P8), shrink `in_buf` when empty. Otherwise `connection_close`, dropping anything pipelined behind it.
+6. `flush_connection` writes. Keep-alive: `arena_reset`, advance `in_off` past this request's `request_len` (or `in_len = 0` when nothing follows it - P9), zero `chunk_scan` (P8), free `in_buf` (or hand back the borrowed `App.read_buf`) when nothing is buffered (M2). Otherwise `connection_close`, dropping anything pipelined behind it.
 
 Only `connection.c`, `event_loop_*.c`, `cluster.c` do I/O. Parsing, routing, dispatch and
 response building never touch a socket, so tests drive them with a fake `Connection` whose arena is a static buffer
@@ -74,7 +74,7 @@ body limit prefixes 16 (`MAX_BODY_LIMITS`; `App.body_limits`, set at runtime by 
 **One arena per worker process, not per connection (M1).** `app_init` mallocs a single 64 KiB buffer and calls
 `arena_init` once into `App.arena`; `connection_create` just points `Connection.arena` at it
 (`conn->arena = &app->arena`) rather than allocating one of its own. Every accepted connection is now just
-`calloc(sizeof(Connection))` plus a separate 8 KiB `malloc` for `in_buf`. This is safe under the single-threaded,
+just `calloc(sizeof(Connection))` - no input buffer either (M2, next paragraph). This is safe under the single-threaded,
 non-blocking event loop model: at most one connection's handler code runs at a time, and `handle_readable`/
 `reject_request` reset the shared arena (`arena_reset(&app->arena)`, through `app`, not `conn` - `conn` may already
 be freed by then) exactly once, right after each dispatch-and-flush cycle they run - by which point
@@ -85,7 +85,23 @@ touches the shared arena at all: each chunk is read into `Connection.file_buf`, 
 malloc'd lazily on first use and reused turn to turn, precisely because a large file spans many event-loop turns
 during which other connections' dispatches would otherwise reuse and overwrite an arena-resident chunk buffer.
 Measured on macOS, 5,000 idle keep-alive connections on one worker now take about 8.2 KB RSS per connection (about
-44 MB total for 5,000), down from about 25 KB per connection (about 121 MB) before this fix (Linux not measured).
+44 MB total for 5,000), down from about 25 KB per connection (about 121 MB) before this fix (Linux not measured);
+M2 below removed the remaining 8 KiB `in_buf`.
+**One receive buffer per worker process, borrowed per read (M2).** `app_init` also mallocs `App.read_buf`
+(`BUF_SIZE`, 8 KiB). A connection with nothing buffered has `in_buf == NULL`; `handle_readable` (`read_and_serve`)
+points `in_buf` at `App.read_buf` for the `recv`, and complete requests are parsed and served in place there (header
+views point into it; they are dead once the handler returns). Before `handle_readable` returns with the connection
+still open, `stop_borrowing_read_buf` either hands the buffer back (nothing left) or copies the unserved bytes
+`[in_off, in_len)` - a partial request, or requests pipelined behind a pending response - into a connection-owned
+`BUF_SIZE` malloc, compacted to offset 0 (`request_len` and `chunk_scan` are relative to `in_off`, so they stay
+valid). Invariant: **`in_buf` never points at `App.read_buf` between event-loop turns**, so a single shared buffer is
+enough. `grow_in_buf` never reallocs the borrowed buffer (it mallocs the grown size and copies);
+`connection_close` never frees it (`app_destroy` does). `flush_connection`'s keep-alive reset frees the owned buffer
+(however far it grew) once `in_len == 0`. The only added cost is one copy of a partial request's bytes, per partial
+read-turn that leaves it incomplete; complete requests - the common case - are never copied.
+Measured on macOS (demo, one worker, 5,000 connections, RSS delta): about **239 B per idle keep-alive connection**
+after one request and **216 B** for an accepted-but-silent one, down from about 8.4 KB each before M2 (44 MB → 1.2 MB
+for 5,000). Kernel socket buffers are not in RSS. `/ping` throughput unchanged (wrk, 50 connections, three rounds).
 The arena serves everything that lives for one request: `Request.body`, the initial `conn->out_buf` build (`res_*`),
 chunked-response growth, and any yyjson document created with `arena_yyjson_alc`. Bump allocation, 8-byte aligned,
 no per-allocation free. When the remaining space is too small (not only for a single request over 64 KiB), the
@@ -100,7 +116,8 @@ arena at all - see above).
 |---|---|---|
 | `App.arena`'s 64 KiB buffer (M1: one per worker process, not one per connection) | `app_init` (one malloc) | `app_destroy` (`arena_destroy` for fallback blocks, then a plain `free` of the buffer itself - `arena_destroy` never frees `buf`, same convention as a test's hand-built Arena) |
 | `Connection` | `connection_create` (one calloc; no arena buffer behind it any more) | `connection_close` (exactly once) |
-| `conn->in_buf` | `connection_create` (+ realloc on growth) | `connection_close` |
+| `conn->in_buf` (M2: NULL while nothing is buffered) | not allocated while it borrows `App.read_buf` (during one `handle_readable`); owned copy: `stop_borrowing_read_buf` (unserved bytes left at the end of `handle_readable`) or `grow_in_buf` (a body past `BUF_SIZE`; realloc on further growth) | the owned copy: `flush_connection`'s keep-alive reset once nothing is buffered, or `connection_close`. The borrowed `App.read_buf`: never through `conn` |
+| `App.read_buf` (M2, `BUF_SIZE`, one per worker process) | `app_init` | `app_destroy` |
 | `conn->arena` | not allocated - always `&app->arena`, set once at `connection_create` | nobody frees it through `conn`; `app_destroy` frees the one underlying `App.arena` after every connection is already closed |
 | `conn->file_buf` (M1: a connection-owned file-streaming chunk buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
 | Arena fallback blocks | `arena_alloc` when the buffer is full | `arena_reset` (each dispatch-and-flush cycle, in `handle_readable`/`reject_request`) or `arena_destroy` (`app_destroy`) |
@@ -222,10 +239,11 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   any suffix/extension check performed on the path before use. Header and cookie values are not percent-decoded by this
   engine at all, so this vector does not apply to them (`req_get_header`/`req_get_cookie` already return raw bytes;
   header values have no length limit at all since P3, see above; a cookie's own value, once split, still has one).
-- **Buffers.** `in_buf` starts at 8 KiB; with headers complete and a body pending it grows by doubling, capped at the
+- **Buffers.** Input is read into the shared `App.read_buf` (8 KiB) and only copied to a connection-owned 8 KiB
+  `in_buf` when bytes are left unserved (M2, see Memory model); with headers complete and a body pending it grows by doubling, capped at the
   known target size (S4: `Content-Length` and chunked both work this way now - `Content-Length` used to realloc straight
   to `header_len + content_length + 1` in one step, reserving virtual memory proportional to what the client merely
-  *declared* rather than what it had actually sent), and shrunk back when the connection goes idle. No header
+  *declared* rather than what it had actually sent), and freed once nothing is buffered. No header
   terminator within 8 KiB → 431.
 - **Pipelining (P9).** Several requests may sit in `in_buf` at once. `serve_buffered_requests` answers them strictly in
   order, one `flush_connection` each, starting at `Connection.in_off`; `request_wire_len` (`http_parser.c`: `header_len` +
@@ -234,6 +252,10 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   Bytes after a `Content-Length` body are the next request, never part of this body. The unserved tail is moved to the
   front of `in_buf` only when more input must be read (`compact_in_buf`, on "need more"), never after each request, so
   each byte moves at most once (per-request `memmove` would be quadratic for a large batch of tiny requests).
+  M2 adds one more move: when `handle_readable` returns with requests still unserved in the borrowed `App.read_buf`
+  (cap hit, or a response pending), `stop_borrowing_read_buf` copies `[in_off, in_len)` into an owned buffer at offset
+  0, so `in_off` is 0 again once `handle_readable` returns; it only goes above 0 inside an owned buffer while
+  `handle_writable` serves from it.
   **Fairness:** at most `MAX_PIPELINED_PER_EVENT` (16) requests per readiness event; past that the connection arms write
   interest and the rest is served by `handle_writable` on the next poll (a connected socket is almost always writable).
   **Backpressure:** while a response is pending (`EAGAIN`), `flush_connection` (`wait_for_writable`) drops read interest
@@ -428,7 +450,6 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
   the first registration, so `req_get_param(req, "oid")` returns `NULL` (the value is under `id`). A route registered after a mid-pattern `*` at the same position
   (`/x/*/y`, then `/x/:id/z`) captures nothing. Use the same `:name` at the same position across routes.
 - **Chunked framing overhead is not capped separately** (P8 left this out): 10 MiB of 1-byte chunks is accepted up to the raw `MAX_BODY_SIZE` wire cap. Since P8 the scan is linear (~14 ms for that worst case, MEASURED), so this is a cost bound, not an amplification.
-- **Per-connection footprint is about 8.2 KB resident on macOS** (M1 fixed the dominant 64 KiB-per-connection arena share of this - see Memory model; 10,000 idle connections are on the order of 84 MB now, down from about 250 MB before). `in_buf` (8 KiB, `BUF_SIZE`) remains per connection; shrinking that too is M2, still open.
 - **`Request.body` is still a copy** (now into the arena), including a 1-byte allocation for empty bodies.
 - Path/query params over 63 chars and queries over 255 chars are truncated silently. So are individual cookie values
   over 255 chars after the `Cookie` header is split (`parse_cookies` → `cookie_values[MAX_COOKIES][256]`) - the raw

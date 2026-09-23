@@ -2286,3 +2286,72 @@ As a result, macOS drops to 1 syscall per connection as well, not only Linux as 
 
 **Status:** Fixed as scoped. `SO_KEEPALIVE` was deliberately left out (see above). Separate finding: the
 Linux-only failure of the S3 `EMFILE` test.
+
+---
+
+## M2 · Every idle connection owns an 8 KiB input buffer
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+Done as `improvements.md` describes: reads go into one buffer per worker, and a connection only owns input
+memory while a request is partly received. One difference: the shared buffer is `BUF_SIZE` (8 KiB), not the
+16–64 KiB the entry suggested. A larger buffer would have changed the 431 header limit, which is defined as "no
+header terminator within a full `BUF_SIZE` buffer". Keeping the size means every limit and growth rule stays
+exactly as it was.
+
+- **`App.read_buf`** (`app_types.h`): one `BUF_SIZE` buffer per worker. `app_init` mallocs it (it exits on
+  failure, like the arena) and `app_destroy` frees it.
+- **`connection_create`** no longer allocates `in_buf`. It stays `NULL` with `in_cap == 0`.
+- **`handle_readable`** is now a wrapper around `read_and_serve`, which returns 0 if the connection is still
+  open and -1 if it was closed; before this, closure could not be seen after `serve_buffered_requests`. If
+  `in_buf` is `NULL`, `read_and_serve` points it at `App.read_buf` and then reads and serves as before, so a
+  complete request is parsed where it landed. When the connection is still open, `stop_borrowing_read_buf`
+  then does one of two things:
+  - nothing is left: it hands the buffer back (`in_buf = NULL`);
+  - bytes `[in_off, in_len)` are still unserved (a partial request, or requests pipelined behind a pending
+    response or past the per-event cap): it copies them into an owned `BUF_SIZE` malloc at offset 0.
+    `request_len` and `chunk_scan` are relative to `in_off`, so they stay valid.
+
+  The rule this enforces: **`in_buf` never points at `App.read_buf` between event-loop turns.**
+- **`grow_in_buf`** never reallocs the borrowed buffer. It mallocs the grown size and copies into it.
+  `connection_close` never frees the borrowed buffer.
+- **`flush_connection`'s keep-alive reset** frees the owned buffer, however large it grew, once
+  `in_len == 0`. This replaces the old "shrink back to `BUF_SIZE`" realloc.
+
+**Tests and results.**
+
+- New suite `tests/test_read_buf.c` (6 tests, added to `make test`). It covers:
+  - fresh and between-request connections have no input buffer;
+  - connection A's partial request (header view and body bytes) survives connection B being served out of
+    the same `App.read_buf` in between;
+  - a body larger than `BUF_SIZE` moves from the borrowed buffer to an owned one with every byte kept;
+  - a request pipelined behind an `EAGAIN` response is copied off the shared buffer and still answered
+    after another connection has used it;
+  - 400 and 431 rejections from the borrowed buffer leave it usable for the next connection;
+  - `close_idle_connections`' 408 on an owned partial buffer.
+
+  With `stop_borrowing_read_buf`'s copy disabled, the suite fails.
+- Existing assertions that checked for the old always-allocated buffer were updated:
+  - `test_connection.c`: `in_cap == BUF_SIZE` after create or once idle is now `in_buf == NULL`;
+  - `test_pipelining.c`, per-event-cap test: the leftover is now at offset 0 of an owned buffer, not at
+    `in_off > 0`.
+- macOS: `make test` (15 suites), `make SANITIZE=1 BUILD_DIR=build-asan test`, and `make test_epoll` all
+  pass. `make fuzz FUZZ_ITERS=300000` is clean. `make check-docs` is ok.
+- **Memory, MEASURED** with the M1 method: the demo, `WORKERS=1`, 5,000 connections held by a script, RSS
+  delta from `ps`. The baseline is the P10 commit (`37d9a46`), built in a scratch worktree.
+
+  | Scenario | Before | After |
+  |---|---|---|
+  | Idle keep-alive, after one `/ping` each | 8,457 B / conn (41.3 MB total) | **239 B / conn** (1.2 MB) |
+  | Accepted, never sent a byte | 8,438 B / conn | **216 B / conn** |
+
+  That is −97%, better than the entry's ESTIMATED "<1 KB". `/ping` still answered while all 5,000
+  connections were held. Kernel socket buffers are not in RSS and are unchanged.
+- **Throughput:** `wrk -t2 -c50 -d5s /ping`, three alternating rounds. Before: 322k / 317k / 334k req/s.
+  After: 333k / 332k / 334k req/s. No change beyond noise, as expected: a complete request is never copied,
+  and the hot path only adds a pointer assignment and a hand-back.
+
+**Status:** Fixed. Not done: a Linux (io_uring) run. The change has no backend-specific code, because the
+io_uring backend also reads through `handle_readable`'s `recv`.

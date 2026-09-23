@@ -122,12 +122,8 @@ Connection *connection_create(App *app, int fd) {
     if (conn == NULL) {
         return NULL;
     }
-    conn->in_buf = malloc(BUF_SIZE);
-    if (conn->in_buf == NULL) {
-        free(conn);
-        return NULL;
-    }
-    conn->in_cap = BUF_SIZE;
+    /* M2: in_buf stays NULL (calloc) - input memory is borrowed from App.read_buf per read and only
+     * owned while a request is partially received (see Connection.in_buf). */
     conn->fd = fd;
     conn->file_fd = -1;
     conn->last_activity = time(NULL);
@@ -179,7 +175,9 @@ void connection_close(App *app, Connection *conn) {
         close(conn->fd);
         conn->fd = -1;
     }
-    free(conn->in_buf);
+    if (app == NULL || conn->in_buf != app->read_buf) {
+        free(conn->in_buf); /* M2: owned (or NULL); App.read_buf is only ever borrowed, app_destroy frees it */
+    }
     conn->in_buf = NULL;
     conn->out_buf = NULL;
     free(conn);
@@ -211,6 +209,8 @@ void app_destroy(App *app) {
     arena_destroy(&app->arena);
     free(app->arena.buf);
     app->arena.buf = NULL;
+    free(app->read_buf); /* M2: no connection is left to have borrowed it */
+    app->read_buf = NULL;
     free(app->connections);
     app->connections = NULL;
     app->connections_cap = 0;
@@ -448,6 +448,18 @@ static void wait_for_writable(App *app, Connection *conn) {
     }
 }
 
+/* M2: nothing is buffered any more - drop the input memory so an idle connection holds none. An
+ * owned buffer is freed; a borrowed App.read_buf is just handed back. */
+static void release_in_buf(const App *app, Connection *conn) {
+    if (conn->in_buf != app->read_buf) {
+        free(conn->in_buf);
+    }
+    conn->in_buf = NULL;
+    conn->in_cap = 0;
+    conn->in_len = 0;
+    conn->in_off = 0;
+}
+
 int flush_connection(App *app, Connection *conn) {
     size_t bytes_written_this_flush = 0;
     const size_t max_flush_bytes = 4 * STREAM_CHUNK_SIZE;
@@ -586,19 +598,11 @@ int flush_connection(App *app, Connection *conn) {
         conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check (S4) */
         conn->chunk_scan = (ChunkScanState){0}; /* next request's chunked body scans from its own start (P8) */
 
-        /* If handle_readable grew in_buf to fit a large body (in_cap >
-         * BUF_SIZE), shrink it back down now that the connection is idle -
-         * otherwise one big request would permanently inflate this
-         * connection's memory footprint for as long as it stays open. A
-         * failed shrink isn't fatal (realloc leaves the original block
-         * untouched on failure) - just keep using the larger buffer.
-         * P9: only when nothing is buffered - pipelined leftovers keep the buffer as it is. */
-        if (conn->in_cap > BUF_SIZE && conn->in_len == 0) {
-            char *shrunk = realloc(conn->in_buf, BUF_SIZE);
-            if (shrunk != NULL) {
-                conn->in_buf = shrunk;
-                conn->in_cap = BUF_SIZE;
-            }
+        /* M2: nothing buffered - free the input buffer (however far it grew for a large body) or hand
+         * App.read_buf back, so an idle keep-alive connection owns no input memory. Pipelined
+         * leftovers (P9) keep the buffer as it is. */
+        if (conn->in_len == 0) {
+            release_in_buf(app, conn);
         }
         return FLUSH_DONE;
     }
@@ -621,7 +625,8 @@ static void reject_request(App *app, Connection *conn, const int status) {
 }
 
 /*
- * in_buf is full with headers complete: grow it to fit the body. Returns 1 grown (keep reading),
+ * in_buf is full with headers complete: grow it to fit the body (M2: a borrowed App.read_buf is
+ * copied into a new owned buffer instead of realloc'd). Returns 1 grown (keep reading),
  * 0 realloc failed (-> 500), -1 chunked raw-size cap hit (-> 413).
  * Both Content-Length and chunked grow the same way (S4): doubling, capped at the known target size
  * (header_len + content_length + 1, or header_len + MAX_BODY_SIZE for chunked's raw wire size) - never
@@ -633,7 +638,8 @@ static void reject_request(App *app, Connection *conn, const int status) {
  * buffering and parse_http_request answered 413. A route-specific limit below MAX_BODY_SIZE
  * (app_use_body_limit) is enforced earlier still, in handle_readable, before this is ever called.
  */
-static int grow_in_buf(Connection *conn, const size_t header_len, const int chunked, const int content_length) {
+static int grow_in_buf(const App *app, Connection *conn, const size_t header_len, const int chunked,
+                       const int content_length) {
     size_t needed;
     if (chunked) {
         const size_t raw_cap = header_len + MAX_BODY_SIZE;
@@ -650,9 +656,19 @@ static int grow_in_buf(Connection *conn, const size_t header_len, const int chun
     } else {
         return 0;
     }
-    char *grown = realloc(conn->in_buf, needed);
-    if (grown == NULL) {
-        return 0;
+    char *grown;
+    if (conn->in_buf == app->read_buf) {
+        /* M2: a borrowed App.read_buf is never realloc'd - move to an owned buffer of the grown size. */
+        grown = malloc(needed);
+        if (grown == NULL) {
+            return 0;
+        }
+        memcpy(grown, conn->in_buf, conn->in_len + 1);
+    } else {
+        grown = realloc(conn->in_buf, needed);
+        if (grown == NULL) {
+            return 0;
+        }
     }
     conn->in_buf = grown;
     conn->in_cap = needed;
@@ -808,16 +824,60 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
     return SERVE_WAIT;
 }
 
-void handle_readable(App *app, Connection *conn) {
+/*
+ * M2: handle_readable is returning with conn still open. If in_buf is the borrowed App.read_buf,
+ * either hand it back (nothing left to serve) or copy the unserved bytes - a partial request, or
+ * requests pipelined behind a pending response - into an owned BUF_SIZE buffer, compacted to offset
+ * 0 (request_len and chunk_scan are relative to in_off, so they stay valid). The leftover always
+ * fits: it came out of a BUF_SIZE buffer. Returns 0, or -1 (malloc failed, conn closed).
+ */
+static int stop_borrowing_read_buf(App *app, Connection *conn) {
+    if (conn->in_buf != app->read_buf) {
+        return 0;
+    }
+    const size_t leftover = conn->in_len - conn->in_off;
+    if (leftover == 0) {
+        release_in_buf(app, conn);
+        return 0;
+    }
+    char *owned = malloc(BUF_SIZE);
+    if (owned == NULL) {
+        connection_close(app, conn); /* leaves the borrowed App.read_buf alone */
+        return -1;
+    }
+    memcpy(owned, conn->in_buf + conn->in_off, leftover);
+    owned[leftover] = '\0';
+    conn->in_buf = owned;
+    conn->in_cap = BUF_SIZE;
+    conn->in_len = leftover;
+    conn->in_off = 0;
+    return 0;
+}
+
+/* handle_readable's body. Returns 0 with conn still open, -1 once conn has been closed (freed). */
+static int read_and_serve(App *app, Connection *conn) {
     if (response_pending(conn) || conn->in_off > 0) {
         /* P9: a response is still draining (reads are normally unwatched meanwhile, see
          * wait_for_writable - this guards a readiness event already queued in the same batch), or
          * buffered pipelined requests are waiting for their handle_writable turn. Reading now would
          * append behind them; they are served first, in order. */
-        int served;
-        if (response_pending(conn) || serve_buffered_requests(app, conn, &served) != SERVE_NEED_MORE) {
-            return;
+        if (response_pending(conn)) {
+            return 0;
         }
+        int served;
+        const int status = serve_buffered_requests(app, conn, &served);
+        if (status != SERVE_NEED_MORE) {
+            return status == SERVE_CLOSED ? -1 : 0;
+        }
+    }
+
+    if (conn->in_buf == NULL) {
+        /* M2: nothing buffered - read into the worker's shared buffer; stop_borrowing_read_buf
+         * (handle_readable) moves any unserved bytes into an owned buffer before returning. */
+        conn->in_buf = app->read_buf;
+        conn->in_cap = BUF_SIZE;
+        conn->in_len = 0;
+        conn->in_off = 0;
     }
 
     while (conn->in_len < conn->in_cap - 1) {
@@ -827,11 +887,11 @@ void handle_readable(App *app, Connection *conn) {
                 break;
             }
             connection_close(app, conn);
-            return;
+            return -1;
         }
         if (n == 0) {
             connection_close(app, conn);
-            return;
+            return -1;
         }
 
         if (conn->request_started == 0) {
@@ -847,8 +907,12 @@ void handle_readable(App *app, Connection *conn) {
          * of non-pipelined throughput). Level-triggered read readiness brings us back if more bytes
          * are already waiting. */
         int served;
-        if (serve_buffered_requests(app, conn, &served) != SERVE_NEED_MORE || served > 0) {
-            return;
+        const int status = serve_buffered_requests(app, conn, &served);
+        if (status == SERVE_CLOSED) {
+            return -1;
+        }
+        if (status != SERVE_NEED_MORE || served > 0) {
+            return 0;
         }
     }
 
@@ -862,13 +926,21 @@ void handle_readable(App *app, Connection *conn) {
         const int content_length = request_framing(conn->in_buf, conn->in_len, &header_len, &chunked, NULL, NULL);
         if (header_len == 0) {
             reject_request(app, conn, 431);
-            return;
+            return -1;
         }
-        const int grown = grow_in_buf(conn, header_len, chunked, content_length);
+        const int grown = grow_in_buf(app, conn, header_len, chunked, content_length);
         if (grown == 1) {
-            return; /* wait for more read events */
+            return 0; /* wait for more read events */
         }
         reject_request(app, conn, grown == -1 ? 413 : 500);
+        return -1;
+    }
+    return 0;
+}
+
+void handle_readable(App *app, Connection *conn) {
+    if (read_and_serve(app, conn) == 0) {
+        stop_borrowing_read_buf(app, conn); /* M2: App.read_buf is never held across event-loop turns */
     }
 }
 
