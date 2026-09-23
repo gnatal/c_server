@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -847,6 +848,48 @@ static void test_body_limit_overflow_is_dropped(void) {
     cleanup_app(&app);
 }
 
+/* M6: static_root is a heap string owned by static mounts only - an ordinary route carries NULL
+ * (not an inline PATH_MAX buffer), a static mount carries exactly its canonical root, and a rejected
+ * duplicate mount frees its root through route_free (ASan/LeakSanitizer catches a miss). The size
+ * guard is what the M6 fix bought: an inline PATH_MAX array alone was 4 KB per Route on Linux. */
+static void test_static_root_is_heap_owned_by_static_mounts_only(void) {
+    assert(sizeof(Route) < 512);
+
+    char canonical[PATH_MAX];
+    assert(realpath(".", canonical) != NULL);
+
+    App app;
+    app_init(&app);
+    app_get(&app, "/plain", dummy_handler_a);
+    app_serve_static(&app, "/assets", ".");
+    app_serve_static(&app, "/assets", "."); /* duplicate: rejected by tree_insert, root freed */
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/plain", sizeof(req.path) - 1);
+    const Route *matched = match_route(&app, &req);
+    assert(matched != NULL);
+    assert(matched->static_root == NULL);
+
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, "/assets/file.txt", sizeof(req.path) - 1);
+    matched = match_route(&app, &req);
+    assert(matched != NULL);
+    assert(matched->handler == NULL);
+    assert(matched->static_root != NULL);
+    assert(strcmp(matched->static_root, canonical) == 0);
+
+    Router router;
+    router_init(&router);
+    router_get(&router, "/x", dummy_handler_a);
+    assert(router.routes[0].static_root == NULL);
+
+    app_free_routes(&app); /* route_free on the static mount's Route and its root */
+    cleanup_app(&app);
+}
+
 int main(void) {
     test_match_path_without_request_captures_nothing();
     test_match_path_segments_and_truncation();
@@ -883,6 +926,7 @@ int main(void) {
     test_body_limit_unscoped_prefix_applies_everywhere();
     test_body_limit_clamped_to_max_body_size();
     test_body_limit_overflow_is_dropped();
+    test_static_root_is_heap_owned_by_static_mounts_only();
 
     printf("all router tests passed\n");
     return 0;

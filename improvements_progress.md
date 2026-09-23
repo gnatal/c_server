@@ -2611,3 +2611,79 @@ Docker's default seccomp profile blocks io_uring). A cookbook server, one keep-a
 - the epoll half of P4;
 - a Linux CI job (T5); this was a manual Docker run;
 - choosing the default Linux backend in light of the speed result above.
+
+---
+
+## M6 · Every `Route` embeds a `PATH_MAX` buffer
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+Done as `improvements.md` suggested: `Route.static_root` is now a `char *` instead of `char[PATH_MAX]`.
+
+- **`app_types.h`:** `static_root` is `NULL` for an ordinary route. For an `app_serve_static` mount it is a
+  `malloc`'d copy of the canonical root, sized to that string and owned by the `Route`.
+- **`router.c`:**
+  - `fill_route` sets `static_root = NULL`. It replaces the old `static_root[0] = '\0'` and is still needed
+    because route slots are not zeroed.
+  - `app_serve_static` allocates the root after `fill_route` succeeds. If that allocation fails, it frees the
+    `Route` and registers nothing (S12 style). This also removes the old silent truncation to `PATH_MAX`.
+  - A new static `route_free(Route *)` frees `static_root` and then the `Route`. Every place that drops a heap
+    `Route` after `fill_route` has succeeded goes through it:
+    - `app_insert_route_struct` when the method-tree cap is hit;
+    - every out-of-memory path in `tree_insert`, and the duplicate-route path;
+    - `free_patricia_tree`, which `app_free_routes` and `app_destroy` call.
+
+    The two `free(route)` calls right after a failed `fill_route` stay plain `free`, because `static_root`
+    is not initialized yet at that point.
+- **`middleware.c`:** a route is a static mount when `static_root != NULL`. The old check was
+  `static_root[0] != '\0'`.
+- A `Router`'s fixed `routes[]` slots never own a root: `Router` has no static registration, and `app_mount`
+  re-registers through `app_add_route_mw`.
+
+**Tests and results.**
+
+- `test_router.c`: `test_static_root_is_heap_owned_by_static_mounts_only`.
+  - Checks `sizeof(Route) < 512`, so a regression back to an inline `PATH_MAX` array fails the test.
+  - An ordinary App route and a `Router` slot both carry `NULL`.
+  - A static mount's route has a `NULL` handler, and its `static_root` equals `realpath(".")`.
+  - A duplicate static mount at the same prefix is rejected. Its root is freed through `route_free`.
+  - The test calls `app_free_routes`, unlike the rest of the file (T3). `leaks --atExit` shows no leaked
+    `Route`, tree node or root from it. The only leaks are the two `app_init` buffers that `cleanup_app`
+    leaves behind in every test.
+- `test_static.c` and `test_middleware.c` were updated for the pointer field. `test_static.c` borrows the
+  fixture's root, and that `Route` is never passed to `route_free`.
+- macOS: `make test` (16 suites), ASan + UBSan (`make SANITIZE=1 BUILD_DIR=build-asan test`), `make test_epoll`
+  and `make check-docs` (136 functions) all pass.
+- **Size, MEASURED** with a `sizeof` probe compiled against `app_types.h` before and after (macOS: gcc-16,
+  `PATH_MAX` 1024; Linux: Alpine 3.20 container, gcc/musl, `PATH_MAX` 4096):
+
+  | | macOS before | macOS after | Linux before | Linux after |
+  |---|---|---|---|---|
+  | `sizeof(Route)` | 1,368 B | **352 B** | 4,440 B | **352 B** |
+  | `sizeof(Router)` (64 inline `Route`s) | 87,696 B | **22,672 B** | 284,304 B | **22,672 B** |
+
+  With 1,000 routes on Linux that is about 4.4 MB → 0.35 MB, as PROJECTED. A `Router`, which the docs allow as
+  a stack local, now needs about 22 KB of stack on Linux instead of 284 KB. The request hot path is
+  unchanged: it reads one pointer instead of one byte, and only on a matched route.
+- **Linux, MEASURED:**
+  - `test_router` and `test_static` pass on Alpine (musl).
+  - Debian bookworm, ASan + LeakSanitizer: `test_static` is clean. In `test_router`, the only leaks from the
+    new test are the two `app_init` buffers (the file-wide T3 pattern). LeakSanitizer reports no leaked
+    `Route`, tree node or `static_root`.
+  - `scripts/docker_stress_test.sh` (4 workers; image built from this working tree), no regression against
+    the C6 record:
+    - keep-alive `/ping`: about 275k req/s at both 100 and 1000 connections;
+    - `/ping` with `Connection: close`: about 54–55k req/s;
+    - `GET /`: 116–125k req/s; `GET /api/todos`: 84–88k req/s;
+    - peak memory about 12.7 MB summed over 5 processes, at most 2.8 MB per process;
+    - 0 worker crashes;
+    - the wrk "timeout" counts follow the known T6 pattern.
+
+    This run exercises only static-mount *registration* (the demo's `/static` mount), not static serving:
+    `GET /` uses `res_send_file` and the script sends no `/static/*` requests. The per-process RSS gain is too
+    small to see here (the demo has about 10 routes, so about 40 KB).
+
+**Status:** Fixed.
+

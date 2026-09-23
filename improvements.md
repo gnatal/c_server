@@ -47,7 +47,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | M3 | ~~TLS connections keep large SSL buffers~~ | Memory | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
 | M4 | ~~Request bodies are copied twice~~ | Memory | | M | **FIXED 2026-09-23**: see `improvements_progress.md` - body is a view into the input buffer (chunked decoded in place); MEASURED peak RSS for a 9.5 MiB upload 41.7 → 32.1 MB (−23%, not the projected −50%: `realloc` growth dominates what's left) | MEASURED |
 | M5 | ~~"Streaming" responses are fully buffered~~ | Memory / Feature | | L | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (38 MB → 1.6 MB RSS for an 8.4 MB body) |
-| M6 | `Route` embeds a `PATH_MAX` buffer | Memory | | S | ~4 KB per route on Linux | Code reading |
+| M6 | ~~`Route` embeds a `PATH_MAX` buffer~~ | Memory | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (`sizeof(Route)` 1,368 → 352 B on macOS; 4,440 → 352 B on Linux) |
 | C1 | `Expect: 100-continue` is ignored | Correctness | | S | **1.007 s → 2.4 ms** per large upload | MEASURED |
 | C2 | Path parameter names are stored per tree position | Correctness | | S | Removes a silent `NULL` | MEASURED |
 | C3 | No `Date` header; 204 carries `Content-Length` | Correctness | | S | RFC compliance | MEASURED |
@@ -330,7 +330,10 @@ record.
 **Fix.** Let a streaming handler register a continuation (`res_stream(res, producer_fn, ctx)`) that the event loop calls whenever the socket is writable and the previous chunk has been sent, with a small bounded buffer. Or flush completed chunks from `res_write` when they exceed a threshold.
 **Probable gain.** Memory for streamed responses bounded by the chunk size instead of the whole response (ESTIMATED), and it enables real streaming workloads. It is a feature change, not just a tuning.
 
-### M6 · Every `Route` embeds a `PATH_MAX` buffer
+### M6 · ~~Every `Route` embeds a `PATH_MAX` buffer~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** `Route.static_root[PATH_MAX]` lives inside every route (`app_types.h:253`), but only `app_serve_static` routes use it. `sizeof(Route)` is 1,368 bytes on macOS (`PATH_MAX` 1024) and about 4.4 KB on Linux (`PATH_MAX` 4096).
 **Fix.** Make it a `char *` (malloc'd only for static mounts).
 **Probable gain.** ~4 KB per route on Linux (1,000 generated routes: ~4.4 MB → ~0.3 MB). Marginal for hand-written apps.

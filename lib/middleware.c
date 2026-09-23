@@ -79,7 +79,7 @@ void chain_next(MiddlewareChain *chain) {
         return;
     }
 
-    if (chain->route != NULL && chain->route->static_root[0] != '\0') {
+    if (chain->route != NULL && chain->route->static_root != NULL) {
         /* A static-file mount (app_serve_static, router.h) has no Handler -
          * route->handler is NULL, a plain Handler(req, res) has no way to
          * receive the mount's root directory anyway - so this is checked

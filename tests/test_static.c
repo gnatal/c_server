@@ -161,12 +161,12 @@ static void teardown_fixture(const StaticFixture *fx) {
     rmdir(fx->outside_dir);
 }
 
-static Route make_static_route(const StaticFixture *fx) {
+static Route make_static_route(StaticFixture *fx) {
     Route route;
     memset(&route, 0, sizeof(route));
     strncpy(route.method, "GET", sizeof(route.method) - 1);
     strncpy(route.path, "/static/*", sizeof(route.path) - 1);
-    memcpy(route.static_root, fx->root, strlen(fx->root) + 1);
+    route.static_root = fx->root; /* borrowed: this Route is never passed to route_free */
     return route;
 }
 

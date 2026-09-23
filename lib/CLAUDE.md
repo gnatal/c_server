@@ -129,7 +129,7 @@ arena at all - see above).
 | yyjson doc built or read with `arena_yyjson_alc(res->conn->arena)` (a pointer already - no `&`, M1) | arena | nothing: `yyjson_*_doc_free` is a no-op for it, the arena reclaims it |
 | yyjson doc with a NULL allocator (e.g. `error_handler_json`) | libc malloc | `yyjson_mut_doc_free` / `yyjson_doc_free` |
 | `yyjson_mut_write(doc, 0, &len)` result | libc malloc, **whatever allocator the doc uses** | caller, C `free` (forgetting it leaks once per request) |
-| `Route`, `PatriciaNode` | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy` |
+| `Route`, `PatriciaNode`; a static mount's `Route.static_root` string (M6: heap, `NULL` on ordinary routes and on every `Router` slot) | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy`; every heap `Route` is dropped through `router.c`'s `route_free` (root + route), including registration failures and duplicates |
 | `app->connections` | `app_init` | `app_destroy` |
 | `App.poll_regs` (C6, io_uring backend only: one `PollRegistration` per fd) | `event_loop_io_uring.c`'s `registration_for`, grown by doubling on the first interest change for an fd past its size | `event_loop_close` |
 | `app->spare_fd` (S3, one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |

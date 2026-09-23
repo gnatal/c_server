@@ -494,7 +494,10 @@ typedef struct {
     Handler handler;              /* NULL for a static-file mount (see static_root) */
     Middleware middlewares[MAX_ROUTE_MIDDLEWARES];
     int middleware_count;
-    char static_root[PATH_MAX];   /* "" for an ordinary route; canonical directory for app_serve_static mounts */
+    char *static_root;            /* NULL for an ordinary route; for an app_serve_static mount, the malloc'd
+                                   * canonical directory, owned by this Route and freed with it (router.c:
+                                   * route_free). Kept out of line (M6): an inline PATH_MAX array made every
+                                   * Route, and every Router's Route[MAX_ROUTER_ROUTES], ~4 KB/route bigger on Linux. */
 } Route;
 
 typedef enum {
