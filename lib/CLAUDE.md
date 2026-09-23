@@ -14,24 +14,24 @@ removed for this reason; see `../improvements_progress.md` for the removal recor
 ## Model
 A process runs one single-threaded, non-blocking event loop: kqueue on macOS/BSD, io_uring on Linux
 (readiness only: a one-shot `POLL_ADD` per fd, re-armed after every event to give level-triggered readiness, then ordinary
-`recv`/`write`; needs liburing, kernel 5.13+ tested only on 6.8) or epoll, chosen per process at runtime (C5, see "Event loop"
+`recv`/`write`; needs liburing, kernel 5.13+ tested only on 6.8) or epoll, chosen per process at runtime (see "Event loop"
 below); on macOS epoll is only built for `make test_epoll` through epoll-shim. `workers != 1` forks N such processes. On
 Linux, each opens its own listen socket sharing the port via `SO_REUSEPORT` (4-tuple hashing balances them). On macOS/BSD
-(`CEXPRESS_SINGLE_ACCEPTOR` - C4: `SO_REUSEPORT` does not balance there, MEASURED over 90% of load on one worker of four),
+(`CEXPRESS_SINGLE_ACCEPTOR`: `SO_REUSEPORT` does not balance there, MEASURED over 90% of load on one worker of four),
 only the master binds and `accept()`s; each accepted fd is handed to a worker over a private socketpair via `SCM_RIGHTS`,
 round-robin (see "Behavior reference, Workers and fork"). Either way, a master respawns any worker that dies, with backoff
-and a restart budget (S7, same section). Handlers run synchronously on the loop: a blocking call (DB,
+and a restart budget (same section). Handlers run synchronously on the loop: a blocking call (DB,
 sleep) stalls that whole worker, so scale with workers, not threads. State is per process; there is no shared memory.
-If io_uring is refused (Docker's default seccomp profile does this: `EPERM`), `event_loop_init` logs it once per process and runs on epoll (C5); `app_listen_worker` exits only if no backend can start.
+If io_uring is refused (Docker's default seccomp profile does this: `EPERM`), `event_loop_init` logs it once per process and runs on epoll; `app_listen_worker` exits only if no backend can start.
 
-Per request (`connection.c: handle_readable` → `serve_buffered_requests`, which repeats steps 1-6 for every complete request already in `in_buf`, starting at `conn->in_off` - P9 pipelining, see "Behavior reference, Pipelining"):
-1. `recv` into `conn->in_buf` - the worker's shared `App.read_buf` when nothing is buffered for this connection (M2, see Memory model) - then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below (P2) - the body-limit check (S4), `request_head_is_complete` (a chunked scan when the body is chunked, resumed from `conn->chunk_scan` so each body byte is scanned once per request, not once per `recv` - P8), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request before P2).
-2. `parse_http_request_in_place(in_buf + in_off, avail, &head, &req, conn->arena, &body_saved)` → `Request` on the stack (copies method/path/query into its fixed arrays; headers and the body are VIEWS into `in_buf`, not copies - P3, M4; a chunked body is decoded in place over its own framing). The body's NUL terminator overwrites the byte after it (for `Content-Length`, the first byte of a pipelined next request); `serve_buffered_requests` restores it (`body_saved`) right after `dispatch`, before `flush_connection`. Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request_from_head` - the copying variant - and `parse_http_request`/`request_is_complete`/`request_framing` remain as unchanged-behavior functions over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
+Per request (`connection.c: handle_readable` → `serve_buffered_requests`, which repeats steps 1-6 for every complete request already in `in_buf`, starting at `conn->in_off` - pipelining, see "Behavior reference, Pipelining"):
+1. `recv` into `conn->in_buf` - the worker's shared `App.read_buf` when nothing is buffered for this connection (see Memory model) - then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below - the body-limit check, `request_head_is_complete` (a chunked scan when the body is chunked, resumed from `conn->chunk_scan` so each body byte is scanned once per request, not once per `recv`), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request previously).
+2. `parse_http_request_in_place(in_buf + in_off, avail, &head, &req, conn->arena, &body_saved)` → `Request` on the stack (copies method/path/query into its fixed arrays; headers and the body are VIEWS into `in_buf`, not copies; a chunked body is decoded in place over its own framing). The body's NUL terminator overwrites the byte after it (for `Content-Length`, the first byte of a pipelined next request); `serve_buffered_requests` restores it (`body_saved`) right after `dispatch`, before `flush_connection`. Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request_from_head` - the copying variant - and `parse_http_request`/`request_is_complete`/`request_framing` remain as unchanged-behavior functions over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
-4. `match_route` (per-method Patricia tree; the walk only finds the `Route`, then `:params` are filled from that Route's own pattern via `match_path` - C2 - so routes may name the same tree position differently; skipped when `Route.has_params` is 0) → `dispatch` (`middleware.c`): app-wide middleware
+4. `match_route` (per-method Patricia tree; the walk only finds the `Route`, then `:params` are filled from that Route's own pattern via `match_path` - so routes may name the same tree position differently; skipped when `Route.has_params` is 0) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
-5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf` (allocated from the arena). `res_stream` (M5) builds only the head there and records a producer on the `Connection`; the body is produced later, by `flush_connection` (see "Behavior reference, Producer streaming").
-6. `flush_connection` writes. Keep-alive: `arena_reset`, advance `in_off` past this request's `request_len` (or `in_len = 0` when nothing follows it - P9), zero `chunk_scan` (P8), free `in_buf` (or hand back the borrowed `App.read_buf`) when nothing is buffered (M2). Otherwise `connection_close`, dropping anything pipelined behind it.
+5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf` (allocated from the arena). `res_stream` builds only the head there and records a producer on the `Connection`; the body is produced later, by `flush_connection` (see "Behavior reference, Producer streaming").
+6. `flush_connection` writes. Keep-alive: `arena_reset`, advance `in_off` past this request's `request_len` (or `in_len = 0` when nothing follows it), zero `chunk_scan`, free `in_buf` (or hand back the borrowed `App.read_buf`) when nothing is buffered. Otherwise `connection_close`, dropping anything pipelined behind it.
 
 Only `connection.c`, `event_loop_*.c`, `cluster.c` do I/O. Parsing, routing, dispatch and
 response building never touch a socket, so tests drive them with a fake `Connection` whose arena is a static buffer
@@ -41,15 +41,15 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | File | Responsibility |
 |---|---|
 | `app_types.h` | every struct/typedef and every compile-time limit |
-| `arena.c/h` | bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`); one shared per worker process (M1, `App.arena`), not one per connection |
-| `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text`. One `parse_request_head` pass feeds the body-limit check, completeness check and full parse (P2); `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers kept for existing callers. Headers are stored as views into the input buffer and cookies are split lazily, on first access (P3) |
+| `arena.c/h` | bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`); one shared per worker process (`App.arena`), not one per connection |
+| `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text`. One `parse_request_head` pass feeds the body-limit check, completeness check and full parse; `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers kept for existing callers. Headers are stored as views into the input buffer and cookies are split lazily, on first access |
 | `router.c/h` | route registration, one Patricia (segment-radix) tree per method, `app_mount`, `app_serve_static`, `app_free_routes` |
 | `middleware.c/h` | pipeline (`chain_next`, `chain_error`, `dispatch`), 404/405/OPTIONS defaults |
-| `response.c/h` | response head assembly, cookies, chunked streaming (`res_write`, buffered), producer streaming (`res_stream`, M5: builds the head and records the producer; `stream_write` frames chunks), file streaming |
+| `response.c/h` | response head assembly, cookies, chunked streaming (`res_write`, buffered), producer streaming (`res_stream`: builds the head and records the producer; `stream_write` frames chunks), file streaming |
 | `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen |
 | `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals). On Linux `event_loop_linux.c` implements `event_loop.h` by forwarding through `App.loop_ops` to the static functions behind `io_uring_loop_ops` / `epoll_loop_ops` (`event_loop_backend.h`, private); kqueue implements it directly |
-| `cluster.c/h` | fork workers, respawn (with backoff and a restart budget, S7), drain; on macOS/BSD (`CEXPRESS_SINGLE_ACCEPTOR`, C4) also the single acceptor - binds the one listen socket, `accept()`s, and hands fds to workers round-robin over per-worker socketpairs |
-| `static.c/h` | traversal-safe file serving, with an in-memory cache of recently served files (P1) |
+| `cluster.c/h` | fork workers, respawn (with backoff and a restart budget), drain; on macOS/BSD (`CEXPRESS_SINGLE_ACCEPTOR`) also the single acceptor - binds the one listen socket, `accept()`s, and hands fds to workers round-robin over per-worker socketpairs |
+| `static.c/h` | traversal-safe file serving, with an in-memory cache of recently served files |
 | `multipart.c/h`, `urlencoded.c/h` | form body parsers (handler-invoked, not automatic) |
 | `vendor/picohttpparser/` | vendored HTTP/1.x request parser (MIT/Perl) |
 | `vendor/yyjson/` | vendored yyjson 0.13.0; JSON reading and writing. `cexpress.h` includes it. There is no engine JSON layer of its own |
@@ -58,36 +58,36 @@ response building never touch a socket, so tests drive them with a fake `Connect
 ## Limits (all compile-time, in `app_types.h`; excess is truncated or dropped, never overflowed, except where marked)
 Routes: no fixed cap per App (each is malloc'd into a tree), 64 per Router (`MAX_ROUTER_ROUTES`), 16 distinct methods · app middleware 16 · route middleware 8 ·
 path params 8 (value 63) · query params 16 (63) · request headers 32 (`MAX_HEADERS`; **a 33rd header is a 400**; a
-header name/value has no length cap of its own since P3 - it is a view into the input buffer, not a fixed-size copy -
+header name/value has no length cap of its own - it is a view into the input buffer, not a fixed-size copy -
 only the whole header block fitting `BUF_SIZE` bounds it) ·
 cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
 body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 ·
 form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB each, 64 MiB total, 1 s revalidation
-(`STATIC_CACHE_*`, `static.c`; a file over the per-entry cap is served but never cached; see "Static" below - P1) ·
+(`STATIC_CACHE_*`, `static.c`; a file over the per-entry cap is served but never cached; see "Static" below) ·
 producer stream output 16 KiB per producer call (`STREAM_CHUNK_SIZE`; one `stream_write` ≤ `STREAM_WRITE_MAX`) and no total cap · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
 pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
-worker init hooks 4 · cluster workers 128 · arena 64 KiB, one per worker process, not per connection (M1; see below; exceeding it falls back to malloc, it is not a limit) ·
+worker init hooks 4 · cluster workers 128 · arena 64 KiB, one per worker process, not per connection (see below; exceeding it falls back to malloc, it is not a limit) ·
 max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped) ·
-body limit prefixes 16 (`MAX_BODY_LIMITS`; `App.body_limits`, set at runtime by `app_use_body_limit`, unlike the other limits here - see "Body limits (S4)" below).
+body limit prefixes 16 (`MAX_BODY_LIMITS`; `App.body_limits`, set at runtime by `app_use_body_limit`, unlike the other limits here - see "Body limits" below).
 
 ## Memory model
-**One arena per worker process, not per connection (M1).** `app_init` mallocs a single 64 KiB buffer and calls
+**One arena per worker process, not per connection.** `app_init` mallocs a single 64 KiB buffer and calls
 `arena_init` once into `App.arena`; `connection_create` just points `Connection.arena` at it
 (`conn->arena = &app->arena`) rather than allocating one of its own. Every accepted connection is now just
-just `calloc(sizeof(Connection))` - no input buffer either (M2, next paragraph). This is safe under the single-threaded,
+`calloc(sizeof(Connection))` - no input buffer either (next paragraph). This is safe under the single-threaded,
 non-blocking event loop model: at most one connection's handler code runs at a time, and `handle_readable`/
 `reject_request` reset the shared arena (`arena_reset(&app->arena)`, through `app`, not `conn` - `conn` may already
 be freed by then) exactly once, right after each dispatch-and-flush cycle they run - by which point
 `flush_connection` has already copied any still-unsent response tail out to a connection-owned buffer if it
 couldn't fully drain in that same cycle (see `Connection.out_buf_owned`), so nothing any connection still needs
 is ever left in the shared arena when another connection's turn begins. File streaming (`res_send_file`) never
-touches the shared arena at all: each chunk is read into `Connection.stream_buf` (named `file_buf` before M5, which made `res_stream` producers share it), a connection-owned buffer
+touches the shared arena at all: each chunk is read into `Connection.stream_buf` (shared with `res_stream` producers), a connection-owned buffer
 malloc'd lazily on first use and reused turn to turn, precisely because a large file spans many event-loop turns
 during which other connections' dispatches would otherwise reuse and overwrite an arena-resident chunk buffer.
 Measured on macOS, 5,000 idle keep-alive connections on one worker now take about 8.2 KB RSS per connection (about
 44 MB total for 5,000), down from about 25 KB per connection (about 121 MB) before this fix (Linux not measured);
-M2 below removed the remaining 8 KiB `in_buf`.
-**One receive buffer per worker process, borrowed per read (M2).** `app_init` also mallocs `App.read_buf`
+the shared receive buffer below removed the remaining 8 KiB `in_buf`.
+**One receive buffer per worker process, borrowed per read.** `app_init` also mallocs `App.read_buf`
 (`BUF_SIZE`, 8 KiB). A connection with nothing buffered has `in_buf == NULL`; `handle_readable` (`read_and_serve`)
 points `in_buf` at `App.read_buf` for the `recv`, and complete requests are parsed and served in place there (header
 views point into it; they are dead once the handler returns). Before `handle_readable` returns with the connection
@@ -100,9 +100,9 @@ enough. `grow_in_buf` never reallocs the borrowed buffer (it mallocs the grown s
 (however far it grew) once `in_len == 0`. The only added cost is one copy of a partial request's bytes, per partial
 read-turn that leaves it incomplete; complete requests - the common case - are never copied.
 Measured on macOS (demo, one worker, 5,000 connections, RSS delta): about **239 B per idle keep-alive connection**
-after one request and **216 B** for an accepted-but-silent one, down from about 8.4 KB each before M2 (44 MB → 1.2 MB
+after one request and **216 B** for an accepted-but-silent one, down from about 8.4 KB each before the shared receive buffer (44 MB → 1.2 MB
 for 5,000). Kernel socket buffers are not in RSS. `/ping` throughput unchanged (wrk, 50 connections, three rounds).
-The arena serves everything that lives for one request (except `Request.body`, a view into `in_buf` since M4 - see
+The arena serves everything that lives for one request (except `Request.body`, a view into `in_buf` - see
 "Behavior reference, Request parsing"): the initial `conn->out_buf` build (`res_*`),
 chunked-response growth, and any yyjson document created with `arena_yyjson_alc`. Bump allocation, 8-byte aligned,
 no per-allocation free. When the remaining space is too small (not only for a single request over 64 KiB), the
@@ -115,35 +115,35 @@ arena at all - see above).
 ## Ownership (who frees what)
 | Thing | Allocated by | Freed by |
 |---|---|---|
-| `App.arena`'s 64 KiB buffer (M1: one per worker process, not one per connection) | `app_init` (one malloc) | `app_destroy` (`arena_destroy` for fallback blocks, then a plain `free` of the buffer itself - `arena_destroy` never frees `buf`, same convention as a test's hand-built Arena) |
+| `App.arena`'s 64 KiB buffer (one per worker process, not one per connection) | `app_init` (one malloc) | `app_destroy` (`arena_destroy` for fallback blocks, then a plain `free` of the buffer itself - `arena_destroy` never frees `buf`, same convention as a test's hand-built Arena) |
 | `Connection` | `connection_create` (one calloc; no arena buffer behind it any more) | `connection_close` (exactly once) |
-| `conn->in_buf` (M2: NULL while nothing is buffered) | not allocated while it borrows `App.read_buf` (during one `handle_readable`); owned copy: `stop_borrowing_read_buf` (unserved bytes left at the end of `handle_readable`) or `grow_in_buf` (a body past `BUF_SIZE`; realloc on further growth) | the owned copy: `flush_connection`'s keep-alive reset once nothing is buffered, or `connection_close`. The borrowed `App.read_buf`: never through `conn` |
-| `App.read_buf` (M2, `BUF_SIZE`, one per worker process) | `app_init` | `app_destroy` |
+| `conn->in_buf` (NULL while nothing is buffered) | not allocated while it borrows `App.read_buf` (during one `handle_readable`); owned copy: `stop_borrowing_read_buf` (unserved bytes left at the end of `handle_readable`) or `grow_in_buf` (a body past `BUF_SIZE`; realloc on further growth) | the owned copy: `flush_connection`'s keep-alive reset once nothing is buffered, or `connection_close`. The borrowed `App.read_buf`: never through `conn` |
+| `App.read_buf` (`BUF_SIZE`, one per worker process) | `app_init` | `app_destroy` |
 | `conn->arena` | not allocated - always `&app->arena`, set once at `connection_create` | nobody frees it through `conn`; `app_destroy` frees the one underlying `App.arena` after every connection is already closed |
-| `conn->stream_buf` (M1, M5: a connection-owned `STREAM_CHUNK_SIZE` turn buffer, lazily malloc'd, reused chunk to chunk - never the shared arena; `file_buf` before M5) | `flush_connection`, on the first chunk of a `res_send_file` response or the first producer call of a `res_stream` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
-| `conn->stream_ctx` (M5: the application's producer state, handed over by `res_stream`) | the handler (application code), before `res_stream` | `stream_release` (`response.c`) calls `stream_ctx_free(ctx)` exactly once: after `STREAM_END` (in `flush_connection`), on `STREAM_ABORT` or any close (`connection_close`), when a later `res_*` in the same handler replaces the stream, or inside `res_stream` for HEAD. If `res_stream` returns -1 the caller still owns it |
+| `conn->stream_buf` (a connection-owned `STREAM_CHUNK_SIZE` turn buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response or the first producer call of a `res_stream` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
+| `conn->stream_ctx` (the application's producer state, handed over by `res_stream`) | the handler (application code), before `res_stream` | `stream_release` (`response.c`) calls `stream_ctx_free(ctx)` exactly once: after `STREAM_END` (in `flush_connection`), on `STREAM_ABORT` or any close (`connection_close`), when a later `res_*` in the same handler replaces the stream, or inside `res_stream` for HEAD. If `res_stream` returns -1 the caller still owns it |
 | Arena fallback blocks | `arena_alloc` when the buffer is full | `arena_reset` (each dispatch-and-flush cycle, in `handle_readable`/`reject_request`) or `arena_destroy` (`app_destroy`) |
-| `Request.body` | engine path (`parse_http_request_in_place`, M4): not allocated - a view into `conn->in_buf`; `parse_http_request`/`_from_head` (tests, tools): copied into the arena. Always non-NULL after success | nobody: the input buffer's own lifecycle (M2) or the arena. Handlers never free it or keep it |
+| `Request.body` | engine path (`parse_http_request_in_place`): not allocated - a view into `conn->in_buf`; `parse_http_request`/`_from_head` (tests, tools): copied into the arena. Always non-NULL after success | nobody: the input buffer's own lifecycle or the arena. Handlers never free it or keep it |
 | `req_get_*` results, `MultipartPart.data` | point inside the Request / body | nobody; valid until the handler returns |
-| `conn->out_buf` | `res_*`, from the shared arena (one allocation per response; a second send just leaves the first in the arena) - **or** a connection-owned `malloc`'d copy of an unsent tail (M1: `conn->out_buf_owned`, made by `flush_connection` when a response can't be fully written in one call, since the shared arena would otherwise be reused by another connection before the write finishes) | the arena copy: nobody, reclaimed by the next `arena_reset`. The owned copy: `flush_connection` once fully drained, or `connection_close` on any error/close path - never both (see `Connection.out_buf_owned`) |
-| yyjson doc built or read with `arena_yyjson_alc(res->conn->arena)` (a pointer already - no `&`, M1) | arena | nothing: `yyjson_*_doc_free` is a no-op for it, the arena reclaims it |
+| `conn->out_buf` | `res_*`, from the shared arena (one allocation per response; a second send just leaves the first in the arena) - **or** a connection-owned `malloc`'d copy of an unsent tail (`conn->out_buf_owned`, made by `flush_connection` when a response can't be fully written in one call, since the shared arena would otherwise be reused by another connection before the write finishes) | the arena copy: nobody, reclaimed by the next `arena_reset`. The owned copy: `flush_connection` once fully drained, or `connection_close` on any error/close path - never both (see `Connection.out_buf_owned`) |
+| yyjson doc built or read with `arena_yyjson_alc(res->conn->arena)` (a pointer already - no `&`) | arena | nothing: `yyjson_*_doc_free` is a no-op for it, the arena reclaims it |
 | yyjson doc with a NULL allocator (e.g. `error_handler_json`) | libc malloc | `yyjson_mut_doc_free` / `yyjson_doc_free` |
 | `yyjson_mut_write(doc, 0, &len)` result | libc malloc, **whatever allocator the doc uses** | caller, C `free` (forgetting it leaks once per request) |
-| `Route`, `PatriciaNode`; a static mount's `Route.static_root` string (M6: heap, `NULL` on ordinary routes and on every `Router` slot) | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy`; every heap `Route` is dropped through `router.c`'s `route_free` (root + route), including registration failures and duplicates |
+| `Route`, `PatriciaNode`; a static mount's `Route.static_root` string (heap, `NULL` on ordinary routes and on every `Router` slot) | `app_add_route_mw`, `app_serve_static`, `tree_insert` | `app_free_routes`, called by `app_destroy`; every heap `Route` is dropped through `router.c`'s `route_free` (root + route), including registration failures and duplicates |
 | `app->connections` | `app_init` | `app_destroy` |
-| `App.loop_ops` (C5: the selected Linux backend's static `EventLoopOps` table; decides which member of the `kq`/`epoll_fd`/`ring` union is live) | not allocated: `event_loop_init` points it at `io_uring_loop_ops` or `epoll_loop_ops` on success | nothing to free; `event_loop_close` sets it back to `NULL` after the backend's own close |
-| `App.poll_regs` (C6, io_uring backend only: one `PollRegistration` per fd) | `event_loop_io_uring.c`'s `registration_for`, grown by doubling on the first interest change for an fd past its size | `event_loop_close` |
-| `app->spare_fd` (S3, one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |
-| `cluster.c`'s `listen_fd` (C4, `CEXPRESS_SINGLE_ACCEPTOR` only - the master's one real listen socket, replacing per-worker binds) | `cluster_listen` (`create_server_socket`) | `cluster_listen`, after every worker has drained, at the end of the same function |
-| `ClusterWorkerSlot.control_fd` per slot (C4 - the master-side end of that worker's socketpair; the worker keeps the other end, `sv[1]`, as its own `server_fd`) | `spawn_worker`, fresh on every spawn *and* every respawn (S7) | `spawn_worker`'s next respawn for that slot (closes the stale one first), or `cluster_listen`'s final cleanup once every worker has drained |
-| Static file cache entries (P1: cached path string + file bytes, `static.c`'s own process-lifetime global, not tied to any `App`) | `static_serve_file`, on a cache miss or a changed file | replaced in place on the next change, evicted (stalest first) once `STATIC_CACHE_MAX_ENTRIES` is reached, or all of them via `static_cache_clear` (tests; nothing in the engine calls it) |
+| `App.loop_ops` (the selected Linux backend's static `EventLoopOps` table; decides which member of the `kq`/`epoll_fd`/`ring` union is live) | not allocated: `event_loop_init` points it at `io_uring_loop_ops` or `epoll_loop_ops` on success | nothing to free; `event_loop_close` sets it back to `NULL` after the backend's own close |
+| `App.poll_regs` (io_uring backend only: one `PollRegistration` per fd) | `event_loop_io_uring.c`'s `registration_for`, grown by doubling on the first interest change for an fd past its size | `event_loop_close` |
+| `app->spare_fd` (one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |
+| `cluster.c`'s `listen_fd` (`CEXPRESS_SINGLE_ACCEPTOR` only - the master's one real listen socket, replacing per-worker binds) | `cluster_listen` (`create_server_socket`) | `cluster_listen`, after every worker has drained, at the end of the same function |
+| `ClusterWorkerSlot.control_fd` per slot (the master-side end of that worker's socketpair; the worker keeps the other end, `sv[1]`, as its own `server_fd`) | `spawn_worker`, fresh on every spawn *and* every respawn | `spawn_worker`'s next respawn for that slot (closes the stale one first), or `cluster_listen`'s final cleanup once every worker has drained |
+| Static file cache entries (cached path string + file bytes, `static.c`'s own process-lifetime global, not tied to any `App`) | `static_serve_file`, on a cache miss or a changed file | replaced in place on the next change, evicted (stalest first) once `STATIC_CACHE_MAX_ENTRIES` is reached, or all of them via `static_cache_clear` (tests; nothing in the engine calls it) |
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
-`parse_http_request` / `parse_http_request_from_head` / `parse_http_request_in_place`: `0` ok (only then does `_in_place` write anything into `raw`), `-1` malformed (including, since S11, a bare `\n` line ending anywhere in the request line or header block, and a `Transfer-Encoding` this engine can't frame - see `req.content_length` below), `-2` path too long (→ 414), `-3` retired (P3: used to mean "a header name/value too long to store", impossible now that headers are views, not fixed-size copies - never returned, kept reserved rather than reused; this is the function's own top-level code, unrelated to `req.content_length`'s own `-3` below), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413), `req.content_length == -3` (S11) means `Transfer-Encoding` names anything other than exactly the single token `chunked` (→ 501).
-`url_decode` / `parse_query_string`: `0` ok, `-1` a decoded byte was NUL (S6) - the destination is still fully written and NUL-terminated, but the caller must treat it as invalid input rather than use it.
-`request_is_complete` / `request_head_is_complete`: `1` for a complete request, for invalid `Content-Length` / chunked+`Content-Length` framing, and for a request line or header block picohttpparser rejects outright (S8: stop reading in every one of these cases, let the parser report the specific error - malformed used to be indistinguishable from "need more bytes", since both leave `header_len == 0`; told apart via `ParsedHead.content_length`, `-1` only on the malformed path). `0` only while more bytes are genuinely needed: before any blank line, or while a well-framed head waits on a short body. A head picohttpparser still calls incomplete past a blank line is malformed (T1: its `parse_http_version` wants 9 bytes before reading any, so `GET / X\r\n\r\n` used to wait for the S1 deadline). Once `1` for a prefix, `1` for every longer buffer, with the same answer, so the verdict does not depend on where `recv()` split the bytes (T1, asserted per input by `fuzz_parser.c` and end to end by `test_answered.c`). `chunked_body_scan` / `chunked_body_scan_resume`: `1` done, `0` need more, `-1` malformed, `-2` too large. The resume variant's `ChunkScanState` (offsets from the body start, so `in_buf` reallocs don't invalidate it) only ever advances past fully received and validated chunks, and the trailer's `\r\n\r\n` search resumes 3 bytes before where it last gave up; a resumed verdict is therefore identical to a from-scratch scan of the same bytes (P8, asserted per-prefix in `test_http_parser.c` and at random split points in `fuzz_parser.c`). State is per request: `Connection.chunk_scan` is zeroed by `connection_create`'s `calloc` and by `flush_connection`'s keep-alive reset. `parse_http_request_from_head` still runs one from-scratch scan plus decode on completion (linear, once).
-`parse_request_head`: same codes as `request_framing` (`0` absent/zero-length or incomplete, `>0` value, `-1` malformed/conflicting, `-2` oversized) - check `ParsedHead.header_len == 0` to tell "incomplete" apart from "malformed" at this layer (both still return via that ambiguity, P2; `request_head_is_complete`, above, is what resolves it before handing off to the rest of the pipeline).
+`parse_http_request` / `parse_http_request_from_head` / `parse_http_request_in_place`: `0` ok (only then does `_in_place` write anything into `raw`), `-1` malformed (including a bare `\n` line ending anywhere in the request line or header block, and a `Transfer-Encoding` this engine can't frame - see `req.content_length` below), `-2` path too long (→ 414), `-3` retired (used to mean "a header name/value too long to store", impossible now that headers are views, not fixed-size copies - never returned, kept reserved rather than reused; this is the function's own top-level code, unrelated to `req.content_length`'s own `-3` below), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400); after `-1`, `req.content_length == -2` means body too large (→ 413), `req.content_length == -3` means `Transfer-Encoding` names anything other than exactly the single token `chunked` (→ 501).
+`url_decode` / `parse_query_string`: `0` ok, `-1` a decoded byte was NUL - the destination is still fully written and NUL-terminated, but the caller must treat it as invalid input rather than use it.
+`request_is_complete` / `request_head_is_complete`: `1` for a complete request, for invalid `Content-Length` / chunked+`Content-Length` framing, and for a request line or header block picohttpparser rejects outright (stop reading in every one of these cases, let the parser report the specific error - malformed used to be indistinguishable from "need more bytes", since both leave `header_len == 0`; told apart via `ParsedHead.content_length`, `-1` only on the malformed path). `0` only while more bytes are genuinely needed: before any blank line, or while a well-framed head waits on a short body. A head picohttpparser still calls incomplete past a blank line is malformed (its `parse_http_version` wants 9 bytes before reading any, so `GET / X\r\n\r\n` used to wait for the request header deadline). Once `1` for a prefix, `1` for every longer buffer, with the same answer, so the verdict does not depend on where `recv()` split the bytes (asserted per input by `fuzz_parser.c` and end to end by `test_answered.c`). `chunked_body_scan` / `chunked_body_scan_resume`: `1` done, `0` need more, `-1` malformed, `-2` too large. The resume variant's `ChunkScanState` (offsets from the body start, so `in_buf` reallocs don't invalidate it) only ever advances past fully received and validated chunks, and the trailer's `\r\n\r\n` search resumes 3 bytes before where it last gave up; a resumed verdict is therefore identical to a from-scratch scan of the same bytes (asserted per-prefix in `test_http_parser.c` and at random split points in `fuzz_parser.c`). State is per request: `Connection.chunk_scan` is zeroed by `connection_create`'s `calloc` and by `flush_connection`'s keep-alive reset. `parse_http_request_from_head` still runs one from-scratch scan plus decode on completion (linear, once).
+`parse_request_head`: same codes as `request_framing` (`0` absent/zero-length or incomplete, `>0` value, `-1` malformed/conflicting, `-2` oversized) - check `ParsedHead.header_len == 0` to tell "incomplete" apart from "malformed" at this layer (both still return via that ambiguity; `request_head_is_complete`, above, is what resolves it before handing off to the rest of the pipeline).
 yyjson: read functions return `NULL` on failure; `yyjson_mut_*_add_*` return `false` on failure (the cookbook and demo do not check them).
 Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `errno` for logic outside the socket layer.
 
@@ -153,7 +153,7 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   search tries, in this order and with backtracking: a literal child, then the `:name` / mid-pattern `*` child, then a trailing `*`.
   So **specificity beats registration order**: `/users/me` wins over `/users/:id` even when registered second.
   A mid-pattern `*` matches one segment and captures nothing. A trailing `*` matches one or more segments (never the bare prefix). A duplicate pattern for the same method keeps the first and warns.
-  **Registration failure is fail-soft, never a truncated/corrupted route (S12).** A method/path that doesn't fit
+  **Registration failure is fail-soft, never a truncated/corrupted route.** A method/path that doesn't fit
   `Route.method`/`Route.path` (7/255 chars) is rejected outright by `fill_route` with a `stderr` message and the
   route is not registered at all - it used to be silently `strncpy`-truncated into a shorter pattern than the
   caller asked for, so a request could match a route nobody actually meant to register. Every allocation on the
@@ -163,12 +163,12 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   corrupting `PatriciaNode.children`. Tree structure already linked in before a failing allocation is left in
   place, not unwound - a `PatriciaNode` with `route == NULL` is already a normal internal node, shared by any
   other route under the same path prefix.
-  **Static children are sorted, not registration order (P7).** A node's `children` array is kept sorted by segment
+  **Static children are sorted, not registration order.** A node's `children` array is kept sorted by segment
   (short-lexicographic: shared-prefix bytes compare first, the shorter segment sorts before a longer one that starts
   with it) and searched with binary search (`find_child`) instead of a linear `memcmp` scan, both on `tree_insert`
   (new child inserted at its sorted position via `memmove`) and on `tree_search_recursive`'s per-segment lookup - a
   path segment with many static siblings (`/api/<many resources>`) is now O(log siblings) instead of O(siblings).
-  MEASURED (`improvements.md`, P7): 8,401 ns → ~80 ns per lookup at 5,000 siblings on a scratch benchmark (one worker
+  MEASURED: 8,401 ns → ~80 ns per lookup at 5,000 siblings on a scratch benchmark (one worker
   process, 1,000,000 lookups). Only static children are affected; `param_child`/`catch_all_child` are still single
   pointers, unaffected. Irrelevant for a hand-written route table (dozens of siblings at most); matters for a
   generated one.
@@ -183,9 +183,9 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 - **Static.** `app_serve_static` registers `GET <prefix>/*`, `realpath`s the root once (a missing root registers nothing and logs it, so every request under the prefix is a 404), refuses `..` (403), re-checks the
   resolved path stays under the root after symlink resolution (403), 404 for non-files, serves `index.html` for a directory,
   never lists. Reads the whole file into memory (≤ 50 MiB) and sends it with `res_send_bytes`. The root is resolved against the process's working directory.
-  **File cache (P1).** `static_serve_file` caches files up to `STATIC_CACHE_MAX_ENTRY_BYTES` after their first read, keyed by
+  **File cache.** `static_serve_file` caches files up to `STATIC_CACHE_MAX_ENTRY_BYTES` after their first read, keyed by
   the pre-`realpath` candidate path (`static_root` + the already-traversal-checked subpath), not the resolved one - MEASURED
-  (`improvements.md`, P1) a 6.6x gap between the static-mount path and an equivalent in-memory response, almost entirely
+  a 6.6x gap between the static-mount path and an equivalent in-memory response, almost entirely
   `open`/`fstat`/`realpath`/`fopen`/`fread`/`malloc`/`free` paid on every request for the same handful of files. A request
   within `STATIC_CACHE_REVALIDATE_SECONDS` (1 s) of the same candidate's last check is served straight from the cache with
   **no filesystem call at all**, not even `realpath`/`stat` - re-verified live at 255,941 req/s for a 52-byte file
@@ -202,12 +202,12 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Header names are matched exactly and case-insensitively (never by substring). Method ≤ 7
   chars. Query and cookies are still parsed eagerly into fixed arrays (cookies lazily *triggered*, see below, but the
   arrays themselves are fixed-size once triggered); headers are not copied at all. More than 32 headers → 400 (checked
-  explicitly against `MAX_HEADERS` in `parse_http_request_from_head`, since P2 raised the underlying `phr_parse_request`
+  explicitly against `MAX_HEADERS` in `parse_http_request_from_head`, since the single-pass head parse raised the underlying `phr_parse_request`
   capacity itself to `MAX_FRAMING_HEADERS`, above `MAX_HEADERS`, precisely so this case is diagnosed as malformed rather
   than mis-reported as "incomplete" - see "Hot-path rules"). A request line or header block picohttpparser rejects
-  outright is likewise 400, immediately (S8, fixed 2026-09-23 - see "Return conventions" above and `improvements_progress.md`),
+  outright is likewise 400, immediately (fixed 2026-09-23 - see "Return conventions" above and `improvements_progress.md`),
   not left open waiting for headers that will never arrive.
-  **Framing ambiguity (S11, fixed 2026-09-23).** picohttpparser itself tolerates a bare `\n` as a line terminator
+  **Framing ambiguity (fixed 2026-09-23).** picohttpparser itself tolerates a bare `\n` as a line terminator
   anywhere one is expected (the request line, any header line, the final blank line) - a leniency a front proxy
   reading strictly per RFC 9112 (CRLF only) would not extend, so the two could disagree about where one request
   ends and the next begins. `parse_request_head` now scans the located header block for any `\n` not immediately
@@ -221,22 +221,21 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   (a substring lookalike, `chunked` alongside any other coding regardless of order, an unsupported coding alone,
   or the coding split across separate duplicate `Transfer-Encoding` header instances) is rejected with 501 `Not
   Implemented`, not silently accepted or ignored.
-  **Header storage (P3).** `req->headers` holds `struct phr_header` VIEWS (`name`/`value` point into `in_buf`, not
+  **Header storage.** `req->headers` holds `struct phr_header` VIEWS (`name`/`value` point into `in_buf`, not
   NUL-terminated) instead of copies into fixed-size arrays, so there is no per-header length cap left to enforce - a
   header of any length that fits within the whole header block (`BUF_SIZE`, 8 KiB, unrelated to this) is accepted.
-  This retired S5's `-3`/431 return code (`parse_http_request` never returns `-3` any more; kept reserved, not reused,
-  so old code branching on it is merely dead) and is the "proper fix" `improvements.md`'s S5 entry predicted P3 would
-  be, superseding the interim fix of simply raising the old fixed-size cap. `req_get_header` materializes a
+  This retired the old `-3`/431 return code (`parse_http_request` never returns `-3` any more; kept reserved, not reused,
+  so old code branching on it is merely dead), superseding the interim fix of simply raising the old fixed-size cap. `req_get_header` materializes a
   NUL-terminated copy of the matching view into `req->arena` (set by every `parse_http_request*` to the arena it was
   given) on every call - not cached, since a handler reads a given header only a handful of times per
   request at most. `parse_headers`, the standalone component parser `tests/` call directly (not on the live request
   path), was changed the same way and takes an `Arena *` now for the same reason - it no longer truncates either.
-  **Cookie splitting is lazy (P3).** `parse_http_request_from_head` no longer calls `parse_cookies` itself; `req_get_cookie`
+  **Cookie splitting is lazy.** `parse_http_request_from_head` no longer calls `parse_cookies` itself; `req_get_cookie`
   does, once, the first time it is called for a given request (`req->cookies_parsed`) - a request that carries a
   `Cookie` header but whose handler never reads one never pays for the split. Cookie storage itself (`cookie_names`/
   `cookie_values`, fixed 64/255-char slots) is unchanged; only *when* the split runs moved.
   Chunked bodies: extensions ignored, trailers discarded, decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at `header_len + MAX_BODY_SIZE`.
-  **Body is not copied (M4).** On the engine path `req->body` points at `in_buf + header_len`. A chunked body is decoded
+  **Body is not copied.** On the engine path `req->body` points at `in_buf + header_len`. A chunked body is decoded
   in place by `chunked_body_decode(body_start, avail, body_start)` (it uses `memmove`: decoded output never overtakes the
   framing being read, since each chunk moves left by at least its own size line). `body[content_length]` is set to
   `'\0'`; that byte is the one after a `Content-Length` body - `in_buf[in_len]` (always writable, already `'\0'`) or a
@@ -246,27 +245,27 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   bytes are consumed once the response is queued. `res_*` copy everything they send, so nothing points into `in_buf`
   after `dispatch`. MEASURED: peak RSS for a 9.5 MiB upload 41.7 → 32.1 MB (Content-Length and chunked alike); what
   remains is mostly the transient old+new block during `grow_in_buf`'s doubling `realloc`.
-  **Embedded NUL (S6).** The path and query names/values are percent-decoded (`decode_bounded`/`url_decode`); a decoded byte
+  **Embedded NUL.** The path and query names/values are percent-decoded (`decode_bounded`/`url_decode`); a decoded byte
   that is NUL (`%00`, or a raw NUL byte already in the request line) is rejected with 400 (`parse_http_request`'s `-4`)
   rather than silently truncating everything downstream that reads `req->path`/`req_get_query` as a C string - MEASURED
-  (`improvements.md`, S6) `GET /static/style.css%00.png` used to be routed and served as `/static/style.css`, a bypass for
+  `GET /static/style.css%00.png` used to be routed and served as `/static/style.css`, a bypass for
   any suffix/extension check performed on the path before use. Header and cookie values are not percent-decoded by this
   engine at all, so this vector does not apply to them (`req_get_header`/`req_get_cookie` already return raw bytes;
-  header values have no length limit at all since P3, see above; a cookie's own value, once split, still has one).
+  header values have no length limit at all, see above; a cookie's own value, once split, still has one).
 - **Buffers.** Input is read into the shared `App.read_buf` (8 KiB) and only copied to a connection-owned 8 KiB
-  `in_buf` when bytes are left unserved (M2, see Memory model); with headers complete and a body pending it grows by doubling, capped at the
-  known target size (S4: `Content-Length` and chunked both work this way now - `Content-Length` used to realloc straight
+  `in_buf` when bytes are left unserved (see Memory model); with headers complete and a body pending it grows by doubling, capped at the
+  known target size (`Content-Length` and chunked both work this way now - `Content-Length` used to realloc straight
   to `header_len + content_length + 1` in one step, reserving virtual memory proportional to what the client merely
   *declared* rather than what it had actually sent), and freed once nothing is buffered. No header
   terminator within 8 KiB → 431.
-- **Pipelining (P9).** Several requests may sit in `in_buf` at once. `serve_buffered_requests` answers them strictly in
+- **Pipelining.** Several requests may sit in `in_buf` at once. `serve_buffered_requests` answers them strictly in
   order, one `flush_connection` each, starting at `Connection.in_off`; `request_wire_len` (`http_parser.c`: `header_len` +
   `Content-Length`, or + `ChunkScanState.body_end` for chunked, which ends after the trailer's blank line) records where
   the next one starts (`Connection.request_len`), and `flush_connection`'s keep-alive reset advances `in_off` by it.
   Bytes after a `Content-Length` body are the next request, never part of this body. The unserved tail is moved to the
   front of `in_buf` only when more input must be read (`compact_in_buf`, on "need more"), never after each request, so
   each byte moves at most once (per-request `memmove` would be quadratic for a large batch of tiny requests).
-  M2 adds one more move: when `handle_readable` returns with requests still unserved in the borrowed `App.read_buf`
+  The shared receive buffer adds one more move: when `handle_readable` returns with requests still unserved in the borrowed `App.read_buf`
   (cap hit, or a response pending), `stop_borrowing_read_buf` copies `[in_off, in_len)` into an owned buffer at offset
   0, so `in_off` is 0 again once `handle_readable` returns; it only goes above 0 inside an owned buffer while
   `handle_writable` serves from it.
@@ -274,16 +273,16 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   interest and the rest is served by `handle_writable` on the next poll (a connected socket is almost always writable).
   **Backpressure:** while a response is pending (`EAGAIN`), `flush_connection` (`wait_for_writable`) drops read interest
   and `handle_readable` consumes nothing, so a request pipelined behind a large response is never dispatched over the
-  pending one (before P9 it was: the buffer still held the first request, which was re-parsed and dispatched again,
+  pending one (previously it was: the buffer still held the first request, which was re-parsed and dispatched again,
   overwriting and leaking the owned tail copy). Read interest returns in the keep-alive reset. A client that pipelines
   without reading is therefore stopped by TCP flow control, not buffered by the server.
   **Syscalls:** `handle_readable` returns as soon as a `recv` produced at least one answered request instead of calling
   `recv` again for an almost-certain `EAGAIN` (level-triggered readiness re-fires if more is waiting) - MEASURED: the
   extra `recv` cost ~9% of non-pipelined `/ping` throughput. A rejected request (400/413/414/431/501) or a response
   with `Connection: close` (including every response during shutdown) closes the connection; whatever was pipelined
-  behind it is dropped unanswered, as RFC 9112 allows. `request_started` (S1) restarts when leftover bytes remain
+  behind it is dropped unanswered, as RFC 9112 allows. `request_started` restarts when leftover bytes remain
   after a response, so a partial pipelined request is still bounded by the header/body deadlines.
-- **Producer streaming (M5, `res_stream`).** The handler sets headers and calls `res_stream(res, producer, ctx, ctx_free)`:
+- **Producer streaming (`res_stream`).** The handler sets headers and calls `res_stream(res, producer, ctx, ctx_free)`:
   the chunked head goes into `out_buf` as for `res_write`, `res->stream_ended` is set (later `res_write`/`res_end` are
   no-ops) and `Connection.stream_fn/stream_ctx/stream_ctx_free` record the producer. The handler returns; the producer is
   never called inside it. `flush_connection`, each time `out_buf` has fully drained and `stream_fn` is set, frees an
@@ -312,7 +311,7 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   stayed at 1.6 MB.
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length`, `Connection` and `Date` are engine-owned.
-- **Date and bodiless statuses (C3).** Every head built by `build_response_head` (and the hand-built overload 503 in
+- **Date and bodiless statuses.** Every head built by `build_response_head` (and the hand-built overload 503 in
   `connection.c`) carries `Date:` right after the status line, from `http_date_for(time(NULL))` (`http_parser.c`): one
   static per-process buffer reformatted only when the second changes (`format_http_date`, pure, locale-free, no
   `gmtime`). Safe only because each worker process is single-threaded. `100 Continue` has no `Date` (optional for 1xx).
@@ -321,17 +320,17 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   file fd kept, and a `res_stream` producer's ctx is freed at once as for HEAD. Dropping the bytes is required, not
   cosmetic: without framing headers, any body byte would be read by a keep-alive client as the next response.
   `CookieOptions` zero value = session cookie; `max_age > 0` seconds, `< 0` expire now.
-- **Accept path (P10).** A new connection costs one syscall: `accept_client` is `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` on
+- **Accept path.** A new connection costs one syscall: `accept_client` is `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` on
   Linux and plain `accept` on BSD/macOS, with no per-connection `fcntl`/`setsockopt`. It depends on inheritance from the
   listener, which `create_server_socket` makes non-blocking and sets `TCP_NODELAY` on. MEASURED: macOS inherits both
   `O_NONBLOCK` and `TCP_NODELAY`; Linux 6.8 inherits `TCP_NODELAY` but not `O_NONBLOCK`, hence `accept4` there, which also
   sets `FD_CLOEXEC` for free. `test_accept_client_socket_options` asserts the result on every platform, so a platform that
   stops inheriting fails a test instead of silently bringing back Nagle or blocking I/O. Both the per-worker path
-  (`accept_connections`) and the C4 master (`cluster.c`) use it. A passed fd keeps these options (they belong to the open
+  (`accept_connections`) and the single-acceptor master (`cluster.c`) use it. A passed fd keeps these options (they belong to the open
   file description), so `reject_overloaded_connection` no longer calls `set_nonblocking` either. No `SO_KEEPALIVE`: half-dead
-  peers are already closed by the idle (60 s), request (S1) and write-stall (S2) deadlines, far sooner than TCP keepalive's
+  peers are already closed by the idle (60 s), request and write-stall deadlines, far sooner than TCP keepalive's
   default 2 h.
-- **Overload (S3).** `accept_connections` sheds load on two independent axes, both O(1), checked before
+- **Overload.** `accept_connections` sheds load on two independent axes, both O(1), checked before
   `ensure_connection_capacity`/`connection_create` so an already-overloaded worker doesn't pay for either. (1)
   `App.open_connections` (a running count, `++` in `accept_connections`, `--` in `connection_close` - not
   `app_count_connections`, an O(n) rescan used only at shutdown) checked against `ServerConfig.max_connections`
@@ -347,7 +346,7 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   reopens it the moment anything closes (the cheapest point to retry, rather than waiting for the next accept batch).
   Unrelated to either: `create_server_socket`'s `listen()` backlog is `max(BACKLOG, SOMAXCONN)`, not the bare
   `BACKLOG` constant.
-- **`Expect: 100-continue` (C1).** When `serve_buffered_requests` finds a request's head complete but its body not,
+- **`Expect: 100-continue`.** When `serve_buffered_requests` finds a request's head complete but its body not,
   `send_continue_if_expected` (`connection.c`) writes `HTTP/1.1 100 Continue\r\n\r\n` straight to the socket, at
   most once per request (`Connection.continue_sent`, cleared with `body_limit_checked` in `flush_connection`'s
   keep-alive branch). The decision is the pure `request_head_expects_continue` (`http_parser.c`): HTTP/1.1+ only
@@ -356,21 +355,21 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   `Content-Length` gets `413` and the body is never invited; a head whose body already arrived is complete and never
   gets a 100. It is never queued in `out_buf`: the loop only reaches it with no response pending, so a pipelined
   request's 100 always follows the previous response. `EAGAIN` on that write is ignored (the client falls back to
-  its own timeout, the pre-C1 behavior); a short write or hard error closes the connection, since half a status line
+  its own timeout, as it did before 100-continue support); a short write or hard error closes the connection, since half a status line
   would corrupt the stream. The route is not matched first: a 404/405 is still sent after the body, as Node does by
   default.
-- **Body limits (S4).** `app_use_body_limit(app, prefix, max_bytes)` (`router.c`) registers a `BodyLimitEntry` in
+- **Body limits.** `app_use_body_limit(app, prefix, max_bytes)` (`router.c`) registers a `BodyLimitEntry` in
   `App.body_limits` (same segment-boundary prefix match as app-wide middleware; `max_bytes` clamped down to
   `MAX_BODY_SIZE`, never loosened past it). `connection.c`'s `reject_if_over_body_limit`, called from
   `handle_readable` right after every `recv` (before the completeness check), takes the `ParsedHead` that
-  `handle_readable` already computed for this `recv` (P2: it no longer runs its own `request_framing` pass -
+  `handle_readable` already computed for this `recv` (it does not run its own `request_framing` pass -
   `Connection.body_limit_checked` still guards it running its actual check more than once per request, cleared
   with `request_started` in `flush_connection`'s keep-alive branch) and, as soon as headers are complete,
   compares a declared `Content-Length` against `app_body_limit_for_path` (longest matching prefix wins,
   independent of registration order; `MAX_BODY_SIZE` if nothing matches) - over it is 413, sent before a single
   body byte is buffered or `in_buf` is grown. Only `Content-Length` is covered; chunked bodies stay governed by
   the global `MAX_BODY_SIZE` raw-wire cap in `grow_in_buf`/`chunked_body_scan` only (a deliberate scope decision,
-  not a gap: chunked's raw-cap doubling was already proportional to bytes received, which is what S4 was chiefly
+  not a gap: chunked's raw-cap doubling was already proportional to bytes received, which is what the body-limit check was chiefly
   about for `Content-Length`).
 - **Timeouts.** `last_activity` advances on received bytes only. Sweep every second; ≥ 60 s silent → close (408 first if a
   request was half-received). A connection with a response pending (`out_buf != NULL` or `file_fd >= 0`) is exempt from
@@ -399,15 +398,15 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 - **Workers and fork.** Never open a database or socket in `main()` before `app_listen`; register `app_on_worker_start`
   and open there (runs once per serving process, after fork). `SIGPIPE` is ignored per process in `app_listen_worker`
   (and, under `CEXPRESS_SINGLE_ACCEPTOR`, in the master too - see below). `cluster_listen` always calls
-  `create_server_socket(port)` once itself before forking anyone - this doubles as the S7 preflight validation.
-  `create_server_socket` itself just `perror`s and returns `-1` on a bind/listen failure (S12, fixed
+  `create_server_socket(port)` once itself before forking anyone - this doubles as the respawn preflight validation.
+  `create_server_socket` itself just `perror`s and returns `-1` on a bind/listen failure (fixed
   2026-09-23 - it no longer `exit()`s the process on its own); `cluster_listen` is what checks that return
   and `exit()`s with one clear message, so a fatal, permanent misconfiguration still stops the master
-  before forking `workers_count` children that would all fail identically - MEASURED, `improvements.md` S7,
+  before forking `workers_count` children that would all fail identically - MEASURED,
   10,594 respawns and 31,788 log lines in about 4 seconds with `WORKERS=2` and the port already taken.
   `app_listen_worker` (`connection.c`, the non-cluster/per-worker caller) checks the same return and exits
   the same way.
-  **Single acceptor (C4, `CEXPRESS_SINGLE_ACCEPTOR`, macOS/BSD only).** That one listen socket (`listen_fd`) is kept
+  **Single acceptor (`CEXPRESS_SINGLE_ACCEPTOR`, macOS/BSD only).** That one listen socket (`listen_fd`) is kept
   open, not closed, for the master's entire lifetime - it never binds a second one, and no worker binds any listen
   socket at all. Each worker instead runs `app_listen_worker_via_control_socket`, which points its `server_fd` at
   the worker-side end of a private `AF_UNIX SOCK_STREAM` socketpair with the master (`ClusterWorkerSlot.control_fd`
@@ -418,28 +417,28 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   `nanosleep` with a `poll()` on `listen_fd` of the same 50 ms timeout (adds no latency: `poll()` returns the
   instant a connection is pending, same backoff/`waitpid` cadence as before), `accept()`s everything pending each
   wake, and hands each fd to the next active worker round-robin (`dispatch_client_fd`, `cluster.c`) - a worker with
-  no active slot available gets its fd closed with no response (best-effort shed, same philosophy as S3, not
+  no active slot available gets its fd closed with no response (best-effort shed, same philosophy as Overload, not
   duplicated here to keep this scoped). `set_nonblocking`/`TCP_NODELAY` are applied once, by the master right after
   its own `accept()`, and are never reapplied worker-side: both are file-status/socket-option properties of the
   underlying open file description, already in effect once the fd rides across via `SCM_RIGHTS` (same as across
   `dup()`/`fork()`). Both ends of every socketpair are set non-blocking too - the event loop's readiness contract is
   "drain until `EAGAIN`"; a blocking control socket's final `recvmsg` after draining everything pending would block
-  forever instead, freezing that worker's entire single-threaded loop. The per-worker S3 `max_connections`/
+  forever instead, freezing that worker's entire single-threaded loop. The per-worker `max_connections`/
   `spare_fd` overload logic is untouched and still runs worker-side, now inside `accept_passed_connections` instead
-  of `accept_connections` - it doesn't care how a client fd arrived. MEASURED (`improvements.md` C4 update): the
+  of `accept_connections` - it doesn't care how a client fd arrived. MEASURED: the
   pre-fix imbalance (over 90% of load on one worker of four) is gone - a live 4-worker run under `wrk -c5000` split
   requests dead evenly across all four (824/824/824/824 dispatched, 0 failures, instrumented count), and
   `scripts/stress_test.sh`'s peak-memory sampler moved from ~88% of total RSS on the largest single process to
   ~24%, matching the four-way split.
-  **Respawn (S7).** A worker that exits abnormally *after*
+  **Respawn.** A worker that exits abnormally *after*
   startup (a real crash, not a bind failure) is respawned with exponential backoff per slot (100 ms, doubling, capped
   at 30 s) instead of instantly; if a slot fails more than `CLUSTER_RESTART_BUDGET` (5) times within
   `CLUSTER_RESTART_WINDOW_MS` (60 s) - a sliding window, not a lifetime count, so an occasional unrelated crash over a
   long-running server's life doesn't eventually trip it - the master gives up on the whole cluster, drains whatever
   workers are still up the same way a SIGTERM would, and `exit()`s non-zero itself (no error code returned to
-  `app_listen`/`main()` - `cluster_listen` stays `void`; S12 addressed the *unchecked-allocation and forced-exit*
-  half of this area, not `app_listen`'s own return-nothing contract, which remains a deliberate, larger, separate
-  change - see `improvements_progress.md`, S12). Both mechanisms are implementation details of `cluster.c` (the constants above
+  `app_listen`/`main()` - `cluster_listen` stays `void`; the *unchecked-allocation and forced-exit*
+  half of this area was addressed, not `app_listen`'s own return-nothing contract, which remains a deliberate, larger, separate
+  change - see `improvements_progress.md`). Both mechanisms are implementation details of `cluster.c` (the constants above
   are file-local, not in `app_types.h`, same convention as `connection.c`'s `ARENA_SIZE`) and share one accounting
   helper, `record_worker_failure`, so a `fork()` failure while trying to (re)spawn a slot counts against the same
   budget as an abnormal exit rather than looping unbounded on its own. Under `CEXPRESS_SINGLE_ACCEPTOR`, a respawn
@@ -447,7 +446,7 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   the master's stale `control_fd` for that slot is explicitly closed first, or it would leak one fd per respawn) -
   the child closes every *other* slot's inherited master-side `control_fd` right after `fork()` (it must not be able
   to read or write a sibling's fd-handoff channel), keeping only its own.
-- **Backend selection (C5, Linux).** Both Linux backends are always compiled (unless `NO_URING=1`, which builds epoll
+- **Backend selection (Linux).** Both Linux backends are always compiled (unless `NO_URING=1`, which builds epoll
   only, without liburing). `event_loop_init` (`event_loop_linux.c`) tries io_uring first; its init returns
   `EVENT_LOOP_UNAVAILABLE` (errno set) only when `io_uring_queue_init` itself fails, before anything else is touched -
   `ENOSYS`, `EPERM` (seccomp, `kernel.io_uring_disabled`), `ENOMEM` (`RLIMIT_MEMLOCK`) alike - and then epoll is tried.
@@ -459,7 +458,7 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   through it (one indirect call per event-loop operation, the same target for the process's life, so it predicts
   perfectly), and it is `NULL` whenever no loop is open, so `event_loop_is_open` never reads the union. The
   startup line names the backend: `Listening on port 8080 (epoll)`. MEASURED (Docker, Alpine, kernel 6.8, default
-  seccomp): `HEAD` before C5 exited at startup (`io_uring_queue_init failed: -1 (Operation not permitted)`), and in
+  seccomp): before the fallback existed, `HEAD` exited at startup (`io_uring_queue_init failed: -1 (Operation not permitted)`), and in
   cluster mode respawned worker 0 five times in 2 s serving nothing; now it logs the fallback and serves on epoll.
   **Spurious `EINTR` after a ring is torn down:** once a process has closed an io_uring ring, the kernel may deliver
   task_work that makes its next `epoll_wait` return `EINTR` (seen on 6.8 when one test process ran io_uring then epoll).
@@ -474,9 +473,9 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   multishot. `tests/test_event_loop.c` checks this contract on all three backends. kqueue and io_uring skip an
   interest change that matches what is already registered (a keep-alive response then costs no extra syscall or SQE:
   `flush_connection` drops write interest after every response even when it was never set); epoll still issues an
-  `epoll_ctl` for every `watch_*` / `unwatch_*` (P4, epoll half open). io_uring queues its SQEs and submits them once per
+  `epoll_ctl` for every `watch_*` / `unwatch_*` (epoll half open). io_uring queues its SQEs and submits them once per
   `event_loop_poll`, combined with the wait (`io_uring_submit_and_wait`).
-  **io_uring stale completions (C6).** Each poll's user_data is `(generation << 32) | (fd + 1)`, the generation taken from
+  **io_uring stale completions.** Each poll's user_data is `(generation << 32) | (fd + 1)`, the generation taken from
   `App.poll_regs[fd]` (`PollRegistration`: `gen`, `mask`, `armed`) and bumped on every arm or removal. A completion whose
   generation is not the fd's current armed one - the kernel's `-ECANCELED` for a removed poll, readiness a removed poll
   reported first, or anything from a previous connection on a reused fd number - is dropped. Before this, the removed
@@ -485,91 +484,91 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   fd number would inherit a stale "already armed" mask and never be polled.
   `event_loop_is_open(app)` is the only valid "is the loop up" test: `App.loop_fd` shares a union with the io_uring ring
   pointer and can read as negative while it is open (it did gate `app_stop`'s listen-socket unwatch and drain-deadline
-  timer until C6).
+  timer until the generation fix).
   `LOOP_EVENT_ERROR` (POLLERR/POLLHUP/POLLNVAL or a negative live completion) closes the connection.
-  `LOOP_EVENT_WRITE` goes to `handle_writable` (P9), not straight to `flush_connection`: it drains a pending response and then
-  serves any pipelined requests still buffered. Since P9 an `EAGAIN` mid-response also unwatches read and the keep-alive reset
+  `LOOP_EVENT_WRITE` goes to `handle_writable`, not straight to `flush_connection`: it drains a pending response and then
+  serves any pipelined requests still buffered. An `EAGAIN` mid-response also unwatches read and the keep-alive reset
   re-watches it (one extra `watch`/`unwatch` pair per response that did not fit the socket buffer in one go, none otherwise).
   **Backend speed on Linux (MEASURED 2026-09-23, Docker on an M3 Pro, kernel 6.8, one worker, `wrk -t8 -c1000`, cookbook
   `/hello`):** epoll served 3.5-3.6 M requests in 12 s, io_uring 2.8-2.9 M - io_uring is 20-25% slower as a pure readiness
   poller (one SQE and CQE per event on top of the same `recv`/`write`). io_uring is still the preferred backend on Linux
-  (C5 kept that default and added the fallback); `CEXPRESS_EVENT_LOOP=epoll` selects the faster one without a rebuild.
+  (the fallback kept that default); `CEXPRESS_EVENT_LOOP=epoll` selects the faster one without a rebuild.
 
 ## Hot-path rules (measured; do not undo)
 Per-request CPU cost of the pure path (parse, route, dispatch, response build; no sockets, one core; `make bench`, Apple M3 Pro,
 gcc-16 -O2, 22 Sep 2026): minimal GET 160 ns, browser-shaped GET (10 headers, cookies, query) 400 ns, JSON POST 195 ns, 404 170 ns
 (single-run noise is ±15-25 ns at this scale, `make bench` re-run several times); a 20-row JSON list through yyjson 700 ns.
 `bench_hotpath.c` also reports a second browser-shaped case where the handler actually calls `req_get_cookie` +
-`req_get_header` (the case P3's laziness can't help, since the handler reads them anyway): ~480 ns - still faster than the
-pre-P3 514 ns baseline, since header storage itself got cheaper independent of whether a handler reads one.
+`req_get_header` (the case lazy header/cookie parsing can't help, since the handler reads them anyway): ~480 ns - still faster than the
+earlier 514 ns baseline, since header storage itself got cheaper independent of whether a handler reads one.
 
 History, most recent first (only ratios transfer between machines; each line is the same four/five cases in the same
-order as above): 180 / 514 / 235 / 180 ns, before P3 changed `req->headers` from fixed-size copies to views into `in_buf`
-(materialized lazily by `req_get_header`) and made cookie splitting lazy (`req_get_cookie`, on its first call per request)
+order as above): 180 / 514 / 235 / 180 ns, before `req->headers` changed from fixed-size copies to views into `in_buf`
+(materialized lazily by `req_get_header`) and cookie splitting became lazy (`req_get_cookie`, on its first call per request)
 instead of eager in `parse_http_request_from_head` - **MEASURED** browser-shaped GET a further −22%, minimal GET −11%,
-JSON POST −17%, 404 −6%, roughly matching `improvements.md`'s P3 PROJECTED "further ~200 ns (browser-shaped)" (514 → 400 ns
+JSON POST −17%, 404 −6%, roughly matching the PROJECTED "further ~200 ns (browser-shaped)" (514 → 400 ns
 here is 114 ns, in the same range accounting for machine/run variance). Before that, 198 / 825 / 313 / 208 / 709 ns, before
-P2 made `bench_hotpath.c`'s `one_request` call `parse_request_head` + `request_head_is_complete` +
+`bench_hotpath.c`'s `one_request` switched to calling `parse_request_head` + `request_head_is_complete` +
 `parse_http_request_from_head` - one picohttpparser pass, matching the real `connection.c` hot path - instead of the
-separate `request_is_complete` + `parse_http_request` it called before, which cost two passes even after P2's own internal
-dedup of `parse_http_request` - **MEASURED** browser-shaped GET −38%, JSON POST −25%, matching `improvements.md`'s P2
+separate `request_is_complete` + `parse_http_request` it called before, which cost two passes even after the single-pass change's own internal
+dedup of `parse_http_request` - **MEASURED** browser-shaped GET −38%, JSON POST −25%, matching the
 PROJECTED estimate almost exactly; minimal GET and 404 move less because they carry only 1-2 headers, so there is less
-redundant tokenizing to remove. Before that, 208 / 781 / 315 / 186 / 659 ns on 21 Sep 2026, before S5 raised
-`Request.header_values`' per-slot size from 256 to 1024 (P3 later deleted this array and the cap entirely - see "Behavior
-reference, Request parsing") - that delta was noise, not attributable to S5. The earliest version of this file recorded
+redundant tokenizing to remove. Before that, 208 / 781 / 315 / 186 / 659 ns on 21 Sep 2026, before raising
+`Request.header_values`' per-slot size from 256 to 1024 (header views later deleted this array and the cap entirely - see "Behavior
+reference, Request parsing") - that delta was noise, not attributable to the change. The earliest version of this file recorded
 390 / 800 / 470 / 430 ns for the handwritten-parser engine on the same machine (no A/B rebuild of that commit was done for
 this update). What to keep:
 - No `strtok_r` / `sscanf` / `strncpy` (zero-pads to the full size) / `strcasestr` over request bytes. Scan with lengths and `memchr`.
-- No whole-struct `memset` of `Request` (9,792 bytes, `sizeof`, `make bench` - down from 43,576 bytes when P3 replaced
+- No whole-struct `memset` of `Request` (9,792 bytes, `sizeof`, `make bench` - down from 43,576 bytes when header views replaced
   `header_names`/`header_values[32][1024]` with `struct phr_header headers[32]`, 1,024 bytes of views instead of a
   34,816-byte fixed-size copy; remaining bulk is `cookie_names`/`cookie_values` (5 KB) and `query_names`/`query_values`/
-  `param_names`/`param_values` (3 KB), still fixed-size copies, deliberately out of P3's scope - see "Known gaps") or
+  `param_names`/`param_values` (3 KB), still fixed-size copies, deliberately out of scope - see "Known gaps") or
   `Response` (16 KB). `parse_http_request_from_head` and `res_init` set scalars and
   `*_count` only; arrays are read up to their count and every slot is NUL-terminated on write.
-- One `phr_parse_request` pass per request on the hot path (P2), not up to four: `handle_readable` calls `parse_request_head`
+- One `phr_parse_request` pass per request on the hot path, not up to four: `handle_readable` calls `parse_request_head`
   once and threads the result through the body-limit check, `request_head_is_complete` and `parse_http_request_from_head`.
   Don't reintroduce a second call to `request_framing` / `request_is_complete` / `parse_http_request` (the whole-buffer
   re-parsing wrappers) anywhere in `connection.c`'s per-`recv` loop - they exist for callers that only need one piece
   (tests, `fuzz_parser.c`) and each costs its own independent pass again.
-- Don't copy header names/values into `Request` (P3): `parse_http_request_from_head` stores views (`req->headers[i] =
+- Don't copy header names/values into `Request`: `parse_http_request_from_head` stores views (`req->headers[i] =
   head->headers[i]`, a struct assignment of two pointers and two `size_t`s) instead of `copy_bounded`-ing each one into
   a fixed-size slot. A request whose headers nobody reads should cost nothing beyond that assignment; don't reintroduce
   a per-header `memcpy` there. Don't call `parse_cookies` from `parse_http_request_from_head` either - `req_get_cookie`
   triggers it lazily, once, on its own first call per request.
-- Don't copy the request body (M4): `connection.c` parses with `parse_http_request_in_place`, so `req->body` is a view into
+- Don't copy the request body: `connection.c` parses with `parse_http_request_in_place`, so `req->body` is a view into
   `in_buf` (chunked decoded in place). Don't switch it back to `parse_http_request_from_head` (a full body `memcpy` into the
   arena, a second 10 MiB block for a maximum-size upload), and keep the saved-byte restore right after `dispatch`.
 - Routing is one tree walk over path segments with no allocation; `req == NULL` searches without capturing (used for the 405 `Allow` list).
-- A Patricia node's static `children` stay sorted; find/insert through `find_child` (binary search), not a linear scan (P7 - "Behavior reference, Routing" above).
+- A Patricia node's static `children` stay sorted; find/insert through `find_child` (binary search), not a linear scan ("Behavior reference, Routing" above).
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
 - Allocate per-request data from `conn->arena`, not `malloc`. Emit JSON through yyjson with `arena_yyjson_alc`.
 - No syscall on a path that changes nothing (`events_watched`; enforced on kqueue only, see Event loop).
 Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
-`make fuzz` (mutation fuzzer over parser/router/response, then T1's end-to-end "every input is answered or closed" check through the real connection code), `make check-docs`. Run sanitizers and fuzz after touching
+`make fuzz` (mutation fuzzer over parser/router/response, then an end-to-end "every input is answered or closed" check through the real connection code), `make check-docs`. Run sanitizers and fuzz after touching
 `http_parser.c`, `router.c`, `response.c` or `arena.c`. The Makefile tracks header dependencies (`-MMD`).
 
 ## Known gaps (verified, not fixed)
-- **Chunked framing overhead is not capped separately** (P8 left this out): 10 MiB of 1-byte chunks is accepted up to the raw `MAX_BODY_SIZE` wire cap. Since P8 the scan is linear (~14 ms for that worst case, MEASURED), so this is a cost bound, not an amplification.
+- **Chunked framing overhead is not capped separately**: 10 MiB of 1-byte chunks is accepted up to the raw `MAX_BODY_SIZE` wire cap. The scan is linear (~14 ms for that worst case, MEASURED), so this is a cost bound, not an amplification.
 - Path/query params over 63 chars and queries over 255 chars are truncated silently. So are individual cookie values
   over 255 chars after the `Cookie` header is split (`parse_cookies` → `cookie_values[MAX_COOKIES][256]`) - the raw
-  `Cookie:` header line itself has no length limit any more (P3: it's a view like every other header, materialized in
+  `Cookie:` header line itself has no length limit any more (it's a view like every other header, materialized in
   full by `req_get_header`/`req_get_cookie`), but a single very long session-token cookie among several shorter ones,
   once split out of that line, can still be truncated to its own 255-byte slot. Request header values otherwise are
-  not truncated at all any more (P3: views, not fixed-size copies) - see "Behavior reference, Request parsing". Query
-  and path-parameter storage stayed fixed-size copies deliberately, out of P3's scope: `req->query_names`/`query_values`
-  is a small, session-eager array (S6 requires validating every value for an embedded NUL at parse time regardless of
+  not truncated at all any more (views, not fixed-size copies) - see "Behavior reference, Request parsing". Query
+  and path-parameter storage stayed fixed-size copies deliberately, out of scope: `req->query_names`/`query_values`
+  is a small, session-eager array (embedded-NUL rejection requires validating every value for an embedded NUL at parse time regardless of
   whether a handler ever reads it, so there is no CPU to save by deferring the copy, only Request's overall size - and
   query/param storage together are under 3 KB, a small fraction of what headers used to cost).
-- **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model). For large bodies use `res_stream` (M5), which never touches the arena past the head.
-- **`res_write` silently truncates at its cap** (MEASURED 2026-09-23 while measuring M5): `append_to_out_buf` refuses anything past `MAX_BODY_SIZE + 8 KiB` of *wire* bytes, chunk framing included, and `res_write` ignores the failure. A CSV of 450,000 short lines (8,426,423 body bytes, about 11 MB framed) went out as 7,947,523 bytes with status 200 and no error anywhere. The handler cannot tell. `res_stream` has no such cap.
-- **A parked `res_stream` producer whose client vanished silently is only noticed on its next write** (M5). A FIN/RST is caught at once (`watch_stream_peer`), but once a pipelined request has arrived behind the stream, read interest is dropped and only a write can fail. A producer that parks indefinitely without ever writing holds its connection and ctx until shutdown; long-lived streams should write a heartbeat (an SSE comment line, `:\n\n`) every so often - the idle sweep calls them about once a second, so they can check the time.
+- **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model). For large bodies use `res_stream`, which never touches the arena past the head.
+- **`res_write` silently truncates at its cap** (MEASURED 2026-09-23 while measuring `res_stream`): `append_to_out_buf` refuses anything past `MAX_BODY_SIZE + 8 KiB` of *wire* bytes, chunk framing included, and `res_write` ignores the failure. A CSV of 450,000 short lines (8,426,423 body bytes, about 11 MB framed) went out as 7,947,523 bytes with status 200 and no error anywhere. The handler cannot tell. `res_stream` has no such cap.
+- **A parked `res_stream` producer whose client vanished silently is only noticed on its next write**. A FIN/RST is caught at once (`watch_stream_peer`), but once a pipelined request has arrived behind the stream, read interest is dropped and only a write can fail. A producer that parks indefinitely without ever writing holds its connection and ctx until shutdown; long-lived streams should write a heartbeat (an SSE comment line, `:\n\n`) every so often - the idle sweep calls them about once a second, so they can check the time.
 - **`app_wake_streams` is O(connection table) and wakes every paused stream on the worker**, not a channel's subscribers; producers with nothing new just park again. It is per process: in a cluster, a publish reaches only the worker that handled it.
 - The io_uring backend is used only as a readiness poller; sockets are still read and written with `recv` / `write`.
 - **wrk against Linux in Docker reports "timeout" counts close to the connection count** (for example 900-1650 at
   `-c1000`), on epoll and io_uring alike, with max latency in milliseconds and none on macOS/kqueue. Same size either
-  backend, so not an engine-backend defect; not explained (see `improvements.md` T6).
+  backend, so not an engine-backend defect; not explained (see `improvements.md`).
 - No HTTP/2, compression, `Range`, or WebSocket. `Expect` values other than `100-continue` are ignored (no `417`).
-- **`res_send_file` and large (uncached) static files are still not optimized** (`improvements.md`, P1's other sub-items,
+- **`res_send_file` and large (uncached) static files are still not optimized** (`improvements.md`, the static-file item's other sub-items,
   not addressed by the static-file cache above): the response head and the file body still go out as separate `write`
   calls (no single buffer / `writev`), and large files are read with plain `read`/`write` in `STREAM_CHUNK_SIZE` pieces
   rather than `sendfile(2)`. No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.
