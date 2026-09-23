@@ -314,11 +314,11 @@ static int ensure_connection_capacity(App *app, int fd) {
  */
 static void reject_overloaded_connection(int client_fd) {
     const char *body = status_text(503);
-    char head[160];
+    char head[192];
     int head_len = snprintf(head, sizeof(head),
-                             "HTTP/1.1 503 %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
+                             "HTTP/1.1 503 %s\r\nDate: %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
                              "Connection: close\r\n\r\n",
-                             body, strlen(body));
+                             body, http_date_for(time(NULL)), strlen(body));
     /* client_fd is already non-blocking: accept_client, or a master's accept_client before an
      * SCM_RIGHTS handoff (P10 - this used to cost its own two fcntl calls). */
     if (head_len > 0 && (size_t)head_len < sizeof(head)) {

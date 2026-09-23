@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "response.h"
 #include "http_parser.h"
 
@@ -55,7 +56,8 @@ void res_status(Response *res, int status) {
 }
 
 void res_set_header(Response *res, const char *name, const char *value) {
-    if (strcasecmp(name, "Content-Length") == 0 || strcasecmp(name, "Connection") == 0) {
+    if (strcasecmp(name, "Content-Length") == 0 || strcasecmp(name, "Connection") == 0 ||
+        strcasecmp(name, "Date") == 0) {
         fprintf(stderr, "res_set_header: \"%s\" is managed by the response layer and cannot be overridden\n", name);
         return;
     }
@@ -120,12 +122,27 @@ static int put_uint(char *buf, const size_t cap, size_t *off, size_t value) {
     return put_bytes(buf, cap, off, digits + i, sizeof(digits) - i);
 }
 
+/* C3: RFC 9110 6.4.1 / 8.6: a 1xx, 204 or 304 response never has content, and 1xx/204 must not carry
+ * Content-Length (nor Transfer-Encoding). Such a response ends at its head, so every sending path must
+ * also drop body bytes - a body sent without framing would be read as the start of the next response. */
+static int status_has_no_body(const int status) {
+    return status < 200 || status == 204 || status == 304;
+}
+
+/* True when no body bytes may follow the head: HEAD (framing headers still describe the GET body) or a
+ * bodiless status (no framing headers at all). */
+static int body_suppressed(const Response *res) {
+    return res->is_head_request || status_has_no_body(res->status);
+}
+
 /*
- * Writes "HTTP/1.1 <status> <reason>\r\nContent-Type: ..\r\n" + framing header
+ * Writes "HTTP/1.1 <status> <reason>\r\nDate: ..\r\nContent-Type: ..\r\n" + framing header
  * (Content-Length, or Transfer-Encoding: chunked when body_len == CHUNKED_BODY)
  * + "Connection: ..\r\n" + custom headers + Set-Cookie lines + (Trailer: names)
  * + blank line into buf. Returns the head length, or 0 if it does not fit.
  * A custom Content-Type (res_set_header) replaces `content_type` and is emitted once.
+ * C3: Date comes from http_date_for's per-second cache (a 29-byte memcpy per response). A 1xx/204/304
+ * gets no framing headers, no Trailer, and no default Content-Type (an explicit one is kept).
  */
 #define CHUNKED_BODY ((size_t)-1)
 
@@ -141,9 +158,16 @@ static size_t build_response_head(const Response *res, const char *content_type,
     bad |= put_uint(buf, cap, &off, (size_t)res->status);
     bad |= put_str(buf, cap, &off, " ");
     bad |= put_str(buf, cap, &off, status_text(res->status));
-    bad |= put_str(buf, cap, &off, "\r\nContent-Type: ");
-    bad |= put_str(buf, cap, &off, content_type);
-    if (body_len == CHUNKED_BODY) {
+    bad |= put_str(buf, cap, &off, "\r\nDate: ");
+    bad |= put_bytes(buf, cap, &off, http_date_for(time(NULL)), HTTP_DATE_LEN);
+    const int no_body = status_has_no_body(res->status);
+    if (!no_body || custom_content_type != NULL) {
+        bad |= put_str(buf, cap, &off, "\r\nContent-Type: ");
+        bad |= put_str(buf, cap, &off, content_type);
+    }
+    if (no_body) {
+        /* no framing: the message ends at the blank line */
+    } else if (body_len == CHUNKED_BODY) {
         bad |= put_str(buf, cap, &off, "\r\nTransfer-Encoding: chunked");
     } else {
         bad |= put_str(buf, cap, &off, "\r\nContent-Length: ");
@@ -154,7 +178,7 @@ static size_t build_response_head(const Response *res, const char *content_type,
     for (int i = 0; i < res->header_count && !bad; i++) {
         const char *name = res->headers[i].name;
         if (strcasecmp(name, "Content-Type") == 0 ||
-            (body_len == CHUNKED_BODY && (strcasecmp(name, "Transfer-Encoding") == 0 ||
+            ((body_len == CHUNKED_BODY || no_body) && (strcasecmp(name, "Transfer-Encoding") == 0 ||
                                           strcasecmp(name, "Content-Length") == 0 ||
                                           strcasecmp(name, "Connection") == 0))) {
             continue;
@@ -172,7 +196,7 @@ static size_t build_response_head(const Response *res, const char *content_type,
         bad |= put_str(buf, cap, &off, "\r\n");
     }
 
-    if (body_len == CHUNKED_BODY && res->trailer_count > 0 && !bad) {
+    if (body_len == CHUNKED_BODY && !no_body && res->trailer_count > 0 && !bad) {
         bad |= put_str(buf, cap, &off, "Trailer: ");
         for (int i = 0; i < res->trailer_count && !bad; i++) {
             bad |= put_str(buf, cap, &off, res->trailers[i].name);
@@ -211,8 +235,9 @@ static void send_with_content_type(Response *res, const char *content_type, cons
     }
 
     /* Content-Length is always the full body's: a HEAD response reports what GET would
-     * (RFC 7231 4.3.2) but sends no body bytes. body == NULL means a file stream (head only). */
-    const size_t sent_body_len = (body != NULL && !res->is_head_request) ? body_len : 0;
+     * (RFC 7231 4.3.2) but sends no body bytes. body == NULL means a file stream (head only).
+     * A 1xx/204/304 sends neither (C3). */
+    const size_t sent_body_len = (body != NULL && !body_suppressed(res)) ? body_len : 0;
 
     /* A second res_send/res_json in the same request replaces the first response (last wins);
      * the earlier buffer is simply left in the arena to be freed at request end. */
@@ -419,7 +444,7 @@ void res_write(Response *res, const char *data, size_t len) {
             return;
         }
     }
-    if (res->is_head_request) {
+    if (body_suppressed(res)) {
         return;
     }
     if (len == 0 && data == NULL) {
@@ -488,7 +513,7 @@ void res_end(Response *res) {
         }
     }
     res->stream_ended = 1;
-    if (res->is_head_request) {
+    if (body_suppressed(res)) {
         return;
     }
     if (append_to_out_buf(res->conn, "0\r\n", 3) != 0) {
@@ -531,7 +556,7 @@ int res_send_file(Response *res, const char *content_type, const char *filepath)
     }
     res->headers_sent = 1;
 
-    if (res->is_head_request || st.st_size == 0) {
+    if (body_suppressed(res) || st.st_size == 0) {
         close(fd);
         res->conn->file_fd = -1;
         res->conn->file_remaining = 0;
@@ -569,7 +594,7 @@ int res_stream(Response *res, StreamProducer producer, void *ctx, StreamCtxFree 
         return -1;
     }
     res->stream_ended = 1; /* res_write / res_end are no-ops from here on: the producer owns the body */
-    if (res->is_head_request) {
+    if (body_suppressed(res)) {
         if (ctx_free != NULL) {
             ctx_free(ctx);
         }

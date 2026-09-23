@@ -570,7 +570,27 @@ static void test_head_request_through_engine(void) {
     teardown(&app, fds);
 }
 
+/* C3: a producer stream on a bodiless status (here 204) never runs: head only, ctx freed at once. */
+static void test_res_stream_bodiless_status_frees_ctx_at_once(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup(&app, fds, &conn);
+
+    Response res;
+    res_init(&res, conn);
+    res_status(&res, 204);
+    CountingCtx *ctx = calloc(1, sizeof(*ctx));
+    assert(res_stream(&res, counting_producer, ctx, free_counting_ctx) == 0);
+    assert(ctx_frees == 1 && conn->stream_fn == NULL);
+    assert(strstr(conn->out_buf, "Transfer-Encoding") == NULL);
+    assert(strstr(conn->out_buf, "\r\n\r\n")[4] == '\0'); /* nothing after the head */
+    conn->out_buf = NULL;
+    teardown(&app, fds);
+}
+
 int main(void) {
+    test_res_stream_bodiless_status_frees_ctx_at_once();
     test_stream_write_framing_and_bounds();
     test_stream_write_full_buffer_writes_nothing();
     test_stream_write_max_fits_an_empty_turn();

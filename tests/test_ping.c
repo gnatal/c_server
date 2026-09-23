@@ -47,8 +47,11 @@ int main(void) {
     app_get(&app, "/ping", handler_ping);
 
     char *resp = fetch(&app, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
-    assert(strcmp(resp,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong") == 0);
+    /* C3: a Date line (fixed width) sits between the status line and Content-Type. */
+    const char *date = resp + strlen("HTTP/1.1 200 OK\r\n");
+    assert(strncmp(resp, "HTTP/1.1 200 OK\r\nDate: ", strlen("HTTP/1.1 200 OK\r\nDate: ")) == 0);
+    assert(strcmp(date + strlen("Date: ") + HTTP_DATE_LEN,
+        "\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong") == 0);
     free(resp);
 
     /* Connection: close is honored (the churn benchmark relies on the server closing after the reply). */

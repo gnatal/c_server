@@ -835,3 +835,63 @@ const char *req_get_query(const Request *req, const char *name) {
     }
     return NULL;
 }
+
+/* Days since 1970-01-01 -> proleptic Gregorian y/m/d (Howard Hinnant's civil_from_days, era-based, exact). */
+static void civil_from_days(long long days, int *year, int *month, int *day) {
+    days += 719468;
+    const long long era = days / 146097;               /* days >= 0 here: the caller clamps t to >= 0 */
+    const long long doe = days - era * 146097;          /* [0, 146096] */
+    const long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const long long mp = (5 * doy + 2) / 153;
+    *day = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *month = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *year = (int)(yoe + era * 400 + (*month <= 2));
+}
+
+static void put_2digits(char *out, int v) {
+    out[0] = (char)('0' + v / 10);
+    out[1] = (char)('0' + v % 10);
+}
+
+void format_http_date(time_t t, char out[HTTP_DATE_LEN + 1]) {
+    static const char weekdays[7][4] = { "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" }; /* 1970-01-01 was a Thursday */
+    static const char months[12][4] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const long long secs = t < 0 ? 0 : (long long)t;
+    const long long days = secs / 86400;
+    const int sod = (int)(secs % 86400);
+    int year, month, day;
+    civil_from_days(days, &year, &month, &day);
+    if (year > 9999) {
+        year = 9999; /* the fixed width has four year digits */
+    }
+
+    memcpy(out, weekdays[days % 7], 3);
+    out[3] = ',';
+    out[4] = ' ';
+    put_2digits(out + 5, day);
+    out[7] = ' ';
+    memcpy(out + 8, months[month - 1], 3);
+    out[11] = ' ';
+    put_2digits(out + 12, year / 100);
+    put_2digits(out + 14, year % 100);
+    out[16] = ' ';
+    put_2digits(out + 17, sod / 3600);
+    out[19] = ':';
+    put_2digits(out + 20, sod / 60 % 60);
+    out[22] = ':';
+    put_2digits(out + 23, sod % 60);
+    memcpy(out + 25, " GMT", 4);
+    out[HTTP_DATE_LEN] = '\0';
+}
+
+const char *http_date_for(const time_t now) {
+    static char cached[HTTP_DATE_LEN + 1];
+    static time_t cached_second = (time_t)-1;
+    if (now != cached_second) {
+        format_http_date(now, cached);
+        cached_second = now;
+    }
+    return cached;
+}

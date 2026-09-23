@@ -2809,3 +2809,70 @@ debugging. Its name is never read at match time.
   routes have no parameters, so they only pay for the `has_params` check.
 
 **Status:** Fixed.
+
+---
+
+## C3 · No `Date` header; a 204 carries `Content-Length`
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+Two changes to the response head, both in the single head builder (`build_response_head`), so every
+sending path gets them.
+
+- **`Date` header.**
+  - `lib/http_parser.c/h` has two new functions, next to `status_text`.
+  - `format_http_date(t, out)` is pure. It writes an IMF-fixdate using a hand-rolled days-to-civil-date
+    conversion, so it has no `strftime` locale dependency and does not need `gmtime_r`'s POSIX feature
+    macro under `-std=c11`.
+  - `http_date_for(now)` is a one-entry, per-process cache. It reformats only when the second changes.
+    That is safe because each worker process is single-threaded.
+  - `build_response_head` puts `Date:` right after the status line. The cost per response is a 29-byte
+    copy plus `time(NULL)` (vDSO on Linux, no syscall on macOS).
+  - The hand-built overload 503 in `connection.c` also gets a `Date`.
+  - `100 Continue` gets no `Date`, which is optional for 1xx.
+  - `res_set_header("Date", …)` is now refused and logged, like `Content-Length` and `Connection`.
+    Without this, a response could carry two `Date` lines.
+- **Bodiless statuses (1xx, 204, 304).**
+  - These heads no longer carry `Content-Length`, `Transfer-Encoding` or `Trailer`, or the default
+    `Content-Type`. An explicit `Content-Type` set by the handler is kept.
+  - A new `body_suppressed(res)` (HEAD, or a bodiless status) replaces the `is_head_request` checks in
+    `send_with_content_type`, `res_write`, `res_end`, `res_send_file` and `res_stream`. No body bytes,
+    chunks or terminating chunk are written, no file fd is kept, and a producer's ctx is freed at once.
+  - This is required, not optional: once the framing headers are dropped, any body bytes left on a
+    keep-alive connection would be read as the next response. Before this change, `res_status(res, 204);
+    res_send(res, "x")` sent `Content-Length: 1` and the byte.
+- Not done: `X-Content-Type-Options: nosniff` on static responses. The item lists it as optional, and it
+  is a separate policy decision.
+
+**Tests and results.**
+
+- `test_http_parser.c`:
+  - `test_format_http_date` checks against Python `email.utils.formatdate(usegmt=True)` values: the epoch,
+    RFC 9110's `Sun, 06 Nov 1994 08:49:37 GMT`, 2000-02-29 (a /400 leap year), 2100-01-01 (not a leap
+    year), today, 9999-12-31, and a pre-epoch value clamped to the epoch.
+  - `test_http_date_for_caches_per_second` checks that the same buffer is returned and is reformatted on
+    a new second.
+- `test_response.c`:
+  - A `without_date` helper asserts the `Date` line's position and shape, then removes it. The existing
+    exact-byte tests keep their expected strings.
+  - `test_date_header_present_and_reserved`.
+  - `test_bodiless_statuses_send_head_only`: 204, 304 and 103 through `res_send` (exact head bytes, the
+    body dropped), an explicit `Content-Type` on a 304, `res_write`/`res_end` with a trailer on a 204
+    (no chunks and no `Trailer`), and `res_send_file` on a 204 (no fd kept).
+- `test_stream.c`: `test_res_stream_bodiless_status_frees_ctx_at_once`.
+- `test_cookbook.c`: recipe 11's `DELETE` 204 used to assert `Content-Length: 0`. It now asserts that
+  there is no `Content-Length`, no `Content-Type` and an empty body.
+- `test_connection.c` checks that the overload 503 carries `Date`. `test_ping.c` checks the fixed-width
+  `Date` line in its exact bytes.
+- `make test` (16 suites), `make SANITIZE=1 BUILD_DIR=build-asan test`, `make fuzz` (1,000,000
+  iterations), `make test_epoll` and `make check-docs` (139 functions) all pass.
+- `make bench`, before vs. after (two runs): minimal GET 214 → 202/191 ns, browser GET 621 → 612/608 ns,
+  POST JSON 204 → 210/209 ns, 404 206 → 214/210 ns. All within run-to-run noise.
+- **Live, curl against the rebuilt demo:** `GET /api/todos`, `HEAD /` and a 404 all show
+  `Date: Wed, 23 Sep 2026 18:01:21 GMT` (the local clock was 15:01 -03). Two requests reused one
+  connection. The demo's own Makefile does not relink when `libcexpress.a` changes: a plain `make demo`
+  kept the old binary, so the demo needed `make -B -C examples/todo_sqlite`.
+
+**Status:** Fixed. Not done: `nosniff`.

@@ -50,7 +50,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | M6 | ~~`Route` embeds a `PATH_MAX` buffer~~ | Memory | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (`sizeof(Route)` 1,368 → 352 B on macOS; 4,440 → 352 B on Linux) |
 | C1 | ~~`Expect: 100-continue` is ignored~~ | Correctness | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (2 MiB curl upload 1.007 s → 1–2 ms, Content-Length and chunked) |
 | C2 | ~~Path parameter names are stored per tree position~~ | Correctness | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED |
-| C3 | No `Date` header; 204 carries `Content-Length` | Correctness | | S | RFC compliance | MEASURED |
+| C3 | ~~No `Date` header; 204 carries `Content-Length`~~ | Correctness | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED |
 | C4 | ~~macOS `SO_REUSEPORT` does not balance workers~~ | Reliability | | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (imbalance, and the fix) |
 | C5 | io_uring failure kills the server (no epoll fallback) | Reliability | | M | Runs under restrictive seccomp | Code reading |
 | C6 | ~~io_uring backend closes every keep-alive connection after its first request~~ | Correctness / Reliability | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (real Linux, via Docker: 1/20 → 1000/1000 requests per connection) |
@@ -360,7 +360,10 @@ record.
 **Fix.** After a successful match, fill `param_names` from the matched `Route`'s own pattern (walk `route->path` for `:` segments) and take only values from the walk, or create separate param nodes per name. Add tests for both cases plus "literal beats parameter".
 **Probable gain.** Correctness; a few nanoseconds per parameterized match.
 
-### C3 · No `Date` header; a 204 carries `Content-Length`
+### C3 · ~~No `Date` header; a 204 carries `Content-Length`~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** Responses have `Content-Type`, `Content-Length` and `Connection` only. RFC 9110 §6.6.1 requires origin servers with a clock to send `Date`. `build_response_head` (`response.c:132-185`) also writes `Content-Length: 0` and `Content-Type: text/plain` on a `204`, which RFC 9110 §8.6 forbids (no `Content-Length` in a 204 or 1xx).
 **Measured.** `GET /ping` and `DELETE` (204) responses show exactly those headers.
 **Fix.** Add a cached, per-second-refreshed `Date` string (the loop already calls `time(NULL)`), and skip the framing headers for 1xx/204/304. Optionally add `X-Content-Type-Options: nosniff` for static responses.

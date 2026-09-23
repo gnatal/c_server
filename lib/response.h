@@ -20,11 +20,13 @@
  * The engine calls this before every dispatch; unit tests may call it instead of memset. */
 void res_init(Response *res, Connection *conn);
 
-/* Sets the status code (default 200). */
+/* Sets the status code (default 200). C3: a 1xx, 204 or 304 status makes the response bodiless - every
+ * sending call then emits the head only (no Content-Length / Transfer-Encoding, no default Content-Type,
+ * no body bytes, no trailers), whatever body it was given. */
 void res_status(Response *res, int status);
 
 /*
- * Sets a response header. Same name (case-insensitive) overwrites. Content-Length and Connection are
+ * Sets a response header. Same name (case-insensitive) overwrites. Content-Length, Connection and Date are
  * computed by the engine and rejected here (logged). A custom Content-Type replaces the default one.
  * Limits: MAX_RESPONSE_HEADERS; name truncated to 63 chars, value to 255; excess is dropped (logged).
  * Safe with request data: an empty name, or any control character (CR, LF, NUL ...) in name or value,

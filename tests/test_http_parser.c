@@ -874,7 +874,42 @@ static void test_request_head_expects_continue(void) {
     assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n") == 0);
 }
 
+/* C3: IMF-fixdate formatting, against reference values from Python's email.utils.formatdate(usegmt=True). */
+static void test_format_http_date(void) {
+    char out[HTTP_DATE_LEN + 1];
+    memset(out, 'x', sizeof(out));
+    format_http_date(0, out);
+    assert(strcmp(out, "Thu, 01 Jan 1970 00:00:00 GMT") == 0);
+    assert(strlen(out) == HTTP_DATE_LEN);
+    format_http_date(784111777, out);
+    assert(strcmp(out, "Sun, 06 Nov 1994 08:49:37 GMT") == 0); /* RFC 9110's own example */
+    format_http_date(951782400, out);
+    assert(strcmp(out, "Tue, 29 Feb 2000 00:00:00 GMT") == 0); /* leap day of a /400 year */
+    format_http_date(951868799, out);
+    assert(strcmp(out, "Tue, 29 Feb 2000 23:59:59 GMT") == 0);
+    format_http_date((time_t)4102444800LL, out);
+    assert(strcmp(out, "Fri, 01 Jan 2100 00:00:00 GMT") == 0); /* 2100 is not a leap year */
+    format_http_date(1790170496, out);
+    assert(strcmp(out, "Wed, 23 Sep 2026 13:34:56 GMT") == 0);
+    format_http_date((time_t)253402300799LL, out);
+    assert(strcmp(out, "Fri, 31 Dec 9999 23:59:59 GMT") == 0); /* last four-digit-year second */
+    format_http_date(-5, out);
+    assert(strcmp(out, "Thu, 01 Jan 1970 00:00:00 GMT") == 0); /* pre-epoch clamps */
+}
+
+/* C3: the cache hands back one stable buffer, reformatted only when the second changes. */
+static void test_http_date_for_caches_per_second(void) {
+    const char *a = http_date_for(784111777);
+    assert(strcmp(a, "Sun, 06 Nov 1994 08:49:37 GMT") == 0);
+    const char *b = http_date_for(784111777);
+    assert(a == b && strcmp(b, "Sun, 06 Nov 1994 08:49:37 GMT") == 0);
+    const char *c = http_date_for(784111778);
+    assert(c == a && strcmp(c, "Sun, 06 Nov 1994 08:49:38 GMT") == 0);
+}
+
 int main(void) {
+    test_format_http_date();
+    test_http_date_for_caches_per_second();
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_extract_content_length();
     test_request_is_complete();

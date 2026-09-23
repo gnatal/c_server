@@ -7,6 +7,7 @@
  */
 
 #include <stddef.h>
+#include <time.h>
 #include "app_types.h"
 
 /*
@@ -208,5 +209,17 @@ int url_decode(const char *src, char *dst, size_t dst_size, int decode_plus);
 
 /* Reason phrase for the 28 statuses the engine knows; "Unknown" otherwise. */
 const char *status_text(int status);
+
+/* C3: an IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT", RFC 9110 5.6.7) is exactly HTTP_DATE_LEN chars. */
+#define HTTP_DATE_LEN 29
+
+/* Writes `t` (seconds since the epoch, UTC) as an IMF-fixdate into out (HTTP_DATE_LEN + 1 bytes, NUL-terminated).
+ * Pure, locale-independent (no strftime / gmtime). Times before 1970 are clamped to the epoch. */
+void format_http_date(time_t t, char out[HTTP_DATE_LEN + 1]);
+
+/* C3: the Date header value for second `now`, from a per-process one-entry cache refreshed only when the second
+ * changes (so formatting costs once a second, not per response). The pointer stays valid; its text changes on the
+ * next call with a different second. Not thread-safe - the engine is single-threaded per worker process. */
+const char *http_date_for(time_t now);
 
 #endif /* HTTP_PARSER_H */

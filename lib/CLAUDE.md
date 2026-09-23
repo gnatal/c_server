@@ -310,7 +310,15 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   `res_write` (and was truncated, see Known gaps), and stayed at 1.6 MB through `res_stream`. A 63 MB export also
   stayed at 1.6 MB.
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
-  (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length` and `Connection` are engine-owned.
+  (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length`, `Connection` and `Date` are engine-owned.
+- **Date and bodiless statuses (C3).** Every head built by `build_response_head` (and the hand-built overload 503 in
+  `connection.c`) carries `Date:` right after the status line, from `http_date_for(time(NULL))` (`http_parser.c`): one
+  static per-process buffer reformatted only when the second changes (`format_http_date`, pure, locale-free, no
+  `gmtime`). Safe only because each worker process is single-threaded. `100 Continue` has no `Date` (optional for 1xx).
+  A 1xx / 204 / 304 status is bodiless on every sending path (`body_suppressed` in `response.c`): no `Content-Length` /
+  `Transfer-Encoding` / `Trailer`, no default `Content-Type` (an explicit one is kept), no body bytes, no chunks, no
+  file fd kept, and a `res_stream` producer's ctx is freed at once as for HEAD. Dropping the bytes is required, not
+  cosmetic: without framing headers, any body byte would be read by a keep-alive client as the next response.
   `CookieOptions` zero value = session cookie; `max_age > 0` seconds, `< 0` expire now.
 - **Accept path (P10).** A new connection costs one syscall: `accept_client` is `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` on
   Linux and plain `accept` on BSD/macOS, with no per-connection `fcntl`/`setsockopt`. It depends on inheritance from the

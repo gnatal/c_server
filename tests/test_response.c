@@ -7,6 +7,7 @@
 #include "response.h"
 
 #include "arena.h"
+#include "http_parser.h"
 
 static Connection *make_conn(void) {
     Connection *conn = calloc(1, sizeof(Connection));
@@ -18,6 +19,26 @@ static Connection *make_conn(void) {
     conn->keep_alive = 1;
     conn->file_fd = -1;
     return conn;
+}
+
+/* C3: every head carries "Date: <IMF-fixdate>\r\n" right after the status line. Asserts that, then returns a
+ * malloc'd copy of the response without that line (caller frees), so exact-byte checks stay clock-independent. */
+static char *without_date(const char *resp, size_t len, size_t *out_len) {
+    const char *status_end = memchr(resp, '\n', len);
+    assert(status_end != NULL);
+    const char *date = status_end + 1;
+    const size_t date_line = strlen("Date: ") + HTTP_DATE_LEN + 2;
+    assert((size_t)(resp + len - date) >= date_line);
+    assert(memcmp(date, "Date: ", 6) == 0);
+    assert(memcmp(date + 6 + HTTP_DATE_LEN - 4, " GMT\r\n", 6) == 0);
+    const size_t head_part = (size_t)(date - resp);
+    char *out = malloc(len - date_line + 1);
+    assert(out != NULL);
+    memcpy(out, resp, head_part);
+    memcpy(out + head_part, date + date_line, len - head_part - date_line);
+    *out_len = len - date_line;
+    out[*out_len] = '\0';
+    return out;
 }
 
 static void free_conn(Connection *conn) {
@@ -355,9 +376,11 @@ static void test_res_init_needs_no_zeroed_struct(void) {
 
     res_send(&res, "hi");
     assert(conn->out_buf != NULL);
-    assert(memcmp(conn->out_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi",
-                  conn->out_len) == 0);
-    assert(conn->out_len == strlen("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi"));
+    size_t len;
+    char *resp = without_date(conn->out_buf, conn->out_len, &len);
+    assert(strcmp(resp, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi") == 0);
+    assert(len == strlen(resp));
+    free(resp);
     free_conn(conn);
 }
 
@@ -374,8 +397,11 @@ static void test_exact_head_bytes(void) {
     const char *expected =
         "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: keep-alive\r\n"
         "X-A: 1\r\nSet-Cookie: s=v; Path=/\r\n\r\n{}";
-    assert(conn->out_len == strlen(expected));
-    assert(memcmp(conn->out_buf, expected, conn->out_len) == 0);
+    size_t len;
+    char *resp = without_date(conn->out_buf, conn->out_len, &len);
+    assert(len == strlen(expected));
+    assert(memcmp(resp, expected, len) == 0);
+    free(resp);
     free_conn(conn);
 
     /* Content-Length of a big body is formatted in full (no truncation in the integer writer). */
@@ -386,7 +412,9 @@ static void test_exact_head_bytes(void) {
     big[1234567] = '\0';
     res_send(&res, big);
     const char *big_head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 1234567\r\n";
-    assert(memcmp(conn->out_buf, big_head, strlen(big_head)) == 0);
+    resp = without_date(conn->out_buf, conn->out_len, &len);
+    assert(memcmp(resp, big_head, strlen(big_head)) == 0);
+    free(resp);
     free(big);
     free_conn(conn);
 }
@@ -400,7 +428,8 @@ static void test_second_send_replaces_first_without_leaking(void) {
     res_send(&res, "first");
     res_status(&res, 500);
     res_send(&res, "second");
-    assert(conn->out_len == strlen("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nsecond"));
+    assert(conn->out_len == strlen("HTTP/1.1 500 Internal Server Error\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\n"
+                                   "Content-Type: text/plain\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nsecond"));
     assert(memcmp(conn->out_buf + conn->out_len - 6, "second", 6) == 0);
     free_conn(conn);
 }
@@ -527,7 +556,88 @@ static void test_trailer_injection_is_refused(void) {
     free_conn(conn);
 }
 
+/* C3: every head carries a Date line, and the engine owns it (res_set_header refuses a custom one). */
+static void test_date_header_present_and_reserved(void) {
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    res_set_header(&res, "date", "Mon, 01 Jan 2001 00:00:00 GMT");
+    assert(res.header_count == 0);
+    res_send(&res, "x");
+    size_t len;
+    char *resp = without_date(conn->out_buf, conn->out_len, &len); /* asserts the Date line's shape */
+    assert(strstr(resp, "Date") == NULL);                           /* exactly one Date line */
+    free(resp);
+    free_conn(conn);
+}
+
+/* C3: 1xx/204/304 are bodiless - no Content-Length / Transfer-Encoding / default Content-Type, no body
+ * bytes - on every sending path, so a keep-alive client never reads stray bytes as the next response. */
+static void test_bodiless_statuses_send_head_only(void) {
+    const int statuses[] = { 204, 304, 103 };
+    for (size_t i = 0; i < sizeof(statuses) / sizeof(statuses[0]); i++) {
+        Connection *conn = make_conn();
+        Response res;
+        res_init(&res, conn);
+        res_status(&res, statuses[i]);
+        res_set_header(&res, "ETag", "\"v1\"");
+        res_send(&res, "must not be sent");
+        size_t len;
+        char *resp = without_date(conn->out_buf, conn->out_len, &len);
+        char expected[160];
+        snprintf(expected, sizeof(expected), "HTTP/1.1 %d %s\r\nConnection: keep-alive\r\nETag: \"v1\"\r\n\r\n",
+                 statuses[i], status_text(statuses[i]));
+        assert(strcmp(resp, expected) == 0);
+        free(resp);
+        free_conn(conn);
+    }
+
+    /* An explicit Content-Type is the handler's choice and is kept (RFC 9110 allows it on a 304). */
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    res_status(&res, 304);
+    res_set_header(&res, "Content-Type", "text/html");
+    res_send(&res, "<p>");
+    size_t len;
+    char *resp = without_date(conn->out_buf, conn->out_len, &len);
+    assert(strcmp(resp, "HTTP/1.1 304 Not Modified\r\nContent-Type: text/html\r\nConnection: keep-alive\r\n\r\n") == 0);
+    free(resp);
+    free_conn(conn);
+
+    /* Chunked path: no Transfer-Encoding, no chunk bytes, no terminating chunk, no Trailer. */
+    conn = make_conn();
+    res_init(&res, conn);
+    res_status(&res, 204);
+    res_set_trailer(&res, "X-Sum", "1");
+    res_write(&res, "abc", 3);
+    res_end(&res);
+    resp = without_date(conn->out_buf, conn->out_len, &len);
+    assert(strcmp(resp, "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n") == 0);
+    free(resp);
+    free_conn(conn);
+
+    /* File path: head only, no fd left to stream. */
+    conn = make_conn();
+    res_init(&res, conn);
+    res_status(&res, 204);
+    char path[] = "/tmp/cexpress_c3_XXXXXX";
+    const int tmp = mkstemp(path);
+    assert(tmp >= 0);
+    assert(write(tmp, "data", 4) == 4);
+    close(tmp);
+    assert(res_send_file(&res, "text/plain", path) == 0);
+    assert(conn->file_fd == -1 && conn->file_remaining == 0);
+    resp = without_date(conn->out_buf, conn->out_len, &len);
+    assert(strcmp(resp, "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n") == 0);
+    free(resp);
+    unlink(path);
+    free_conn(conn);
+}
+
 int main(void) {
+    test_date_header_present_and_reserved();
+    test_bodiless_statuses_send_head_only();
     test_custom_header_is_sent();
     test_repeated_set_header_overwrites_case_insensitively();
     test_reserved_headers_are_rejected();

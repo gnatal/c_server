@@ -1775,6 +1775,7 @@ static void test_accept_connections_enforces_max_connections(void) {
     assert(n > 0);
     assert(strstr(resp, "HTTP/1.1 503 Service Unavailable") != NULL);
     assert(strstr(resp, "Connection: close") != NULL);
+    assert(strstr(resp, "\r\nDate: ") != NULL && strstr(resp, " GMT\r\n") != NULL); /* C3 */
 
     for (int i = 0; i < 3; i++) {
         close(clients[i]);

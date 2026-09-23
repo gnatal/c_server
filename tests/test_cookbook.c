@@ -231,7 +231,10 @@ static void test_redirect_status_and_stream_recipes(App *app) {
 
     resp = get(app, "DELETE /things/5 HTTP/1.1\r\n\r\n");
     assert(starts_with(resp, "HTTP/1.1 204 No Content"));
-    assert(strstr(resp, "Content-Length: 0\r\n") != NULL);
+    /* C3: a 204 carries no framing headers (RFC 9110 8.6) and no default Content-Type. */
+    assert(strstr(resp, "Content-Length") == NULL);
+    assert(strstr(resp, "Content-Type") == NULL);
+    assert(strcmp(body_of(resp), "") == 0);
     free(resp);
 
     resp = get(app, "POST /things HTTP/1.1\r\n\r\n");
