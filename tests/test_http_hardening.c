@@ -90,9 +90,13 @@ static void test_request_framing(void) {
     assert(request_framing(no_headers, strlen(no_headers), &header_len, &chunked, NULL, NULL) == 0);
     assert(header_len == strlen(no_headers));
 
+    /* S11: "gzip, chunked" is no longer accepted as chunked framing - this engine implements exactly one
+     * transfer-coding ("chunked", named alone), and layering an unimplemented coding like gzip on top
+     * used to be silently accepted via a bare substring search for "chunked" in the header value. Now
+     * rejected (-3, -> 501) - see test_transfer_encoding_token_matching for the full matrix. */
     const char *te = "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
-    assert(request_framing(te, strlen(te), &header_len, &chunked, NULL, NULL) == 0);
-    assert(chunked == 1 && header_len == strlen(te));
+    assert(request_framing(te, strlen(te), &header_len, &chunked, NULL, NULL) == -3);
+    assert(chunked == 0 && header_len == strlen(te));
 }
 
 /* request_framing's optional path_out/path_len_out (S4: app_use_body_limit needs the request path
@@ -387,6 +391,97 @@ static void test_malformed_request_line_rejected(void) {
     assert(header_len == 0);
 }
 
+/* S11: picohttpparser accepts a bare '\n' as a line terminator anywhere one is expected - a leniency a
+ * strict front proxy would not extend, letting the two disagree about request boundaries (smuggling
+ * ambiguity). request_framing now rejects any request whose request line or header block contains a bare
+ * '\n' (malformed, same shape as S8's -1: header_len == 0, request_is_complete reports "complete" so the
+ * rejection surfaces immediately instead of waiting for more bytes that would just repeat the problem). */
+static void test_bare_lf_rejected(void) {
+    const char *bare_lf_lines[] = {
+        "GET / HTTP/1.1\n\r\n",                       /* request line terminated by a lone LF */
+        "GET / HTTP/1.1\r\nHost: x\n\r\n",             /* a header line terminated by a lone LF */
+        "GET / HTTP/1.1\r\nHost: x\r\n\n",             /* the final blank line is a lone LF */
+    };
+    for (size_t i = 0; i < sizeof(bare_lf_lines) / sizeof(bare_lf_lines[0]); i++) {
+        const char *line = bare_lf_lines[i];
+        size_t header_len = 99;
+        int chunked = 99;
+        assert(request_framing(line, strlen(line), &header_len, &chunked, NULL, NULL) == -1);
+        assert(header_len == 0);
+        assert(request_is_complete(line, strlen(line)) == 1);
+
+        Request req;
+        assert(parse_http_request(line, strlen(line), &req, &test_arena) == -1);
+        arena_reset(&test_arena);
+    }
+
+    /* An ordinary, fully CRLF-terminated request is unaffected. */
+    const char *clean = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(request_is_complete(clean, strlen(clean)) == 1);
+    Request req;
+    assert(parse_http_request(clean, strlen(clean), &req, &test_arena) == 0);
+    arena_reset(&test_arena);
+}
+
+/* S11: Transfer-Encoding is matched token-exact, not by substring. Only a value that reduces (after
+ * splitting on commas and trimming OWS) to exactly one token, "chunked" (case-insensitive), is accepted -
+ * this engine implements no other transfer-coding, so anything else (a substring lookalike, "chunked"
+ * accompanied by any other coding regardless of order, or an unsupported coding alone) is rejected with
+ * -3 (-> 501 at the connection layer) instead of either being silently ignored or mistaken for plain
+ * chunked framing. */
+static void test_transfer_encoding_token_matching(void) {
+    struct {
+        const char *header_line;
+        int expect_chunked;
+        int expect_code; /* content_length code: 0 (absent-equivalent), or -3 (unsupported/ambiguous) */
+    } cases[] = {
+        {"Transfer-Encoding: chunked\r\n", 1, 0},
+        {"Transfer-Encoding: CHUNKED\r\n", 1, 0},
+        {"Transfer-Encoding:   chunked  \r\n", 1, 0},       /* OWS around the token */
+        {"Transfer-Encoding: xchunked\r\n", 0, -3},          /* substring, not a token - closed by S11 */
+        {"Transfer-Encoding: chunkedx\r\n", 0, -3},
+        {"Transfer-Encoding: gzip\r\n", 0, -3},              /* unsupported coding, alone */
+        {"Transfer-Encoding: gzip, chunked\r\n", 0, -3},     /* chunked present, but not alone */
+        {"Transfer-Encoding: chunked, gzip\r\n", 0, -3},     /* chunked not last either way - rejected */
+        {"Transfer-Encoding: chunked, chunked\r\n", 0, -3},  /* duplicate token: still not "exactly one" */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char req_buf[256];
+        snprintf(req_buf, sizeof(req_buf), "POST /a HTTP/1.1\r\n%sContent-Length: 0\r\n\r\n",
+                 cases[i].expect_code == 0 ? "" : cases[i].header_line);
+        /* Cases expected to be accepted as chunked must not also carry Content-Length (S3/smuggling
+         * shape: chunked + Content-Length together is its own -1, unrelated to what's being tested
+         * here), so build those without one. */
+        if (cases[i].expect_code == 0) {
+            snprintf(req_buf, sizeof(req_buf), "POST /a HTTP/1.1\r\n%s\r\n4\r\nWiki\r\n0\r\n\r\n",
+                     cases[i].header_line);
+        }
+        size_t header_len = 99;
+        int chunked = 99;
+        const int code = request_framing(req_buf, strlen(req_buf), &header_len, &chunked, NULL, NULL);
+        assert(chunked == cases[i].expect_chunked);
+        /* request_framing's return is the Content-Length code, not chunked decode state - these cases
+         * carry no Content-Length header, so accepted ones return 0 (absent), same as any other request
+         * with no Content-Length header at all. */
+        assert(code == cases[i].expect_code);
+    }
+
+    /* Splitting the coding list across two separate Transfer-Encoding header instances doesn't evade
+     * the check: neither header line alone is the sole token "chunked". */
+    const char *split = "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n";
+    size_t header_len;
+    int chunked;
+    assert(request_framing(split, strlen(split), &header_len, &chunked, NULL, NULL) == -3);
+
+    /* End to end: parse_http_request surfaces -3 as -1 (malformed) with req.content_length == -3, the
+     * same generic "content_length < 0" plumbing S4/S8 already use for their own sentinels. */
+    const char *gzip_only = "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip\r\nContent-Length: 0\r\n\r\n";
+    Request req;
+    assert(parse_http_request(gzip_only, strlen(gzip_only), &req, &test_arena) == -1);
+    assert(req.content_length == -3);
+    arena_reset(&test_arena);
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_framing_is_line_anchored();
@@ -401,6 +496,8 @@ int main(void) {
     test_percent_decoding_at_boundaries();
     test_embedded_nul_rejected();
     test_malformed_request_line_rejected();
+    test_bare_lf_rejected();
+    test_transfer_encoding_token_matching();
     printf("all http hardening tests passed\n");
     return 0;
 }

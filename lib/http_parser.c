@@ -87,6 +87,44 @@ static int list_has_token(const char *value, const char *token) {
     return 0;
 }
 
+/* True (1) when v[0..end) is a comma-separated list with exactly one non-empty token and that token
+ * case-insensitively equals token[0..token_len) - not merely "token appears somewhere in the list"
+ * (list_has_token, above), which is the wrong question for Transfer-Encoding (S11): this engine
+ * implements exactly one transfer-coding, "chunked", named alone, and a bare substring/list-membership
+ * search used to also accept "Transfer-Encoding: xchunked" (substring match with no token boundary) and
+ * "Transfer-Encoding: gzip, chunked" (chunked present, but silently ignoring the gzip coding this engine
+ * never decodes) as if the body were framed as plain chunked. v need not be NUL-terminated. */
+static int is_sole_token(const char *v, const char *end, const char *token, const size_t token_len) {
+    int count = 0;
+    int last_matches = 0;
+    while (v < end) {
+        while (v < end && (*v == ',' || is_ows(*v))) v++;
+        const char *start = v;
+        while (v < end && *v != ',' && !is_ows(*v)) v++;
+        const size_t tok_len = (size_t)(v - start);
+        if (tok_len == 0) continue;
+        count++;
+        last_matches = (tok_len == token_len && strncasecmp(start, token, token_len) == 0);
+    }
+    return count == 1 && last_matches;
+}
+
+/* True (1) when block[0..len) - a header block, a request line + headers, or any prefix of either -
+ * contains a '\n' not immediately preceded by '\r' (S11). picohttpparser tolerates a bare '\n' as a line
+ * terminator anywhere one is expected (the request line, any header line, the final blank line) - lenient
+ * parsing that a front proxy reading strictly per RFC 9112 (CRLF only) would not extend the same
+ * tolerance to, so the two could disagree about where one request ends and the next begins. Called only
+ * once a complete header block has been located (header_len > 0); scanning a still-incomplete prefix
+ * would flag a lone '\n' that a not-yet-arrived '\r' would have paired with. */
+static int has_bare_lf(const char *block, const size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (block[i] == '\n' && (i == 0 || block[i - 1] != '\r')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 
 /* ---- message framing (Content-Length / Transfer-Encoding) ---- */
 
@@ -98,6 +136,7 @@ static int compute_content_length_and_chunked(const struct phr_header *headers, 
     *chunked_out = 0;
     int content_length = 0;
     int has_cl = 0;
+    int te_unsupported = 0;
 
     for (size_t i = 0; i < num_headers; i++) {
         if (headers[i].name_len == 14 && strncasecmp(headers[i].name, "Content-Length", 14) == 0) {
@@ -122,17 +161,21 @@ static int compute_content_length_and_chunked(const struct phr_header *headers, 
                 has_cl = 1;
             }
         } else if (headers[i].name_len == 17 && strncasecmp(headers[i].name, "Transfer-Encoding", 17) == 0) {
-            const char *q = headers[i].value;
-            size_t q_len = headers[i].value_len;
-            for (size_t k = 0; k + 7 <= q_len; k++) {
-                if (strncasecmp(q + k, "chunked", 7) == 0) {
-                    *chunked_out = 1;
-                    break;
-                }
+            /* S11: token-exact match, not a substring search - "chunked" must be the value's one and
+             * only transfer-coding (checked per header instance, so a value split across duplicate
+             * Transfer-Encoding headers, e.g. "gzip" on one line and "chunked" on another, is caught
+             * too: neither instance alone is the sole token "chunked"). Anything else this engine
+             * cannot frame (empty, multiple codings, or a single unsupported one like "gzip") flags
+             * te_unsupported instead of silently being ignored or mistaken for chunked framing. */
+            if (is_sole_token(headers[i].value, headers[i].value + headers[i].value_len, "chunked", 7)) {
+                *chunked_out = 1;
+            } else {
+                te_unsupported = 1;
             }
         }
     }
 
+    if (te_unsupported) return -3; /* -> 501, "Transfer-Encoding" names a coding this engine can't frame */
     if (*chunked_out && has_cl) return -1;
     return content_length;
 }
@@ -156,6 +199,15 @@ int parse_request_head(const char *buf, const size_t len, ParsedHead *head) {
         /* Malformed request line: header_len stays 0 too, distinguished from "incomplete" only by this
          * return value - content_length is set to -1 here (rather than left at its 0 default) precisely
          * so request_head_is_complete (S8) can tell the two apart despite both having header_len == 0. */
+        head->content_length = -1;
+        return -1;
+    }
+
+    /* S11: picohttpparser itself accepts a bare '\n' as a line terminator throughout the request line
+     * and header block; reject that ambiguity here rather than let it through - same "malformed"
+     * contract as res == -1 above (header_len stays 0, content_length is -1), since a proxy reading
+     * strictly per RFC 9112 could disagree with this parser about where the request ends. */
+    if (has_bare_lf(buf, (size_t)res)) {
         head->content_length = -1;
         return -1;
     }
@@ -226,9 +278,9 @@ static int scan_framing(const char *block, const size_t len, int *has_cl_out, in
                 else if (!has_cl) result = value;
                 has_cl = 1;
             } else if (name_len == 17 && strncasecmp(p, "Transfer-Encoding", 17) == 0) {
-                for (const char *q = v; (size_t)(le - q) >= 7; q++) {
-                    if (strncasecmp(q, "chunked", 7) == 0) { chunked = 1; break; }
-                }
+                /* S11: token-exact match (see is_sole_token), not a bare substring search - this used to
+                 * also match "Transfer-Encoding: xchunked" or treat "gzip, chunked" as plain chunked. */
+                if (is_sole_token(v, le, "chunked", 7)) chunked = 1;
             }
         }
         if (le >= end) break;

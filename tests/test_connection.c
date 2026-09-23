@@ -772,6 +772,50 @@ static void test_handle_readable_chunked_and_content_length_400(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+static void test_handle_readable_bare_lf_400(void) {
+    /* S11: picohttpparser tolerates a bare '\n' as a line terminator, a leniency a strict front proxy
+     * would not extend - closing that ambiguity end to end through the real connection path. */
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    const char *raw = "GET / HTTP/1.1\nHost: x\r\n\r\n";
+    assert(write(fds[1], raw, strlen(raw)) == (ssize_t)strlen(raw));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 400 Bad Request") != NULL);
+    assert(app.connections[fds[0]] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
+static void test_handle_readable_unsupported_transfer_encoding_501(void) {
+    /* S11: a Transfer-Encoding this engine can't frame (here, "chunked" isn't the value's sole token) is
+     * rejected with 501 rather than silently mistaken for plain chunked framing via a substring match. */
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    const char *raw = "POST /upload HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
+    assert(write(fds[1], raw, strlen(raw)) == (ssize_t)strlen(raw));
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    ssize_t n = read(fds[1], resp, sizeof(resp) - 1);
+    assert(n > 0);
+    assert(strstr(resp, "HTTP/1.1 501 Not Implemented") != NULL);
+    assert(app.connections[fds[0]] == NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 static void test_handle_readable_path_too_long_414(void) {
     App app;
     int fds[2];
@@ -1623,6 +1667,8 @@ int main(void) {
     test_handle_readable_chunked_too_large_413();
     test_handle_readable_chunked_malformed_400();
     test_handle_readable_chunked_and_content_length_400();
+    test_handle_readable_bare_lf_400();
+    test_handle_readable_unsupported_transfer_encoding_501();
     test_handle_readable_path_too_long_414();
     test_handle_readable_connection_close();
     test_close_idle_connections_closes_stale_keep_alive();

@@ -119,7 +119,7 @@ arena at all - see above).
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
-`parse_http_request` / `parse_http_request_from_head`: `0` ok, `-1` malformed, `-2` path too long (→ 414), `-3` retired (P3: used to mean "a header name/value too long to store", impossible now that headers are views, not fixed-size copies - never returned, kept reserved rather than reused), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413).
+`parse_http_request` / `parse_http_request_from_head`: `0` ok, `-1` malformed (including, since S11, a bare `\n` line ending anywhere in the request line or header block, and a `Transfer-Encoding` this engine can't frame - see `req.content_length` below), `-2` path too long (→ 414), `-3` retired (P3: used to mean "a header name/value too long to store", impossible now that headers are views, not fixed-size copies - never returned, kept reserved rather than reused; this is the function's own top-level code, unrelated to `req.content_length`'s own `-3` below), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413), `req.content_length == -3` (S11) means `Transfer-Encoding` names anything other than exactly the single token `chunked` (→ 501).
 `url_decode` / `parse_query_string`: `0` ok, `-1` a decoded byte was NUL (S6) - the destination is still fully written and NUL-terminated, but the caller must treat it as invalid input rather than use it.
 `request_is_complete` / `request_head_is_complete`: `1` for a complete request, for invalid `Content-Length` / chunked+`Content-Length` framing, and for a request line or header block picohttpparser rejects outright (S8: stop reading in every one of these cases, let the parser report the specific error - malformed used to be indistinguishable from "need more bytes", since both leave `header_len == 0`; told apart via `ParsedHead.content_length`, `-1` only on the malformed path). `0` only while more bytes are genuinely needed. `chunked_body_scan`: `1` done, `0` need more, `-1` malformed, `-2` too large.
 `parse_request_head`: same codes as `request_framing` (`0` absent/zero-length or incomplete, `>0` value, `-1` malformed/conflicting, `-2` oversized) - check `ParsedHead.header_len == 0` to tell "incomplete" apart from "malformed" at this layer (both still return via that ambiguity, P2; `request_head_is_complete`, above, is what resolves it before handing off to the rest of the pipeline).
@@ -166,7 +166,8 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   is served normally but never cached (no behavior change for large files). The cache is a single process-lifetime table
   shared by every mount, not scoped to an `App` - see Ownership above and `static_cache_clear` (`static.h`) for the one thing
   that frees it (tests; not called anywhere in the engine itself).
-- **Request parsing.** picohttpparser does the request line and header block; it is strict about tokens and accepts bare `\n` line endings, and rejects HTTP versions other than 1.x. `Content-Length`
+- **Request parsing.** picohttpparser does the request line and header block; it is strict about tokens and
+  rejects HTTP versions other than 1.x. `Content-Length`
   must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Header names are matched exactly and case-insensitively (never by substring). Method ≤ 7
   chars. Query and cookies are still parsed eagerly into fixed arrays (cookies lazily *triggered*, see below, but the
   arrays themselves are fixed-size once triggered); headers are not copied at all. More than 32 headers → 400 (checked
@@ -175,6 +176,20 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   than mis-reported as "incomplete" - see "Hot-path rules"). A request line or header block picohttpparser rejects
   outright is likewise 400, immediately (S8, fixed 2026-09-23 - see "Return conventions" above and `improvements_progress.md`),
   not left open waiting for headers that will never arrive.
+  **Framing ambiguity (S11, fixed 2026-09-23).** picohttpparser itself tolerates a bare `\n` as a line terminator
+  anywhere one is expected (the request line, any header line, the final blank line) - a leniency a front proxy
+  reading strictly per RFC 9112 (CRLF only) would not extend, so the two could disagree about where one request
+  ends and the next begins. `parse_request_head` now scans the located header block for any `\n` not immediately
+  preceded by `\r` and rejects the whole request (400) if found, rather than accepting whatever picohttpparser
+  happened to tolerate. Separately, `Transfer-Encoding` used to be detected with a bare substring search for
+  "chunked" anywhere in the header value, so `Transfer-Encoding: xchunked` counted as chunked framing and
+  `Transfer-Encoding: gzip, chunked` was accepted and treated as plain chunked with the `gzip` half silently
+  ignored. Both are now matched token-exact (`is_sole_token`, `http_parser.c`): a `Transfer-Encoding` value is
+  accepted as chunked framing only when it reduces, after splitting on commas and trimming OWS, to exactly one
+  token that case-insensitively equals `chunked` - this engine implements no other transfer-coding. Anything else
+  (a substring lookalike, `chunked` alongside any other coding regardless of order, an unsupported coding alone,
+  or the coding split across separate duplicate `Transfer-Encoding` header instances) is rejected with 501 `Not
+  Implemented`, not silently accepted or ignored.
   **Header storage (P3).** `req->headers` holds `struct phr_header` VIEWS (`name`/`value` point into `in_buf`, not
   NUL-terminated) instead of copies into fixed-size arrays, so there is no per-header length cap left to enforce - a
   header of any length that fits within the whole header block (`BUF_SIZE`, 8 KiB, unrelated to this) is accepted.

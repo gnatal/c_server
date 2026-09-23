@@ -667,14 +667,19 @@ void handle_readable(App *app, Connection *conn) {
             if (parse_status != 0) {
                 /* -2: path too long (414). -3 (S5) is retired (P3): req->headers holds views now, so
                  * there is no fixed-size copy left to overflow - parse_http_request_from_head never
-                 * returns it any more. -4: a percent-decoded path/query name/query value contained an
-                 * embedded NUL, never silently truncated (400, S6) - falls into "anything else" below
-                 * along with -1 (malformed), since both are already 400.
-                 * content_length == -2: body over MAX_BODY_SIZE (413), for both Content-Length and
-                 * chunked framing. Anything else: 400. */
+                 * returns it any more (this is parse_status's own -3; req.content_length's -3 below is
+                 * an unrelated sentinel in a different code space). -4: a percent-decoded path/query
+                 * name/query value contained an embedded NUL, never silently truncated (400, S6) - falls
+                 * into "anything else" below along with -1 (malformed), since both are already 400.
+                 * req.content_length == -2: body over MAX_BODY_SIZE (413), for both Content-Length and
+                 * chunked framing. req.content_length == -3 (S11): Transfer-Encoding names a coding this
+                 * engine doesn't implement, or "chunked" isn't its sole token (501, "Not Implemented" -
+                 * the server understood the request but can't process that transfer-coding). Anything
+                 * else: 400. */
                 /* req.body is managed by arena, no need to free */
                 const int status = parse_status == -2 ? 414
                                   : req.content_length == -2 ? 413
+                                  : req.content_length == -3 ? 501
                                   : 400;
                 reject_request(app, conn, status);
                 return;

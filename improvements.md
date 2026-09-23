@@ -30,9 +30,8 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | S6 | ~~`%00` in a path truncates it~~ | Security | Med | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (`style.css%00.png` → 200) |
 | S7 | ~~Failing workers are respawned with no backoff~~ | Reliability | High | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (10,594 respawns in 4 s) |
 | S8 | ~~Malformed request line gets no response~~ | Security / Correctness | Med | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED |
-| S9 | Demo ships a default API key | Security | Med | S | Removes a known-credential default | Code reading |
 | S10 | ~~TLS hardening gaps (renegotiation, handshake deadline)~~ | Security | Low | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | ESTIMATED |
-| S11 | Bare `\n` and substring `chunked` accepted (smuggling ambiguity) | Security | Low | S | Removes proxy desync ambiguity | Code reading + MEASURED (bare LF) |
+| S11 | ~~Bare `\n` and substring `chunked` accepted (smuggling ambiguity)~~ | Security | Low | S | **FIXED 2026-09-23**: see `improvements_progress.md` | Code reading + MEASURED (bare LF) |
 | S12 | Startup allocations and `exit()` calls in library code | Reliability | Low | S | Errors reach the application | Code reading |
 | P1 | ~~Static and file responses go through slow paths~~ (static-file cache only) | Performance | | M | **PARTIALLY FIXED 2026-09-22**: see `improvements_progress.md` - the `/static` mount's 6.6× gap is closed; `res_send_file`/large-file streaming (item 1's other sub-parts) are untouched | MEASURED |
 | P2 | ~~Request headers are parsed three times~~ | Performance | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - `last_len` incremental resume across separate `recv`s (and P9, which depends on it) are untouched | MEASURED (was PROJECTED from MEASURED parts) |
@@ -61,7 +60,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 
 ## 2. Suggested order
 
-**Quick wins (each S, do first):** S6, S7, S1, S2, C1, C3, P5, M3, P7, S9, **C6 (MEASURED 2026-09-22, breaks Linux keep-alive - do this one early)**.
+**Quick wins (each S, do first):** S6, S7, S1, S2, C1, C3, P5, M3, P7, **C6 (MEASURED 2026-09-22, breaks Linux keep-alive - do this one early)**.
 **Then (M):** S3+S4 together, P1, M1+M2 together, P4, P2, C2, P8, P9.
 **Larger (L):** P3, M5, C4, C5.
 
@@ -146,11 +145,6 @@ record.
 **Fix.** In `request_is_complete`, check `content_length < 0` before `header_len == 0` (two lines) so the parser reports 400. Add the regression to `tests/test_connection.c`.
 **Probable gain.** Correct 400s, and malformed connections are freed immediately instead of after 8 KiB or 60 s+ (and, until S1 is fixed, potentially never). No hot-path cost.
 
-### S9 · The demo ships a default API key
-**Problem.** `examples/todo_sqlite/middlewares.c:11` falls back to `"my-secret-api-key"` when `API_KEY` is unset, and the README documents it. When unset it also calls `getenv("API_KEY")` on every request (`:22`). The `Bearer` scheme is matched case-sensitively (`:87`); RFC 7235 says schemes are case-insensitive.
-**Fix.** Refuse to start (or generate a random key and print it once) unless `API_KEY` is set or a `--insecure-demo` flag is given; resolve the key once at startup; compare the scheme case-insensitively; add a per-IP failed-auth limit.
-**Probable gain.** Removes a well-known credential from anything deployed from the demo. (`getenv` per request costs tens of ns; irrelevant for speed.)
-
 ### S10 · ~~TLS hardening gaps~~ (REMOVED 2026-09-22)
 **TLS was removed from the engine entirely on 2026-09-22** — see `improvements_progress.md` for the removal record
 and `lib/CLAUDE.md`'s "No TLS" note for the rationale (TLS termination belongs at a gateway/reverse proxy in front
@@ -160,7 +154,10 @@ of an HTTP/1.1 parsing library, not inside it). This entry is kept for historica
 **Fix.** Add `SSL_OP_NO_RENEGOTIATION`, decide ticket policy (`SSL_OP_NO_TICKET` or rotate keys across workers, since each worker has its own context), and expose an optional cipher/curve configuration.
 **Probable gain.** Hardening; not exercised here (ESTIMATED). Also note that with several workers each has an independent session cache, so resumption only works if tickets share a key.
 
-### S11 · Parser accepts ambiguous framing that proxies may read differently
+### S11 · ~~Parser accepts ambiguous framing that proxies may read differently~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** picohttpparser accepts bare `\n` line endings (MEASURED: a request with only `\n` parsed with its header). `request_framing` and `scan_framing` decide "chunked" by searching the `Transfer-Encoding` value for the substring `chunked` (`http_parser.c:126-131`), so `Transfer-Encoding: xchunked` counts. A front proxy that reads either differently can desynchronize request boundaries.
 **Fix.** Reject request lines and headers that end in a bare `\n` (400); accept `chunked` only as the final comma-separated token of `Transfer-Encoding`, reject any other `Transfer-Encoding` on requests with 501/400.
 **Probable gain.** Closes desync ambiguity when deployed behind a proxy; negligible cost. Not exploited here (Low).

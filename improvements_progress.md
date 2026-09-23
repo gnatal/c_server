@@ -1803,3 +1803,127 @@ on this toolchain.
 only ever executes on a request already destined for rejection); `make bench` was not re-run since neither
 changed function is on the path any well-formed request takes.
 
+---
+
+## S11 · Parser accepts ambiguous framing that proxies may read differently
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+Two independent ambiguities, both in `lib/http_parser.c`, matching `improvements.md`'s own split of the
+problem into "bare `\n`" and "substring `chunked`".
+
+- **Bare `\n` line endings (`has_bare_lf`, new static helper).** picohttpparser tolerates a lone `\n` as a
+  line terminator anywhere one is expected - the request line, any header line, and the final blank line
+  (verified by reading `vendor/picohttpparser/picohttpparser.c`'s line-ending checks: every one of them is
+  `if (*buf == '\r') { ...; EXPECT '\n'; } else if (*buf == '\n') { ... }`, accepting the bare form in all
+  three places, not just between headers). A front proxy reading strictly per RFC 9112 (CRLF only) would
+  not extend the same tolerance, so the two could disagree about where one request ends and the next
+  begins. `parse_request_head` now calls `has_bare_lf(buf, header_len)` right after `phr_parse_request`
+  successfully locates the header block (i.e. only once a complete block is known - scanning a
+  still-incomplete prefix would flag a lone `\n` whose pairing `\r` just hasn't arrived yet) and, if any
+  `\n` in that block is not immediately preceded by `\r`, treats the whole request as malformed: same
+  contract S8 established (`header_len` reset to 0, `content_length` set to `-1`, function returns `-1`),
+  which `request_head_is_complete`/`parse_http_request_from_head` already handle correctly (report
+  "complete" immediately, reject with 400) - no changes needed to either for this half of the fix, they
+  already do the right thing for any malformed-request-line shape since S8.
+- **Transfer-Encoding matched by substring (`is_sole_token`, new static helper, replacing the loop in
+  `compute_content_length_and_chunked` and `scan_framing`).** The old check was
+  `strncasecmp(q + k, "chunked", 7) == 0` slid across the whole header value byte by byte - true for
+  `Transfer-Encoding: xchunked` (matches at offset 1) and for `Transfer-Encoding: chunked, gzip` (matches
+  at offset 0, then the trailing `, gzip` was never looked at again). `is_sole_token` instead tokenizes on
+  commas, trims OWS per token, and returns true only when there is **exactly one** non-empty token and it
+  case-insensitively equals the target - reused by both the live per-request path
+  (`compute_content_length_and_chunked`, which now flags a new `te_unsupported` local instead of setting
+  `*chunked_out` on any match) and `scan_framing` (the separate, second implementation backing the public
+  `extract_content_length`/`request_has_chunked_encoding` accessors - P2's own comment already notes these
+  are intentionally a second copy, not reachable from the live request path).
+  **Design decision (not explicitly spelled out in `improvements.md`'s two-line fix sketch): the "final
+  token" wording was resolved as "the *only* token".** RFC 9112 §6.1 technically permits something like
+  `Transfer-Encoding: gzip, chunked` (chunked must be the last-applied/outermost coding, but an inner
+  coding like gzip is syntactically legal) - a fully spec-compliant implementation could accept that and
+  hand the still-gzipped, now-dechunked bytes to the application. This engine does not decode `gzip` or
+  any other content coding anywhere (`lib/CLAUDE.md`'s "Known gaps": "No HTTP/2, `Expect: 100-continue`,
+  compression, ..."), so accepting a coding it will never actually apply and silently dechunking anyway
+  seemed more likely to mislead an application (which would receive gzip-compressed bytes with no signal
+  that they need further decoding) than to help a real client - "deny by default" (the same principle
+  `lib/CLAUDE.md` already states for routing and overload handling) was judged the safer default here.
+  Consequence: only `Transfer-Encoding: chunked` (exactly, case-insensitive, OWS-tolerant) is accepted;
+  everything else - `gzip` alone, `gzip, chunked`, `chunked, gzip`, `chunked, chunked` (a duplicate token
+  is still "not exactly one" by this rule), or the same coding list split across two separate duplicate
+  `Transfer-Encoding` header instances (checked per-instance, so neither half alone is the sole token
+  "chunked") - is rejected.
+- **New content_length sentinel, `-3` (`req.content_length` only, not to be confused with the already-
+  retired `-3` in `parse_http_request`'s own top-level return code, a different code space entirely -
+  documented explicitly in both `http_parser.h` and `lib/CLAUDE.md` to head off exactly that confusion).**
+  `compute_content_length_and_chunked` returns `-3` when `te_unsupported` is set, checked before the
+  pre-existing `chunked+Content-Length -> -1` conflict check (an unsupported/ambiguous encoding is
+  reported as such regardless of what Content-Length says). This plumbs through for free everywhere
+  `content_length < 0` was already handled specially: `request_head_is_complete` already reports
+  "complete" for any negative `content_length` (no change needed), `reject_if_over_body_limit` (S4)
+  already skips its own check for any negative `content_length` (no change needed), and
+  `parse_http_request_from_head`'s existing `if (head->content_length < 0) { req->content_length =
+  head->content_length; return -1; }` branch (predates this fix) already copies the sentinel through to
+  `req.content_length` and returns the generic `-1`. The only new code needed downstream was in
+  `connection.c`'s status-mapping ternary: `req.content_length == -3 ? 501 : 400`, alongside the
+  pre-existing `== -2 ? 413`.
+
+**Deliberately not done:** `improvements.md`'s fix sketch mentions "400" as an alternative to 501 for a
+bad `Transfer-Encoding` ("reject ... with 501/400"). 501 was chosen exclusively, not both/either, because
+RFC 9112 §6.1 specifically prescribes 501 for "a transfer coding it does not understand," which is exactly
+this case - the request is not syntactically malformed (400's usual meaning here), the server simply
+doesn't implement the coding named. A bare `\n` line ending remains 400 (genuinely malformed framing, no
+ambiguity about which code fits).
+
+**Tests and results.**
+
+- Unit tests added to `tests/test_http_hardening.c` (registered in `main`):
+  - `test_bare_lf_rejected` - three shapes (bare `\n` ending the request line, a header line, and the
+    final blank line) each asserted through `request_framing` (`-1`, `header_len == 0`),
+    `request_is_complete` (`1`, immediate rejection not "need more"), and `parse_http_request` (`-1`); an
+    ordinary fully-CRLF request is confirmed unaffected.
+  - `test_transfer_encoding_token_matching` - a table of nine `Transfer-Encoding` values covering: plain
+    `chunked` (and case/OWS variants) accepted; `xchunked`/`chunkedx` (substring, not token) rejected;
+    `gzip` alone, `gzip, chunked`, `chunked, gzip`, and `chunked, chunked` all rejected (`-3`); plus a
+    separate case for the same coding split across two duplicate `Transfer-Encoding` header instances
+    (`gzip` on one line, `chunked` on another) confirming neither line alone satisfies "sole token
+    chunked"; and an end-to-end `parse_http_request` case confirming `-3` surfaces as `req.content_length
+    == -3` with a top-level return of `-1`, the same generic plumbing S4/S8 already established for their
+    own sentinels.
+  - Updated the pre-existing `test_request_framing`'s `"Transfer-Encoding: gzip, chunked"` case, which
+    previously asserted this was accepted as chunked framing (`chunked == 1`) - the exact previously-wrong
+    behavior S11 targets - to assert the new, correct rejection (`-3`, `chunked == 0`) instead, with a
+    comment explaining why the expectation changed rather than silently flipping the assertion.
+- Unit tests added to `tests/test_connection.c` (registered in `main`), end-to-end through the real
+  `handle_readable` path rather than the pure parser functions above:
+  - `test_handle_readable_bare_lf_400` - `GET / HTTP/1.1\nHost: x\r\n\r\n` (bare-`\n`-terminated request
+    line) gets an explicit `400 Bad Request` and the connection is closed.
+  - `test_handle_readable_unsupported_transfer_encoding_501` - `Transfer-Encoding: gzip, chunked` gets an
+    explicit `501 Not Implemented` and the connection is closed, rather than being silently accepted and
+    mishandled as plain chunked framing.
+- `make test`: all 13 suites pass (test_http_hardening: 2 new cases + 1 updated; test_connection: 2 new
+  cases).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan.
+- `make fuzz` (1,000,000 iterations): clean (118,469 parsed, 784,307 complete - both figures move run to
+  run depending on what the random mutator happens to generate and are not meaningful to compare directly
+  against a prior run's numbers elsewhere in this document).
+- `make check-docs`: passes (126 engine functions - no public API changed; `is_sole_token`/`has_bare_lf`
+  are file-local statics).
+- Compiled `lib/http_parser.c` and `lib/connection.c` directly with the project's `-Wall -Wextra -std=c11
+  -O2` flags: no new warnings.
+- Verified every existing test that constructs a `Transfer-Encoding: chunked` request (`test_http_parser.c`,
+  `test_connection.c`'s chunked-body suite) still passes unchanged - all of them already used the single
+  exact token, so the stricter matching doesn't disturb any legitimate existing coverage; only the one
+  `test_request_framing` case using the "gzip, chunked" shape needed updating (above), and it was updating
+  a previously-wrong expectation, not losing coverage.
+
+**Status:** Fixed. `scan_framing`'s copy of the fix (backing the public `extract_content_length`/
+`request_has_chunked_encoding` accessors) applies the same token-exact matching for consistency between
+the two implementations, but - being a boolean-only accessor with no HTTP status code to report - has no
+`-3`/501 concept of its own; it simply returns `0` ("not chunked") for anything that isn't the sole token
+"chunked", same as it already did for values that plainly weren't chunked at all (e.g. `"gzip"` alone,
+already correctly `0` before this fix). No hot-path cost beyond what framing already computed: both new
+helpers run once per request, only over bytes already being scanned for other reasons (the header block,
+already located; a `Transfer-Encoding` value, already being read to decide `chunked_out`).
+
