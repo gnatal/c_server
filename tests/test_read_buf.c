@@ -48,7 +48,19 @@ static void big_handler(const Request *req, Response *res) {
     free(body); /* res_send_bytes copied it into the arena */
 }
 
+/* M4: reports whether req->body is a view into the connection's input buffer (not an arena copy). */
+static void body_location_handler(const Request *req, Response *res) {
+    const Connection *c = res->conn;
+    const int in_input = req->body >= c->in_buf && req->body + req->content_length < c->in_buf + c->in_cap;
+    char body[128];
+    snprintf(body, sizeof(body), "in_input=%d len=%d nul=%d first=%c", in_input, req->content_length,
+             req->body[req->content_length] == '\0', req->content_length > 0 ? req->body[0] : '-');
+    res_status(res, 200);
+    res_send(res, body);
+}
+
 static void register_routes(App *app) {
+    app_post(app, "/where", body_location_handler);
     app_get(app, "/a", echo_path_handler);
     app_get(app, "/b", echo_path_handler);
     app_get(app, "/big", big_handler);
@@ -324,6 +336,53 @@ static void test_idle_sweep_408_with_owned_partial_buffer(void) {
     app_destroy(&app);
 }
 
+/* M4: the handler's req->body is a view into in_buf - the borrowed App.read_buf for a small body, the
+ * grown owned buffer for a large one, decoded in place for chunked - never an arena copy. A request
+ * pipelined right behind a Content-Length body (its first byte held the body's NUL) is still served. */
+static void test_body_is_a_view_into_the_input_buffer(void) {
+    App app;
+    setup_app(&app);
+    int fds[2];
+    Connection *conn = add_connection(&app, fds);
+    char out[4096];
+
+    send_all(fds[1], "POST /where HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /a HTTP/1.1\r\n\r\n");
+    handle_readable(&app, conn);
+    read_available(fds[1], out, sizeof(out));
+    assert(strstr(out, "in_input=1 len=5 nul=1 first=h") != NULL);
+    assert(strstr(out, "\r\n\r\n/a") != NULL); /* 'G' restored after the body's NUL */
+
+    send_all(fds[1], "POST /where HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
+                     "GET /b HTTP/1.1\r\n\r\n");
+    handle_readable(&app, conn);
+    read_available(fds[1], out, sizeof(out));
+    assert(strstr(out, "in_input=1 len=5 nul=1 first=a") != NULL);
+    assert(strstr(out, "\r\n\r\n/b") != NULL);
+
+    const size_t body_len = 20000;
+    char *wire = malloc(256 + body_len);
+    assert(wire != NULL);
+    const int head_len = snprintf(wire, 256, "POST /where HTTP/1.1\r\nContent-Length: %zu\r\n\r\n", body_len);
+    memset(wire + head_len, 'z', body_len);
+    const size_t wire_len = (size_t)head_len + body_len;
+    size_t sent = 0;
+    out[0] = '\0';
+    for (int spins = 0; spins < 1000 && strstr(out, "HTTP/1.1") == NULL; spins++) {
+        if (sent < wire_len) {
+            const size_t piece = wire_len - sent < 4096 ? wire_len - sent : 4096;
+            send_bytes(fds[1], wire + sent, piece);
+            sent += piece;
+        }
+        handle_readable(&app, conn);
+        read_available(fds[1], out, sizeof(out));
+    }
+    assert(strstr(out, "in_input=1 len=20000 nul=1 first=z") != NULL);
+    free(wire);
+
+    close(fds[1]);
+    app_destroy(&app);
+}
+
 int main(void) {
     test_idle_connection_owns_no_input_buffer();
     test_partial_request_survives_another_connections_read();
@@ -331,6 +390,7 @@ int main(void) {
     test_pipelined_leftover_behind_pending_response_is_owned();
     test_rejection_from_read_buf_keeps_shared_buffer();
     test_idle_sweep_408_with_owned_partial_buffer();
+    test_body_is_a_view_into_the_input_buffer();
     printf("all read_buf tests passed\n");
     return 0;
 }

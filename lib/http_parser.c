@@ -365,8 +365,9 @@ static void reset_request(Request *req, Arena *arena) {
     req->arena = arena;
 }
 
-int parse_http_request_from_head(const char *raw, const size_t raw_len, const ParsedHead *head,
-                                 Request *req, Arena *arena) {
+/* Everything but the body: method, path, query, header views, framing verdict. 0 when the body can
+ * be attached next, else the parse_http_request return code (req->content_length carries -2/-3). */
+static int parse_request_fields(const ParsedHead *head, Request *req, Arena *arena) {
     reset_request(req, arena);
 
     /* S8: header_len == 0 here means picohttpparser rejected the request line outright (malformed) -
@@ -431,6 +432,15 @@ int parse_http_request_from_head(const char *raw, const size_t raw_len, const Pa
         req->content_length = head->content_length;
         return -1;
     }
+    return 0;
+}
+
+int parse_http_request_from_head(const char *raw, const size_t raw_len, const ParsedHead *head,
+                                 Request *req, Arena *arena) {
+    const int fields = parse_request_fields(head, req, arena);
+    if (fields != 0) {
+        return fields;
+    }
 
     const char *body_start = raw + head->header_len;
     const size_t available = raw_len - head->header_len;
@@ -459,6 +469,40 @@ int parse_http_request_from_head(const char *raw, const size_t raw_len, const Pa
     if (!req->body) return -1;
     memcpy(req->body, body_start, body_len);
     req->body[body_len] = '\0';
+    return 0;
+}
+
+int parse_http_request_in_place(char *raw, const size_t raw_len, const ParsedHead *head, Request *req,
+                               Arena *arena, char *saved_byte_out) {
+    const int fields = parse_request_fields(head, req, arena);
+    if (fields != 0) {
+        return fields;
+    }
+
+    char *body_start = raw + head->header_len;
+    const size_t available = raw_len - head->header_len;
+    size_t body_len;
+    if (head->chunked) {
+        size_t decoded_len = 0;
+        const int scan = chunked_body_scan(body_start, available, MAX_BODY_SIZE, &decoded_len);
+        if (scan == -2) {
+            req->content_length = -2;
+            return -1;
+        }
+        if (scan != 1) return -1;
+        /* M4: decoded output never overtakes the framing being read (each chunk's data moves left by
+         * at least its own size line), so it is written over the raw chunks it came from. */
+        body_len = chunked_body_decode(body_start, available, body_start);
+    } else {
+        body_len = (size_t)head->content_length;
+        if (body_len > available) body_len = available;
+    }
+    /* M4: the NUL goes on the byte just past the body - for Content-Length the first byte of a
+     * pipelined next request, or raw[raw_len] - so hand the original back for the caller to restore. */
+    *saved_byte_out = body_start[body_len];
+    body_start[body_len] = '\0';
+    req->body = body_start;
+    req->content_length = (int)body_len;
     return 0;
 }
 
@@ -724,7 +768,7 @@ size_t chunked_body_decode(const char *body_start, const size_t available, char 
             break; /* trailer header lines, if any, are discarded */
         }
 
-        memcpy(out + out_len, body_start + pos, chunk_size);
+        memmove(out + out_len, body_start + pos, chunk_size); /* out may be body_start (M4: in place) */
         out_len += chunk_size;
         pos += chunk_size + 2;
     }

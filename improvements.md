@@ -45,7 +45,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | M1 | ~~64 KiB arena per connection~~ | Memory | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - MEASURED 8.2 KB per idle connection, matching the projected 8.4 KB | MEASURED |
 | M2 | ~~8 KiB input buffer per idle connection~~ | Memory | | M | **FIXED 2026-09-23**: see `improvements_progress.md` - MEASURED 8,457 → 239 B per idle keep-alive connection (5,000 connections: 41 MB → 1.2 MB), throughput unchanged | MEASURED |
 | M3 | ~~TLS connections keep large SSL buffers~~ | Memory | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
-| M4 | Request bodies are copied twice | Memory | | M | Peak upload memory halved | PROJECTED |
+| M4 | ~~Request bodies are copied twice~~ | Memory | | M | **FIXED 2026-09-23**: see `improvements_progress.md` - body is a view into the input buffer (chunked decoded in place); MEASURED peak RSS for a 9.5 MiB upload 41.7 → 32.1 MB (−23%, not the projected −50%: `realloc` growth dominates what's left) | MEASURED |
 | M5 | "Streaming" responses are fully buffered | Memory / Feature | | L | Bounded memory; enables SSE and large streams | Code reading |
 | M6 | `Route` embeds a `PATH_MAX` buffer | Memory | | S | ~4 KB per route on Linux | Code reading |
 | C1 | `Expect: 100-continue` is ignored | Correctness | | S | **1.007 s → 2.4 ms** per large upload | MEASURED |
@@ -312,7 +312,9 @@ record.
 **Fix.** Add `SSL_MODE_RELEASE_BUFFERS` to `SSL_CTX_set_mode`. One token.
 **Probable gain.** **MEASURED −33 KB per idle TLS connection** (~100 MB saved at 3,000 connections) for about nothing in throughput. Do it.
 
-### M4 · Request bodies are copied twice
+### M4 · ~~Request bodies are copied twice~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical record.
+
 **Problem.** A body lives in `in_buf` (sized to the full declared length) and is then copied into the arena by `parse_http_request` (`http_parser.c:323-326`); a 10 MiB upload peaks at ~20 MiB (and the arena copy falls back to `malloc`). `Request.body` is documented as "still a copy".
 **Fix.** Point `req->body` into `in_buf`: `in_buf[in_len]` is already `'\0'` (`connection.c:436`), and since pipelining is not supported, the body ends at `in_len` for the Content-Length case. Decode chunked bodies **in place** (decoded output is never longer than the raw input).
 **Probable gain.** **PROJECTED** peak memory of an upload halved (20 → 10 MiB) and one fewer 10 MiB `memcpy` (~1–2 ms). With P9 (pipelining) the body no longer necessarily ends at `in_len`; then copy only when extra bytes follow, or NUL-terminate by saving/restoring one byte.

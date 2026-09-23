@@ -101,6 +101,19 @@ int parse_http_request_from_head(const char *raw, size_t raw_len, const ParsedHe
                                  Arena *arena);
 
 /*
+ * parse_http_request_in_place (M4): parse_http_request_from_head without the body copy - the engine's
+ * path (connection.c). req->body points INTO raw at raw + head->header_len; a chunked body is decoded
+ * in place over its own framing (raw is modified). One '\0' is written at req->body[content_length]:
+ * for a Content-Length body that is the byte just past the request (raw[raw_len] when nothing follows,
+ * so raw[raw_len] must be writable), and *saved_byte_out receives what was there - the caller restores
+ * it once the body is no longer needed (before anything else parses raw again, e.g. a pipelined next
+ * request). Written only on success (0); same return codes and limits as parse_http_request otherwise.
+ * The body is valid only while raw is: never past the handler's return.
+ */
+int parse_http_request_in_place(char *raw, size_t raw_len, const ParsedHead *head, Request *req, Arena *arena,
+                               char *saved_byte_out);
+
+/*
  * request_framing: locate the header block and decide how the body is framed.
  *   *header_len_out = bytes up to and including "\r\n\r\n", or 0 if headers are incomplete or malformed
  *     (a bare '\n' line ending anywhere, or a malformed request line - both S8/S11 - leave this at 0 too;
@@ -144,7 +157,8 @@ int request_wants_close(const Request *req);
  *   1 complete (*decoded_len_out = decoded size), 0 need more bytes,
  *  -1 malformed framing, -2 decoded size would exceed max_decoded_len.
  * chunked_body_decode requires a prior scan result of 1 on the same input; `out` needs
- * decoded_len bytes; returns bytes written (binary-safe: never strlen the result).
+ * decoded_len bytes and may be body_start itself (M4: in-place decode); returns bytes written
+ * (binary-safe: never strlen the result).
  * chunked_body_scan_resume (P8): same result codes, but continues from *state (zeroed = body start)
  * and advances it past every fully validated chunk, so calling it again after more bytes are
  * appended to the same body costs only the new bytes (plus one re-read size line). body_start and

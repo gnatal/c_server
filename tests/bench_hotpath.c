@@ -60,25 +60,28 @@ static const char *BROWSER_GET_COOKIE_ROUTE =
 
 /* Same sequence as connection.c: handle_readable (P2: one parse_request_head pass, reused by the
  * completeness check and the full parse, instead of request_is_complete and parse_http_request each
- * running their own). */
-static void one_request(const App *app_const, const char *raw, const size_t len, Connection *conn) {
+ * running their own), and M4's in-place parse (body is a view into raw; its saved byte is restored
+ * after dispatch, so raw is unchanged for the next iteration - no chunked cases here). */
+static void one_request(const App *app_const, char *raw, const size_t len, Connection *conn) {
     App *app = (App *)app_const;
     Request req;
     req.body = NULL;
     ParsedHead head;
+    char saved = '\0';
     parse_request_head(raw, len, &head);
     if (request_head_is_complete(&head, raw, len, NULL) &&
-        parse_http_request_from_head(raw, len, &head, &req, &test_arena) == 0) {
+        parse_http_request_in_place(raw, len, &head, &req, &test_arena, &saved) == 0) {
         Response res;
         res_init(&res, conn);
         conn->keep_alive = !request_wants_close(&req);
         dispatch(app, match_route(app, &req), &req, &res);
+        req.body[req.content_length] = saved;
     }
     arena_reset(&test_arena);
     arena_reset(conn->arena);
 }
 
-static void run(const char *label, App *app, const char *raw, const int iterations) {
+static void run(const char *label, App *app, const char *raw_const, const int iterations) {
     Connection conn;
     memset(&conn, 0, sizeof(conn));
     /* M1: Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
@@ -87,11 +90,17 @@ static void run(const char *label, App *app, const char *raw, const int iteratio
     arena_init(&conn_arena, test_arena_buf, sizeof(test_arena_buf));
     conn.arena = &conn_arena;
     conn.file_fd = -1;
-    const size_t len = strlen(raw);
+    const size_t len = strlen(raw_const);
+    char *raw = malloc(len + 1); /* writable, like in_buf (raw[len] takes a body's NUL) */
+    if (raw == NULL) {
+        return;
+    }
+    memcpy(raw, raw_const, len + 1);
     for (int i = 0; i < iterations / 10; i++) one_request(app, raw, len, &conn);
     const double start = now_ns();
     for (int i = 0; i < iterations; i++) one_request(app, raw, len, &conn);
     const double per_request = (now_ns() - start) / iterations;
+    free(raw);
     printf("%-46s %7.0f ns/request\n", label, per_request);
 }
 

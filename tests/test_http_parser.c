@@ -758,6 +758,92 @@ static void test_parse_query_string(void) {
     assert(req.query_count == MAX_QUERY_PARAMS);
 }
 
+/* M4: parse_http_request_in_place gives the same Request as the copying parser, but req->body points
+ * into the caller's buffer (no copy); a chunked body is decoded over its own framing. The byte its
+ * NUL replaced is handed back, and restoring it leaves the bytes after the body unchanged. */
+static void check_in_place_matches_copy(const char *wire, const size_t request_len) {
+    const size_t wire_len = strlen(wire);
+    char *buf = malloc(wire_len + 1);
+    assert(buf != NULL);
+    memcpy(buf, wire, wire_len + 1);
+
+    Request copied;
+    arena_reset(&test_arena);
+    assert(parse_http_request(wire, request_len, &copied, &test_arena) == 0);
+
+    ParsedHead head;
+    parse_request_head(buf, request_len, &head);
+    Request in_place;
+    char saved = 'x';
+    assert(parse_http_request_in_place(buf, request_len, &head, &in_place, &test_arena, &saved) == 0);
+
+    assert(in_place.body == buf + head.header_len); /* a view, not an arena copy */
+    assert(in_place.content_length == copied.content_length);
+    assert(memcmp(in_place.body, copied.body, (size_t)copied.content_length) == 0);
+    assert(in_place.body[in_place.content_length] == '\0');
+    assert(strcmp(in_place.method, copied.method) == 0 && strcmp(in_place.path, copied.path) == 0);
+    assert(in_place.header_count == copied.header_count);
+
+    in_place.body[in_place.content_length] = saved;
+    /* Everything after the request (a pipelined next one, or the terminating NUL) is intact. */
+    assert(memcmp(buf + request_len, wire + request_len, wire_len - request_len + 1) == 0);
+    if (!head.chunked) {
+        assert(memcmp(buf, wire, wire_len + 1) == 0); /* Content-Length: nothing modified at all */
+    }
+    free(buf);
+}
+
+static void test_parse_http_request_in_place(void) {
+    /* Content-Length body followed by a pipelined request: the NUL lands on its 'G' and is restored. */
+    const char *pipelined = "POST /u HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n";
+    check_in_place_matches_copy(pipelined, strstr(pipelined, "GET /next") - pipelined);
+
+    /* Body ends the buffer: the NUL goes on raw[raw_len], already '\0'. */
+    const char *at_end = "POST /u HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    check_in_place_matches_copy(at_end, strlen(at_end));
+
+    /* No body: an empty, NUL-terminated view (used to be a 1-byte arena allocation). */
+    const char *no_body = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\n\r\n";
+    check_in_place_matches_copy(no_body, strstr(no_body, "GET /b") - no_body);
+
+    /* Chunked with an extension, a trailer and a pipelined request behind it: decoded in place. */
+    const char *chunked = "POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                          "4;ext=1\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nX-T: 1\r\n\r\n"
+                          "GET /next HTTP/1.1\r\n\r\n";
+    check_in_place_matches_copy(chunked, strstr(chunked, "GET /next") - chunked);
+
+    /* Binary chunk data (embedded NULs), data longer than its own size line so source and destination
+     * overlap during the in-place move. */
+    char binary[512];
+    int n = snprintf(binary, sizeof(binary), "POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n40\r\n");
+    for (int i = 0; i < 0x40; i++) binary[n++] = (char)(i % 7 == 0 ? 0 : 'a' + i % 26);
+    n += snprintf(binary + n, sizeof(binary) - (size_t)n, "\r\n0\r\n\r\n");
+    char *bin_buf = malloc((size_t)n + 1);
+    assert(bin_buf != NULL);
+    memcpy(bin_buf, binary, (size_t)n);
+    bin_buf[n] = '\0';
+    Request copied;
+    arena_reset(&test_arena);
+    assert(parse_http_request(binary, (size_t)n, &copied, &test_arena) == 0);
+    assert(copied.content_length == 0x40);
+    ParsedHead head;
+    parse_request_head(bin_buf, (size_t)n, &head);
+    Request in_place;
+    char saved;
+    assert(parse_http_request_in_place(bin_buf, (size_t)n, &head, &in_place, &test_arena, &saved) == 0);
+    assert(in_place.content_length == 0x40 && memcmp(in_place.body, copied.body, 0x40) == 0);
+    free(bin_buf);
+
+    /* A failed parse writes nothing: a malformed chunk leaves the buffer byte-for-byte unchanged. */
+    const char *bad = "POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n";
+    char bad_buf[128];
+    memcpy(bad_buf, bad, strlen(bad) + 1);
+    parse_request_head(bad_buf, strlen(bad), &head);
+    saved = 'q';
+    assert(parse_http_request_in_place(bad_buf, strlen(bad), &head, &in_place, &test_arena, &saved) == -1);
+    assert(strcmp(bad_buf, bad) == 0 && saved == 'q');
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_extract_content_length();
@@ -771,6 +857,7 @@ int main(void) {
     test_chunked_body_decode();
     test_request_is_complete_chunked();
     test_parse_http_request_chunked();
+    test_parse_http_request_in_place();
     test_status_text();
     test_url_decode();
     test_parse_headers();

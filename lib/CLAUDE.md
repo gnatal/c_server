@@ -26,7 +26,7 @@ If `event_loop_init` fails (for example io_uring is blocked by the runtime), `ap
 
 Per request (`connection.c: handle_readable` → `serve_buffered_requests`, which repeats steps 1-6 for every complete request already in `in_buf`, starting at `conn->in_off` - P9 pipelining, see "Behavior reference, Pipelining"):
 1. `recv` into `conn->in_buf` - the worker's shared `App.read_buf` when nothing is buffered for this connection (M2, see Memory model) - then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below (P2) - the body-limit check (S4), `request_head_is_complete` (a chunked scan when the body is chunked, resumed from `conn->chunk_scan` so each body byte is scanned once per request, not once per `recv` - P8), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request before P2).
-2. `parse_http_request_from_head(in_buf, in_len, &head, &req, conn->arena)` → `Request` on the stack (copies method/path/query into its fixed arrays; headers are stored as VIEWS into `in_buf`, not copies, and the body is copied into the shared arena - P3, M1). Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request`/`request_is_complete`/`request_framing` remain as thin, unchanged-behavior wrappers over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
+2. `parse_http_request_in_place(in_buf + in_off, avail, &head, &req, conn->arena, &body_saved)` → `Request` on the stack (copies method/path/query into its fixed arrays; headers and the body are VIEWS into `in_buf`, not copies - P3, M4; a chunked body is decoded in place over its own framing). The body's NUL terminator overwrites the byte after it (for `Content-Length`, the first byte of a pipelined next request); `serve_buffered_requests` restores it (`body_saved`) right after `dispatch`, before `flush_connection`. Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request_from_head` - the copying variant - and `parse_http_request`/`request_is_complete`/`request_framing` remain as unchanged-behavior functions over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
 4. `match_route` (per-method Patricia tree, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
@@ -102,7 +102,8 @@ read-turn that leaves it incomplete; complete requests - the common case - are n
 Measured on macOS (demo, one worker, 5,000 connections, RSS delta): about **239 B per idle keep-alive connection**
 after one request and **216 B** for an accepted-but-silent one, down from about 8.4 KB each before M2 (44 MB → 1.2 MB
 for 5,000). Kernel socket buffers are not in RSS. `/ping` throughput unchanged (wrk, 50 connections, three rounds).
-The arena serves everything that lives for one request: `Request.body`, the initial `conn->out_buf` build (`res_*`),
+The arena serves everything that lives for one request (except `Request.body`, a view into `in_buf` since M4 - see
+"Behavior reference, Request parsing"): the initial `conn->out_buf` build (`res_*`),
 chunked-response growth, and any yyjson document created with `arena_yyjson_alc`. Bump allocation, 8-byte aligned,
 no per-allocation free. When the remaining space is too small (not only for a single request over 64 KiB), the
 allocation falls back to `malloc` and is chained in a list that `arena_reset` frees. Consequences: nothing reached
@@ -121,7 +122,7 @@ arena at all - see above).
 | `conn->arena` | not allocated - always `&app->arena`, set once at `connection_create` | nobody frees it through `conn`; `app_destroy` frees the one underlying `App.arena` after every connection is already closed |
 | `conn->file_buf` (M1: a connection-owned file-streaming chunk buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
 | Arena fallback blocks | `arena_alloc` when the buffer is full | `arena_reset` (each dispatch-and-flush cycle, in `handle_readable`/`reject_request`) or `arena_destroy` (`app_destroy`) |
-| `Request.body` | `parse_http_request`, from the arena (always non-NULL after success) | nobody: reclaimed with the arena. Handlers never free it |
+| `Request.body` | engine path (`parse_http_request_in_place`, M4): not allocated - a view into `conn->in_buf`; `parse_http_request`/`_from_head` (tests, tools): copied into the arena. Always non-NULL after success | nobody: the input buffer's own lifecycle (M2) or the arena. Handlers never free it or keep it |
 | `req_get_*` results, `MultipartPart.data` | point inside the Request / body | nobody; valid until the handler returns |
 | `conn->out_buf` | `res_*`, from the shared arena (one allocation per response; a second send just leaves the first in the arena) - **or** a connection-owned `malloc`'d copy of an unsent tail (M1: `conn->out_buf_owned`, made by `flush_connection` when a response can't be fully written in one call, since the shared arena would otherwise be reused by another connection before the write finishes) | the arena copy: nobody, reclaimed by the next `arena_reset`. The owned copy: `flush_connection` once fully drained, or `connection_close` on any error/close path - never both (see `Connection.out_buf_owned`) |
 | yyjson doc built or read with `arena_yyjson_alc(res->conn->arena)` (a pointer already - no `&`, M1) | arena | nothing: `yyjson_*_doc_free` is a no-op for it, the arena reclaims it |
@@ -136,7 +137,7 @@ arena at all - see above).
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
-`parse_http_request` / `parse_http_request_from_head`: `0` ok, `-1` malformed (including, since S11, a bare `\n` line ending anywhere in the request line or header block, and a `Transfer-Encoding` this engine can't frame - see `req.content_length` below), `-2` path too long (→ 414), `-3` retired (P3: used to mean "a header name/value too long to store", impossible now that headers are views, not fixed-size copies - never returned, kept reserved rather than reused; this is the function's own top-level code, unrelated to `req.content_length`'s own `-3` below), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413), `req.content_length == -3` (S11) means `Transfer-Encoding` names anything other than exactly the single token `chunked` (→ 501).
+`parse_http_request` / `parse_http_request_from_head` / `parse_http_request_in_place`: `0` ok (only then does `_in_place` write anything into `raw`), `-1` malformed (including, since S11, a bare `\n` line ending anywhere in the request line or header block, and a `Transfer-Encoding` this engine can't frame - see `req.content_length` below), `-2` path too long (→ 414), `-3` retired (P3: used to mean "a header name/value too long to store", impossible now that headers are views, not fixed-size copies - never returned, kept reserved rather than reused; this is the function's own top-level code, unrelated to `req.content_length`'s own `-3` below), `-4` a percent-decoded path/query name/query value contains an embedded NUL (→ 400, S6); after `-1`, `req.content_length == -2` means body too large (→ 413), `req.content_length == -3` (S11) means `Transfer-Encoding` names anything other than exactly the single token `chunked` (→ 501).
 `url_decode` / `parse_query_string`: `0` ok, `-1` a decoded byte was NUL (S6) - the destination is still fully written and NUL-terminated, but the caller must treat it as invalid input rather than use it.
 `request_is_complete` / `request_head_is_complete`: `1` for a complete request, for invalid `Content-Length` / chunked+`Content-Length` framing, and for a request line or header block picohttpparser rejects outright (S8: stop reading in every one of these cases, let the parser report the specific error - malformed used to be indistinguishable from "need more bytes", since both leave `header_len == 0`; told apart via `ParsedHead.content_length`, `-1` only on the malformed path). `0` only while more bytes are genuinely needed. `chunked_body_scan` / `chunked_body_scan_resume`: `1` done, `0` need more, `-1` malformed, `-2` too large. The resume variant's `ChunkScanState` (offsets from the body start, so `in_buf` reallocs don't invalidate it) only ever advances past fully received and validated chunks, and the trailer's `\r\n\r\n` search resumes 3 bytes before where it last gave up; a resumed verdict is therefore identical to a from-scratch scan of the same bytes (P8, asserted per-prefix in `test_http_parser.c` and at random split points in `fuzz_parser.c`). State is per request: `Connection.chunk_scan` is zeroed by `connection_create`'s `calloc` and by `flush_connection`'s keep-alive reset. `parse_http_request_from_head` still runs one from-scratch scan plus decode on completion (linear, once).
 `parse_request_head`: same codes as `request_framing` (`0` absent/zero-length or incomplete, `>0` value, `-1` malformed/conflicting, `-2` oversized) - check `ParsedHead.header_len == 0` to tell "incomplete" apart from "malformed" at this layer (both still return via that ambiguity, P2; `request_head_is_complete`, above, is what resolves it before handing off to the rest of the pipeline).
@@ -223,8 +224,8 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   This retired S5's `-3`/431 return code (`parse_http_request` never returns `-3` any more; kept reserved, not reused,
   so old code branching on it is merely dead) and is the "proper fix" `improvements.md`'s S5 entry predicted P3 would
   be, superseding the interim fix of simply raising the old fixed-size cap. `req_get_header` materializes a
-  NUL-terminated copy of the matching view into `req->arena` (set by `parse_http_request_from_head` to the same arena
-  `req->body` came from) on every call - not cached, since a handler reads a given header only a handful of times per
+  NUL-terminated copy of the matching view into `req->arena` (set by every `parse_http_request*` to the arena it was
+  given) on every call - not cached, since a handler reads a given header only a handful of times per
   request at most. `parse_headers`, the standalone component parser `tests/` call directly (not on the live request
   path), was changed the same way and takes an `Arena *` now for the same reason - it no longer truncates either.
   **Cookie splitting is lazy (P3).** `parse_http_request_from_head` no longer calls `parse_cookies` itself; `req_get_cookie`
@@ -232,6 +233,16 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   `Cookie` header but whose handler never reads one never pays for the split. Cookie storage itself (`cookie_names`/
   `cookie_values`, fixed 64/255-char slots) is unchanged; only *when* the split runs moved.
   Chunked bodies: extensions ignored, trailers discarded, decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at `header_len + MAX_BODY_SIZE`.
+  **Body is not copied (M4).** On the engine path `req->body` points at `in_buf + header_len`. A chunked body is decoded
+  in place by `chunked_body_decode(body_start, avail, body_start)` (it uses `memmove`: decoded output never overtakes the
+  framing being read, since each chunk moves left by at least its own size line). `body[content_length]` is set to
+  `'\0'`; that byte is the one after a `Content-Length` body - `in_buf[in_len]` (always writable, already `'\0'`) or a
+  pipelined next request's first byte, which `serve_buffered_requests` restores after `dispatch`. For chunked the NUL
+  lands inside the request's own consumed framing, so nothing outside the request changes. The request's wire bytes are
+  altered by a chunked decode, which is safe because `request_len` and every header view were computed first and the
+  bytes are consumed once the response is queued. `res_*` copy everything they send, so nothing points into `in_buf`
+  after `dispatch`. MEASURED: peak RSS for a 9.5 MiB upload 41.7 → 32.1 MB (Content-Length and chunked alike); what
+  remains is mostly the transient old+new block during `grow_in_buf`'s doubling `realloc`.
   **Embedded NUL (S6).** The path and query names/values are percent-decoded (`decode_bounded`/`url_decode`); a decoded byte
   that is NUL (`%00`, or a raw NUL byte already in the request line) is rejected with 400 (`parse_http_request`'s `-4`)
   rather than silently truncating everything downstream that reads `req->path`/`req_get_query` as a C string - MEASURED
@@ -436,6 +447,9 @@ this update). What to keep:
   a fixed-size slot. A request whose headers nobody reads should cost nothing beyond that assignment; don't reintroduce
   a per-header `memcpy` there. Don't call `parse_cookies` from `parse_http_request_from_head` either - `req_get_cookie`
   triggers it lazily, once, on its own first call per request.
+- Don't copy the request body (M4): `connection.c` parses with `parse_http_request_in_place`, so `req->body` is a view into
+  `in_buf` (chunked decoded in place). Don't switch it back to `parse_http_request_from_head` (a full body `memcpy` into the
+  arena, a second 10 MiB block for a maximum-size upload), and keep the saved-byte restore right after `dispatch`.
 - Routing is one tree walk over path segments with no allocation; `req == NULL` searches without capturing (used for the 405 `Allow` list).
 - A Patricia node's static `children` stay sorted; find/insert through `find_child` (binary search), not a linear scan (P7 - "Behavior reference, Routing" above).
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
@@ -450,7 +464,6 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
   the first registration, so `req_get_param(req, "oid")` returns `NULL` (the value is under `id`). A route registered after a mid-pattern `*` at the same position
   (`/x/*/y`, then `/x/:id/z`) captures nothing. Use the same `:name` at the same position across routes.
 - **Chunked framing overhead is not capped separately** (P8 left this out): 10 MiB of 1-byte chunks is accepted up to the raw `MAX_BODY_SIZE` wire cap. Since P8 the scan is linear (~14 ms for that worst case, MEASURED), so this is a cost bound, not an amplification.
-- **`Request.body` is still a copy** (now into the arena), including a 1-byte allocation for empty bodies.
 - Path/query params over 63 chars and queries over 255 chars are truncated silently. So are individual cookie values
   over 255 chars after the `Cookie` header is split (`parse_cookies` → `cookie_values[MAX_COOKIES][256]`) - the raw
   `Cookie:` header line itself has no length limit any more (P3: it's a view like every other header, materialized in

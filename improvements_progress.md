@@ -2355,3 +2355,80 @@ exactly as it was.
 
 **Status:** Fixed. Not done: a Linux (io_uring) run. The change has no backend-specific code, because the
 io_uring backend also reads through `handle_readable`'s `recv`.
+
+---
+
+## M4 · Request bodies are copied twice
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+Done as `improvements.md` suggested: `req->body` points into the input buffer and chunked bodies are decoded
+in place. Because P9 (pipelining) was in by then, the body no longer always ends at `in_len`, so the fix uses
+the entry's own fallback: one byte is saved and restored around the NUL terminator.
+
+- **New `parse_http_request_in_place(char *raw, ...)`** (`http_parser.c/h`), which the engine uses.
+  - It shares a new static `parse_request_fields` (method, path, query, header views, framing verdict) with
+    `parse_http_request_from_head`, so the two differ only in how they attach the body.
+  - It sets `req->body = raw + header_len`. A chunked body is decoded into that same spot.
+  - It writes `'\0'` at `body[content_length]` and hands back the byte that was there. For a
+    `Content-Length` body that is `raw[raw_len]` (already `'\0'`) or the first byte of a pipelined next
+    request. For chunked, it falls inside the request's own framing.
+  - It writes nothing unless it succeeds.
+- **The copying parsers are unchanged.** `parse_http_request_from_head` and `parse_http_request` still take
+  `const char *` and copy the body into the arena. Tests, the fuzzer and the cookbook use them, which keeps
+  the "pure parser over a `const char *` buffer" rule for everything except the engine's own call.
+- **`chunked_body_decode`** uses `memmove` instead of `memcpy`, so `out` may equal `body_start`. The
+  decoded bytes never overtake the framing being read, because each chunk moves left by at least the length
+  of its own size line.
+- **`connection.c`: `serve_buffered_requests`** calls the in-place parser and restores the saved byte right
+  after `dispatch`, before `flush_connection`. That order matters: `flush_connection` can free `in_buf`
+  (M2), and the next loop iteration parses from that byte. This is safe because `res_*` copy everything they
+  send, and `request_len` and every header view are computed before a chunked body is decoded.
+- `tests/bench_hotpath.c` now uses the in-place path on a writable copy of each request, so it matches
+  `connection.c` again.
+
+**Tests and results.**
+
+- `test_http_parser.c`: `test_parse_http_request_in_place`. For each of these cases, the in-place result
+  matches `parse_http_request` (same fields and body bytes), `req->body == raw + header_len`, and the
+  restored byte leaves everything after the request intact:
+  - a `Content-Length` body with a pipelined request behind it;
+  - a body that ends the buffer;
+  - no body;
+  - chunked with an extension, a trailer and a pipelined request behind it.
+
+  It also covers binary chunk data with embedded NULs where the in-place move overlaps, and checks that a
+  malformed chunk leaves the buffer byte-for-byte unchanged.
+- `test_read_buf.c`: `test_body_is_a_view_into_the_input_buffer`. Through a real connection, the handler
+  sees `req->body` inside `res->conn->in_buf` in three cases: a small body (borrowed buffer), a chunked body
+  (decoded in place), and a 20,000-byte body (grown owned buffer). The body is NUL-terminated, and a GET
+  pipelined right behind the `Content-Length` body is still answered.
+- `fuzz_parser.c`: on every input the engine would parse, the in-place parser is compared with the copying
+  one: same status and same body bytes. After the restore, a `Content-Length` request's buffer must be
+  unchanged, and a failed parse must write nothing. Clean at 1,000,000 iterations.
+
+  The first run of this check aborted. The cause was a bug in the harness, not the engine: it compared
+  against incomplete requests, which the copying parser accepts by clamping the body but the engine never
+  parses. Fixed in the harness.
+- macOS: `make test` (15 suites), ASan + UBSan, `make test_epoll` and `make check-docs` (131 functions) all
+  pass.
+- **Peak memory, MEASURED.** A single-process server with one `POST /upload` route received three 9.5 MiB
+  uploads; the figure is max RSS from `/usr/bin/time -l`. The baseline is the same tree with
+  `connection.c` switched back to `parse_http_request_from_head`, so nothing else differs.
+
+  | Upload | Before | After |
+  |---|---|---|
+  | `Content-Length` | 41.7 MB | **32.1 MB** |
+  | chunked | 41.7 MB | **32.1 MB** |
+
+  The 9.6 MB saved is exactly the removed body copy. That is −23%, not the −50% `improvements.md`
+  PROJECTED. The projection counted only `in_buf` plus the copy, but `grow_in_buf`'s doubling `realloc`
+  also holds the old and new blocks at once near the top (for example 8 MiB + 9.5 MiB). Growing straight to
+  the target once most of the body has arrived would reduce that. It is not done here.
+
+  Upload time stayed at 4–11 ms per request either way; the saved `memcpy` is below this noise. `make
+  bench` (small JSON body) is unchanged within noise.
+
+**Status:** Fixed. Not done: reducing `realloc`'s transient peak (above), and a Linux run.

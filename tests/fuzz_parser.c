@@ -64,7 +64,31 @@ int main(int argc, char **argv) {
       }
     }
     Request req;
-    if (parse_http_request(buf, len, &req, &test_arena) == 0) {
+    const int copy_status = parse_http_request(buf, len, &req, &test_arena);
+    {
+      /* M4: the in-place parser must agree with the copying one - same status, same body bytes - and
+       * after its saved byte is restored, nothing past the body may differ (all of it, for a
+       * Content-Length body). The one extra byte is the writable raw[raw_len] slot it may NUL. */
+      char *mut = malloc(len + 1); memcpy(mut, buf, len); mut[len] = '\0';
+      ParsedHead head; parse_request_head(mut, len, &head);
+      Request ip; char saved = 0;
+      /* Only a request the engine would parse: parse_http_request also accepts an incomplete one
+       * (a short body is clamped), the connection path never hands it one. */
+      const int ready = request_head_is_complete(&head, mut, len, NULL);
+      const int ip_status = ready ? parse_http_request_in_place(mut, len, &head, &ip, &test_arena, &saved) : copy_status;
+      if (ip_status != copy_status) abort();
+      if (!ready) {
+        if (memcmp(mut, buf, len) != 0) abort();
+      } else if (ip_status == 0) {
+        if (ip.content_length != req.content_length || memcmp(ip.body, req.body, (size_t)req.content_length) != 0) abort();
+        ip.body[ip.content_length] = saved;
+        if (!head.chunked && memcmp(mut, buf, len) != 0) abort();
+      } else if (memcmp(mut, buf, len) != 0) {
+        abort(); /* a failed parse writes nothing */
+      }
+      free(mut);
+    }
+    if (copy_status == 0) {
       parsed_ok++;
       (void)req_get_header(&req, "host"); (void)req_get_query(&req, "a"); (void)req_get_cookie(&req, "a");
       (void)request_wants_close(&req);

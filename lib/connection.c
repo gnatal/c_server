@@ -745,7 +745,7 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
             conn->in_len = 0;
             return SERVE_NEED_MORE;
         }
-        const char *req_start = conn->in_buf + conn->in_off;
+        char *req_start = conn->in_buf + conn->in_off;
         const size_t req_avail = conn->in_len - conn->in_off;
 
         /* One phr_parse_request pass, reused below by the body-limit check, the completeness check
@@ -764,7 +764,10 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
         }
 
         Request req;
-        const int parse_status = parse_http_request_from_head(req_start, req_avail, &head, &req, conn->arena);
+        /* M4: req.body is a view into in_buf (no copy); body_saved is the byte its NUL replaced. */
+        char body_saved = '\0';
+        const int parse_status = parse_http_request_in_place(req_start, req_avail, &head, &req, conn->arena,
+                                                             &body_saved);
         if (parse_status != 0) {
             /* -2: path too long (414). -3 (S5) is retired (P3): req->headers holds views now, so
              * there is no fixed-size copy left to overflow - parse_http_request_from_head never
@@ -777,8 +780,6 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
              * engine doesn't implement, or "chunked" isn't its sole token (501, "Not Implemented" -
              * the server understood the request but can't process that transfer-coding). Anything
              * else: 400. */
-            /* req.body is managed by arena, no need to free */
-            /* req.body is managed by arena, no need to free */
             const int status = parse_status == -2 ? 414
                               : req.content_length == -2 ? 413
                               : req.content_length == -3 ? 501
@@ -796,7 +797,10 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
         res.is_head_request = strcmp(req.method, "HEAD") == 0;
         const Route *route = match_route(app, &req);
         dispatch(app, route, &req, &res);
-        /* req.body is managed by arena, no need to free */
+        /* M4: the body's NUL may sit on the first byte of a pipelined next request - put it back now
+         * that the handler is done (res_* copied anything it sent), before flush_connection can free
+         * in_buf or the next iteration parses from it. */
+        req.body[req.content_length] = body_saved;
 
         const int flushed = flush_connection(app, conn);
         /* M1: conn may already be freed by flush_connection (a non-keep-alive response, or a

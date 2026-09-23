@@ -134,12 +134,14 @@ typedef struct {
 
     int content_length;      /* body size in bytes (decoded size for chunked); -2 after a failed parse = too large */
 
-    /* Allocated by parse_http_request from the connection arena (never NULL after success, NUL-terminated,
-     * may contain NUL bytes: use content_length, not strlen). Reclaimed with the arena after the response is
-     * flushed; nobody frees it, and handlers must not keep it past their return. */
+    /* Never NULL after success, NUL-terminated, may contain NUL bytes: use content_length, not strlen.
+     * On the engine path (parse_http_request_in_place, M4) it points INTO the connection's in_buf - no
+     * copy; a chunked body is decoded in place there. parse_http_request / _from_head (tests, tools)
+     * copy it into the arena instead. Either way nobody frees it, and handlers must not keep it past
+     * their return. */
     char *body;
 
-    /* P3: set by parse_http_request_from_head to the same arena `body` above came from. req_get_header
+    /* P3: set by every parse_http_request* to the arena passed in (the one a copied `body` came from). req_get_header
      * and req_get_cookie (on its first call) allocate from it to materialize NUL-terminated strings out
      * of the views above. NULL only for a Request no parse function has ever populated (e.g. a test
      * fixture built and filled by hand without going through parse_http_request*) - req_get_header

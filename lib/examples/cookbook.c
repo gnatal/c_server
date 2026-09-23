@@ -10,7 +10,7 @@
  *
  * DON'T (each of these is a real bug pattern, see lib/CLAUDE.md "Ownership"):
  *  1. free() or keep anything reached through `req`: it dies when the handler returns. That covers
- *     req->body (it lives in the connection arena) and every pointer from req_get_param / req_get_query /
+ *     req->body (a view into the connection's input buffer since M4) and every pointer from req_get_param / req_get_query /
  *     req_get_header / req_get_cookie.
  *  2. strlen(req->body) for binary bodies: use req->content_length (bodies may hold NUL bytes).
  *  3. keep a string borrowed from a parsed yyjson document (yyjson_get_str) or anything from arena_alloc past the
