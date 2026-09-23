@@ -2990,3 +2990,100 @@ says to retry `EINTR`.
   (kqueue) is unchanged. ASan on Linux was not run (musl has no ASan runtime).
 
 **Status:** Fixed. Not done: changing the Linux default to epoll, and a Linux CI job (T5).
+
+---
+
+## T1 · No oracle that every input is answered or closed
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+S8 had added regressions for a few malformed request lines, but the fuzzer still checked memory safety
+only. T1 adds the missing oracle at two layers, and it found a bug on its first run.
+
+- **Parser-level oracle, `tests/fuzz_parser.c` (`check_answered`, every input).**
+  - `request_is_complete == 0` only while no blank line has arrived yet, or while a well-framed head
+    waits for a body that is genuinely short (the `Content-Length` is not all there, or a chunked scan
+    needs more). The blank-line test (`first_blank_line_end`) does not use the parser.
+  - A parsed head ends exactly at the first blank line, on `\r\n\r\n`.
+  - Recv-split invariance: a random walk over cuts, taken the way `connection.c` does (head re-parsed on
+    every read, `chunk_scan` carried), decides "complete" exactly where a from-scratch scan does. Any
+    complete prefix stays complete, and gets the same answer (dispatch, 400, 413, 414 or 501) as the
+    whole buffer.
+  - A failure prints the oracle's line and the input, escaped, ready to paste into a regression test.
+- **End-to-end oracle, new `tests/test_answered.c`.**
+  - Inputs are written into a `socketpair(2)` in pieces (whole, byte by byte, every single cut, or
+    random cuts). They are driven through the real `handle_readable`/`handle_writable` by a small
+    level-triggered loop that follows `Connection.events_watched`.
+  - The output is compared with a reference model (`model_run`) built from the pure functions, walking
+    the whole input as one buffer:
+    - the same statuses, in the same order;
+    - `100 Continue` only for a request that asked for it, at most once, and always for a request left
+      waiting on its body (C1);
+    - the connection closed exactly when the model says, and the peer sees EOF only then;
+    - `Connection: close` on exactly that last answer;
+    - when the connection stays open, exactly the unanswered tail still in `in_buf`;
+    - a bounded number of loop turns, so a stuck connection fails the test instead of hanging it.
+  - The model applies the same parser-independent "wait only for a short body" rule. A parser bug
+    therefore cannot pass just because the model and the engine share it.
+  - `make test` runs a curated corpus with exhaustive cuts: 27 seeds, 8 pipelines, 20 pipelined requests
+    (past `MAX_PIPELINED_PER_EVENT`) and a 414. It also runs 3,000 random inputs, 11,490 runs in total,
+    in about 0.5 s. `make fuzz` runs an ASan + UBSan build with `FUZZ_ANSWERED_ITERS` (100,000) random
+    inputs. `make test_epoll` runs it against the epoll backend.
+- **Bug found: a short version token was never answered.**
+  - picohttpparser's `parse_http_version` returns "incomplete" (-2) whenever fewer than 9 bytes follow
+    the request target, before looking at any of them.
+  - So `GET / X\r\n\r\n`, `GET /ping HTTP\r\n\r\n` or `GET / HTTP/1\r\n\r\n` read as "need more bytes"
+    for good, since the client has nothing left to send. The connection held the request until the S1
+    header deadline and then sent 408, instead of an immediate 400. S8's fix did not cover this path:
+    it only handled picohttpparser's -1.
+  - Fix, in `parse_request_head`: when picohttpparser returns -2 but the buffer already contains a blank
+    line, the head is malformed. A valid head ends at its first blank line, so no later byte can make it
+    valid. The case then goes through S8's existing malformed path (`header_len == 0`,
+    `content_length == -1`).
+  - The vendored picohttpparser is unchanged. The new scan (`has_blank_line`, `memchr`-based) runs only
+    on the "incomplete" path, so it adds nothing for a request that arrives whole. For a slow-dripped
+    head it is one more linear pass per read, the same order as picohttpparser's own from-scratch
+    re-parse.
+  - The single leading empty line picohttpparser skips is not mistaken for a finished head (tested).
+
+**Tests and results.**
+
+- `tests/test_http_hardening.c`:
+  - `test_short_version_token_rejected` covers six malformed shapes, including the fuzzer's own find
+    `GET  H&TTP/1. 1\r\n\r\n`, a bare-LF blank line, and a short token followed by a header. It also
+    checks that prefixes with no blank line yet still report "incomplete", and that a leading CRLF
+    before a valid request still parses.
+  - `test_every_prefix_is_answered_or_waits_for_bytes` runs the oracle deterministically over every
+    prefix of 15 inputs, each in an exact-size heap buffer.
+- **Mutation check.** Each change below was injected one at a time, and each was caught with the input
+  that exposes it. The first two are caught by all three layers (hardening tests, `fuzz_parser`,
+  `test_answered`); the rest by `test_answered`.
+  1. This fix reverted.
+  2. S8's guard removed.
+  3. `handle_writable` no longer resumes a pipeline capped at 16.
+  4. `100 Continue` never sent.
+  5. M4's saved byte not restored.
+  6. The S4 route body limit skipped.
+  7. `Connection: close` ignored.
+  8. `request_wire_len` off by one.
+  9. `compact_in_buf` dropping a byte.
+- `make test` (17 suites), `make SANITIZE=1 BUILD_DIR=build-asan test`, `make test_epoll` (5 suites),
+  `make check-docs` (140 functions) and `make fuzz` all pass. `make fuzz` ran 1,000,000 parser
+  iterations and 100,000 end-to-end inputs (300,000 runs). `fuzz_answered` also passed with
+  `FUZZ_SEED` 1 and 2, each 100,000 inputs.
+- **MEASURED, live.** A minimal `/ping` server built from `HEAD` and from this tree, probed with a raw
+  socket:
+
+  | Request | `HEAD` | This tree |
+  |---|---|---|
+  | `GET / X\r\n\r\n` | 408 after 9.998 s | 400 after 0.000 s |
+  | `GET /ping HTTP\r\n\r\n` | 408 after 10.000 s | 400 after 0.000 s |
+  | `GET /ping HTTP/1.1\r\n\r\n` | 200 after 0.000 s | 200 after 0.000 s |
+
+**Found along the way (tooling).** macOS's make compares timestamps at 1-second resolution. A source file
+restored within the same second as its object build is treated as up to date, so the mutation check
+needed `make -B` to avoid testing stale objects.
+
+**Status:** Fixed. T2–T7 (section 7 of `improvements.md`) are separate items and still open.

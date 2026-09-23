@@ -60,6 +60,14 @@ if [ "$MEASURE_MEMORY" = "1" ] && [ -x /usr/bin/time ]; then
     fi
 fi
 
+# The engine sets SO_REUSEPORT, so a second server on the same port binds without error and the two
+# silently share its connections - a leftover demo or stress run would answer part of this run.
+if curl -s -o /dev/null --max-time 1 "$BASE/" || lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "error: something is already listening on port $PORT (see: lsof -nP -iTCP:$PORT -sTCP:LISTEN)." >&2
+    echo "       Stop it or set PORT=..., otherwise it shares this run's connections (SO_REUSEPORT)." >&2
+    exit 1
+fi
+
 SERVER_LOG="$(mktemp -t cexpress_server.XXXXXX)"
 PEAK_FILE="$(mktemp -t cexpress_peak.XXXXXX)"
 
@@ -107,10 +115,17 @@ stop_server() {
 }
 
 cleanup() {
+    local status=$?
     stop_server
+    if [ "$status" -ne 0 ] && [ -s "${SERVER_LOG:-}" ]; then
+        echo "==> Server log (stderr):" >&2
+        tail -n 40 "$SERVER_LOG" >&2
+    fi
     rm -f "$DEMO_DIR/$DB_PATH" "$DEMO_DIR/${DB_PATH}-shm" "$DEMO_DIR/${DB_PATH}-wal" "$SERVER_LOG" "$PEAK_FILE"
 }
 trap cleanup EXIT
+# set -e exits silently; name the failing line and command first.
+trap 'echo "error: stress_test.sh line $LINENO failed (exit $?): $BASH_COMMAND" >&2' ERR
 
 # Total RSS in KB of the master plus every live worker, and how many processes that was.
 server_rss() {
@@ -141,16 +156,29 @@ kb_to_mb() {
 }
 
 echo "==> Waiting for server to come up"
+ready=0
 for _ in $(seq 1 50); do
-    curl -s -o /dev/null "$BASE/" && break
+    if curl -s -o /dev/null "$BASE/"; then
+        ready=1
+        break
+    fi
     sleep 0.2
 done
+if [ "$ready" != "1" ]; then
+    echo "error: server did not answer GET / on port $PORT within 10 s" >&2
+    exit 1
+fi
 
 echo "==> Seeding 20 todos"
 for i in $(seq 1 20); do
-    curl -s -o /dev/null -X POST "$BASE/api/todos" \
+    rc=0
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/todos" \
         -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-        -d "{\"title\":\"seed todo $i\"}"
+        -d "{\"title\":\"seed todo $i\"}")" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$code" != "201" ]; then
+        echo "error: seed request $i failed: curl exit $rc, HTTP status ${code:-none}" >&2
+        exit 1
+    fi
 done
 
 if [ "$MEASURE_MEMORY" = "1" ]; then

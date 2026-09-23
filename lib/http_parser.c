@@ -125,6 +125,23 @@ static int has_bare_lf(const char *block, const size_t len) {
     return 0;
 }
 
+/* T1: true (1) when buf[0..len) contains a blank line - a '\n' followed by "\n" or "\r\n", every line
+ * ending picohttpparser accepts. A valid head ends at its first blank line, so when picohttpparser still
+ * reports "incomplete" (-2) past one, no later byte can make the head valid. picohttpparser does that for
+ * a short version token: parse_http_version asks for 9 bytes before looking at any of them, so
+ * "GET / X\r\n\r\n" was "incomplete" forever and went unanswered until the S1 deadline. */
+static int has_blank_line(const char *buf, const size_t len) {
+    const char *p = buf;
+    const char *const end = buf + len;
+    const char *nl;
+    while ((nl = memchr(p, '\n', (size_t)(end - p))) != NULL) {
+        if (nl + 1 < end && (nl[1] == '\n' || (nl[1] == '\r' && nl + 2 < end && nl[2] == '\n'))) {
+            return 1;
+        }
+        p = nl + 1;
+    }
+    return 0;
+}
 
 /* ---- message framing (Content-Length / Transfer-Encoding) ---- */
 
@@ -194,8 +211,10 @@ int parse_request_head(const char *buf, const size_t len, ParsedHead *head) {
     const int res = phr_parse_request(buf, len, &head->method, &head->method_len, &head->path, &head->path_len,
                                       &head->minor_version, head->headers, &head->num_headers, 0);
 
-    if (res == -2) return 0; // Incomplete: header_len stays 0
-    if (res == -1) {
+    /* Incomplete: header_len stays 0. Unless a blank line has already arrived (T1, see has_blank_line):
+     * then it is malformed, and falls through to the S8 path below. */
+    if (res == -2 && !has_blank_line(buf, len)) return 0;
+    if (res < 0) {
         /* Malformed request line: header_len stays 0 too, distinguished from "incomplete" only by this
          * return value - content_length is set to -1 here (rather than left at its 0 default) precisely
          * so request_head_is_complete (S8) can tell the two apart despite both having header_len == 0. */

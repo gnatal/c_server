@@ -14,6 +14,15 @@ Utility and load-testing scripts used to benchmark latency, throughput, and memo
 - `export_framework.sh` (`make export DEST=...`): copies `lib/` into another directory together with a standalone Makefile and README (see `../importing.md`). The generated Makefile lists the current sources (arena, yyjson, picohttpparser, the per-OS event loop: on Linux the dispatcher plus both the io_uring and epoll backends, or epoll only with `NO_URING=1`) and links `-luring` on Linux unless `NO_URING=1`. TLS is out of scope for this library (terminate it at a gateway/reverse proxy in front); the exported Makefile has no OpenSSL detection.
 
 ## Known problems with `stress_test.sh`
+- **Changed 2026-09-23: failures are reported instead of silent.** Under `set -euo pipefail` the first failing
+  command used to exit through the `EXIT` trap, which stopped the server and deleted its log, so a run could end
+  right after "Seeding 20 todos" with only the workers' SIGTERM drain messages and no reason (seen once, not
+  reproduced: 6 startup+seed runs, one full run and 300 immediate post-startup POSTs all passed). Now: an `ERR` trap
+  names the failing line and command; on a non-zero exit the trap prints the last 40 lines of the server's stderr
+  before deleting it; the readiness wait fails explicitly if `GET /` never answers; and each seed `POST` must
+  return HTTP 201 (curl exit code and status are printed otherwise). The script also refuses to start when
+  something already listens on `PORT`: the engine sets `SO_REUSEPORT`, so a leftover server would bind alongside
+  the new one without error and silently take part of the run's connections.
 - **Fixed 2026-09-22: it used to start the demo from the repository root.** The demo resolves `public/` and the
   default `todos.db` against its working directory, so from the root `app_serve_static` logged `root directory
   "public" does not exist, not registered` and `GET /` answered `404` with a 9-byte body - the `GET / (Todo UI)`

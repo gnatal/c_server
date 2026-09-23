@@ -54,7 +54,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | C4 | ~~macOS `SO_REUSEPORT` does not balance workers~~ | Reliability | | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (imbalance, and the fix) |
 | C5 | ~~io_uring failure kills the server (no epoll fallback)~~ | Reliability | | M | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (Docker default seccomp: exit/crash loop → serves on epoll) |
 | C6 | ~~io_uring backend closes every keep-alive connection after its first request~~ | Correctness / Reliability | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (real Linux, via Docker: 1/20 → 1000/1000 requests per connection) |
-| T1 | Test and tooling gaps that let the bugs above through | Testing | | S–M | Prevents regressions | Code reading |
+| T1 | ~~No oracle that every input is answered or closed~~ (T2–T7 are separate rows in section 7) | Testing | | S–M | **FIXED 2026-09-23**: see `improvements_progress.md` - the new oracle found one more S8-class hang on its first run (`GET / X\r\n\r\n` unanswered until the 408 deadline), fixed | MEASURED |
 
 ---
 
@@ -401,7 +401,7 @@ record.
 
 | ID | Gap | Fix |
 |---|---|---|
-| T1 | ~~No test sends a malformed **request line**~~ **PARTIALLY FIXED 2026-09-23**: `test_http_hardening.c` and `test_connection.c` now cover it (S8's fix), see `improvements_progress.md`; the fuzzer still checks memory safety only, not "every input is answered or closed" | A fuzzer oracle that asserts `request_is_complete` eventually returns 1 for terminated garbage remains open |
+| T1 | ~~No test sends a malformed **request line**~~ **FIXED 2026-09-23**: S8's regressions, then T1's oracle - `fuzz_parser.c` asserts "wait only for a short body or before any blank line" plus recv-split invariance on every input, and the new `test_answered.c` checks the real `handle_readable` against a reference model under every split (see `improvements_progress.md`) | Done. Its first run found `GET / X\r\n\r\n` (version token under 9 bytes) held unanswered until the 408 deadline; fixed in `parse_request_head` |
 | T2 | No test for "literal beats `:param`", different parameter names at one position, `%00`, over-long headers, 33 headers | Add to `test_router.c` / `test_http_hardening.c` (C2, S5, S6) |
 | T3 | `tests/test_router.c` frees only `app->connections`, so route trees leak; a Linux LeakSanitizer run would report them | Call `app_free_routes` in `cleanup_app` |
 | T4 | `scripts/stress_test.sh` starts the demo from the repo root (its `GET /` measures a 404) and its memory sampler disagrees with direct measurement | `cd examples/todo_sqlite` before launching; verify the sampler against `ps` |

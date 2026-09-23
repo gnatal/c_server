@@ -64,6 +64,8 @@ int parse_http_request(const char *raw, size_t raw_len, Request *req, Arena *are
  * completeness check, the full parse - doesn't pay for its own pass over the same bytes (P2).
  * head->header_len == 0 means incomplete or malformed (distinguished only by this function's return
  * value, exactly as request_framing already worked): every other field is then not meaningful.
+ * T1: a head picohttpparser still calls incomplete although buf already holds a blank line (e.g. a
+ * version token under 9 bytes, "GET / X\r\n\r\n") is malformed (-1), never incomplete.
  * request_framing and request_is_complete are now thin wrappers over this plus request_head_is_complete;
  * they keep their own signatures for existing callers and are unaffected in behavior.
  */
@@ -147,7 +149,9 @@ int request_framing(const char *buf, size_t len, size_t *header_len_out, int *ch
  * request_is_complete: 1 when buf[0..len) holds a full request (headers + framed body), when framing is
  * invalid/oversized, or when the request line/header block itself is malformed - "HTTP/2.0", garbage, no
  * HTTP version - in every one of those cases parse_http_request reports the specific error (S8).
- * 0 means "read more bytes" (the only remaining case). Called after every recv().
+ * 0 means "read more bytes", and only ever for one of two cases (T1, asserted by fuzz_parser.c and
+ * test_answered.c): no blank line has arrived yet, or a well-framed head waits on a body that is not all
+ * there. Once 1 for a prefix, 1 for every longer buffer. Called after every recv().
  */
 int request_is_complete(const char *buf, size_t len);
 

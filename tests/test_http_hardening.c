@@ -482,6 +482,129 @@ static void test_transfer_encoding_token_matching(void) {
     arena_reset(&test_arena);
 }
 
+/* T1: picohttpparser's parse_http_version asks for 9 bytes before it looks at any, so a version token
+ * shorter than "HTTP/1.x" plus a line end made a finished head read as "incomplete" - forever, since the
+ * client has nothing left to send - and the request went unanswered until the S1 deadline (408). Found by
+ * fuzz_parser.c's T1 oracle. A head is malformed once a blank line has arrived without it parsing. */
+static void test_short_version_token_rejected(void) {
+    const char *malformed[] = {
+        "GET / X\r\n\r\n",
+        "GET / HTTP\r\n\r\n",
+        "GET / HTTP/1\r\n\r\n",
+        "GET  H&TTP/1. 1\r\n\r\n",            /* the fuzzer's own find */
+        "GET / X\n\n",                          /* bare-LF blank line: also a finished head */
+        "GET / X\r\nHost: y\r\n\r\n",           /* short token, then a header */
+    };
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+        const char *line = malformed[i];
+        size_t header_len = 99;
+        int chunked = 99;
+        assert(request_framing(line, strlen(line), &header_len, &chunked, NULL, NULL) == -1);
+        assert(header_len == 0);
+        assert(request_is_complete(line, strlen(line)) == 1);
+        Request req;
+        assert(parse_http_request(line, strlen(line), &req, &test_arena) == -1);
+        arena_reset(&test_arena);
+    }
+
+    /* No blank line yet: still "need more bytes", however short the version token so far. */
+    const char *incomplete[] = {
+        "GET / X\r\n", "GET / X\r\n\r", "GET / HTTP/1.1\r\nHost: x\r\n", "GET / HTTP/1.1\r\nHost: x\r\n\r", "\r\n",
+        "\r\nGET / HTTP/1.1\r\n",
+    };
+    for (size_t i = 0; i < sizeof(incomplete) / sizeof(incomplete[0]); i++) {
+        assert(request_is_complete(incomplete[i], strlen(incomplete[i])) == 0);
+    }
+
+    /* The one leading empty line picohttpparser skips is still not mistaken for a finished head. */
+    const char *leading_crlf = "\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    Request req;
+    assert(request_is_complete(leading_crlf, strlen(leading_crlf)) == 1);
+    assert(parse_http_request(leading_crlf, strlen(leading_crlf), &req, &test_arena) == 0);
+    assert(strcmp(req.path, "/a") == 0);
+    arena_reset(&test_arena);
+}
+
+/* 1 when buf[0..len) holds a blank line ('\n' then "\n" or "\r\n"): the end of any head. */
+static int has_blank_line(const char *buf, const size_t len) {
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (buf[i] == '\n' && (buf[i + 1] == '\n' || (buf[i + 1] == '\r' && i + 2 < len && buf[i + 2] == '\n'))) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The status connection.c answers with (0 = dispatched), from a from-scratch parse of buf[0..len). */
+static int answer_for(const char *buf, const size_t len) {
+    char *exact = malloc(len ? len : 1);
+    assert(exact != NULL);
+    memcpy(exact, buf, len);
+    Request req;
+    const int st = parse_http_request(exact, len, &req, &test_arena);
+    assert(st == 0 || st == -1 || st == -2 || st == -4); /* every status has an answer */
+    const int answer = st == 0 ? 0 : st == -2 ? 414 : req.content_length == -2 ? 413 : req.content_length == -3 ? 501 : 400;
+    arena_reset(&test_arena);
+    free(exact);
+    return answer;
+}
+
+/* T1: "every input is answered or closed", at the parser level, for every prefix of each input (every
+ * point a recv() could stop at): request_is_complete says "wait" only before any blank line or while a
+ * well-framed head's body is genuinely short; once it says "complete" it keeps saying so; the
+ * incremental path connection.c takes (head re-parsed per read, chunk_scan carried) agrees at every
+ * prefix; and the answer chosen at the first complete prefix is the answer for the whole buffer. The
+ * same oracle runs on random inputs in fuzz_parser.c, and end to end in test_answered.c. */
+static void test_every_prefix_is_answered_or_waits_for_bytes(void) {
+    const char *inputs[] = {
+        "GET /a HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nT: v\r\n\r\n",
+        "POST /a HTTP/1.1\r\nContent-Length: 4\r\n\r\n\n\n\r\n",       /* blank lines inside a body */
+        "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n",
+        "GET / X\r\n\r\nGET /a HTTP/1.1\r\n\r\n",
+        "GET /a HTTP/1.1\r\nHost: x\n\r\n",
+        "GET /a HTTP/2.0\r\n\r\n",
+        "POST /a HTTP/1.1\r\nContent-Length: 99999999\r\n\r\n",
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n\r\n",
+        "POST /a HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
+        "GET /%00 HTTP/1.1\r\n\r\n",
+        "\r\nGET /a HTTP/1.1\r\n\r\n",
+        "not http at all\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+        const char *in = inputs[i];
+        const size_t len = strlen(in);
+        size_t first = 0;
+        ChunkScanState carried = {0};
+        for (size_t k = 1; k <= len; k++) {
+            char *exact = malloc(k); /* no NUL, no slack: the parser must stay inside k bytes */
+            assert(exact != NULL);
+            memcpy(exact, in, k);
+            ParsedHead head;
+            parse_request_head(exact, k, &head);
+            const int complete = request_is_complete(exact, k);
+            assert(request_head_is_complete(&head, exact, k, &carried) == complete);
+            if (first != 0) {
+                assert(complete == 1); /* never "wait" again once the request was complete */
+            } else if (complete) {
+                first = k;
+            } else if (head.header_len == 0) {
+                assert(!has_blank_line(exact, k));
+            } else if (head.chunked) {
+                size_t decoded;
+                assert(chunked_body_scan(exact + head.header_len, k - head.header_len, MAX_BODY_SIZE, &decoded) == 0);
+            } else {
+                assert(head.content_length > 0 && k - head.header_len < (size_t)head.content_length);
+            }
+            free(exact);
+        }
+        assert(first != 0); /* every input above is a finished request, well-formed or not */
+        assert(answer_for(in, first) == answer_for(in, len));
+    }
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_framing_is_line_anchored();
@@ -498,6 +621,8 @@ int main(void) {
     test_malformed_request_line_rejected();
     test_bare_lf_rejected();
     test_transfer_encoding_token_matching();
+    test_short_version_token_rejected();
+    test_every_prefix_is_answered_or_waits_for_bytes();
     printf("all http hardening tests passed\n");
     return 0;
 }

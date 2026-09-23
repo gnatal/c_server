@@ -61,12 +61,13 @@ PING_TEST_BIN        = $(BIN_DIR)/test_ping
 PIPELINING_TEST_BIN  = $(BIN_DIR)/test_pipelining
 READ_BUF_TEST_BIN    = $(BIN_DIR)/test_read_buf
 STREAM_TEST_BIN      = $(BIN_DIR)/test_stream
+ANSWERED_TEST_BIN    = $(BIN_DIR)/test_answered
 
 TEST_BINS = $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
             $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN) $(URLENCODED_TEST_BIN) \
             $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) \
             $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN) $(PIPELINING_TEST_BIN) \
-            $(READ_BUF_TEST_BIN) $(STREAM_TEST_BIN)
+            $(READ_BUF_TEST_BIN) $(STREAM_TEST_BIN) $(ANSWERED_TEST_BIN)
 
 .PHONY: all demo test clean test_epoll bench fuzz check-docs
 
@@ -121,6 +122,10 @@ $(STREAM_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+$(ANSWERED_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT_LOOP_OBJS) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_answered.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 $(RESPONSE_TEST_BIN): $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_response.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -167,13 +172,21 @@ bench: $(BENCH_BIN)
 check-docs:
 	./scripts/check_docs.sh
 
-# Mutation fuzzing of the request parser under ASan + UBSan (see tests/fuzz_parser.c).
+# Mutation fuzzing of the request parser under ASan + UBSan (see tests/fuzz_parser.c), then T1's end-to-end
+# "every input is answered or closed" oracle over real sockets (tests/test_answered.c) with
+# FUZZ_ANSWERED_ITERS random inputs. FUZZ_SEED varies both runs' inputs (0 = the default stream).
 FUZZ_ITERS ?= 1000000
+FUZZ_ANSWERED_ITERS ?= 100000
+FUZZ_SEED ?= 0
 fuzz:
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -o $(BIN_DIR)/fuzz_parser \
 	    tests/fuzz_parser.c lib/http_parser.c lib/router.c lib/middleware.c lib/response.c lib/static.c lib/arena.c lib/vendor/picohttpparser/picohttpparser.c
-	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$(BIN_DIR)/fuzz_parser $(FUZZ_ITERS)
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$(BIN_DIR)/fuzz_parser $(FUZZ_ITERS) $(FUZZ_SEED)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -o $(BIN_DIR)/fuzz_answered \
+	    tests/test_answered.c lib/connection.c $(EVENT_LOOP_SRC) lib/cluster.c lib/http_parser.c lib/router.c lib/middleware.c \
+	    lib/response.c lib/static.c lib/arena.c lib/vendor/picohttpparser/picohttpparser.c $(LDFLAGS)
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$(BIN_DIR)/fuzz_answered $(FUZZ_ANSWERED_ITERS) $(FUZZ_SEED)
 
 # Epoll verification on macOS via epoll-shim (if installed)
 EPOLL_SHIM_PREFIX ?= /opt/homebrew/opt/epoll-shim
@@ -184,6 +197,7 @@ ifeq ($(shell test -d $(EPOLL_SHIM_PREFIX) && echo yes),yes)
     CONNECTION_EPOLL_TEST_BIN = $(BIN_DIR)/test_connection_epoll
     PIPELINING_EPOLL_TEST_BIN = $(BIN_DIR)/test_pipelining_epoll
     STREAM_EPOLL_TEST_BIN = $(BIN_DIR)/test_stream_epoll
+    ANSWERED_EPOLL_TEST_BIN = $(BIN_DIR)/test_answered_epoll
 
 $(OBJ_DIR)/lib/event_loop_epoll_shim.o: lib/event_loop_epoll.c
 	@mkdir -p $(dir $@)
@@ -229,11 +243,20 @@ $(STREAM_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shi
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
 
-test_epoll: $(EPOLL_TEST_BIN) $(CONNECTION_EPOLL_TEST_BIN) $(PIPELINING_EPOLL_TEST_BIN) $(STREAM_EPOLL_TEST_BIN)
+$(OBJ_DIR)/tests/test_answered_shim.o: tests/test_answered.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+
+$(ANSWERED_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_answered_shim.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
+
+test_epoll: $(EPOLL_TEST_BIN) $(CONNECTION_EPOLL_TEST_BIN) $(PIPELINING_EPOLL_TEST_BIN) $(STREAM_EPOLL_TEST_BIN) $(ANSWERED_EPOLL_TEST_BIN)
 	./$(EPOLL_TEST_BIN)
 	./$(CONNECTION_EPOLL_TEST_BIN)
 	./$(PIPELINING_EPOLL_TEST_BIN)
 	./$(STREAM_EPOLL_TEST_BIN)
+	./$(ANSWERED_EPOLL_TEST_BIN)
 endif
 
 test: $(TEST_BINS)
@@ -253,6 +276,7 @@ test: $(TEST_BINS)
 	./$(PIPELINING_TEST_BIN)
 	./$(READ_BUF_TEST_BIN)
 	./$(STREAM_TEST_BIN)
+	./$(ANSWERED_TEST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer
