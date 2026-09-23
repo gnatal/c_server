@@ -32,7 +32,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | S8 | ~~Malformed request line gets no response~~ | Security / Correctness | Med | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED |
 | S10 | ~~TLS hardening gaps (renegotiation, handshake deadline)~~ | Security | Low | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | ESTIMATED |
 | S11 | ~~Bare `\n` and substring `chunked` accepted (smuggling ambiguity)~~ | Security | Low | S | **FIXED 2026-09-23**: see `improvements_progress.md` | Code reading + MEASURED (bare LF) |
-| S12 | Startup allocations and `exit()` calls in library code | Reliability | Low | S | Errors reach the application | Code reading |
+| S12 | ~~Startup allocations and `exit()` calls in library code~~ | Reliability | Low | S | **FIXED 2026-09-23**: see `improvements_progress.md` | Code reading |
 | P1 | ~~Static and file responses go through slow paths~~ (static-file cache only) | Performance | | M | **PARTIALLY FIXED 2026-09-22**: see `improvements_progress.md` - the `/static` mount's 6.6× gap is closed; `res_send_file`/large-file streaming (item 1's other sub-parts) are untouched | MEASURED |
 | P2 | ~~Request headers are parsed three times~~ | Performance | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - `last_len` incremental resume across separate `recv`s (and P9, which depends on it) are untouched | MEASURED (was PROJECTED from MEASURED parts) |
 | P3 | ~~Headers are copied into fixed 19 KB `Request` arrays~~ | Performance / Memory | | L | **FIXED 2026-09-22**: see `improvements_progress.md` - headers are views (S5's `-3`/431 retired) and cookies parse lazily; query parsing left eager, out of scope | MEASURED (was PROJECTED) |
@@ -162,7 +162,10 @@ record.
 **Fix.** Reject request lines and headers that end in a bare `\n` (400); accept `chunked` only as the final comma-separated token of `Transfer-Encoding`, reject any other `Transfer-Encoding` on requests with 501/400.
 **Probable gain.** Closes desync ambiguity when deployed behind a proxy; negligible cost. Not exploited here (Low).
 
-### S12 · Startup allocations unchecked; library calls `exit()`
+### S12 · ~~Startup allocations unchecked; library calls `exit()`~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** `app_add_route_mw` (`router.c:102`) does `malloc(sizeof(Route))` and writes to it with no check; `create_patricia_node` (`:404`) and the `realloc` of `children` (`:453`) are unchecked; `fill_route` truncates a route pattern over 255 characters with `strncpy` (`:47`), silently registering a *different* route. `create_server_socket` calls `exit()`/`perror` on failure.
 **Fix.** Check every allocation and return an error; reject (not truncate) over-long patterns with a message; return error codes from `create_server_socket` and `event_loop_init` so the application decides.
 **Probable gain.** Robustness at startup and better embedding behavior; no runtime cost.

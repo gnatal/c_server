@@ -1927,3 +1927,113 @@ already correctly `0` before this fix). No hot-path cost beyond what framing alr
 helpers run once per request, only over bytes already being scanned for other reasons (the header block,
 already located; a `Transfer-Encoding` value, already being read to decide `chunked_out`).
 
+## S12 · Startup allocations unchecked; library calls `exit()`
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+Two independent problems in `improvements.md`'s S12, both in route registration (`lib/router.c`) plus
+one in socket setup (`lib/connection.c`), fixed separately since they don't share code:
+
+- **`fill_route` now rejects an over-long `method`/`path` instead of truncating it (`lib/router.c`).**
+  The old `strncpy(route->path, path, sizeof(route->path) - 1)` silently cut a pattern over 255 chars
+  down to whatever fit, registering a shorter route than the caller asked for with no signal anything
+  was wrong - a request whose path happened to match that truncated prefix would hit a route the caller
+  never actually registered. `fill_route` changed from `void` to `int`: it now checks
+  `strlen(method) >= sizeof(route->method)` and `strlen(path) >= sizeof(route->path)` up front and
+  returns `-1` (route left untouched, a `stderr` message printed) before touching either field, `0` on
+  success. All three callers (`app_add_route_mw`, `router_add_route_mw`, `app_serve_static`) check the
+  return and skip registering rather than proceeding with a corrupted route: `app_add_route_mw` frees the
+  `malloc`'d `Route` it no longer needs; `router_add_route_mw` (routes live in a fixed
+  `Route[MAX_ROUTER_ROUTES]` array, not malloc'd) simply leaves the slot unfilled and does not increment
+  `route_count`, the same "reject, don't consume a slot" convention it already used for the
+  `MAX_ROUTER_ROUTES`-exceeded case just above it.
+- **Every allocation in the Patricia tree build path is now checked (`create_patricia_node`,
+  `tree_insert`, `lib/router.c`).** `create_patricia_node`'s `calloc`/`malloc` were unchecked (a failure
+  handed the caller a node with a dangling or missing `prefix`); it now returns `NULL` on either failing,
+  freeing the partially-built node first if the second allocation (`prefix`) is the one that fails.
+  `tree_insert`'s own root-node creation, every per-segment `create_patricia_node` call (static child,
+  `:name` child, `*` child, catch-all child), and the `children` array `realloc` are each checked; any
+  failure prints one `stderr` message, frees the `Route` being inserted (it was never linked into the
+  tree), and returns without corrupting `current->children`/`child_count` - the `realloc` result lands in
+  a local `new_children` first and only replaces `current->children` once confirmed non-`NULL`, so a
+  failed `realloc` (which leaves the original block untouched) doesn't leak it or write through a `NULL`
+  pointer via the following `memmove`. Any tree structure already linked in before the failing allocation
+  is left in place deliberately, not unwound: a `PatriciaNode` with `route == NULL` is already a normal,
+  valid internal node (used by every route that shares that path prefix), so a partially-built path
+  costs nothing and helps the next successful insert under the same prefix reuse it.
+  `app_add_route_mw` and `app_serve_static`'s own `malloc(sizeof(Route))` (the `Route` handed to
+  `tree_insert`) are checked the same way, printing a message and returning rather than passing a `NULL`
+  route pointer downstream.
+- **`create_server_socket` (`lib/connection.c`) returns `-1` on failure instead of `perror()`+`exit()`.**
+  Every failing step (`socket`, both `setsockopt`s except the best-effort `SO_REUSEPORT`, `bind`,
+  `listen`, and now `set_nonblocking` too - previously not even checked) already closes the fd it opened
+  (steps after the first) and returns `-1`, `perror`ing the specific syscall that failed exactly as
+  before - only the process-killing `exit(EXIT_FAILURE)` calls were removed. This makes the function
+  reusable as a plain library building block instead of one that can unilaterally terminate whatever
+  process links it in. The two call sites now decide for themselves whether a failure here is fatal, and
+  both still choose to `exit(EXIT_FAILURE)` after printing their own context-specific message - same
+  externally observable behavior, decision now made at the outer boundary rather than forced deep inside
+  socket setup, matching the convention `event_loop_init` already used (see `lib/CLAUDE.md`, "Return
+  conventions"/"Workers and fork"):
+  - `app_listen_worker` (`connection.c`): checks `app->server_fd < 0` right after the call (only reached
+    when `!app->accept_via_fd_passing`, i.e. not the `CEXPRESS_SINGLE_ACCEPTOR` fd-passing worker path,
+    which never calls this function at all) and exits with a one-line message naming the port.
+  - `cluster_listen` (`cluster.c`): its pre-existing S7 preflight bind check (validate the port once,
+    before forking anyone, so a fatal misconfiguration doesn't produce a respawn storm - see the S7
+    section above) relied on `create_server_socket`'s own `exit()` to do the actual stopping; it now
+    checks the return itself (both the `CEXPRESS_SINGLE_ACCEPTOR` branch, which keeps the fd open for the
+    cluster's lifetime, and the plain preflight-only branch, which discards it) and exits the same way.
+  `event_loop_init` was *not* changed - it already returns an error code (`0`/`-1`); the "so the
+  application decides" half of S12's fix sketch was already satisfied for it, `app_listen_worker` already
+  chooses to `perror`+`exit()` on its failure today, and `lib/CLAUDE.md` documents this as the intended,
+  permanent contract ("there is no runtime fallback to epoll"), not a gap. `cluster_listen`'s own
+  restart-budget-exhausted `exit()` (S7, unrelated allocation-free code path near the end of the
+  function) and `app_init`'s `calloc`/`malloc` `exit()`s (the connection table and the M1 shared arena -
+  the server cannot run at all without either, and both already document this as the same intentional
+  convention) are both out of scope for this fix and unchanged - `improvements.md`'s S12 entry names only
+  `app_add_route_mw`/`create_patricia_node`/`realloc`/`fill_route`/`create_server_socket` specifically.
+
+**Deliberately not done:** turning `app_listen`/`app_listen_worker`/`cluster_listen` themselves into
+functions that return an error code all the way back to `main()` - `improvements.md`'s own S7 fix record
+(the `cluster_listen` restart-budget-exhausted comment) already calls this "a larger, separate change";
+S12 only asked for the two named unchecked-`exit()` sources to stop forcing that decision internally,
+which is what this fix does, not a change to the public `app_listen` contract (still `void`, unchanged in
+every example/doc/test).
+
+**Tests and results.**
+
+- Unit tests added to `tests/test_router.c` (registered in `main`):
+  - `test_app_add_route_rejects_overlong_path` - a path of exactly 255 chars (fits `Route.path`) is
+    accepted and matches normally; a path of 257 chars is rejected, and confirms the specific old bug
+    this targets doesn't recur: the rejected route's *truncated first-255-chars prefix* does not match
+    anything either (it was never silently registered under a shorter name).
+  - `test_router_add_route_rejects_overlong_path` - the `Router` (fixed-array) path: an over-long pattern
+    passed to `router_get` leaves `router.route_count` at `0`, confirming the slot is left uncounted
+    rather than filled with a truncated pattern.
+- No new allocation-failure tests were added: none of `malloc`/`calloc`/`realloc` in this codebase can be
+  made to fail deterministically without a fault-injection allocator this project doesn't have (the
+  existing convention throughout - `app_init`, `connection_create`, elsewhere - is the same: checked, not
+  independently tested for the OOM branch itself). The code paths were instead verified by inspection and
+  by the fact every existing route-registration test (`test_router.c`, `test_cookbook.c`, the demo) still
+  registers and matches routes correctly through the now-checked path.
+- `make test`: all 13 suites pass, including `test_cluster.c`'s
+  `test_cluster_master_exits_fast_when_port_is_taken` (S7's own regression, unchanged - it asserts the
+  master exits non-zero in under 2 seconds when the port is already bound, which now happens through
+  `cluster_listen`'s own explicit exit rather than `create_server_socket`'s former internal one; the
+  observable behavior is identical, confirmed by this suite still passing without modification) and
+  `test_cluster_master_exits_after_restart_budget_exceeded` (S7's other regression, exercising the
+  separate, unrelated `cluster_listen` `exit()` at the end of the function, also unchanged).
+- `make SANITIZE=1 BUILD_DIR=build-asan test`: all 13 suites pass clean under ASan + UBSan.
+- `make fuzz` (1,000,000 iterations): clean (118,469 parsed, 784,307 complete).
+- `make check-docs`: passes (126 engine functions - no public API changed; `fill_route` stayed a
+  file-local `static`, `create_server_socket` was already declared in `connection.h` and its signature is
+  unchanged, only its failure behavior).
+
+**Status:** Fixed. Every allocation named in `improvements.md`'s S12 entry is now checked, an over-long
+route pattern is rejected rather than silently registering a different, shorter route, and
+`create_server_socket` no longer forces the calling process to exit - the two composing functions that
+call it (`app_listen_worker`, `cluster_listen`) make that call themselves, at the same points and with the
+same externally observable outcome as before.
+

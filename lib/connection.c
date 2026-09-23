@@ -38,17 +38,24 @@ int set_nonblocking(int fd) {
     return 0;
 }
 
+/* S12: returns -1 on any failure (socket already closed first) instead of perror()+exit() - a
+ * library function shouldn't unilaterally kill the process it's linked into. The two library-side
+ * callers (app_listen_worker below, cluster_listen in cluster.c) are the ones that decide a failure
+ * here is fatal and exit() themselves, same convention event_loop_init already uses (see lib/CLAUDE.md,
+ * "Workers and fork"/"Return conventions") - the decision just now lives at that outer boundary
+ * instead of being forced deep inside socket setup. */
 int create_server_socket(int port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     const int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt SO_REUSEADDR");
-        exit(EXIT_FAILURE);
+        close(server_fd);
+        return -1;
     }
 
 #ifdef SO_REUSEPORT
@@ -65,7 +72,8 @@ int create_server_socket(int port) {
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind");
-        exit(EXIT_FAILURE);
+        close(server_fd);
+        return -1;
     }
 
     /* S3: take whichever is larger - BACKLOG is a floor, not a cap. No-op on a system whose
@@ -75,10 +83,14 @@ int create_server_socket(int port) {
     const int backlog = BACKLOG > SOMAXCONN ? BACKLOG : SOMAXCONN;
     if (listen(server_fd, backlog) < 0) {
         perror("listen");
-        exit(EXIT_FAILURE);
+        close(server_fd);
+        return -1;
     }
 
-    set_nonblocking(server_fd);
+    if (set_nonblocking(server_fd) < 0) {
+        close(server_fd);
+        return -1;
+    }
 
     return server_fd;
 }
@@ -816,6 +828,10 @@ void app_listen_worker(App *app, int port) {
      * is unaffected: accept_via_fd_passing is 0 for them, same bind-here behavior as before. */
     if (!app->accept_via_fd_passing) {
         app->server_fd = create_server_socket(port);
+        if (app->server_fd < 0) {
+            fprintf(stderr, "app_listen_worker: could not create listening socket on port %d\n", port);
+            exit(EXIT_FAILURE);
+        }
     }
     if (event_loop_init(app) != 0) {
         perror("event_loop_init");

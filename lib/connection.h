@@ -79,7 +79,7 @@ int app_count_connections(const App *app);
  *   allocating one of its own.
  */
 int set_nonblocking(int fd);
-int create_server_socket(int port);
+int create_server_socket(int port); /* -1 on failure (S12); does not exit() the process itself */
 Connection *connection_create(App *app, int fd);
 void connection_close(App *app, Connection *conn);
 void accept_connections(App *app);

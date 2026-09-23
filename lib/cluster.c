@@ -309,18 +309,25 @@ void cluster_listen(App *app, int port, int num_workers) {
      * every one of workers_count children fail create_server_socket's own bind()/listen() identically
      * and immediately, and the old respawn-on-exit loop re-forked each one right away - MEASURED
      * 10,594 respawns in about 4 seconds with WORKERS=2 and the port already taken.
-     * create_server_socket already prints one clear perror() and calls exit() (S12: still unfixed -
-     * it exits rather than returning an error code, so this call doubles as the "better" fix
-     * improvements.md suggests: verify the listen socket before forking, so a fatal configuration
-     * error stops the whole server once) on any such failure, so calling it here for the sole purpose
-     * of validating and then discarding the fd turns what used to be a fork storm into that single
-     * message. */
+     * S12: create_server_socket itself just returns -1 on failure now (it no longer exit()s on its
+     * own); this call site is the one that decides a preflight failure is fatal and turns it into a
+     * single clear message + exit(), which still gives the same "one message, no fork storm" behavior
+     * this comment originally described. */
 #ifdef CEXPRESS_SINGLE_ACCEPTOR
     /* C4: kept open (not closed like the preflight-only check below) - this is the one real listen
      * socket for the whole cluster's lifetime; only the master accepts on it. */
     int listen_fd = create_server_socket(port);
+    if (listen_fd < 0) {
+        fprintf(stderr, "cluster_listen: could not create listening socket on port %d\n", port);
+        exit(EXIT_FAILURE);
+    }
 #else
-    close(create_server_socket(port));
+    int preflight_fd = create_server_socket(port);
+    if (preflight_fd < 0) {
+        fprintf(stderr, "cluster_listen: could not create listening socket on port %d\n", port);
+        exit(EXIT_FAILURE);
+    }
+    close(preflight_fd);
 #endif
 
     ClusterWorkerSlot workers[MAX_CLUSTER_WORKERS];
@@ -569,12 +576,13 @@ void cluster_listen(App *app, int port, int num_workers) {
     printf("All workers terminated cleanly. Master exiting.\n");
 
     if (fatal) {
-        /* S7/S12: cluster_listen is void, with no way to hand a failure back to app_listen/main() -
-         * same "library calls exit() for a fatal condition" convention create_server_socket and
-         * event_loop_init already use (S12: still unfixed there either - a real error-code path is a
-         * larger, separate change). A non-zero status here is what lets an orchestrator (systemd,
-         * Docker, Kubernetes) see the server as failed and act on it, instead of the process quietly
-         * running with fewer workers than requested or exiting 0 as if nothing happened. */
+        /* S7/S12: cluster_listen is void, with no way to hand a failure back to app_listen/main() - the
+         * restart budget being exhausted is decided and acted on right here rather than propagated as a
+         * return code (a real error-code path all the way back to main() is a larger, separate change;
+         * create_server_socket itself no longer forces this - S12 - it now just returns -1 and this file's
+         * callers are the ones that choose to exit()). A non-zero status here is what lets an orchestrator
+         * (systemd, Docker, Kubernetes) see the server as failed and act on it, instead of the process
+         * quietly running with fewer workers than requested or exiting 0 as if nothing happened. */
         exit(EXIT_FAILURE);
     }
 }

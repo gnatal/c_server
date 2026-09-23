@@ -352,6 +352,63 @@ static void test_app_add_route_mw_truncates_overflow(void) {
     cleanup_app(&app);
 }
 
+/* S12: fill_route used to strncpy an over-long path into Route.path (256 bytes) and silently
+ * truncate it, registering a different, shorter route than the caller asked for. It must now reject
+ * the registration outright instead - nothing should match at the truncated prefix. */
+static void test_app_add_route_rejects_overlong_path(void) {
+    App app;
+    app_init(&app);
+
+    char path_at_cap[256];    /* 255 chars + NUL: exactly fits Route.path, must be accepted */
+    path_at_cap[0] = '/';
+    memset(path_at_cap + 1, 'a', sizeof(path_at_cap) - 2);
+    path_at_cap[sizeof(path_at_cap) - 1] = '\0';
+    assert(strlen(path_at_cap) == 255);
+
+    char path_over_cap[258]; /* 257 chars: one too many, must be rejected */
+    path_over_cap[0] = '/';
+    memset(path_over_cap + 1, 'b', sizeof(path_over_cap) - 2);
+    path_over_cap[sizeof(path_over_cap) - 1] = '\0';
+    assert(strlen(path_over_cap) == 257);
+
+    app_add_route_mw(&app, "GET", path_at_cap, dummy_handler_a, NULL, 0);
+    app_add_route_mw(&app, "GET", path_over_cap, dummy_handler_b, NULL, 0);
+
+    Request req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, path_at_cap, sizeof(req.path) - 1);
+    req.path[sizeof(req.path) - 1] = '\0';
+    const Route *route = match_route(&app, &req);
+    assert(route != NULL && route->handler == dummy_handler_a);
+
+    /* The rejected route must not have been silently registered under some truncated prefix. */
+    char truncated_prefix[256];
+    strncpy(truncated_prefix, path_over_cap, 255);
+    truncated_prefix[255] = '\0';
+    memset(&req, 0, sizeof(req));
+    strncpy(req.method, "GET", sizeof(req.method) - 1);
+    strncpy(req.path, truncated_prefix, sizeof(req.path) - 1);
+    req.path[sizeof(req.path) - 1] = '\0';
+    route = match_route(&app, &req);
+    assert(route == NULL);
+
+    cleanup_app(&app);
+}
+
+static void test_router_add_route_rejects_overlong_path(void) {
+    Router router;
+    router_init(&router);
+
+    char path_over_cap[258];
+    path_over_cap[0] = '/';
+    memset(path_over_cap + 1, 'c', sizeof(path_over_cap) - 2);
+    path_over_cap[sizeof(path_over_cap) - 1] = '\0';
+
+    router_get(&router, path_over_cap, dummy_handler_a); /* rejected, slot not consumed */
+    assert(router.route_count == 0);
+}
+
 static void test_app_put_patch_delete_register_correct_methods(void) {
     App app;
     app_init(&app);
@@ -805,6 +862,8 @@ int main(void) {
     test_app_get_mw_stores_route_middleware();
     test_app_post_mw_stores_route_middleware();
     test_app_add_route_mw_truncates_overflow();
+    test_app_add_route_rejects_overlong_path();
+    test_router_add_route_rejects_overlong_path();
     test_app_put_patch_delete_register_correct_methods();
     test_app_put_patch_delete_mw_store_route_middleware();
     test_router_put_patch_delete_register_correct_methods();

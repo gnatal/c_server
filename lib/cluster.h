@@ -29,8 +29,9 @@ int cluster_worker_id(void);
 /*
  * Starts the multi-process cluster supervisor:
  * - If num_workers <= 1: runs app_listen_worker directly in the current process.
- * - If num_workers > 1: verifies the port is bindable once (create_server_socket, which exits with a
- *   clear error on failure - S7/S12) before forking anyone, then forks num_workers child processes.
+ * - If num_workers > 1: verifies the port is bindable once (create_server_socket - S7; it returns -1 on
+ *   failure rather than exiting itself, S12, and cluster_listen is what turns that into a clear error
+ *   and exit()) before forking anyone, then forks num_workers child processes.
  *   On Linux, each opens its own independent SO_REUSEPORT listening socket and event loop (4-tuple
  *   hashing balances them across workers). On macOS/BSD (CEXPRESS_SINGLE_ACCEPTOR - C4: SO_REUSEPORT
  *   does not balance there), only the master binds and accept()s the one listen socket; each accepted

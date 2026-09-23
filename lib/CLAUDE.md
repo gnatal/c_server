@@ -132,6 +132,16 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   search tries, in this order and with backtracking: a literal child, then the `:name` / mid-pattern `*` child, then a trailing `*`.
   So **specificity beats registration order**: `/users/me` wins over `/users/:id` even when registered second.
   A mid-pattern `*` matches one segment and captures nothing. A trailing `*` matches one or more segments (never the bare prefix). A duplicate pattern for the same method keeps the first and warns.
+  **Registration failure is fail-soft, never a truncated/corrupted route (S12).** A method/path that doesn't fit
+  `Route.method`/`Route.path` (7/255 chars) is rejected outright by `fill_route` with a `stderr` message and the
+  route is not registered at all - it used to be silently `strncpy`-truncated into a shorter pattern than the
+  caller asked for, so a request could match a route nobody actually meant to register. Every allocation on the
+  registration path (`app_add_route_mw`'s/`app_serve_static`'s `Route` `malloc`, `create_patricia_node`'s
+  `calloc`/`malloc`, `tree_insert`'s `children` `realloc`) is checked the same way: a failure logs to `stderr`,
+  frees the `Route` being inserted, and registers nothing, rather than dereferencing a partially-built node or
+  corrupting `PatriciaNode.children`. Tree structure already linked in before a failing allocation is left in
+  place, not unwound - a `PatriciaNode` with `route == NULL` is already a normal internal node, shared by any
+  other route under the same path prefix.
   **Static children are sorted, not registration order (P7).** A node's `children` array is kept sorted by segment
   (short-lexicographic: shared-prefix bytes compare first, the shorter segment sorts before a longer one that starts
   with it) and searched with binary search (`find_child`) instead of a linear `memcmp` scan, both on `tree_insert`
@@ -276,11 +286,14 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 - **Workers and fork.** Never open a database or socket in `main()` before `app_listen`; register `app_on_worker_start`
   and open there (runs once per serving process, after fork). `SIGPIPE` is ignored per process in `app_listen_worker`
   (and, under `CEXPRESS_SINGLE_ACCEPTOR`, in the master too - see below). `cluster_listen` always calls
-  `create_server_socket(port)` once itself before forking anyone - this doubles as the S7 preflight validation
-  (`create_server_socket` already `perror`s and `exit()`s, S12: still unfixed there, on a bind/listen failure, so a
-  fatal, permanent misconfiguration stops the master with one clear message instead of forking `workers_count`
-  children that would all fail identically - MEASURED, `improvements.md` S7, 10,594 respawns and 31,788 log lines
-  in about 4 seconds with `WORKERS=2` and the port already taken).
+  `create_server_socket(port)` once itself before forking anyone - this doubles as the S7 preflight validation.
+  `create_server_socket` itself just `perror`s and returns `-1` on a bind/listen failure (S12, fixed
+  2026-09-23 - it no longer `exit()`s the process on its own); `cluster_listen` is what checks that return
+  and `exit()`s with one clear message, so a fatal, permanent misconfiguration still stops the master
+  before forking `workers_count` children that would all fail identically - MEASURED, `improvements.md` S7,
+  10,594 respawns and 31,788 log lines in about 4 seconds with `WORKERS=2` and the port already taken.
+  `app_listen_worker` (`connection.c`, the non-cluster/per-worker caller) checks the same return and exits
+  the same way.
   **Single acceptor (C4, `CEXPRESS_SINGLE_ACCEPTOR`, macOS/BSD only).** That one listen socket (`listen_fd`) is kept
   open, not closed, for the master's entire lifetime - it never binds a second one, and no worker binds any listen
   socket at all. Each worker instead runs `app_listen_worker_via_control_socket`, which points its `server_fd` at
@@ -310,8 +323,10 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   at 30 s) instead of instantly; if a slot fails more than `CLUSTER_RESTART_BUDGET` (5) times within
   `CLUSTER_RESTART_WINDOW_MS` (60 s) - a sliding window, not a lifetime count, so an occasional unrelated crash over a
   long-running server's life doesn't eventually trip it - the master gives up on the whole cluster, drains whatever
-  workers are still up the same way a SIGTERM would, and `exit()`s non-zero itself (same S12 caveat: no error code
-  returned to `app_listen`/`main()`). Both mechanisms are implementation details of `cluster.c` (the constants above
+  workers are still up the same way a SIGTERM would, and `exit()`s non-zero itself (no error code returned to
+  `app_listen`/`main()` - `cluster_listen` stays `void`; S12 addressed the *unchecked-allocation and forced-exit*
+  half of this area, not `app_listen`'s own return-nothing contract, which remains a deliberate, larger, separate
+  change - see `improvements_progress.md`, S12). Both mechanisms are implementation details of `cluster.c` (the constants above
   are file-local, not in `app_types.h`, same convention as `connection.c`'s `ARENA_SIZE`) and share one accounting
   helper, `record_worker_failure`, so a `fork()` failure while trying to (re)spawn a slot counts against the same
   budget as an abnormal exit rather than looping unbounded on its own. Under `CEXPRESS_SINGLE_ACCEPTOR`, a respawn

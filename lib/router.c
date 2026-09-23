@@ -55,9 +55,23 @@ void app_init(App *app) {
 
 /* Shared fill logic for one route slot, used by both app_add_route_mw and
  * router_add_route_mw - an App and a Router register routes identically,
- * they just land in different fixed Route[MAX_ROUTES] arrays. */
-static void fill_route(Route *route, const char *method, const char *path, Handler handler,
-                        const Middleware *middlewares, int middleware_count) {
+ * they just land in different fixed Route[MAX_ROUTES] arrays.
+ * S12: a method/path that doesn't fit its fixed slot is rejected outright (0/-1), not silently
+ * truncated by strncpy - a truncated pattern used to register a different, shorter route than the
+ * caller asked for with no indication anything was wrong. Returns 0 on success, -1 (route left
+ * untouched, nothing registered) if either is too long. */
+static int fill_route(Route *route, const char *method, const char *path, Handler handler,
+                       const Middleware *middlewares, int middleware_count) {
+    if (strlen(method) >= sizeof(route->method)) {
+        fprintf(stderr, "route registration: method \"%s\" exceeds %zu chars, route \"%s\" not registered\n",
+                method, sizeof(route->method) - 1, path);
+        return -1;
+    }
+    if (strlen(path) >= sizeof(route->path)) {
+        fprintf(stderr, "route registration: path \"%s\" exceeds %zu chars, route not registered\n",
+                path, sizeof(route->path) - 1);
+        return -1;
+    }
     strncpy(route->method, method, sizeof(route->method) - 1);
     route->method[sizeof(route->method) - 1] = '\0';
     strncpy(route->path, path, sizeof(route->path) - 1);
@@ -81,6 +95,7 @@ static void fill_route(Route *route, const char *method, const char *path, Handl
         route->middlewares[i] = middlewares[i];
     }
     route->middleware_count = middleware_count;
+    return 0;
 }
 
 static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route);
@@ -114,7 +129,14 @@ void app_add_route(App *app, const char *method, const char *path, Handler handl
 void app_add_route_mw(App *app, const char *method, const char *path, Handler handler,
                        const Middleware *middlewares, int middleware_count) {
     Route *route = malloc(sizeof(Route));
-    fill_route(route, method, path, handler, middlewares, middleware_count);
+    if (route == NULL) {
+        fprintf(stderr, "app_add_route: out of memory, route \"%s %s\" not registered\n", method, path);
+        return;
+    }
+    if (fill_route(route, method, path, handler, middlewares, middleware_count) != 0) {
+        free(route);
+        return;
+    }
     app_insert_route_struct(app, route);
 }
 
@@ -196,7 +218,11 @@ void router_add_route_mw(Router *router, const char *method, const char *path, H
         fprintf(stderr, "router_add_route: MAX_ROUTER_ROUTES exceeded\n");
         return;
     }
-    fill_route(&router->routes[router->route_count++], method, path, handler, middlewares, middleware_count);
+    if (fill_route(&router->routes[router->route_count], method, path, handler,
+                    middlewares, middleware_count) != 0) {
+        return; /* slot left unfilled and uncounted - nothing to free, it's part of the fixed array */
+    }
+    router->route_count++;
 }
 
 void router_get(Router *router, const char *path, Handler handler) {
@@ -333,7 +359,14 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
     snprintf(pattern, sizeof(pattern), "%s/*", normalized_prefix);
     
     Route *route = malloc(sizeof(Route));
-    fill_route(route, "GET", pattern, NULL, NULL, 0);
+    if (route == NULL) {
+        fprintf(stderr, "app_serve_static: out of memory, \"%s\" not registered\n", root_dir);
+        return;
+    }
+    if (fill_route(route, "GET", pattern, NULL, NULL, 0) != 0) {
+        free(route);
+        return;
+    }
 
     size_t root_len = strlen(canonical_root);
     if (root_len >= sizeof(route->static_root)) {
@@ -501,10 +534,20 @@ static int find_child(PatriciaNode *const *children, int child_count, const char
     return 0;
 }
 
+/* S12: returns NULL (nothing partially allocated - a failed prefix malloc frees the node before
+ * returning) on either allocation failing, instead of handing the caller a node with a dangling or
+ * missing prefix. */
 static PatriciaNode *create_patricia_node(const char *prefix, size_t prefix_len, NodeType type) {
     PatriciaNode *n = calloc(1, sizeof(PatriciaNode));
+    if (n == NULL) {
+        return NULL;
+    }
     if (prefix_len > 0) {
         n->prefix = malloc(prefix_len + 1);
+        if (n->prefix == NULL) {
+            free(n);
+            return NULL;
+        }
         memcpy(n->prefix, prefix, prefix_len);
         n->prefix[prefix_len] = '\0';
         n->prefix_len = (int)prefix_len;
@@ -513,16 +556,26 @@ static PatriciaNode *create_patricia_node(const char *prefix, size_t prefix_len,
     return n;
 }
 
+/* S12: every node allocation and the children realloc are checked; on failure this frees `route`
+ * (never inserted) and logs, rather than dereferencing a NULL node or leaking `route`. Any tree
+ * structure already linked in before the failing allocation is harmless - a PatriciaNode with no
+ * route is already a normal, valid internal node, and it's still shared by any other route that
+ * needs that same path prefix. */
 static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route) {
     if (*root_ptr == NULL) {
         *root_ptr = create_patricia_node("", 0, NODE_STATIC);
+        if (*root_ptr == NULL) {
+            fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+            free(route);
+            return;
+        }
     }
-    
+
     PatriciaNode *current = *root_ptr;
     const char *cursor = path;
     size_t seg_len;
     const char *seg = next_segment(&cursor, &seg_len);
-    
+
     while (seg != NULL) {
         NodeType type = NODE_STATIC;
         if (seg_len == 1 && seg[0] == '*') {
@@ -536,19 +589,31 @@ static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route)
         } else if (seg[0] == ':') {
             type = NODE_PARAM;
         }
-        
+
         PatriciaNode *next_node = NULL;
-        
+
         if (type == NODE_STATIC) {
             int idx;
             if (find_child(current->children, current->child_count, seg, seg_len, &idx)) {
                 next_node = current->children[idx];
             } else {
                 if (current->child_count >= current->child_cap) {
-                    current->child_cap = current->child_cap == 0 ? 4 : current->child_cap * 2;
-                    current->children = realloc(current->children, current->child_cap * sizeof(PatriciaNode *));
+                    int new_cap = current->child_cap == 0 ? 4 : current->child_cap * 2;
+                    PatriciaNode **new_children = realloc(current->children, (size_t)new_cap * sizeof(PatriciaNode *));
+                    if (new_children == NULL) {
+                        fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+                        free(route);
+                        return;
+                    }
+                    current->children = new_children;
+                    current->child_cap = new_cap;
                 }
                 next_node = create_patricia_node(seg, seg_len, NODE_STATIC);
+                if (next_node == NULL) {
+                    fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+                    free(route);
+                    return;
+                }
                 memmove(&current->children[idx + 1], &current->children[idx],
                         (size_t)(current->child_count - idx) * sizeof(PatriciaNode *));
                 current->children[idx] = next_node;
@@ -561,19 +626,29 @@ static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route)
                 } else {
                     current->param_child = create_patricia_node("*", 1, NODE_PARAM);
                 }
+                if (current->param_child == NULL) {
+                    fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+                    free(route);
+                    return;
+                }
             }
             next_node = current->param_child;
         } else if (type == NODE_CATCH_ALL) {
             if (!current->catch_all_child) {
                 current->catch_all_child = create_patricia_node("*", 1, NODE_CATCH_ALL);
+                if (current->catch_all_child == NULL) {
+                    fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+                    free(route);
+                    return;
+                }
             }
             next_node = current->catch_all_child;
         }
-        
+
         current = next_node;
         seg = next_segment(&cursor, &seg_len);
     }
-    
+
     if (!current->route) {
         current->route = route;
     } else {
