@@ -24,14 +24,14 @@ and a restart budget (S7, same section). Handlers run synchronously on the loop:
 sleep) stalls that whole worker, so scale with workers, not threads. State is per process; there is no shared memory.
 If `event_loop_init` fails (for example io_uring is blocked by the runtime), `app_listen_worker` prints the error and exits; there is no runtime fallback to epoll.
 
-Per request (`connection.c: handle_readable`):
+Per request (`connection.c: handle_readable` → `serve_buffered_requests`, which repeats steps 1-6 for every complete request already in `in_buf`, starting at `conn->in_off` - P9 pipelining, see "Behavior reference, Pipelining"):
 1. `recv` into `conn->in_buf`, then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below (P2) - the body-limit check (S4), `request_head_is_complete` (a chunked scan when the body is chunked, resumed from `conn->chunk_scan` so each body byte is scanned once per request, not once per `recv` - P8), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request before P2).
 2. `parse_http_request_from_head(in_buf, in_len, &head, &req, conn->arena)` → `Request` on the stack (copies method/path/query into its fixed arrays; headers are stored as VIEWS into `in_buf`, not copies, and the body is copied into the shared arena - P3, M1). Failure → reject (400 / 413 / 414 / 431), close. (`parse_http_request`/`request_is_complete`/`request_framing` remain as thin, unchanged-behavior wrappers over `parse_request_head` for callers - tests, `fuzz_parser.c` - that only need one piece.)
 3. `keep_alive = !request_wants_close && !shutting_down`; `res.is_head_request` set.
 4. `match_route` (per-method Patricia tree, fills `:params`) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
 5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf` (allocated from the arena).
-6. `flush_connection` writes. Keep-alive: `arena_reset`, `in_len = 0`, zero `chunk_scan` (P8), shrink `in_buf`. Otherwise `connection_close`.
+6. `flush_connection` writes. Keep-alive: `arena_reset`, advance `in_off` past this request's `request_len` (or `in_len = 0` when nothing follows it - P9), zero `chunk_scan` (P8), shrink `in_buf` when empty. Otherwise `connection_close`, dropping anything pipelined behind it.
 
 Only `connection.c`, `event_loop_*.c`, `cluster.c` do I/O. Parsing, routing, dispatch and
 response building never touch a socket, so tests drive them with a fake `Connection` whose arena is a static buffer
@@ -227,6 +227,26 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   to `header_len + content_length + 1` in one step, reserving virtual memory proportional to what the client merely
   *declared* rather than what it had actually sent), and shrunk back when the connection goes idle. No header
   terminator within 8 KiB → 431.
+- **Pipelining (P9).** Several requests may sit in `in_buf` at once. `serve_buffered_requests` answers them strictly in
+  order, one `flush_connection` each, starting at `Connection.in_off`; `request_wire_len` (`http_parser.c`: `header_len` +
+  `Content-Length`, or + `ChunkScanState.body_end` for chunked, which ends after the trailer's blank line) records where
+  the next one starts (`Connection.request_len`), and `flush_connection`'s keep-alive reset advances `in_off` by it.
+  Bytes after a `Content-Length` body are the next request, never part of this body. The unserved tail is moved to the
+  front of `in_buf` only when more input must be read (`compact_in_buf`, on "need more"), never after each request, so
+  each byte moves at most once (per-request `memmove` would be quadratic for a large batch of tiny requests).
+  **Fairness:** at most `MAX_PIPELINED_PER_EVENT` (16) requests per readiness event; past that the connection arms write
+  interest and the rest is served by `handle_writable` on the next poll (a connected socket is almost always writable).
+  **Backpressure:** while a response is pending (`EAGAIN`), `flush_connection` (`wait_for_writable`) drops read interest
+  and `handle_readable` consumes nothing, so a request pipelined behind a large response is never dispatched over the
+  pending one (before P9 it was: the buffer still held the first request, which was re-parsed and dispatched again,
+  overwriting and leaking the owned tail copy). Read interest returns in the keep-alive reset. A client that pipelines
+  without reading is therefore stopped by TCP flow control, not buffered by the server.
+  **Syscalls:** `handle_readable` returns as soon as a `recv` produced at least one answered request instead of calling
+  `recv` again for an almost-certain `EAGAIN` (level-triggered readiness re-fires if more is waiting) - MEASURED: the
+  extra `recv` cost ~9% of non-pipelined `/ping` throughput. A rejected request (400/413/414/431/501) or a response
+  with `Connection: close` (including every response during shutdown) closes the connection; whatever was pipelined
+  behind it is dropped unanswered, as RFC 9112 allows. `request_started` (S1) restarts when leftover bytes remain
+  after a response, so a partial pipelined request is still bounded by the header/body deadlines.
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length` and `Connection` are engine-owned.
   `CookieOptions` zero value = session cookie; `max_age > 0` seconds, `< 0` expire now.
@@ -338,6 +358,10 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   matches, so a keep-alive response costs no extra `kevent` there. The epoll and io_uring backends issue a syscall on every `watch_*` / `unwatch_*`
   (`epoll_ctl`; io_uring submits a poll-remove plus a new multishot poll), including the `unwatch_write` that `flush_connection` runs after every keep-alive response.
   `LOOP_EVENT_ERROR` (POLLERR/POLLHUP or a negative completion) closes the connection.
+  `LOOP_EVENT_WRITE` goes to `handle_writable` (P9), not straight to `flush_connection`: it drains a pending response and then
+  serves any pipelined requests still buffered. Since P9 an `EAGAIN` mid-response also unwatches read and the keep-alive reset
+  re-watches it (one extra `watch`/`unwatch` pair per response that did not fit the socket buffer in one go, none otherwise).
+  On io_uring every such change goes through `update_poll`, the C6 cancellation path below.
 
 ## Hot-path rules (measured; do not undo)
 Per-request CPU cost of the pure path (parse, route, dispatch, response build; no sockets, one core; `make bench`, Apple M3 Pro,
@@ -393,9 +417,6 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
 - **Path parameter names are per tree position, not per route.** Routes `/orders/:id/items` and `/orders/:oid/notes` share one parameter node named after
   the first registration, so `req_get_param(req, "oid")` returns `NULL` (the value is under `id`). A route registered after a mid-pattern `*` at the same position
   (`/x/*/y`, then `/x/:id/z`) captures nothing. Use the same `:name` at the same position across routes.
-- **Pipelining is dropped.** After the first request is answered, `flush_connection` sets `in_len = 0`, discarding any further
-  request already in the buffer (client sees one response for two requests). Fix needs the parser to report bytes consumed,
-  `memmove` of the remainder, and re-running the parse loop after each flush.
 - **Chunked framing overhead is not capped separately** (P8 left this out): 10 MiB of 1-byte chunks is accepted up to the raw `MAX_BODY_SIZE` wire cap. Since P8 the scan is linear (~14 ms for that worst case, MEASURED), so this is a cost bound, not an amplification.
 - **Per-connection footprint is about 8.2 KB resident on macOS** (M1 fixed the dominant 64 KiB-per-connection arena share of this - see Memory model; 10,000 idle connections are on the order of 84 MB now, down from about 250 MB before). `in_buf` (8 KiB, `BUF_SIZE`) remains per connection; shrinking that too is M2, still open.
 - **`Request.body` is still a copy** (now into the arena), including a 1-byte allocation for empty bodies.

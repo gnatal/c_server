@@ -1,0 +1,351 @@
+/*
+ * P9: HTTP/1.1 pipelining - several requests arriving in one buffer are each answered, in order, on
+ * the same connection. Split from test_connection.c (already past the 1,000-line cap) but driven the
+ * same way: a socketpair(2) peer, handle_readable/handle_writable called directly, no real listener.
+ */
+#include <assert.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include "app_types.h"
+#include "event_loop.h"
+#include "connection.h"
+#include "router.h"
+#include "response.h"
+#include "http_parser.h"
+
+#define BIG_BODY_LEN (1024 * 1024) /* far larger than a socketpair's kernel buffer: forces EAGAIN */
+
+static void ping_handler(const Request *req, Response *res) {
+    (void)req;
+    res_status(res, 200);
+    res_send(res, "pong");
+}
+
+/* Echoes the path so the order of answers is visible in the response stream. */
+static void echo_path_handler(const Request *req, Response *res) {
+    res_status(res, 200);
+    res_send(res, req->path);
+}
+
+static void echo_len_handler(const Request *req, Response *res) {
+    char body[64];
+    snprintf(body, sizeof(body), "received %d bytes", req->content_length);
+    res_status(res, 200);
+    res_send(res, body);
+}
+
+static void big_handler(const Request *req, Response *res) {
+    (void)req;
+    unsigned char *body = malloc(BIG_BODY_LEN);
+    assert(body != NULL);
+    memset(body, 'x', BIG_BODY_LEN);
+    res_status(res, 200);
+    res_send_bytes(res, "application/octet-stream", body, BIG_BODY_LEN);
+    free(body); /* res_send_bytes copied it into the arena */
+}
+
+static void setup(App *app, int fds[2], Connection **conn) {
+    app_init(app);
+    assert(event_loop_init(app) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    assert(set_nonblocking(fds[0]) == 0);
+    assert(set_nonblocking(fds[1]) == 0);
+    *conn = connection_create(app, fds[0]);
+    assert(*conn != NULL);
+    app->connections[fds[0]] = *conn;
+    assert(event_loop_watch_read(app, fds[0], *conn) == 0);
+
+    app_get(app, "/ping", ping_handler);
+    app_get(app, "/a", echo_path_handler);
+    app_get(app, "/b", echo_path_handler);
+    app_get(app, "/c", echo_path_handler);
+    app_get(app, "/big", big_handler);
+    app_post(app, "/upload", echo_len_handler);
+}
+
+static void teardown(App *app, int fds[2]) {
+    close(fds[1]);
+    app_destroy(app); /* closes and frees whatever connection is still tracked */
+}
+
+static void send_all(const int fd, const char *data) {
+    const size_t len = strlen(data);
+    assert(write(fd, data, len) == (ssize_t)len);
+}
+
+/* Everything the server has written so far (non-blocking peer), NUL-terminated. */
+static size_t read_available(const int fd, char *out, const size_t cap) {
+    size_t total = 0;
+    for (;;) {
+        const ssize_t n = read(fd, out + total, cap - 1 - total);
+        if (n <= 0) {
+            break;
+        }
+        total += (size_t)n;
+        if (total == cap - 1) {
+            break;
+        }
+    }
+    out[total] = '\0';
+    return total;
+}
+
+static int count_occurrences(const char *haystack, const char *needle) {
+    int count = 0;
+    for (const char *p = strstr(haystack, needle); p != NULL; p = strstr(p + 1, needle)) {
+        count++;
+    }
+    return count;
+}
+
+/* Two GETs in one write: the second used to be discarded with in_len = 0 (one answer for two). */
+static void test_two_gets_in_one_write_both_answered_in_order(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup(&app, fds, &conn);
+
+    send_all(fds[1], "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_readable(&app, conn);
+
+    char out[4096];
+    read_available(fds[1], out, sizeof(out));
+    assert(count_occurrences(out, "HTTP/1.1 200 OK") == 2);
+    const char *first = strstr(out, "\r\n\r\n/a");
+    const char *second = strstr(out, "\r\n\r\n/b");
+    assert(first != NULL && second != NULL && first < second);
+
+    assert(app.connections[fds[0]] == conn);
+    assert(conn->in_len == 0 && conn->in_off == 0 && conn->request_len == 0);
+    assert(conn->request_started == 0); /* nothing left buffered: idle between requests (S1) */
+
+    teardown(&app, fds);
+}
+
+/* A Content-Length body ends exactly where the next request starts - not at in_len. */
+static void test_content_length_body_then_get(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup(&app, fds, &conn);
+
+    send_all(fds[1], "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+                     "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_readable(&app, conn);
+
+    char out[4096];
+    read_available(fds[1], out, sizeof(out));
+    const char *upload = strstr(out, "received 5 bytes");
+    const char *pong = strstr(out, "pong");
+    assert(upload != NULL && pong != NULL && upload < pong);
+    assert(app.connections[fds[0]] == conn);
+    assert(conn->in_len == 0);
+
+    teardown(&app, fds);
+}
+
+/* A chunked body (with a trailer) ends after its trailer's blank line (ChunkScanState.body_end). */
+static void test_chunked_body_then_get(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup(&app, fds, &conn);
+
+    send_all(fds[1], "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     "5\r\nHello\r\n6\r\n World\r\n0\r\nX-Trailer: t\r\n\r\n"
+                     "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_readable(&app, conn);
+
+    char out[4096];
+    read_available(fds[1], out, sizeof(out));
+    const char *upload = strstr(out, "received 11 bytes");
+    const char *pong = strstr(out, "pong");
+    assert(upload != NULL && pong != NULL && upload < pong);
+    assert(conn->in_len == 0);
+    assert(conn->chunk_scan.pos == 0 && conn->chunk_scan.body_end == 0); /* reset for the next request */
+
+    teardown(&app, fds);
+}
+
+/* One full request plus half of the next: the half is kept (moved to the front of in_buf, its S1
+ * clock started) and completed by the next read. */
+static void test_partial_second_request_is_kept_and_completed(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup(&app, fds, &conn);
+
+    const char *half = "GET /b HTTP/1.1\r\nHo";
+    char first_write[256];
+    snprintf(first_write, sizeof(first_write), "GET /a HTTP/1.1\r\nHost: x\r\n\r\n%s", half);
+    send_all(fds[1], first_write);
+    handle_readable(&app, conn);
+
+    char out[4096];
+    read_available(fds[1], out, sizeof(out));
+    assert(count_occurrences(out, "HTTP/1.1 200 OK") == 1);
+    assert(strstr(out, "\r\n\r\n/a") != NULL);
+    assert(conn->in_off == 0);
+    assert(conn->in_len == strlen(half));
+    assert(memcmp(conn->in_buf, half, strlen(half)) == 0);
+    assert(conn->request_started != 0);
+
+    send_all(fds[1], "st: x\r\n\r\n");
+    handle_readable(&app, conn);
+    read_available(fds[1], out, sizeof(out));
+    assert(count_occurrences(out, "HTTP/1.1 200 OK") == 1);
+    assert(strstr(out, "\r\n\r\n/b") != NULL);
+    assert(conn->in_len == 0);
+
+    teardown(&app, fds);
+}
+
+/* More than MAX_PIPELINED_PER_EVENT requests: the first batch is served, the rest wait behind a
+ * write-readiness wakeup (fairness), and handle_writable serves them without any new input. */
+static void test_per_event_cap_yields_then_resumes(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup(&app, fds, &conn);
+
+    const int total = MAX_PIPELINED_PER_EVENT + 4;
+    char batch[2048];
+    size_t off = 0;
+    for (int i = 0; i < total; i++) {
+        off += (size_t)snprintf(batch + off, sizeof(batch) - off, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+    send_all(fds[1], batch);
+    handle_readable(&app, conn);
+
+    char out[16384];
+    read_available(fds[1], out, sizeof(out));
+    assert(count_occurrences(out, "pong") == MAX_PIPELINED_PER_EVENT);
+    assert(conn->in_off > 0 && conn->in_off < conn->in_len);
+    assert(conn->events_watched & EVENT_WRITE);
+
+    /* The armed write-readiness wakeup: serves the rest with no new input. */
+    handle_writable(&app, conn);
+    read_available(fds[1], out, sizeof(out));
+    assert(count_occurrences(out, "pong") == 4);
+    assert(conn->in_len == 0 && conn->in_off == 0);
+    assert(!(conn->events_watched & EVENT_WRITE));
+    assert(conn->events_watched & EVENT_READ);
+
+    teardown(&app, fds);
+}
+
+/* Connection: close on the first request ends the connection after its response; what was
+ * pipelined behind it is never answered. */
+static void test_connection_close_drops_the_rest(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup(&app, fds, &conn);
+
+    send_all(fds[1], "GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_readable(&app, conn);
+
+    char out[4096];
+    read_available(fds[1], out, sizeof(out));
+    assert(count_occurrences(out, "HTTP/1.1 200 OK") == 1);
+    assert(strstr(out, "/b") == NULL);
+    assert(app.connections[fds[0]] == NULL);
+
+    teardown(&app, fds);
+}
+
+/* A malformed request after a good one: the good one is answered, then 400 and close. */
+static void test_malformed_second_request_gets_400_after_first_answer(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup(&app, fds, &conn);
+
+    send_all(fds[1], "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGARBAGE\r\n\r\n");
+    handle_readable(&app, conn);
+
+    char out[4096];
+    read_available(fds[1], out, sizeof(out));
+    const char *ok = strstr(out, "HTTP/1.1 200 OK");
+    const char *bad = strstr(out, "HTTP/1.1 400");
+    assert(ok != NULL && bad != NULL && ok < bad);
+    assert(app.connections[fds[0]] == NULL);
+
+    teardown(&app, fds);
+}
+
+/* A response too large to write in one go leaves requests pipelined behind it untouched: reads stop
+ * (no second dispatch over the pending response, which is what happened before P9 when a request
+ * arrived mid-write), and handle_writable serves them once the big response has fully drained. */
+static void test_pending_response_holds_pipeline_until_drained(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup(&app, fds, &conn);
+
+    send_all(fds[1], "GET /big HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_readable(&app, conn);
+
+    assert(app.connections[fds[0]] == conn);
+    assert(conn->out_buf != NULL && conn->out_sent < conn->out_len); /* real EAGAIN mid-response */
+    assert(conn->out_buf_owned);
+    assert(conn->events_watched & EVENT_WRITE);
+    assert(!(conn->events_watched & EVENT_READ));
+
+    /* More input while pending is not consumed. */
+    send_all(fds[1], "GET /c HTTP/1.1\r\nHost: x\r\n\r\n");
+    const size_t in_len_before = conn->in_len;
+    handle_readable(&app, conn);
+    assert(conn->in_len == in_len_before);
+
+    /* Drain the peer while the server keeps writing; count body bytes and find the follow-ups. */
+    static char out[BIG_BODY_LEN + 8192];
+    size_t got = 0;
+    for (int spins = 0; spins < 100000 && app.connections[fds[0]] == conn; spins++) {
+        const ssize_t n = read(fds[1], out + got, sizeof(out) - 1 - got);
+        if (n > 0) {
+            got += (size_t)n;
+        }
+        if (conn->out_buf == NULL && conn->file_fd < 0 && conn->in_len == 0) {
+            break;
+        }
+        handle_writable(&app, conn);
+        if (conn->events_watched & EVENT_READ) {
+            handle_readable(&app, conn); /* reads resumed: pick up /c */
+        }
+    }
+    for (ssize_t n; (n = read(fds[1], out + got, sizeof(out) - 1 - got)) > 0;) {
+        got += (size_t)n;
+    }
+    out[got] = '\0';
+
+    assert(conn->out_buf == NULL);
+    assert(conn->in_len == 0);
+    assert(conn->events_watched & EVENT_READ);
+    assert(got > BIG_BODY_LEN);
+    /* The big body is 'x' bytes, so the follow-up answers are found after it, in order. */
+    const char *after_big = out + BIG_BODY_LEN;
+    const char *a = strstr(after_big, "\r\n\r\n/a");
+    const char *c = strstr(after_big, "\r\n\r\n/c");
+    assert(a != NULL && c != NULL && a < c);
+    assert(count_occurrences(after_big, "HTTP/1.1 200 OK") == 2);
+
+    teardown(&app, fds);
+}
+
+int main(void) {
+    test_two_gets_in_one_write_both_answered_in_order();
+    test_content_length_body_then_get();
+    test_chunked_body_then_get();
+    test_partial_second_request_is_kept_and_completed();
+    test_per_event_cap_yields_then_resumes();
+    test_connection_close_drops_the_rest();
+    test_malformed_second_request_gets_400_after_first_answer();
+    test_pending_response_holds_pipeline_until_drained();
+    printf("all pipelining tests passed\n");
+    return 0;
+}

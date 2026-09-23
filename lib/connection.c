@@ -416,7 +416,21 @@ void accept_passed_connections(App *app) {
 }
 #endif
 
-void flush_connection(App *app, Connection *conn) {
+/*
+ * P9: a response could not be fully written this turn. Ask for write readiness and stop reading
+ * until it drains: in_buf may already hold the next pipelined request, and serving it now would
+ * build a new response over the one still pending. Level-triggered read readiness would otherwise
+ * keep firing for bytes handle_readable must not consume yet. flush_connection's keep-alive branch
+ * re-watches read once the response is fully queued (a closed connection needs neither).
+ */
+static void wait_for_writable(App *app, Connection *conn) {
+    event_loop_watch_write(app, conn->fd, conn);
+    if (conn->events_watched & EVENT_READ) {
+        event_loop_unwatch_read(app, conn->fd);
+    }
+}
+
+int flush_connection(App *app, Connection *conn) {
     size_t bytes_written_this_flush = 0;
     const size_t max_flush_bytes = 4 * STREAM_CHUNK_SIZE;
 
@@ -442,7 +456,7 @@ void flush_connection(App *app, Connection *conn) {
                         char *tail = malloc(remaining);
                         if (tail == NULL) {
                             connection_close(app, conn);
-                            return;
+                            return FLUSH_CLOSED;
                         }
                         memcpy(tail, conn->out_buf + conn->out_sent, remaining);
                         conn->out_buf = tail;
@@ -451,11 +465,11 @@ void flush_connection(App *app, Connection *conn) {
                         conn->out_cap = remaining;
                         conn->out_buf_owned = 1;
                     }
-                    event_loop_watch_write(app, conn->fd, conn);
-                    return;
+                    wait_for_writable(app, conn);
+                    return FLUSH_PENDING;
                 }
                 connection_close(app, conn);
-                return;
+                return FLUSH_CLOSED;
             }
             conn->out_sent += (size_t)n;
             conn->last_activity = time(NULL);
@@ -468,8 +482,8 @@ void flush_connection(App *app, Connection *conn) {
             if (conn->file_remaining > 0) {
                 if (bytes_written_this_flush >= max_flush_bytes) {
                     /* Yield to event loop to share bandwidth fairly */
-                    event_loop_watch_write(app, conn->fd, conn);
-                    return;
+                    wait_for_writable(app, conn);
+                    return FLUSH_PENDING;
                 }
 
                 size_t to_read = conn->file_remaining < STREAM_CHUNK_SIZE
@@ -489,14 +503,14 @@ void flush_connection(App *app, Connection *conn) {
                     conn->file_buf = malloc(STREAM_CHUNK_SIZE);
                     if (conn->file_buf == NULL) {
                         connection_close(app, conn);
-                        return;
+                        return FLUSH_CLOSED;
                     }
                 }
                 conn->out_buf = conn->file_buf;
                 ssize_t r = read(conn->file_fd, conn->out_buf, to_read);
                 if (r <= 0) {
                     connection_close(app, conn);
-                    return;
+                    return FLUSH_CLOSED;
                 }
                 conn->out_len = (size_t)r;
                 conn->out_sent = 0;
@@ -526,34 +540,52 @@ void flush_connection(App *app, Connection *conn) {
     }
 
     if (conn->keep_alive) {
-        /* Drop write registration from a partial write above */
+        /* Drop write registration from a partial write above, and resume reading (P9: reads pause
+         * while a response is pending - see wait_for_writable). */
         event_loop_unwatch_write(app, conn->fd, conn);
+        if (!(conn->events_watched & EVENT_READ)) {
+            event_loop_watch_read(app, conn->fd, conn);
+        }
         conn->out_buf = NULL;
         conn->out_len = 0;
         conn->out_sent = 0;
         conn->out_cap = 0;
-        conn->in_len = 0;
-        conn->request_started = 0; /* back to idle between requests: only IDLE_TIMEOUT_SECONDS applies (S1) */
+        /* P9: keep whatever follows the request just answered (a pipelined next request, whole or
+         * partial) instead of discarding the buffer. request_len == 0 means nobody recorded how long
+         * the request was (a direct flush_connection call): drop everything, the pre-P9 behavior. */
+        const size_t consumed = conn->request_len;
+        conn->request_len = 0;
+        if (consumed == 0 || conn->in_off + consumed >= conn->in_len) {
+            conn->in_len = 0;
+            conn->in_off = 0;
+        } else {
+            conn->in_off += consumed;
+        }
+        /* Back to idle between requests (S1) - unless pipelined bytes are already waiting, which
+         * start the next request's clock now. */
+        conn->request_started = conn->in_len > 0 ? time(NULL) : 0;
         conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying (S2) */
         conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check (S4) */
-        conn->chunk_scan = (ChunkScanState){0, 0, 0}; /* next request's chunked body scans from its own start (P8) */
+        conn->chunk_scan = (ChunkScanState){0}; /* next request's chunked body scans from its own start (P8) */
 
         /* If handle_readable grew in_buf to fit a large body (in_cap >
          * BUF_SIZE), shrink it back down now that the connection is idle -
          * otherwise one big request would permanently inflate this
          * connection's memory footprint for as long as it stays open. A
          * failed shrink isn't fatal (realloc leaves the original block
-         * untouched on failure) - just keep using the larger buffer. */
-        if (conn->in_cap > BUF_SIZE) {
+         * untouched on failure) - just keep using the larger buffer.
+         * P9: only when nothing is buffered - pipelined leftovers keep the buffer as it is. */
+        if (conn->in_cap > BUF_SIZE && conn->in_len == 0) {
             char *shrunk = realloc(conn->in_buf, BUF_SIZE);
             if (shrunk != NULL) {
                 conn->in_buf = shrunk;
                 conn->in_cap = BUF_SIZE;
             }
         }
-    } else {
-        connection_close(app, conn);
+        return FLUSH_DONE;
     }
+    connection_close(app, conn);
+    return FLUSH_CLOSED;
 }
 
 /* Sends `status` with its reason phrase as the body, then closes the connection. */
@@ -640,10 +672,134 @@ static int reject_if_over_body_limit(App *app, Connection *conn, const ParsedHea
     return 0;
 }
 
+/* serve_buffered_requests results (P9). */
+#define SERVE_NEED_MORE 0
+#define SERVE_WAIT 1
+#define SERVE_CLOSED -1
+
+/* P9: whether a response is still being written (built but not fully queued on the socket). */
+static int response_pending(const Connection *conn) {
+    return conn->out_buf != NULL || conn->file_fd >= 0;
+}
+
+/* P9: moves the unserved tail of in_buf (from in_off) to the front. Called only when more input has
+ * to be read after it (serve_buffered_requests' SERVE_NEED_MORE), so every byte moves at most once. */
+static void compact_in_buf(Connection *conn) {
+    if (conn->in_off == 0) {
+        return;
+    }
+    const size_t leftover = conn->in_len - conn->in_off;
+    memmove(conn->in_buf, conn->in_buf + conn->in_off, leftover);
+    conn->in_len = leftover;
+    conn->in_off = 0;
+    conn->in_buf[conn->in_len] = '\0';
+}
+
+/*
+ * P9: serves every complete request buffered in in_buf[in_off..in_len), in order, one response each,
+ * up to MAX_PIPELINED_PER_EVENT per call; *served_out = how many were dispatched. Returns:
+ *   SERVE_NEED_MORE  no complete request left (in_buf compacted: any partial request now starts at 0)
+ *   SERVE_WAIT       a response is pending (write readiness resumes it) or the per-call cap was hit
+ *                    (a write-readiness wakeup is armed to continue - see handle_writable)
+ *   SERVE_CLOSED     the connection was closed (rejected, non-keep-alive, or a write error): conn freed
+ */
+static int serve_buffered_requests(App *app, Connection *conn, int *served_out) {
+    *served_out = 0;
+    for (int served = 0; served < MAX_PIPELINED_PER_EVENT; served++, (*served_out)++) {
+        if (conn->in_off == conn->in_len) {
+            conn->in_off = 0;
+            conn->in_len = 0;
+            return SERVE_NEED_MORE;
+        }
+        const char *req_start = conn->in_buf + conn->in_off;
+        const size_t req_avail = conn->in_len - conn->in_off;
+
+        /* One phr_parse_request pass, reused below by the body-limit check, the completeness check
+         * and the full parse (P2) - these used to each run their own independent pass over the same
+         * bytes, up to four per request after S4 added the body-limit check's own. */
+        ParsedHead head;
+        parse_request_head(req_start, req_avail, &head);
+
+        if (reject_if_over_body_limit(app, conn, &head)) {
+            return SERVE_CLOSED;
+        }
+
+        if (!request_head_is_complete(&head, req_start, req_avail, &conn->chunk_scan)) {
+            compact_in_buf(conn);
+            return SERVE_NEED_MORE;
+        }
+
+        Request req;
+        const int parse_status = parse_http_request_from_head(req_start, req_avail, &head, &req, conn->arena);
+        if (parse_status != 0) {
+            /* -2: path too long (414). -3 (S5) is retired (P3): req->headers holds views now, so
+             * there is no fixed-size copy left to overflow - parse_http_request_from_head never
+             * returns it any more (this is parse_status's own -3; req.content_length's -3 below is
+             * an unrelated sentinel in a different code space). -4: a percent-decoded path/query
+             * name/query value contained an embedded NUL, never silently truncated (400, S6) - falls
+             * into "anything else" below along with -1 (malformed), since both are already 400.
+             * req.content_length == -2: body over MAX_BODY_SIZE (413), for both Content-Length and
+             * chunked framing. req.content_length == -3 (S11): Transfer-Encoding names a coding this
+             * engine doesn't implement, or "chunked" isn't its sole token (501, "Not Implemented" -
+             * the server understood the request but can't process that transfer-coding). Anything
+             * else: 400. */
+            /* req.body is managed by arena, no need to free */
+            /* req.body is managed by arena, no need to free */
+            const int status = parse_status == -2 ? 414
+                              : req.content_length == -2 ? 413
+                              : req.content_length == -3 ? 501
+                              : 400;
+            reject_request(app, conn, status);
+            return SERVE_CLOSED;
+        }
+        /* Parse succeeded, so framing is valid: this is where the next pipelined request starts. */
+        conn->request_len = request_wire_len(&head, &conn->chunk_scan);
+
+        Response res;
+        res_init(&res, conn);
+        conn->keep_alive = !request_wants_close(&req) && !app->is_shutting_down;
+        /* Set before dispatch so HEAD bodies are suppressed for matched routes and 404/405 alike. */
+        res.is_head_request = strcmp(req.method, "HEAD") == 0;
+        const Route *route = match_route(app, &req);
+        dispatch(app, route, &req, &res);
+        /* req.body is managed by arena, no need to free */
+
+        const int flushed = flush_connection(app, conn);
+        /* M1: conn may already be freed by flush_connection (a non-keep-alive response, or a
+         * hard write error) - reset the shared arena through app, never conn, once this
+         * dispatch-and-flush cycle that just used it is over (flush_connection has already
+         * copied out anywhere it returned early with a still-pending response, so nothing any
+         * connection still needs is left in it). */
+        arena_reset(&app->arena);
+        if (flushed == FLUSH_CLOSED) {
+            return SERVE_CLOSED;
+        }
+        if (flushed == FLUSH_PENDING) {
+            return SERVE_WAIT; /* in_off still marks the next request; handle_writable resumes */
+        }
+    }
+    if (conn->in_off == conn->in_len) {
+        conn->in_off = 0;
+        conn->in_len = 0;
+        return SERVE_NEED_MORE;
+    }
+    /* Cap reached with bytes still buffered: let other connections run, and come back on the next
+     * poll via write readiness (a connected socket is almost always writable). Nothing is pending,
+     * so read interest stays as it is. */
+    event_loop_watch_write(app, conn->fd, conn);
+    return SERVE_WAIT;
+}
+
 void handle_readable(App *app, Connection *conn) {
-    if (conn->request_started == 0) {
-        /* First byte of a fresh request after an idle keep-alive gap: (re)start the deadline clock (S1). */
-        conn->request_started = time(NULL);
+    if (response_pending(conn) || conn->in_off > 0) {
+        /* P9: a response is still draining (reads are normally unwatched meanwhile, see
+         * wait_for_writable - this guards a readiness event already queued in the same batch), or
+         * buffered pipelined requests are waiting for their handle_writable turn. Reading now would
+         * append behind them; they are served first, in order. */
+        int served;
+        if (response_pending(conn) || serve_buffered_requests(app, conn, &served) != SERVE_NEED_MORE) {
+            return;
+        }
     }
 
     while (conn->in_len < conn->in_cap - 1) {
@@ -660,68 +816,29 @@ void handle_readable(App *app, Connection *conn) {
             return;
         }
 
+        if (conn->request_started == 0) {
+            /* First byte of a fresh request after an idle keep-alive gap: (re)start the deadline clock (S1). */
+            conn->request_started = time(NULL);
+        }
         conn->in_len += (size_t)n;
         conn->in_buf[conn->in_len] = '\0';
         conn->last_activity = time(NULL);
 
-        /* One phr_parse_request pass, reused below by the body-limit check, the completeness check
-         * and the full parse (P2) - these used to each run their own independent pass over the same
-         * bytes, up to four per request after S4 added the body-limit check's own. */
-        ParsedHead head;
-        parse_request_head(conn->in_buf, conn->in_len, &head);
-
-        if (reject_if_over_body_limit(app, conn, &head)) {
-            return;
-        }
-
-        if (request_head_is_complete(&head, conn->in_buf, conn->in_len, &conn->chunk_scan)) {
-            Request req;
-            const int parse_status = parse_http_request_from_head(conn->in_buf, conn->in_len, &head, &req, conn->arena);
-            if (parse_status != 0) {
-                /* -2: path too long (414). -3 (S5) is retired (P3): req->headers holds views now, so
-                 * there is no fixed-size copy left to overflow - parse_http_request_from_head never
-                 * returns it any more (this is parse_status's own -3; req.content_length's -3 below is
-                 * an unrelated sentinel in a different code space). -4: a percent-decoded path/query
-                 * name/query value contained an embedded NUL, never silently truncated (400, S6) - falls
-                 * into "anything else" below along with -1 (malformed), since both are already 400.
-                 * req.content_length == -2: body over MAX_BODY_SIZE (413), for both Content-Length and
-                 * chunked framing. req.content_length == -3 (S11): Transfer-Encoding names a coding this
-                 * engine doesn't implement, or "chunked" isn't its sole token (501, "Not Implemented" -
-                 * the server understood the request but can't process that transfer-coding). Anything
-                 * else: 400. */
-                /* req.body is managed by arena, no need to free */
-                const int status = parse_status == -2 ? 414
-                                  : req.content_length == -2 ? 413
-                                  : req.content_length == -3 ? 501
-                                  : 400;
-                reject_request(app, conn, status);
-                return;
-            }
-
-            Response res;
-            res_init(&res, conn);
-            conn->keep_alive = !request_wants_close(&req) && !app->is_shutting_down;
-            /* Set before dispatch so HEAD bodies are suppressed for matched routes and 404/405 alike. */
-            res.is_head_request = strcmp(req.method, "HEAD") == 0;
-            const Route *route = match_route(app, &req);
-            dispatch(app, route, &req, &res);
-            /* req.body is managed by arena, no need to free */
-
-            flush_connection(app, conn);
-            /* M1: conn may already be freed by flush_connection (a non-keep-alive response, or a
-             * hard write error) - reset the shared arena through app, never conn, once this
-             * dispatch-and-flush cycle that just used it is over (flush_connection has already
-             * copied out anywhere it returned early with a still-pending response, so nothing any
-             * connection still needs is left in it). */
-            arena_reset(&app->arena);
+        /* Return as soon as anything was answered, even if more input may follow: another recv()
+         * here would almost always just return EAGAIN (one wasted syscall per request - MEASURED ~9%
+         * of non-pipelined throughput). Level-triggered read readiness brings us back if more bytes
+         * are already waiting. */
+        int served;
+        if (serve_buffered_requests(app, conn, &served) != SERVE_NEED_MORE || served > 0) {
             return;
         }
     }
 
     if (conn->in_len >= conn->in_cap - 1) {
-        /* Buffer full, request still incomplete. No header terminator yet means the headers
-         * themselves are too big (431, the Slowloris shape). With headers complete it is only
-         * a body larger than the buffer, so grow (never masks an oversized-header attack). */
+        /* Buffer full, request still incomplete (in_off is 0 here: SERVE_NEED_MORE compacted it).
+         * No header terminator yet means the headers themselves are too big (431, the Slowloris
+         * shape). With headers complete it is only a body larger than the buffer, so grow (never
+         * masks an oversized-header attack). */
         size_t header_len;
         int chunked;
         const int content_length = request_framing(conn->in_buf, conn->in_len, &header_len, &chunked, NULL, NULL);
@@ -734,6 +851,21 @@ void handle_readable(App *app, Connection *conn) {
             return; /* wait for more read events */
         }
         reject_request(app, conn, grown == -1 ? 413 : 500);
+    }
+}
+
+void handle_writable(App *app, Connection *conn) {
+    if (response_pending(conn)) {
+        if (flush_connection(app, conn) != FLUSH_DONE) {
+            return; /* still draining, or closed */
+        }
+    } else {
+        /* Woken only to resume a pipeline that hit MAX_PIPELINED_PER_EVENT (serve_buffered_requests). */
+        event_loop_unwatch_write(app, conn->fd, conn);
+    }
+    if (conn->in_len > conn->in_off) {
+        int served;
+        serve_buffered_requests(app, conn, &served);
     }
 }
 
@@ -767,8 +899,10 @@ void close_idle_connections(App *app) {
         if (conn->request_started != 0) {
             size_t header_len = 0;
             int chunked = 0;
-            if (conn->in_len > 0) {
-                request_framing(conn->in_buf, conn->in_len, &header_len, &chunked, NULL, NULL);
+            if (conn->in_len > conn->in_off) {
+                /* P9: from in_off - bytes before it belong to a request already answered. */
+                request_framing(conn->in_buf + conn->in_off, conn->in_len - conn->in_off, &header_len, &chunked,
+                                NULL, NULL);
             }
             const int headers_complete = header_len > 0;
             const time_t deadline = headers_complete ? REQUEST_BODY_TIMEOUT_SECONDS : REQUEST_HEADER_TIMEOUT_SECONDS;
@@ -915,7 +1049,7 @@ void app_listen_worker(App *app, int port) {
             if (ev->type == LOOP_EVENT_READ) {
                 handle_readable(app, conn);
             } else if (ev->type == LOOP_EVENT_WRITE) {
-                flush_connection(app, conn);
+                handle_writable(app, conn);
             }
         }
 

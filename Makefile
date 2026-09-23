@@ -50,11 +50,12 @@ CLUSTER_TEST_BIN     = $(BIN_DIR)/test_cluster
 COOKBOOK_TEST_BIN    = $(BIN_DIR)/test_cookbook
 BENCH_BIN            = $(BIN_DIR)/bench_hotpath
 PING_TEST_BIN        = $(BIN_DIR)/test_ping
+PIPELINING_TEST_BIN  = $(BIN_DIR)/test_pipelining
 
 TEST_BINS = $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
             $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN) $(URLENCODED_TEST_BIN) \
             $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) \
-            $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN)
+            $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN) $(PIPELINING_TEST_BIN)
 
 .PHONY: all demo test clean test_epoll bench fuzz check-docs
 
@@ -94,6 +95,10 @@ $(HTTP_HARDENING_TEST_BIN): $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/p
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(CONNECTION_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_connection.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(PIPELINING_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(OBJ_DIR)/$(EVENT_LOOP_SRC:.c=.o) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_pipelining.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -158,6 +163,7 @@ ifeq ($(shell test -d $(EPOLL_SHIM_PREFIX) && echo yes),yes)
     EPOLL_SHIM_LDFLAGS = -L$(EPOLL_SHIM_PREFIX)/lib -lepoll-shim
     EPOLL_TEST_BIN = $(BIN_DIR)/test_epoll
     CONNECTION_EPOLL_TEST_BIN = $(BIN_DIR)/test_connection_epoll
+    PIPELINING_EPOLL_TEST_BIN = $(BIN_DIR)/test_pipelining_epoll
 
 $(OBJ_DIR)/lib/event_loop_epoll_shim.o: lib/event_loop_epoll.c
 	@mkdir -p $(dir $@)
@@ -183,9 +189,18 @@ $(CONNECTION_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
 
-test_epoll: $(EPOLL_TEST_BIN) $(CONNECTION_EPOLL_TEST_BIN)
+$(OBJ_DIR)/tests/test_pipelining_shim.o: tests/test_pipelining.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+
+$(PIPELINING_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_pipelining_shim.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
+
+test_epoll: $(EPOLL_TEST_BIN) $(CONNECTION_EPOLL_TEST_BIN) $(PIPELINING_EPOLL_TEST_BIN)
 	./$(EPOLL_TEST_BIN)
 	./$(CONNECTION_EPOLL_TEST_BIN)
+	./$(PIPELINING_EPOLL_TEST_BIN)
 endif
 
 test: $(TEST_BINS)
@@ -202,6 +217,7 @@ test: $(TEST_BINS)
 	./$(COOKBOOK_TEST_BIN)
 	./$(HTTP_HARDENING_TEST_BIN)
 	./$(PING_TEST_BIN)
+	./$(PIPELINING_TEST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer

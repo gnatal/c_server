@@ -58,6 +58,8 @@
 #define MAX_BOUNDARY_LEN 71           /* RFC 2046: 70 chars + NUL */
 #define MAX_CHUNK_SIZE_LINE_LEN 64    /* a chunk-size line longer than this is malformed */
 #define MAX_EVENTS 64                 /* events fetched per event-loop poll */
+#define MAX_PIPELINED_PER_EVENT 16    /* P9: requests served back to back from one connection's buffer
+                                        * before yielding to the event loop (fairness across connections) */
 #define BACKLOG 128                   /* listen() backlog floor; create_server_socket takes max(BACKLOG, SOMAXCONN) */
 #define DEFAULT_PORT 8080
 #define DEFAULT_MAX_CONNECTIONS 10000 /* ServerConfig.max_connections default, applied by app_init (see below) */
@@ -201,11 +203,14 @@ typedef struct {
  *   decoded_len  sum of the chunk sizes before pos
  *   trailer_from once pos is at the last-chunk ("0") line: where the search for the trailer's
  *                terminating "\r\n\r\n" resumes (bytes before it are known not to start one)
+ *   body_end     set when the scan returns 1: offset just past that "\r\n\r\n", i.e. the chunked
+ *                body's full wire length - where a pipelined next request starts (P9)
  */
 typedef struct {
     size_t pos;
     size_t decoded_len;
     size_t trailer_from;
+    size_t body_end;
 } ChunkScanState;
 
 /* ---- connection and event loop ---- */
@@ -246,6 +251,16 @@ typedef struct Connection {
     char *in_buf;
     size_t in_cap;
     size_t in_len;
+
+    /* P9 (pipelining): in_buf may hold more than one request. in_off is where the request being
+     * served (or next to be served) starts; request_len is the wire length (headers + framed body)
+     * of the request just dispatched, set before its flush_connection. When that response is fully
+     * queued on a keep-alive connection, in_off advances by request_len instead of in_buf being
+     * discarded. in_off > 0 only while a response is pending or the serve loop yielded
+     * (MAX_PIPELINED_PER_EVENT): the leftover is moved to the front of in_buf once, when more input
+     * must be read, so every byte moves at most once. Every in_buf parse starts at in_buf + in_off. */
+    size_t in_off;
+    size_t request_len;
 
     /* Output: one response built by res_send / res_json / res_write into memory from `arena` (M1: a
      * pointer to the single shared per-worker arena, not a per-connection one - see `arena` below).

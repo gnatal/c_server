@@ -58,14 +58,22 @@ int app_count_connections(const App *app);
 /*
  * Engine internals (called from the event loop; exposed for tests).
  *
- * handle_readable: recv() into conn->in_buf until EAGAIN. Once request_is_complete, it parses,
- *   routes and dispatches synchronously, then flush_connection. Rejects with 431 (headers over
- *   BUF_SIZE, or a single header name/value too long to store - S5), 414 (path over 255), 413 (body
- *   over MAX_BODY_SIZE or an app_use_body_limit prefix - S4), 400 (malformed), 500 (OOM growing
- *   the buffer); each rejection closes the connection. in_buf grows to fit a declared body and
- *   shrinks back to BUF_SIZE once the connection is idle.
+ * handle_readable: recv() into conn->in_buf until EAGAIN. After each recv it serves every complete
+ *   request in the buffer, in order (P9: pipelining - parse, route, dispatch, flush_connection, then
+ *   the next one from conn->in_off), up to MAX_PIPELINED_PER_EVENT per event. Rejects with 431 (headers
+ *   over BUF_SIZE), 414 (path over 255), 413 (body over MAX_BODY_SIZE or an app_use_body_limit prefix -
+ *   S4), 400 (malformed), 501 (unsupported Transfer-Encoding), 500 (OOM growing the buffer); each
+ *   rejection closes the connection, dropping anything pipelined behind it. in_buf grows to fit a
+ *   declared body and shrinks back to BUF_SIZE once the connection is idle. While a response is
+ *   pending it reads nothing (read interest is dropped until the response drains).
+ * handle_writable: the LOOP_EVENT_WRITE handler (P9). Continues a pending response via
+ *   flush_connection; once none is pending, serves any pipelined requests still buffered (also the
+ *   wakeup used when handle_readable hit MAX_PIPELINED_PER_EVENT).
  * flush_connection: non-blocking write of conn->out_buf (and a streamed file, 64 KB per turn).
- *   On EAGAIN it waits for writability. When done: keep-alive resets the connection, otherwise it closes.
+ *   On EAGAIN it waits for writability and stops reading. When done: keep-alive resets the connection
+ *   for the next request (advancing conn->in_off past conn->request_len bytes, or discarding in_buf
+ *   when request_len is 0), otherwise it closes. Returns FLUSH_DONE (fully queued, connection kept),
+ *   FLUSH_PENDING (waiting for write readiness) or FLUSH_CLOSED (conn has been freed: don't touch it).
  * close_idle_connections: run once per second; a connection with no received bytes for
  *   IDLE_TIMEOUT_SECONDS (60) is closed (408 first if a request was half-received). A connection
  *   with a response still being written is left alone.
@@ -84,8 +92,12 @@ Connection *connection_create(App *app, int fd);
 void connection_close(App *app, Connection *conn);
 void accept_connections(App *app);
 void accept_passed_connections(App *app);
-void flush_connection(App *app, Connection *conn);
+#define FLUSH_DONE 0
+#define FLUSH_PENDING 1
+#define FLUSH_CLOSED -1
+int flush_connection(App *app, Connection *conn);
 void handle_readable(App *app, Connection *conn);
+void handle_writable(App *app, Connection *conn);
 void close_idle_connections(App *app);
 
 #endif /* CONNECTION_H */

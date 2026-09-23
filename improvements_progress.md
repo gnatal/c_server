@@ -2108,3 +2108,108 @@ from there.
   the per-read header parse.
 
 **Status:** Fixed as scoped. The optional cap on chunk count or framing overhead is still open (see above).
+
+---
+
+## P9 · HTTP pipelining is dropped
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+`improvements.md` suggested reporting the bytes each request consumed, moving the leftover to the front of
+`in_buf` after each flush, and looping with a per-event cap. The fix follows that, with two changes. First,
+leftover bytes are not moved after every request. Second, reads pause while a response is pending.
+
+- **Where a request ends (`lib/http_parser.c`).** New pure function `request_wire_len(head, chunk_scan)`:
+  `header_len + Content-Length`, or `header_len + ChunkScanState.body_end` for a chunked body. `body_end` is
+  a new field that `chunked_body_scan_resume` sets when it finds the trailer's final blank line. Parsing needed
+  no change for pipelined bytes. A `Content-Length` body is already copied at its declared length. The chunked
+  scan and decode already stop at the first terminator, even with the next request's bytes after it.
+- **Connection state (`lib/app_types.h`).** Two new `Connection` fields. `in_off` is where the next unserved
+  request starts in `in_buf`. `request_len` is the wire length of the request just dispatched. New constant
+  `MAX_PIPELINED_PER_EVENT` (16).
+- **Serve loop (`lib/connection.c`).** New `serve_buffered_requests`. It serves every complete request from
+  `in_off` in order: parse, body-limit check, completeness check, parse, dispatch, `flush_connection`,
+  `arena_reset`. It returns one of three results:
+  - *need more*: no complete request is left, and the partial tail has been moved to the front of `in_buf`.
+  - *wait*: a response is pending, or the cap was hit.
+  - *closed*: the connection was closed.
+
+  `handle_readable` now reads and then hands off to this loop.
+- **Leftover bytes are moved once, not per request.** `flush_connection`'s keep-alive reset advances
+  `in_off` by `request_len`. It sets `in_len = 0` only when nothing follows. The tail is moved to the front
+  (`compact_in_buf`) only on "need more", right before more input is read. Moving it after every request, as
+  suggested, would be quadratic. Example: a large POST followed by about 1 MB of 20-byte pipelined GETs in the
+  same buffer would be about 50,000 moves of about 0.5 MB each. With one move per "need more", each byte
+  moves at most once. `request_len == 0` (a direct `flush_connection` call that recorded no length) keeps the
+  pre-P9 behavior of discarding the buffer.
+- **Fairness cap.** After 16 requests with more still buffered, the loop arms write interest and returns. The
+  next poll reports the socket writable, and the new `handle_writable` continues. `LOOP_EVENT_WRITE` now goes
+  to `handle_writable` (drain a pending response, then serve anything still buffered) instead of straight to
+  `flush_connection`. `handle_readable` also serves the backlog before it reads, if a read event comes first.
+- **Backpressure, which also fixes a bug that existed before P9.** On `EAGAIN` (and on the file-streaming
+  fairness yield) `flush_connection` now calls `wait_for_writable`: watch write *and* unwatch read. The
+  keep-alive reset watches read again. `handle_readable` does nothing while a response is pending. The old
+  code had a bug here. If a request arrived while a response was still draining, `in_buf` still held the
+  first request, so the first request was parsed and dispatched a second time. `res_init` then overwrote
+  `out_buf`, which leaked the connection-owned tail copy (M1) and sent a duplicate response. Now a client that
+  pipelines without reading hits TCP flow control; the server does not buffer for it.
+- **`flush_connection` now returns a value:** `FLUSH_DONE`, `FLUSH_PENDING` or `FLUSH_CLOSED`, defined in
+  `connection.h`. The serve loop needs to know whether `conn` still exists. Existing callers that ignore the
+  result are unaffected.
+- **S1 clock.** `request_started` is now set when the first byte is actually received, instead of on entry
+  to `handle_readable`. The keep-alive reset sets it to now when leftover bytes remain, and to 0 when none
+  do. A partial pipelined request is therefore still bounded by the header and body deadlines.
+  `close_idle_connections` runs its framing check from `in_off`.
+- **A regression was found and fixed during the work.** The first version kept reading after serving a
+  request. Each non-pipelined request then cost one extra `recv` that returned `EAGAIN`. MEASURED over three
+  alternating rounds: about 301k vs about 328k req/s, a 9% loss. `handle_readable` now returns as soon as a
+  `recv` has produced at least one answered request, as the old code did. Level-triggered readiness brings it
+  back if more input is waiting.
+- **Unchanged:** a rejected request (400/413/414/431/501) or a `Connection: close` response, including every
+  response during shutdown, still closes the connection. Anything pipelined behind it is dropped unanswered,
+  which RFC 9112 allows.
+
+**Tests and results.**
+
+- New suite `tests/test_pipelining.c` (the 14th; added to `make test` and to `make test_epoll`).
+  `test_connection.c` is already past the 1,000-line cap. The suite has eight cases:
+  - two GETs in one write, answered in order;
+  - a `Content-Length` POST followed by a GET;
+  - a chunked POST with a trailer followed by a GET;
+  - one request plus half of the next: the half is moved to the front, its S1 clock runs, and the next read
+    completes it;
+  - `MAX_PIPELINED_PER_EVENT + 4` requests: 16 answers, write interest armed, then `handle_writable` answers
+    the last 4 with no new input and drops write interest;
+  - `Connection: close` on the first request drops the second;
+  - a malformed second request gets 400 after the first request's 200;
+  - a 1 MiB response that hits a real `EAGAIN` with requests pipelined behind it. The test asserts that read
+    interest is dropped, that later input is not consumed while the response is pending, and that both
+    follow-up answers arrive after the big body, in order, once it drains.
+- `tests/test_http_parser.c` `test_request_wire_len`: for a headers-only request, a `Content-Length` request
+  and a chunked request with a trailer, `buf + request_wire_len` points exactly at the next request.
+- `make test`: all 14 suites pass. `make test_epoll` (epoll backend via epoll-shim): `test_event_loop`,
+  `test_connection` and `test_pipelining` pass. `make SANITIZE=1 BUILD_DIR=build-asan test`: all pass under
+  ASan and UBSan. `make fuzz`: 1,000,000 iterations clean. `make check-docs`: ok (129 functions;
+  `handle_writable` and `request_wire_len` added to `lib/API.md`).
+- **Not run on Linux.** The io_uring backend was not exercised. It still has C6's cancellation bug, and P9
+  adds read watch/unwatch calls when a response does not fit the socket buffer in one write, so those
+  responses also go through `update_poll`.
+- **Live measurement.** Scratch `/ping` server, 1 worker, Apple M3 Pro, gcc-16 -O2, `wrk` on the same
+  machine. The pipelining script sends 16 requests per write. The "before" build is `HEAD` (P8, without P9)
+  in a temporary worktree, since removed.
+
+  | Check | Before P9 | After P9 |
+  |---|---|---|
+  | Raw socket: 2 pipelined requests | 1 response | 2 responses |
+  | Raw socket: 16 / 40 pipelined requests | 1 response | 16 / 40 responses (40 goes past the per-event cap: resume path live on kqueue) |
+  | `wrk -t2 -c50`, no pipelining (3 alternating rounds) | 327–330k req/s | 326–333k req/s |
+  | `wrk -t2 -c50`, pipeline depth 16 | 8 req/s (hangs: 1 answer per 16 requests) | 547–555k req/s |
+
+  **MEASURED:** pipelining clients now get every response. At depth 16, throughput is about 1.7x the
+  non-pipelined rate, at the low end of `improvements.md`'s ESTIMATED 2–5x. The client and server shared one
+  machine, so the ratio is likely understated. Non-pipelined throughput is unchanged.
+
+**Status:** Fixed as scoped. Not done: Linux/io_uring verification (blocked on C6), and M4's note that a body
+no longer necessarily ends at `in_len` (M4 is still open; P9 does not change body copying).

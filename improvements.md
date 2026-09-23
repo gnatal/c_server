@@ -40,7 +40,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | P5 | ~~With TLS on, every loop iteration scans the whole connection table~~ | Performance | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
 | P7 | ~~Router child lookup is a linear scan~~ | Performance | | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (problem and fix) |
 | P8 | ~~Chunked bodies are re-scanned from the start on every `recv`~~ | Performance / Security | Med | M | **FIXED 2026-09-23**: see `improvements_progress.md` - MEASURED 10 MiB worst case in 14 ms (was ~71 s extrapolated) | MEASURED |
-| P9 | HTTP pipelining is dropped | Performance / Correctness | | M | Large for pipelining clients | ESTIMATED |
+| P9 | ~~HTTP pipelining is dropped~~ | Performance / Correctness | | M | **FIXED 2026-09-23**: see `improvements_progress.md` - MEASURED 16/16 pipelined requests answered (was 1/16); depth-16 `/ping` at 1.7x the non-pipelined rate, non-pipelined unchanged | MEASURED |
 | P10 | `accept` path uses 4 syscalls plus setup | Performance | | S | Fewer syscalls per new connection on Linux | ESTIMATED |
 | M1 | ~~64 KiB arena per connection~~ | Memory | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - MEASURED 8.2 KB per idle connection, matching the projected 8.4 KB | MEASURED |
 | M2 | 8 KiB input buffer per idle connection | Memory | | M | Idle connection to <1 KB (with M1) | ESTIMATED |
@@ -269,7 +269,9 @@ record.
 **Fix.** Keep the scan position, decoded length and chunk state per connection (`ChunkScanState`) and resume. Also cap the number of chunks or the framing-overhead ratio.
 **Probable gain.** Turns O(n²) into O(n): the ~75 s worst case becomes ~15 ms (10 MiB at ~714 MB/s, **PROJECTED**). Legitimate chunked uploads are unaffected in the common case.
 
-### P9 · HTTP pipelining is dropped
+### P9 · ~~HTTP pipelining is dropped~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical record.
+
 **Problem.** After the first response `flush_connection` sets `in_len = 0` (`connection.c:353`), discarding any bytes of a second request already received. The client sees one response for two requests.
 **Fix.** Have `parse_http_request` return bytes consumed; after `flush_connection`, `memmove` the leftover to the start of `in_buf` and loop `handle_readable` until the buffer holds no complete request. Bound the loop (for example 16 requests per readiness event) for fairness.
 **Probable gain.** Correctness for pipelining clients and load tools (`wrk` with a pipelining script). **ESTIMATED**: on servers that support it, pipelined GETs commonly reach 2–5× the non-pipelined request rate because syscalls per request approach 1/depth.

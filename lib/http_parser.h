@@ -79,6 +79,15 @@ int parse_request_head(const char *buf, size_t len, ParsedHead *head);
 int request_head_is_complete(const ParsedHead *head, const char *buf, size_t len, ChunkScanState *chunk_scan);
 
 /*
+ * request_wire_len (P9): bytes the request occupies on the wire - headers plus its framed body, so
+ * buf + request_wire_len is where a pipelined next request starts. Valid only after
+ * request_head_is_complete returned 1 for a head with header_len > 0 and content_length >= 0 (a
+ * well-framed request); for a chunked body chunk_scan must be the state that call used (it reads
+ * chunk_scan->body_end). Anything after a Content-Length body is never part of it.
+ */
+size_t request_wire_len(const ParsedHead *head, const ChunkScanState *chunk_scan);
+
+/*
  * parse_http_request_from_head: the population half of parse_http_request, given an already-parsed
  * head (parse_request_head) instead of re-running phr_parse_request/request_framing on the same bytes
  * (P2). The caller must already have confirmed the request is ready to parse via request_head_is_complete
@@ -140,6 +149,7 @@ int request_wants_close(const Request *req);
  * and advances it past every fully validated chunk, so calling it again after more bytes are
  * appended to the same body costs only the new bytes (plus one re-read size line). body_start and
  * the bytes already scanned must be unchanged between calls (offsets, so a realloc'd copy is fine).
+ * On 1 it also sets state->body_end: the body's full wire length including trailers (P9).
  * chunked_body_scan is the from-scratch wrapper.
  */
 int chunked_body_scan(const char *body_start, size_t available, size_t max_decoded_len, size_t *decoded_len_out);

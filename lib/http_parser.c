@@ -325,11 +325,18 @@ int request_head_is_complete(const ParsedHead *head, const char *buf, const size
     const size_t body_have = len - head->header_len;
     if (head->chunked) {
         size_t decoded_len;
-        ChunkScanState from_scratch = {0, 0, 0};
+        ChunkScanState from_scratch = {0};
         ChunkScanState *state = chunk_scan != NULL ? chunk_scan : &from_scratch;
         return chunked_body_scan_resume(buf + head->header_len, body_have, MAX_BODY_SIZE, state, &decoded_len) != 0;
     }
     return body_have >= (size_t)head->content_length;
+}
+
+size_t request_wire_len(const ParsedHead *head, const ChunkScanState *chunk_scan) {
+    if (head->chunked) {
+        return head->header_len + chunk_scan->body_end;
+    }
+    return head->header_len + (size_t)head->content_length;
 }
 
 int request_is_complete(const char *buf, const size_t len) {
@@ -613,7 +620,7 @@ static const char *find_double_crlf(const char *buf, const size_t len) {
 
 int chunked_body_scan(const char *body_start, const size_t available, const size_t max_decoded_len,
                       size_t *decoded_len_out) {
-    ChunkScanState state = {0, 0, 0};
+    ChunkScanState state = {0};
     return chunked_body_scan_resume(body_start, available, max_decoded_len, &state, decoded_len_out);
 }
 
@@ -664,7 +671,9 @@ int chunked_body_scan_resume(const char *body_start, const size_t available, con
              * resumes where the previous one gave up (minus 3 bytes, so a "\r\n\r\n" split across
              * reads is still found) - a slow-dripped trailer is scanned once, not once per recv. */
             const size_t from = state->trailer_from > pos ? state->trailer_from : pos;
-            if (find_double_crlf(body_start + from, available - from) != NULL) {
+            const char *end = find_double_crlf(body_start + from, available - from);
+            if (end != NULL) {
+                state->body_end = (size_t)(end - body_start) + 4; /* P9: next pipelined request starts here */
                 return 1;
             }
             if (available - from > 3) {

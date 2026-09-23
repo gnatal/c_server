@@ -382,7 +382,7 @@ static void test_chunked_body_scan(void) {
  * terminating "\r\n\r\n" split across calls, malformed framing, and the size cap. */
 static void assert_resume_matches_scratch(const char *body, const size_t max_decoded_len) {
     const size_t len = strlen(body);
-    ChunkScanState state = {0, 0, 0};
+    ChunkScanState state = {0};
     for (size_t avail = 0; avail <= len; avail++) {
         size_t scratch_len = 0;
         size_t resume_len = 0;
@@ -408,7 +408,7 @@ static void test_chunked_body_scan_resume(void) {
     /* The state only moves past fully validated chunks: after the first chunk and half of the
      * second, pos sits at the second chunk's size line and decoded_len counts the first alone. */
     const char *body = "4\r\nWiki\r\n5\r\nped";
-    ChunkScanState state = {0, 0, 0};
+    ChunkScanState state = {0};
     size_t decoded_len = 0;
     assert(chunked_body_scan_resume(body, strlen(body), MAX_BODY_SIZE, &state, &decoded_len) == 0);
     assert(state.pos == 9);
@@ -418,7 +418,7 @@ static void test_chunked_body_scan_resume(void) {
     /* Resuming from a state that is already past a chunk does not re-read it: poisoning the bytes
      * before state.pos changes nothing (proves the scan really starts at state.pos). */
     char poisoned[] = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-    ChunkScanState mid = {0, 0, 0};
+    ChunkScanState mid = {0};
     assert(chunked_body_scan_resume(poisoned, 12, MAX_BODY_SIZE, &mid, &decoded_len) == 0);
     assert(mid.pos == 9);
     memset(poisoned, 'Z', mid.pos);
@@ -427,12 +427,42 @@ static void test_chunked_body_scan_resume(void) {
 
     /* Trailer search resumes too: a long trailer dripped in pieces moves trailer_from forward. */
     const char *trailer = "0\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n";
-    ChunkScanState t = {0, 0, 0};
+    ChunkScanState t = {0};
     assert(chunked_body_scan_resume(trailer, 20, MAX_BODY_SIZE, &t, &decoded_len) == 0);
     assert(t.pos == 0);
     assert(t.trailer_from == 17);
     assert(chunked_body_scan_resume(trailer, strlen(trailer), MAX_BODY_SIZE, &t, &decoded_len) == 1);
     assert(decoded_len == 0);
+}
+
+/* P9: request_wire_len is where a pipelined next request starts - headers plus the framed body,
+ * never anything after it. */
+static void test_request_wire_len(void) {
+    const char *next = "GET /next HTTP/1.1\r\n\r\n";
+    char buf[512];
+
+    const char *get = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    snprintf(buf, sizeof(buf), "%s%s", get, next);
+    ParsedHead head;
+    ChunkScanState scan = {0};
+    parse_request_head(buf, strlen(buf), &head);
+    assert(request_head_is_complete(&head, buf, strlen(buf), &scan) == 1);
+    assert(request_wire_len(&head, &scan) == strlen(get));
+
+    const char *post = "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+    snprintf(buf, sizeof(buf), "%s%s", post, next);
+    parse_request_head(buf, strlen(buf), &head);
+    assert(request_head_is_complete(&head, buf, strlen(buf), &scan) == 1);
+    assert(request_wire_len(&head, &scan) == strlen(post));
+
+    const char *chunked = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                          "4\r\nWiki\r\n0\r\nX-T: v\r\n\r\n";
+    snprintf(buf, sizeof(buf), "%s%s", chunked, next);
+    scan = (ChunkScanState){0};
+    parse_request_head(buf, strlen(buf), &head);
+    assert(request_head_is_complete(&head, buf, strlen(buf), &scan) == 1);
+    assert(request_wire_len(&head, &scan) == strlen(chunked));
+    assert(strncmp(buf + request_wire_len(&head, &scan), "GET /next", 9) == 0);
 }
 
 static void test_chunked_body_decode(void) {
@@ -737,6 +767,7 @@ int main(void) {
     test_request_has_chunked_encoding();
     test_chunked_body_scan();
     test_chunked_body_scan_resume();
+    test_request_wire_len();
     test_chunked_body_decode();
     test_request_is_complete_chunked();
     test_parse_http_request_chunked();
