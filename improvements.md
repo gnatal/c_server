@@ -41,7 +41,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | P7 | ~~Router child lookup is a linear scan~~ | Performance | | S | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (problem and fix) |
 | P8 | ~~Chunked bodies are re-scanned from the start on every `recv`~~ | Performance / Security | Med | M | **FIXED 2026-09-23**: see `improvements_progress.md` - MEASURED 10 MiB worst case in 14 ms (was ~71 s extrapolated) | MEASURED |
 | P9 | ~~HTTP pipelining is dropped~~ | Performance / Correctness | | M | **FIXED 2026-09-23**: see `improvements_progress.md` - MEASURED 16/16 pipelined requests answered (was 1/16); depth-16 `/ping` at 1.7x the non-pipelined rate, non-pipelined unchanged | MEASURED |
-| P10 | `accept` path uses 4 syscalls plus setup | Performance | | S | Fewer syscalls per new connection on Linux | ESTIMATED |
+| P10 | ~~`accept` path uses 4 syscalls plus setup~~ | Performance | | S | **FIXED 2026-09-23**: see `improvements_progress.md` - accept is 1 syscall on Linux and macOS; MEASURED on Linux 10.0 → 7.0 syscalls per `Connection: close` request | MEASURED |
 | M1 | ~~64 KiB arena per connection~~ | Memory | | M | **FIXED 2026-09-22**: see `improvements_progress.md` - MEASURED 8.2 KB per idle connection, matching the projected 8.4 KB | MEASURED |
 | M2 | 8 KiB input buffer per idle connection | Memory | | M | Idle connection to <1 KB (with M1) | ESTIMATED |
 | M3 | ~~TLS connections keep large SSL buffers~~ | Memory | | S | **REMOVED 2026-09-22**: TLS was removed from the engine, see `improvements_progress.md` | MEASURED |
@@ -276,7 +276,9 @@ record.
 **Fix.** Have `parse_http_request` return bytes consumed; after `flush_connection`, `memmove` the leftover to the start of `in_buf` and loop `handle_readable` until the buffer holds no complete request. Bound the loop (for example 16 requests per readiness event) for fairness.
 **Probable gain.** Correctness for pipelining clients and load tools (`wrk` with a pipelining script). **ESTIMATED**: on servers that support it, pipelined GETs commonly reach 2–5× the non-pipelined request rate because syscalls per request approach 1/depth.
 
-### P10 · The accept path uses more syscalls than needed
+### P10 · ~~The accept path uses more syscalls than needed~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical record.
+
 **Problem.** Per accepted connection: `accept`, `fcntl(F_GETFL)`, `fcntl(F_SETFL)`, `setsockopt(TCP_NODELAY)`, then `calloc` + `malloc` (`connection.c:245-269`, `set_nonblocking` `:35`). On Linux `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)` does the first three in one call, and `TCP_NODELAY` set once on the listening socket is inherited by accepted sockets.
 **Measured (negative result).** Removing the 64 KiB zeroing (`calloc` → `malloc`) made **no difference** to connection churn (36.4–37.8k vs 36.7–37.6k req/s, three alternating rounds), so allocation is not the bottleneck; syscalls and the kernel are. Also note macOS ephemeral-port exhaustion (TIME_WAIT) makes churn runs unreliable beyond a couple of seconds.
 **Fix.** `accept4` on Linux; set `TCP_NODELAY` once on the listen socket (verify inheritance per platform); add `SO_KEEPALIVE` or an app-level keepalive for half-dead peers.

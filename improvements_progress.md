@@ -2213,3 +2213,76 @@ leftover bytes are not moved after every request. Second, reads pause while a re
 
 **Status:** Fixed as scoped. Not done: Linux/io_uring verification (blocked on C6), and M4's note that a body
 no longer necessarily ends at `in_len` (M4 is still open; P9 does not change body copying).
+
+---
+
+## P10 · The accept path uses more syscalls than needed
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+`improvements.md` suggested `accept4` on Linux and setting `TCP_NODELAY` once on the listener ("verify
+inheritance per platform"). I checked inheritance first with a scratch program. It sets `O_NONBLOCK` and
+`TCP_NODELAY` on a listener, accepts one loopback connection, and reads the options back.
+
+| Platform | `O_NONBLOCK` inherited by `accept` | `TCP_NODELAY` inherited | `FD_CLOEXEC` |
+|---|---|---|---|
+| macOS 26 (this machine) | yes | yes | no |
+| Linux 6.8 (Docker, Alpine) | **no** | yes | no (yes with `accept4(SOCK_CLOEXEC)`) |
+
+As a result, macOS drops to 1 syscall per connection as well, not only Linux as the entry estimated.
+
+- **`lib/connection.c`: `create_server_socket`** now sets `TCP_NODELAY` on the listener. A failure returns
+  `-1`, as the other listener options do.
+- **New `accept_client(listen_fd)`**, declared in `connection.h`. On Linux it calls
+  `accept4(listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC)`. Elsewhere it calls plain `accept`. There
+  are no per-connection `fcntl` or `setsockopt` calls, and the peer address, which nothing used, is no
+  longer requested. The caller still sees `accept`'s `errno`, so S3's `EMFILE`/`ENFILE` spare-fd handling
+  is unchanged.
+- **Callers.** `accept_connections` and the C4 master's accept loop (`cluster.c`, macOS/BSD) now both call
+  `accept_client`. `reject_overloaded_connection` (S3's 503) no longer calls `set_nonblocking`, because every
+  fd that reaches it is already non-blocking, including fds passed over `SCM_RIGHTS`, which keep their
+  options. The now-unused `<netinet/tcp.h>` include was removed from `cluster.c`.
+- **`SO_KEEPALIVE` not added** (the entry listed it as optional). Idle (60 s), request-deadline (S1) and
+  write-stall (S2) timeouts already close half-dead peers, much sooner than TCP keepalive's default of 2 h.
+- **`FD_CLOEXEC` is still not set on macOS.** That was already the case before P10. Setting it would cost
+  one `fcntl` per connection, which is exactly what P10 removes.
+
+**Tests and results.**
+
+- New `test_accept_client_socket_options` (`tests/test_connection.c`, real loopback listener). It checks:
+  - the listener has `TCP_NODELAY`;
+  - an fd from `accept_client` is non-blocking with `TCP_NODELAY`, and has `FD_CLOEXEC` on Linux;
+  - a read on it returns `EAGAIN` instead of blocking;
+  - `accept_client` on a drained listener returns `EAGAIN`;
+  - a connection admitted through `accept_connections` has the same options.
+
+  This is the per-platform check of the inheritance the fix depends on.
+- macOS: `make test` (14 suites), `make test_epoll`, and `make SANITIZE=1 BUILD_DIR=build-asan test` all
+  pass. `make fuzz` is clean. `make check-docs` is ok (130 functions).
+- Linux (Docker, kernel 6.8, io_uring, `seccomp=unconfined`): the new test passes and `test_pipelining`
+  passes. `test_connection` then fails later, at `test_accept_connections_emfile_frees_a_slot_and_recovers`.
+  **This failure exists before P10:** the same assertion fails on unmodified `HEAD`. The test encodes the
+  macOS behavior (the connection that hit `EMFILE` is destroyed), while Linux evidently keeps it queued, so
+  the retry accepts it. The test's own comment says this was never verified on Linux. Not fixed here.
+- **Syscall count, MEASURED** on Linux in Docker. `strace -c` was attached to a 1-worker `/ping` server
+  while a client made 1,000 sequential `Connection: close` requests. `HEAD` and the P10 build were built in
+  the same container.
+
+  | Syscall | Before | After |
+  |---|---|---|
+  | `accept` / `accept4` | 2,000 (1,000 `EAGAIN`) | 2,000 (1,000 `EAGAIN`) |
+  | `fcntl` | 2,000 | 0 |
+  | `setsockopt` | 1,000 | 0 |
+  | All syscalls | 10,015 | 7,007 |
+
+  That is 3 of 10 syscalls removed per new connection (−30%), matching `improvements.md`'s ESTIMATED "3 of
+  ~8" for the accept step. On macOS the same 3 calls are skipped: the code no longer makes them, and the
+  test shows the options are in effect anyway. It was not counted with `dtruss`, which needs SIP disabled.
+  Throughput under connection churn was not measured. `improvements.md` already notes that macOS TIME_WAIT
+  exhaustion makes churn runs unreliable, and the Linux client used here, a sequential Python loop, is
+  limited by the client, not the server.
+
+**Status:** Fixed as scoped. `SO_KEEPALIVE` was deliberately left out (see above). Separate finding: the
+Linux-only failure of the S3 `EMFILE` test.

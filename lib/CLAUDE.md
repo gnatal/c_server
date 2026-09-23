@@ -250,6 +250,16 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length` and `Connection` are engine-owned.
   `CookieOptions` zero value = session cookie; `max_age > 0` seconds, `< 0` expire now.
+- **Accept path (P10).** A new connection costs one syscall: `accept_client` is `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` on
+  Linux and plain `accept` on BSD/macOS, with no per-connection `fcntl`/`setsockopt`. It depends on inheritance from the
+  listener, which `create_server_socket` makes non-blocking and sets `TCP_NODELAY` on. MEASURED: macOS inherits both
+  `O_NONBLOCK` and `TCP_NODELAY`; Linux 6.8 inherits `TCP_NODELAY` but not `O_NONBLOCK`, hence `accept4` there, which also
+  sets `FD_CLOEXEC` for free. `test_accept_client_socket_options` asserts the result on every platform, so a platform that
+  stops inheriting fails a test instead of silently bringing back Nagle or blocking I/O. Both the per-worker path
+  (`accept_connections`) and the C4 master (`cluster.c`) use it. A passed fd keeps these options (they belong to the open
+  file description), so `reject_overloaded_connection` no longer calls `set_nonblocking` either. No `SO_KEEPALIVE`: half-dead
+  peers are already closed by the idle (60 s), request (S1) and write-stall (S2) deadlines, far sooner than TCP keepalive's
+  default 2 h.
 - **Overload (S3).** `accept_connections` sheds load on two independent axes, both O(1), checked before
   `ensure_connection_capacity`/`connection_create` so an already-overloaded worker doesn't pay for either. (1)
   `App.open_connections` (a running count, `++` in `accept_connections`, `--` in `connection_close` - not

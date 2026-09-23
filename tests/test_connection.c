@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +8,7 @@
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include "app_types.h"
 #include "event_loop.h"
 #include "connection.h"
@@ -1571,6 +1573,65 @@ static void test_flush_connection_file_stream_survives_another_connections_dispa
     app_destroy(&app);
 }
 
+/* P10: accept_client is a single accept/accept4 call with no per-connection fcntl/setsockopt; the fd
+ * it returns must still be non-blocking with TCP_NODELAY (inherited from create_server_socket's
+ * listener on BSD/macOS; accept4 flags + listener inheritance on Linux, where FD_CLOEXEC comes free
+ * too). Fails if a platform stops inheriting either, instead of Nagle or blocking I/O coming back
+ * silently. Also covers the admitted Connection end to end through accept_connections. */
+static void test_accept_client_socket_options(void) {
+    App app;
+    setup_test_server(&app);
+
+    int nodelay = 0;
+    socklen_t optlen = sizeof(nodelay);
+    assert(getsockopt(app.server_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, &optlen) == 0);
+    assert(nodelay != 0);
+
+    const int client = connect_loopback_client(&app);
+    int accepted = -1;
+    for (int attempt = 0; attempt < 10 && accepted < 0; attempt++) {
+        accepted = accept_client(app.server_fd);
+        if (accepted < 0) {
+            assert(errno == EAGAIN || errno == EWOULDBLOCK);
+            struct timespec pause = {0, 5 * 1000 * 1000};
+            nanosleep(&pause, NULL);
+        }
+    }
+    assert(accepted >= 0);
+    assert(fcntl(accepted, F_GETFL) & O_NONBLOCK);
+    nodelay = 0;
+    optlen = sizeof(nodelay);
+    assert(getsockopt(accepted, IPPROTO_TCP, TCP_NODELAY, &nodelay, &optlen) == 0);
+    assert(nodelay != 0);
+#if defined(__linux__)
+    assert(fcntl(accepted, F_GETFD) & FD_CLOEXEC);
+#endif
+    char byte;
+    assert(read(accepted, &byte, 1) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)); /* never blocks */
+    close(accepted);
+    close(client);
+
+    /* Drained: EAGAIN, not a block (the listener itself is non-blocking). */
+    assert(accept_client(app.server_fd) < 0);
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    /* Same options on a connection admitted through the real accept_connections path. */
+    const int client2 = connect_loopback_client(&app);
+    drain_accept_connections(&app);
+    assert(app_count_connections(&app) == 1);
+    for (int fd = 0; fd < app.connections_cap; fd++) {
+        if (app.connections[fd] != NULL) {
+            assert(fcntl(fd, F_GETFL) & O_NONBLOCK);
+            nodelay = 0;
+            optlen = sizeof(nodelay);
+            assert(getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, &optlen) == 0);
+            assert(nodelay != 0);
+        }
+    }
+    close(client2);
+    app_destroy(&app);
+}
+
 /* S3: accept_connections used to accept without limit, bounded only by RLIMIT_NOFILE - a flood of
  * connections had no graceful degradation, just an eventual, silent EMFILE. max_connections caps
  * concurrently open connections per worker; past it, accept_connections still accept()s (it has to,
@@ -1743,6 +1804,7 @@ int main(void) {
     test_app_stop_drains_and_flushes_pending_write();
     test_res_send_file_streams_to_socket();
     test_flush_connection_file_stream_survives_another_connections_dispatch();
+    test_accept_client_socket_options();
     test_accept_connections_enforces_max_connections();
     test_accept_connections_max_connections_zero_is_unlimited();
     test_accept_connections_emfile_frees_a_slot_and_recovers();

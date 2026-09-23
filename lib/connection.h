@@ -77,7 +77,7 @@ int app_count_connections(const App *app);
  * close_idle_connections: run once per second; a connection with no received bytes for
  *   IDLE_TIMEOUT_SECONDS (60) is closed (408 first if a request was half-received). A connection
  *   with a response still being written is left alone.
- * accept_connections: accepts every pending client (non-blocking, TCP_NODELAY) and registers it.
+ * accept_connections: accepts every pending client (accept_client: non-blocking, TCP_NODELAY) and registers it.
  * accept_passed_connections (C4, CEXPRESS_SINGLE_ACCEPTOR only): the fd-passing counterpart - drains
  *   every fd the cluster master has handed this worker over its control socket (server_fd) via
  *   SCM_RIGHTS and registers each one the same way. Never called unless app->accept_via_fd_passing
@@ -87,7 +87,14 @@ int app_count_connections(const App *app);
  *   allocating one of its own.
  */
 int set_nonblocking(int fd);
-int create_server_socket(int port); /* -1 on failure (S12); does not exit() the process itself */
+int create_server_socket(int port); /* -1 on failure (S12); does not exit() the process itself.
+                                     * The listener is non-blocking with TCP_NODELAY (P10: inherited
+                                     * by accepted sockets) */
+/* accept_client (P10): one syscall per connection - accept4(SOCK_NONBLOCK | SOCK_CLOEXEC) on Linux,
+ * plain accept() on BSD/macOS where the listener's O_NONBLOCK carries over. The returned fd is
+ * non-blocking with TCP_NODELAY when listen_fd came from create_server_socket. -1 with accept's
+ * errno (EAGAIN when drained, EMFILE/ENFILE when out of descriptors). */
+int accept_client(int listen_fd);
 Connection *connection_create(App *app, int fd);
 void connection_close(App *app, Connection *conn);
 void accept_connections(App *app);

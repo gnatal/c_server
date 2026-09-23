@@ -64,6 +64,16 @@ int create_server_socket(int port) {
     }
 #endif
 
+    /* P10: set once here instead of once per accepted connection - accepted sockets inherit it from
+     * the listener (MEASURED on macOS 26 and Linux 6.8; asserted by test_connection.c's
+     * test_accept_client_socket_options so a platform that stops inheriting it fails a test instead
+     * of silently turning Nagle back on). */
+    if (setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt TCP_NODELAY");
+        close(server_fd);
+        return -1;
+    }
+
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
@@ -93,6 +103,18 @@ int create_server_socket(int port) {
     }
 
     return server_fd;
+}
+
+int accept_client(const int listen_fd) {
+#if defined(__linux__)
+    /* One syscall: Linux does not inherit O_NONBLOCK across accept(), accept4 sets it (and
+     * FD_CLOEXEC) atomically. TCP_NODELAY is inherited from the listener. */
+    return accept4(listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#else
+    /* BSD/macOS: an accepted socket inherits O_NONBLOCK and TCP_NODELAY from the listening socket
+     * (create_server_socket sets both), so plain accept() is already the whole job. */
+    return accept(listen_fd, NULL, NULL);
+#endif
 }
 
 Connection *connection_create(App *app, int fd) {
@@ -290,7 +312,8 @@ static void reject_overloaded_connection(int client_fd) {
                              "HTTP/1.1 503 %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
                              "Connection: close\r\n\r\n",
                              body, strlen(body));
-    set_nonblocking(client_fd);
+    /* client_fd is already non-blocking: accept_client, or a master's accept_client before an
+     * SCM_RIGHTS handoff (P10 - this used to cost its own two fcntl calls). */
     if (head_len > 0 && (size_t)head_len < sizeof(head)) {
         ssize_t n = write(client_fd, head, (size_t)head_len);
         if (n == head_len) {
@@ -303,10 +326,11 @@ static void reject_overloaded_connection(int client_fd) {
 /*
  * Shared tail of admitting one already-obtained client fd (via accept() or, under
  * CEXPRESS_SINGLE_ACCEPTOR, a passed fd received over a control socket - C4): S3's overload check,
- * table growth and Connection setup. Does NOT set O_NONBLOCK/TCP_NODELAY - callers that actually
- * accept() the fd themselves do that once, right there; a passed fd already has both set (POSIX:
- * file status flags and socket options are properties of the underlying open file description, not
- * the fd number, so they carry over across an SCM_RIGHTS handoff same as across dup()/fork()).
+ * table growth and Connection setup. Expects O_NONBLOCK/TCP_NODELAY to be in effect already: an fd
+ * from accept_client has both (P10: accept4 / inheritance from the listener, no per-fd syscalls); a
+ * passed fd was accept_client'ed by the master and keeps both (POSIX: file status flags and socket
+ * options are properties of the underlying open file description, not the fd number, so they carry
+ * over across an SCM_RIGHTS handoff same as across dup()/fork()).
  */
 static void admit_connection(App *app, int client_fd) {
     /* S3: shed load past the configured cap instead of accumulating connections (and their
@@ -341,9 +365,7 @@ static void admit_connection(App *app, int client_fd) {
 
 void accept_connections(App *app) {
     while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(app->server_fd, (struct sockaddr *)&client_addr, &client_len);
+        const int client_fd = accept_client(app->server_fd);
         if (client_fd < 0) {
             /* Out of descriptors process- or system-wide: without a free slot, accept() keeps
              * failing this way forever (nothing here releases one on its own), silently starving
@@ -365,10 +387,6 @@ void accept_connections(App *app) {
             }
             break;
         }
-
-        set_nonblocking(client_fd);
-        const int nodelay = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
         admit_connection(app, client_fd);
     }

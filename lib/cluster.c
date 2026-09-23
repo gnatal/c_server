@@ -13,7 +13,6 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
-#include <netinet/tcp.h>
 #endif
 
 static int g_is_worker = 0;
@@ -476,13 +475,10 @@ void cluster_listen(App *app, int port, int num_workers) {
             int pr = poll(&pfd, 1, 50);
             if (pr > 0 && (pfd.revents & POLLIN)) {
                 while (1) {
-                    int client_fd = accept(listen_fd, NULL, NULL);
+                    const int client_fd = accept_client(listen_fd); /* non-blocking + TCP_NODELAY (P10) */
                     if (client_fd < 0) {
                         break; /* EAGAIN (drained) or a transient error: stop draining this wake */
                     }
-                    set_nonblocking(client_fd);
-                    const int nodelay = 1;
-                    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
                     if (!dispatch_client_fd(workers, workers_count, &next_worker, client_fd)) {
                         /* No active worker could take it (e.g. mid crash-loop, every slot down).
                          * Best-effort shed, same philosophy as accept_connections' own S3 overload
