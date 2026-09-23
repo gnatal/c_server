@@ -180,6 +180,100 @@ static void test_match_route(void) {
  * proves that still finds the right sibling regardless of registration order, including segments
  * that are prefixes of one another (e.g. "res1" vs "res10"), where a naive length-then-bytes or
  * bytes-then-length comparator could misorder the array and make binary search miss a match. */
+/* C2: fills req for a GET match_route and returns the matched Route. */
+static const Route *route_get(const App *app, Request *req, const char *path) {
+    memset(req, 0, sizeof(*req));
+    strncpy(req->method, "GET", sizeof(req->method) - 1);
+    strncpy(req->path, path, sizeof(req->path) - 1);
+    return match_route(app, req);
+}
+
+/* C2: parameter names come from the matched route, not from whichever route created the shared
+ * tree node at that position. */
+static void test_match_route_param_names_are_per_route(void) {
+    App app;
+    app_init(&app);
+    app_get(&app, "/orders/:id/items", dummy_handler_a);
+    app_get(&app, "/orders/:oid/notes", dummy_handler_b);
+    Request req;
+
+    const Route *matched = route_get(&app, &req, "/orders/7/notes");
+    assert(matched != NULL && matched->handler == dummy_handler_b);
+    assert(req.param_count == 1);
+    assert(strcmp(req_get_param(&req, "oid"), "7") == 0);
+    assert(req_get_param(&req, "id") == NULL);
+
+    matched = route_get(&app, &req, "/orders/8/items");
+    assert(matched != NULL && matched->handler == dummy_handler_a);
+    assert(req.param_count == 1);
+    assert(strcmp(req_get_param(&req, "id"), "8") == 0);
+    assert(req_get_param(&req, "oid") == NULL);
+    cleanup_app(&app);
+}
+
+/* C2: a mid-pattern '*' registered first no longer hides a later ':name' at the same position, and
+ * the '*' route itself still captures nothing. */
+static void test_match_route_param_after_mid_wildcard(void) {
+    App app;
+    app_init(&app);
+    app_get(&app, "/x/*/y", dummy_handler_a);
+    app_get(&app, "/x/:id/z", dummy_handler_b);
+    Request req;
+
+    const Route *matched = route_get(&app, &req, "/x/42/z");
+    assert(matched != NULL && matched->handler == dummy_handler_b);
+    assert(req.param_count == 1);
+    assert(strcmp(req_get_param(&req, "id"), "42") == 0);
+
+    matched = route_get(&app, &req, "/x/42/y");
+    assert(matched != NULL && matched->handler == dummy_handler_a);
+    assert(req.param_count == 0);
+    cleanup_app(&app);
+}
+
+/* C2: a literal segment wins over a parameter at the same position, and a backtrack from the
+ * literal branch into the param branch leaves only the param route's captures. */
+static void test_match_route_literal_beats_param(void) {
+    App app;
+    app_init(&app);
+    app_get(&app, "/users/:id", dummy_handler_a);
+    app_get(&app, "/users/me", dummy_handler_b);
+    app_get(&app, "/teams/new/:slot", dummy_handler_b);
+    app_get(&app, "/teams/:team/:member", dummy_handler_a);
+    Request req;
+
+    const Route *matched = route_get(&app, &req, "/users/me");
+    assert(matched != NULL && matched->handler == dummy_handler_b);
+    assert(req.param_count == 0);
+
+    matched = route_get(&app, &req, "/users/you");
+    assert(matched != NULL && matched->handler == dummy_handler_a);
+    assert(strcmp(req_get_param(&req, "id"), "you") == 0);
+
+    /* "/teams/new/a" stays on the literal branch; "/teams/old/a" takes the param branch. */
+    matched = route_get(&app, &req, "/teams/new/a");
+    assert(matched != NULL && matched->handler == dummy_handler_b);
+    assert(req.param_count == 1);
+    assert(strcmp(req_get_param(&req, "slot"), "a") == 0);
+
+    matched = route_get(&app, &req, "/teams/old/a");
+    assert(matched != NULL && matched->handler == dummy_handler_a);
+    assert(req.param_count == 2);
+    assert(strcmp(req_get_param(&req, "team"), "old") == 0);
+    assert(strcmp(req_get_param(&req, "member"), "a") == 0);
+
+    /* Backtrack: "/files/new/view" enters the literal "new" branch, which only has "edit", then
+     * falls back to the param route - which must see its own two names, nothing from the dead end. */
+    app_get(&app, "/files/new/edit", dummy_handler_b);
+    app_get(&app, "/files/:fid/:action", dummy_handler_a);
+    matched = route_get(&app, &req, "/files/new/view");
+    assert(matched != NULL && matched->handler == dummy_handler_a);
+    assert(req.param_count == 2);
+    assert(strcmp(req_get_param(&req, "fid"), "new") == 0);
+    assert(strcmp(req_get_param(&req, "action"), "view") == 0);
+    cleanup_app(&app);
+}
+
 static void test_match_route_many_siblings(void) {
     App app;
     app_init(&app);
@@ -896,6 +990,9 @@ int main(void) {
     test_allowed_methods_does_not_touch_request();
     test_match_path_exact_literals();
     test_match_path_params();
+    test_match_route_param_names_are_per_route();
+    test_match_route_param_after_mid_wildcard();
+    test_match_route_literal_beats_param();
     test_match_path_max_params();
     test_match_path_wildcards();
     test_match_route();

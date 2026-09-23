@@ -60,7 +60,8 @@ void app_options_mw(App *app, const char *path, Handler handler, const Middlewar
  * match_path: 1 if `path` matches `pattern`. Captures ':name' segments into req (param_count is reset first);
  *   req may be NULL to test a match without capturing. Never writes outside req's param slots.
  * match_route: first route matching req->method and req->path (with the HEAD->GET fallback), or NULL.
- *   Fills req's path params for the matched route.
+ *   Fills req's path params from the matched route's OWN pattern (C2), so routes may use different
+ *   ':name's at the same position ("/o/:id/items" and "/o/:oid/notes" each see their own name).
  * match_route_allowed_methods: comma-separated, de-duplicated methods of every route matching
  *   req->path, in registration order, into `allowed`; returns how many (0 = a true 404). Does not modify req.
  * req_get_param: captured value (percent-decoded, first match) or NULL.

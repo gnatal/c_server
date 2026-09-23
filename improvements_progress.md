@@ -2760,3 +2760,52 @@ and no `417`.
 
 **Status:** Fixed. Not done: route matching before the 100, `417`, and a Linux curl timing run.
 
+
+---
+
+## C2 · Path parameter names are stored per tree position
+
+**Date completed.** 2026-09-23.
+
+**How it was completed.**
+
+The Patricia tree has one `param_child` per node, shared by every route with a `:name` (or a
+mid-pattern `*`) at that position. Its `prefix` was the first registrant's name, and the walk named
+captures from it. So a later route with a different name at the same position got its value under
+the wrong name, and a `:name` after a `*` got no capture at all.
+
+The fix takes names from the route that matched, not from the tree:
+
+- `lib/router.c`: `tree_search_recursive` / `tree_search` no longer take a `Request` and capture
+  nothing. They only find the `Route`. This also drops the save/restore of `param_count` on backtrack.
+  `match_route` then calls a new `fill_route_params`, which resets `param_count` and, when the route has
+  a parameter, runs `match_path(route->path, req->path, req)`. `match_path` already captured names and
+  values from a pattern, treated a mid `*` as a non-capturing single segment, and truncated to 63 chars.
+  The tree has already proved the match, so this second walk is only for capture.
+- `lib/app_types.h`: `Route.has_params`, set in `fill_route` (`strchr(path, ':')`), so routes without
+  parameters skip the second walk. It is the last field, so the positional `Route` initializers in
+  `tests/test_middleware.c` still line up (they now pass a trailing `0`).
+- `lib/router.h`: `match_route`'s contract now says params come from the matched route's own pattern.
+- `lib/CLAUDE.md`: removed the "Known gaps" entry and described the new step 4 of the request lifecycle.
+
+Tree shape is unchanged: routes still share the param node. The node's `prefix` is now used only for
+debugging. Its name is never read at match time.
+
+**Tests and results.**
+
+- `tests/test_router.c`:
+  - `test_match_route_param_names_are_per_route`: `/orders/:id/items` then `/orders/:oid/notes`. Each
+    route sees only its own name (`oid` = `7`, and `id` is `NULL` for that route, and the reverse).
+    This is the case `improvements.md` measured returning `NULL`.
+  - `test_match_route_param_after_mid_wildcard`: `/x/*/y` then `/x/:id/z`. `id` = `42`, and the `*`
+    route has `param_count == 0`.
+  - `test_match_route_literal_beats_param`: `/users/me` beats `/users/:id`. A literal branch
+    (`/teams/new/:slot`) beats `/teams/:team/:member`. `/files/new/view` dead-ends in the literal
+    `/files/new/edit` branch, then backtracks into `/files/:fid/:action` with exactly its two captures.
+- `make test` (16 suites), `make SANITIZE=1 BUILD_DIR=build-asan test`, `make fuzz` (1,000,000
+  iterations) and `make check-docs` (137 functions) all pass.
+- `make bench`, before and after on the same machine: minimal GET 206 → 212 ns, POST JSON 221 → 210 ns,
+  404 207 → 212 ns, and the browser GET is 614 ns both times. That is within run-to-run noise. The bench
+  routes have no parameters, so they only pay for the `has_params` check.
+
+**Status:** Fixed.

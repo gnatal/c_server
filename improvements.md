@@ -49,7 +49,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a week or more. Severit
 | M5 | ~~"Streaming" responses are fully buffered~~ | Memory / Feature | | L | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (38 MB → 1.6 MB RSS for an 8.4 MB body) |
 | M6 | ~~`Route` embeds a `PATH_MAX` buffer~~ | Memory | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (`sizeof(Route)` 1,368 → 352 B on macOS; 4,440 → 352 B on Linux) |
 | C1 | ~~`Expect: 100-continue` is ignored~~ | Correctness | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED (2 MiB curl upload 1.007 s → 1–2 ms, Content-Length and chunked) |
-| C2 | Path parameter names are stored per tree position | Correctness | | S | Removes a silent `NULL` | MEASURED |
+| C2 | ~~Path parameter names are stored per tree position~~ | Correctness | | S | **FIXED 2026-09-23**: see `improvements_progress.md` | MEASURED |
 | C3 | No `Date` header; 204 carries `Content-Length` | Correctness | | S | RFC compliance | MEASURED |
 | C4 | ~~macOS `SO_REUSEPORT` does not balance workers~~ | Reliability | | M | **FIXED 2026-09-22**: see `improvements_progress.md` | MEASURED (imbalance, and the fix) |
 | C5 | io_uring failure kills the server (no epoll fallback) | Reliability | | M | Runs under restrictive seccomp | Code reading |
@@ -351,7 +351,10 @@ record.
 **Fix.** When the headers are complete, the body is pending and `Expect: 100-continue` is present, validate the method/path/limits (send `413`/`417` on failure), then write `HTTP/1.1 100 Continue\r\n\r\n` once and continue reading.
 **Probable gain.** Removes a one-second stall from every large upload by these clients. Cost: one small write per such request.
 
-### C2 · Path parameter names are stored per tree position
+### C2 · ~~Path parameter names are stored per tree position~~ (FIXED 2026-09-23)
+**Fixed on 2026-09-23** — see `improvements_progress.md` for the fix record. Kept below for historical
+record.
+
 **Problem.** (Finding 2 in `finds.md`.) A `:name` node keeps the name from the first route registered at that position (`router.c:459-466`); later routes with a different name at the same position capture nothing under theirs.
 **Measured.** `/orders/:id/items` then `/orders/:oid/notes`: `req_get_param("oid")` returned `NULL`. `/x/*/y` followed by `/x/:id/z` captured nothing.
 **Fix.** After a successful match, fill `param_names` from the matched `Route`'s own pattern (walk `route->path` for `:` segments) and take only values from the walk, or create separate param nodes per name. Add tests for both cases plus "literal beats parameter".

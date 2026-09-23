@@ -86,6 +86,7 @@ static int fill_route(Route *route, const char *method, const char *path, Handle
     strncpy(route->path, path, sizeof(route->path) - 1);
     route->path[sizeof(route->path) - 1] = '\0';
     route->handler = handler;
+    route->has_params = strchr(route->path, ':') != NULL;
 
     /* Every route filled through here is an ordinary (non-static) route -
      * only app_serve_static sets static_root, after fill_route returns.
@@ -678,93 +679,82 @@ static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route)
     }
 }
 
-static const Route *tree_search_recursive(PatriciaNode *node, const char *cursor, const char *seg, size_t seg_len, Request *req) {
+/* C2: the walk only finds the Route; it captures nothing. A param node is shared by every route with a
+ * parameter (or mid-pattern '*') at that position, so its prefix is only the FIRST registrant's name -
+ * naming captures from it returned NULL for "/orders/:oid/notes" registered after "/orders/:id/items".
+ * match_route fills names/values afterwards from the matched Route's own pattern (fill_route_params). */
+static const Route *tree_search_recursive(const PatriciaNode *node, const char *cursor, const char *seg, size_t seg_len) {
     if (seg == NULL) {
         return node->route;
     }
-    
+
+    const char *next_cursor = cursor;
+    size_t next_seg_len = 0;
+    const char *next_seg = next_segment(&next_cursor, &next_seg_len);
+
     int idx;
     if (find_child(node->children, node->child_count, seg, seg_len, &idx)) {
-        const char *next_cursor = cursor;
-        size_t next_seg_len;
-        const char *next_seg = next_segment(&next_cursor, &next_seg_len);
-        const Route *res = tree_search_recursive(node->children[idx], next_cursor, next_seg, next_seg_len, req);
+        const Route *res = tree_search_recursive(node->children[idx], next_cursor, next_seg, next_seg_len);
         if (res) return res;
     }
-    
+
     if (node->param_child) {
-        int saved_param_count = req ? req->param_count : 0;
-        if (req && req->param_count < MAX_PARAMS && node->param_child->prefix_len > 0 && node->param_child->prefix[0] != '*') {
-            const size_t name_len = node->param_child->prefix_len;
-            const size_t name_cap = sizeof(req->param_names[0]) - 1;
-            const size_t value_cap = sizeof(req->param_values[0]) - 1;
-            const size_t name_copy = name_len < name_cap ? name_len : name_cap;
-            const size_t value_copy = seg_len < value_cap ? seg_len : value_cap;
-            
-            char *name_slot = req->param_names[req->param_count];
-            char *value_slot = req->param_values[req->param_count];
-            memcpy(name_slot, node->param_child->prefix, name_copy);
-            name_slot[name_copy] = '\0';
-            memcpy(value_slot, seg, value_copy);
-            value_slot[value_copy] = '\0';
-            req->param_count++;
-        }
-        
-        const char *next_cursor = cursor;
-        size_t next_seg_len;
-        const char *next_seg = next_segment(&next_cursor, &next_seg_len);
-        const Route *res = tree_search_recursive(node->param_child, next_cursor, next_seg, next_seg_len, req);
+        const Route *res = tree_search_recursive(node->param_child, next_cursor, next_seg, next_seg_len);
         if (res) return res;
-        
-        if (req) req->param_count = saved_param_count;
     }
-    
+
     if (node->catch_all_child) {
         return node->catch_all_child->route;
     }
-    
+
     return NULL;
 }
 
-static const Route *tree_search(PatriciaNode *node, const char *path, Request *req) {
+static const Route *tree_search(const PatriciaNode *node, const char *path) {
     if (!node) return NULL;
     const char *cursor = path;
-    size_t seg_len;
+    size_t seg_len = 0;
     const char *seg = next_segment(&cursor, &seg_len);
-    return tree_search_recursive(node, cursor, seg, seg_len, req);
+    return tree_search_recursive(node, cursor, seg, seg_len);
+}
+
+/* C2: names AND values come from the matched route's own pattern, so every route sees its own ':name's
+ * regardless of what an earlier route called the shared tree position. The tree already proved the
+ * match, so match_path cannot fail here; routes without ':' skip the second walk entirely. */
+static const Route *fill_route_params(const Route *route, Request *req) {
+    req->param_count = 0;
+    if (route != NULL && route->has_params) {
+        match_path(route->path, req->path, req);
+    }
+    return route;
 }
 
 const Route *match_route(const App *app, Request *req) {
-    if (req != NULL) {
-        req->param_count = 0;
-    }
-    
+    req->param_count = 0;
+
     for (int i = 0; i < app->method_tree_count; i++) {
         if (strcmp(app->method_trees[i].method, req->method) == 0) {
-            const Route *route = tree_search(app->method_trees[i].tree, req->path, req);
-            if (route) return route;
+            const Route *route = tree_search(app->method_trees[i].tree, req->path);
+            if (route) return fill_route_params(route, req);
             break;
         }
     }
-    
+
     if (strcmp(req->method, "HEAD") == 0) {
-        if (req != NULL) {
-            req->param_count = 0;
-        }
         for (int i = 0; i < app->method_tree_count; i++) {
             if (strcmp(app->method_trees[i].method, "GET") == 0) {
-                const Route *route = tree_search(app->method_trees[i].tree, req->path, req);
-                if (route) return route;
+                const Route *route = tree_search(app->method_trees[i].tree, req->path);
+                if (route) return fill_route_params(route, req);
                 break;
             }
         }
     }
-    
+
     return NULL;
 }
 
-static int tree_has_match(PatriciaNode *node, const char *path) {
-    return tree_search(node, path, NULL) != NULL;
+static int tree_has_match(const PatriciaNode *node, const char *path) {
+    return tree_search(node, path) != NULL;
 }
 
 int match_route_allowed_methods(const App *app, const Request *req, char *allowed, size_t allowed_size) {

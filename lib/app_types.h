@@ -503,6 +503,8 @@ typedef struct {
                                    * canonical directory, owned by this Route and freed with it (router.c:
                                    * route_free). Kept out of line (M6): an inline PATH_MAX array made every
                                    * Route, and every Router's Route[MAX_ROUTER_ROUTES], ~4 KB/route bigger on Linux. */
+    int has_params;               /* 1 if path has a ':name' segment (C2: match_route then fills req params
+                                   * from THIS pattern, never from the shared tree node's name) */
 } Route;
 
 typedef enum {
