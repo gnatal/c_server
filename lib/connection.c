@@ -244,7 +244,7 @@ void app_stop(App *app) {
 
     /* Stop accepting new connections: deregister from event loop and close server socket */
     if (app->server_fd >= 0) {
-        if (app->loop_fd >= 0) {
+        if (event_loop_is_open(app)) {
             event_loop_unwatch_read(app, app->server_fd);
         }
         close(app->server_fd);
@@ -271,7 +271,7 @@ void app_stop(App *app) {
 
     /* Arm a oneshot shutdown deadline timer on the event loop so slow/stalled clients
      * cannot prevent the server process from exiting indefinitely. */
-    if (app->loop_fd >= 0) {
+    if (event_loop_is_open(app)) {
         event_loop_arm_shutdown_timer(app);
     }
 }

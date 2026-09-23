@@ -8,6 +8,7 @@
  */
 
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
 #include <limits.h>
 #include "arena.h"
@@ -248,6 +249,22 @@ typedef int (*StreamProducer)(StreamWriter *out, void *ctx);
 typedef void (*StreamCtxFree)(void *ctx);
 
 /* ---- connection and event loop ---- */
+
+/*
+ * io_uring backend (C6): what event_loop_io_uring.c has registered for one fd. Polls are one-shot and
+ * re-armed after every event, which gives the level-triggered readiness the engine assumes everywhere
+ * (multishot polls fire on wakeups, i.e. edge-triggered). Every arm gets a new `gen`, encoded with the
+ * fd in the poll's user_data, so a completion from a poll that has since been removed or replaced
+ * (the kernel's -ECANCELED for a removed poll, or readiness it reported just before) is recognized as
+ * stale and dropped instead of being reported as an error or delivered to whatever now owns the fd.
+ * `mask` is the wanted POLLIN/POLLOUT interest (0 = none); an unchanged mask costs nothing (P4).
+ * `armed` is 1 while a poll for `gen` is in flight.
+ */
+typedef struct {
+    uint32_t gen;
+    uint16_t mask;
+    uint16_t armed;
+} PollRegistration;
 
 /* Per-connection state, one per accepted fd, owned by App.connections[fd]. Freed only by connection_close. */
 typedef struct Connection {
@@ -570,12 +587,18 @@ typedef struct {
      * process. Set once by app_listen_worker_via_control_socket, before app_listen_worker's event loop
      * starts; never toggled afterward. */
     int accept_via_fd_passing;
+    /* Which member is live depends on the backend: never test loop_fd on io_uring (it would read half
+     * of the ring pointer) - use event_loop_is_open (event_loop.h). */
     union {
         int kq;          /* macOS/BSD */
         int epoll_fd;    /* Linux epoll backend (-DCEXPRESS_USE_EPOLL) */
         void *ring;      /* Linux io_uring (struct io_uring*) */
         int loop_fd;     /* platform-neutral int name */
     };
+    /* io_uring backend only (C6): the live poll registration of each fd, indexed by fd, grown on demand
+     * by event_loop_io_uring.c and freed by event_loop_close. NULL/0 on the other backends. */
+    PollRegistration *poll_regs;
+    int poll_regs_cap;
     int timer_idle_fd;
     int timer_shutdown_fd;
     int signal_fd;

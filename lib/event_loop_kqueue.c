@@ -54,6 +54,10 @@ int event_loop_init(App *app) {
     return 0;
 }
 
+int event_loop_is_open(const App *app) {
+    return app != NULL && app->kq >= 0;
+}
+
 void event_loop_close(App *app) {
     if (app == NULL) {
         return;

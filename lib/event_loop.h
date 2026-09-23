@@ -13,6 +13,13 @@
 int event_loop_init(App *app);
 
 /*
+ * 1 between a successful event_loop_init and event_loop_close, else 0. The backend handle shares a
+ * union in App (kq / epoll_fd / ring), so callers must ask this instead of testing App.loop_fd: on
+ * io_uring that field is half of a pointer and can read as negative while the loop is open.
+ */
+int event_loop_is_open(const App *app);
+
+/*
  * Closes the event loop descriptor and any auxiliary descriptors (timerfds,
  * signalfds on Linux), and restores default dispositions and masks for
  * SIGINT and SIGTERM. Safe and idempotent.

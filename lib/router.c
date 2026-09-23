@@ -25,6 +25,8 @@ void app_init(App *app) {
 #else
     app->loop_fd = -1;
 #endif
+    app->poll_regs = NULL;
+    app->poll_regs_cap = 0;
     app->timer_idle_fd = -1;
     app->timer_shutdown_fd = -1;
     app->signal_fd = -1;

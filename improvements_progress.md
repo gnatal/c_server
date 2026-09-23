@@ -2517,3 +2517,97 @@ previous output has reached the socket, so a streamed response costs one fixed b
 - trailers on producer streams;
 - a Linux or io_uring run. C6's re-arm bug affects `watch`/`unwatch` there generally, and park and resume
   toggle interest more often than a normal response does.
+
+---
+
+## C6 · io_uring backend closes every keep-alive connection after its first request
+
+**Date completed.** 2026-09-23.
+
+**Reproduced first** (Docker on the M3 Pro, Alpine, kernel 6.8, `--security-opt seccomp=unconfined`, since
+Docker's default seccomp profile blocks io_uring). A cookbook server, one keep-alive connection, sequential
+`GET /hello`: **1 of 20** requests answered, then the server closed the connection.
+
+**How it was completed** (`lib/event_loop_io_uring.c`; the new type and fields are in `app_types.h`).
+
+- **Generation-tagged registrations.** A poll's user_data is now `(generation << 32) | (fd + 1)`. Each fd's
+  generation lives in `App.poll_regs[fd]` (`PollRegistration { gen, mask, armed }`), bumped on every arm
+  and every removal. A completion whose generation is not the fd's live armed one is dropped. That covers
+  three cases:
+  - the kernel's `-ECANCELED` for a removed poll (the C6 bug itself);
+  - readiness a removed poll reported just before it was removed;
+  - leftovers from a previous connection on a reused fd number.
+- **One-shot polls, re-armed after each event.** This part was not in `improvements.md`'s fix sketch.
+  Once the cancellation was fixed, a chunked response over keep-alive **hung mid-stream**. Multishot
+  io_uring polls fire on wakeups (edge-triggered). `connection.c` assumes level-triggered readiness in at
+  least three places:
+  - `read_and_serve` returns after serving and expects to be called again while bytes remain;
+  - `flush_connection`'s fairness yield arms write interest on a socket that is already writable;
+  - `MAX_PIPELINED_PER_EVENT` relies on the same wakeup.
+
+  The old remove+add on every change re-armed the poll as a side effect, which re-checks readiness, so
+  this only surfaced once no-op changes were skipped. Re-arming a one-shot poll after each event re-checks
+  readiness, so a condition that is still true fires again next turn. That gives level-triggered semantics
+  without depending on `IORING_POLL_ADD_LEVEL` (not in this kernel's uapi headers, and its multishot
+  semantics are unclear).
+- **P4, io_uring half.** An interest change equal to what is already registered costs nothing: no SQE, no
+  submit. SQEs are queued and submitted once per `event_loop_poll`, combined with the wait
+  (`io_uring_submit_and_wait`), instead of one `io_uring_submit` per change.
+- **Latent Linux bug found along the way.** `app_stop` tested `app->loop_fd >= 0` to mean "event loop is
+  up". On io_uring that field is the low half of the ring pointer (a union) and can be negative. When it
+  was, shutdown skipped both the listen-socket unwatch and the drain-deadline timer, so a stalled client
+  could hold the process open. Added `event_loop_is_open` (`event_loop.h`, all three backends), and
+  `connection.c` now uses it.
+
+**Tests and results.**
+
+- `tests/test_event_loop.c`: four new tests of the backend contract `connection.c` relies on, run on all
+  three backends:
+  - the keep-alive interest cycle 50 times with no `LOOP_EVENT_ERROR`;
+  - level-triggered read and write readiness;
+  - no stale events on a reused fd;
+  - `event_loop_is_open`.
+
+  The first test **fails on the original io_uring backend** with exactly the C6 error, and passes after the
+  fix. C6 had slipped through because every connection test drives `handle_readable`/`handle_writable` by
+  hand and never runs the backend.
+- macOS: `make test` (16 suites), `make test_epoll` and `make check-docs` pass.
+- Linux (Docker, Alpine, gcc, liburing, kernel 6.8): 16 of 17 suites pass. `test_connection` fails only at
+  its last test, `test_accept_connections_emfile_frees_a_slot_and_recovers`. That failure is pre-existing
+  and identical before this change: the test encodes macOS behavior, and Linux recovers the connection
+  that hit `EMFILE`.
+- Linux ASan + UBSan + LeakSanitizer (Debian bookworm): every suite that uses the event loop is clean. The
+  leaks reported in `test_middleware`/`test_router` are the known T3 (route trees in test cleanup); neither
+  suite links the event loop.
+- **MEASURED, real event loop on Linux** (cookbook server, one worker):
+
+  | Probe | Before | After |
+  |---|---|---|
+  | Sequential `GET /hello` on one keep-alive connection | 1/20 | **1000/1000** |
+  | Chunked `/export?rows=200000` responses on one keep-alive connection | — | **50/50** (hung before one-shot re-arm) |
+  | 20 pipelined requests in one write (past the 16-per-turn cap) | — | 20/20 |
+  | SSE subscribe + 3 publishes | — | 3/3 delivered |
+  | Client disconnect mid-stream | — | connection released |
+
+- **`scripts/docker_stress_test.sh`** (`PHASES="ping churn"`, 4 workers, 100 and 1000 connections):
+  - **0 read errors.** Before the fix, read errors exceeded the number of successful requests.
+  - About 275k req/s with keep-alive against about 58k with `Connection: close`, so keep-alive now pays off.
+  - No worker crashes.
+- **wrk "timeout" counts.** wrk reports timeouts close to the connection count (up to about 1650 at
+  `-c1000`) with a millisecond max latency. A control run with the **epoll** backend on the same kernel
+  shows the same pattern (0 to 1650), and macOS/kqueue shows none. It is not specific to io_uring and is
+  not explained; filed with T6 in `lib/CLAUDE.md` "Known gaps".
+- **Backend speed, MEASURED as a side result:**
+
+  | Backend | Requests in 12 s (`-c1000`) | Requests in 5 s |
+  |---|---|---|
+  | epoll | **3.5–3.6 M** | 1.45–1.66 M |
+  | io_uring | 2.8–2.9 M | about 1.2 M |
+
+  io_uring used only as a readiness poller (one SQE and one CQE per event on top of the same
+  `recv`/`write`) is 20–25% slower than epoll. The Makefile still defaults to io_uring on Linux.
+
+**Status:** Fixed. Not done:
+- the epoll half of P4;
+- a Linux CI job (T5); this was a manual Docker run;
+- choosing the default Linux backend in light of the speed result above.
