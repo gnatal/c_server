@@ -24,7 +24,8 @@ typedef struct {
 /* Initializes an arena with a pre-allocated static/heap buffer. */
 void arena_init(Arena *a, char *buf, size_t cap);
 
-/* Allocates `size` bytes from the arena. Returns NULL on hard OOM. */
+/* Allocates `size` bytes from the arena. Returns NULL on hard OOM or when `size` is so large
+ * (near SIZE_MAX) that aligning it or adding the fallback node header would overflow. */
 void *arena_alloc(Arena *a, size_t size);
 
 /* Resets the arena offset to 0 and frees any fallback 'large' allocations.

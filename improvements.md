@@ -43,7 +43,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **M5** | Static cache: `./` aliases create duplicate entries; 64 MiB per worker | Low | S | CODE |
 | **M6** | A partial request always costs a full 8 KiB owned buffer | Low | S | CODE |
 | **P7** | Static cache lookup is a linear `strcmp` scan over up to 256 entries | Low | S | CODE |
-| **S10** | `arena_alloc` has no size-overflow check | Low (hardening) | S | CODE |
+| **S10** | ~~`arena_alloc` has no size-overflow check~~ **FIXED 2026-09-24** | Low (hardening) | S | CODE |
 
 **Suggested order:** S1, M1, S2 and M2 first (each S effort, each confirmed). Then S3, S4, S5, P1 and
 P2, which are also small. Then P3, S6–S9, M3. The rest when convenient.
@@ -483,6 +483,13 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   values into the request arena (pointer + length) and remove the fixed 255-character cap.
 
 ### S10 · `arena_alloc` has no size-overflow check
+- **Status: FIXED 2026-09-24.** `arena_alloc` returns `NULL` (arena state untouched) when
+  `size > SIZE_MAX - ALIGNMENT - sizeof(ArenaNode)`, so neither `align_up` nor the fallback's
+  `sizeof(ArenaNode) + size` can wrap. The in-buffer check is now `aligned_size <= cap - offset` (no addition;
+  `offset <= cap` always holds). Tests: `tests/test_arena.c` (new suite): alignment and bump offsets, exact fit,
+  malloc fallback and reset, `SIZE_MAX` / `SIZE_MAX - 3` / node-header-wrap sizes → `NULL` with offset unchanged,
+  yyjson `realloc` to `SIZE_MAX` → `NULL`. Mutation-checked: the old `arena_alloc` fails the suite (`SIZE_MAX`
+  handed out a pointer into the buffer).
 - **Impact:** Low (hardening; no current caller passes a size near `SIZE_MAX`)
 - **Effort:** S
 - **Where:** `lib/arena.c:19` (`align_up(size)` wraps around for sizes near `SIZE_MAX`), `:22`

@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "arena.h"
@@ -16,10 +17,14 @@ void arena_init(Arena *a, char *buf, size_t cap) {
 }
 
 void *arena_alloc(Arena *a, size_t size) {
-    size_t aligned_size = align_up(size);
+    /* Reject sizes where align_up or sizeof(ArenaNode) + size would wrap around */
+    if (size > SIZE_MAX - ALIGNMENT - sizeof(ArenaNode)) {
+        return NULL;
+    }
+    const size_t aligned_size = align_up(size);
 
-    /* Try to allocate from the pre-allocated fixed buffer */
-    if (a->offset + aligned_size <= a->cap) {
+    /* Try to allocate from the pre-allocated fixed buffer (offset <= cap always holds, so no overflow) */
+    if (aligned_size <= a->cap - a->offset) {
         void *ptr = a->buf + a->offset;
         a->offset += aligned_size;
         return ptr;

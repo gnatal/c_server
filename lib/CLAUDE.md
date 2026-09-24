@@ -122,7 +122,9 @@ The arena serves everything that lives for one request (except `Request.body`, a
 values (`ResponseHeader.value`, copied by `res_set_header`/`res_set_trailer`; an overwrite leaves the old copy until reset),
 chunked-response growth, and any yyjson document created with `arena_yyjson_alc`. Bump allocation, 8-byte aligned,
 no per-allocation free. When the remaining space is too small (not only for a single request over 64 KiB), the
-allocation falls back to `malloc` and is chained in a list that `arena_reset` frees. Consequences: nothing reached
+allocation falls back to `malloc` and is chained in a list that `arena_reset` frees. A size above
+`SIZE_MAX - 8 - sizeof(ArenaNode)` returns `NULL` without touching the arena (the alignment and fallback-header
+arithmetic would otherwise wrap), the same as a failed fallback `malloc`. Consequences: nothing reached
 through `req` or `res` may be kept past the handler; a growing chunked response copies into a new arena block each
 doubling and leaves the old block in the arena until the request ends; a static file is read into a malloc'd buffer
 and copied again into the arena by `res_send_bytes` (unlike `res_send_file`, which never copies the body into the
