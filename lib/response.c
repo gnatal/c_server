@@ -474,15 +474,20 @@ static int append_to_out_buf(Connection *conn, const void *data, size_t len) {
         while (new_cap < conn->out_len + len + 1) {
             new_cap *= 2;
         }
-        char *grown = arena_alloc(conn->arena, new_cap);
+        /* in place when out_buf is the arena's last block (the usual res_write sequence), otherwise a copy;
+         * out_cap is always the size out_buf was allocated with, which arena_grow's in-place check needs.
+         * A connection-owned tail copy is never in the arena, so it is copied as before. */
+        char *const old_buf = conn->out_buf_owned ? NULL : conn->out_buf;
+        char *grown = old_buf != NULL ? arena_grow(conn->arena, old_buf, conn->out_cap, new_cap)
+                                      : arena_alloc(conn->arena, new_cap);
         if (grown == NULL) {
             return -1;
         }
-        if (conn->out_buf != NULL && conn->out_len > 0) {
+        if (old_buf == NULL && conn->out_buf != NULL && conn->out_len > 0) {
             memcpy(grown, conn->out_buf, conn->out_len);
         }
         conn->out_buf = grown;
-        conn->out_buf_owned = 0; /* a fresh arena allocation is never a connection-owned tail-copy */
+        conn->out_buf_owned = 0; /* an arena allocation is never a connection-owned tail-copy */
         conn->out_cap = new_cap;
     }
     memcpy(conn->out_buf + conn->out_len, data, len);

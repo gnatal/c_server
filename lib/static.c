@@ -206,6 +206,20 @@ static StaticCacheEntry *cache_find(const char *path, uint64_t *hash_memo) {
     return NULL;
 }
 
+/* An entry for the same file (device + inode) whose body is still current (same mtime and size), cached
+ * under another candidate: a symlink or hard link inside the root, or a case variant on a case-insensitive
+ * filesystem. Its body is shared rather than read and held again. Linear; runs on a miss only. */
+static StaticCacheEntry *cache_find_same_file(const struct stat *st) {
+    for (int i = 0; i < g_static_cache_count; i++) {
+        StaticCacheEntry *const entry = &g_static_cache[i];
+        if (entry->ino == st->st_ino && entry->dev == st->st_dev && entry->mtime == st->st_mtime &&
+            entry->body->len == (size_t)st->st_size) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
 /* Frees the least-recently-confirmed-fresh entry's owned memory to make room for a new one. */
 static void cache_evict_stalest(void) {
     if (g_static_cache_count == 0) {
@@ -243,7 +257,7 @@ static const StaticCacheEntry *cache_lookup_fresh(const char *path, uint64_t *ha
  * `content_type` must have static storage duration (static_mime_type's return value qualifies); nothing
  * here ever frees it.
  */
-static int cache_insert(const char *path, uint64_t *hash_memo, SharedBody *body, time_t mtime,
+static int cache_insert(const char *path, uint64_t *hash_memo, SharedBody *body, const struct stat *st,
                         const char *content_type, time_t now) {
     if (body->len > STATIC_CACHE_MAX_ENTRY_BYTES) {
         return -1;
@@ -266,7 +280,9 @@ static int cache_insert(const char *path, uint64_t *hash_memo, SharedBody *body,
 
     shared_body_release(entry->body);
     entry->body = body;
-    entry->mtime = mtime;
+    entry->mtime = st->st_mtime;
+    entry->dev = st->st_dev;
+    entry->ino = st->st_ino;
     entry->last_checked = now;
     entry->content_type = content_type;
     return 0;
@@ -386,6 +402,20 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
         return;
     }
 
+    /* Another name for a file already cached (symlink, hard link, case variant): share its bytes. The new
+     * entry keys this candidate so its next hit takes the fast path; both entries hold one reference. */
+    const StaticCacheEntry *same_file = cache_find_same_file(&st);
+    if (same_file != NULL) {
+        SharedBody *const shared = same_file->body;
+        shared_body_retain(shared); /* our reference: handed to the cache, or released below */
+        res_status(res, 200);
+        res_send_shared(res, content_type, shared);
+        if (cache_insert(candidate, &candidate_hash, shared, &st, content_type, now) != 0) {
+            shared_body_release(shared);
+        }
+        return;
+    }
+
     FILE *f = fopen(resolved, "rb");
     if (f == NULL) {
         res_status(res, 404);
@@ -415,7 +445,7 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
 
     /* cache_insert takes our reference on success (0); on failure (too big to cache, or out of memory for
      * the cache's own bookkeeping) we still hold it - never a double release, never a leak either way. */
-    if (cache_insert(candidate, &candidate_hash, body, st.st_mtime, content_type, now) != 0) {
+    if (cache_insert(candidate, &candidate_hash, body, &st, content_type, now) != 0) {
         shared_body_release(body);
     }
 }

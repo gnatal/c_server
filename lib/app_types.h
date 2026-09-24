@@ -69,7 +69,8 @@
 
 #define ARENA_SIZE (64 * 1024)        /* App.arena's fixed buffer: one shared per-worker bump allocator, not one
                                         * per connection; reset once per request, falls back to malloc beyond this */
-#define BUF_SIZE 8192                 /* App.read_buf and an owned in_buf's start size; also the request-header limit (431 beyond) */
+#define BUF_SIZE 8192                 /* App.read_buf, and the request-header limit (431 beyond) */
+#define IN_BUF_GRANULE 512            /* an owned in_buf for a partial request is its bytes + NUL rounded up to this */
 #define MAX_BODY_SIZE (10 * 1024 * 1024)        /* request body (Content-Length or decoded chunked) and streamed response buffer; 413 beyond */
 #define MAX_STATIC_FILE_SIZE (50 * 1024 * 1024) /* static_serve_file refuses larger files with 500 */
 #define STATIC_CACHE_MAX_ENTRIES 256            /* distinct cached files per process (static.c); LRU-by-staleness eviction beyond it */

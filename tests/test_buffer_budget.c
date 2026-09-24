@@ -110,8 +110,8 @@ static void test_upload_is_counted_and_released(void) {
     snprintf(head, sizeof(head), "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: %zu\r\n\r\n", body_len);
     send_all(peer, head, strlen(head));
     handle_readable(&app, conn);
-    /* partial request moved off App.read_buf into an owned BUF_SIZE buffer */
-    assert(conn->held_bytes == BUF_SIZE && app.buffered_bytes == BUF_SIZE);
+    /* partial request moved off App.read_buf into an owned buffer of its size, rounded up to IN_BUF_GRANULE */
+    assert(conn->held_bytes == IN_BUF_GRANULE && app.buffered_bytes == IN_BUF_GRANULE);
 
     char chunk[4096];
     memset(chunk, 'x', sizeof(chunk));
@@ -197,14 +197,14 @@ static void test_upload_over_budget_503(void) {
 static void test_partial_request_over_budget_503(void) {
     App app;
     app_setup(&app);
-    app.config.max_buffered_bytes = BUF_SIZE;
+    app.config.max_buffered_bytes = IN_BUF_GRANULE; /* room for exactly one right-sized partial request */
     const char *partial = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
 
     int peer_a;
     Connection *a = open_conn(&app, &peer_a);
     send_all(peer_a, partial, strlen(partial));
     handle_readable(&app, a);
-    assert(a->held_bytes == BUF_SIZE && app.buffered_bytes == BUF_SIZE);
+    assert(a->held_bytes == IN_BUF_GRANULE && app.buffered_bytes == IN_BUF_GRANULE);
 
     int peer_b;
     const int fd_b = (open_conn(&app, &peer_b))->fd;
@@ -214,7 +214,7 @@ static void test_partial_request_over_budget_503(void) {
     char resp[256];
     read_some(peer_b, resp, sizeof(resp));
     assert(strncmp(resp, "HTTP/1.1 503 ", 13) == 0);
-    assert(app.buffered_bytes == BUF_SIZE);
+    assert(app.buffered_bytes == IN_BUF_GRANULE);
 
     /* A completes normally; a whole request that needs no owned buffer is never refused */
     send_all(peer_a, "defghij", 7);

@@ -675,6 +675,46 @@ static void test_cache_lookup_survives_crossing_hash_threshold(void) {
     rmdir(root);
 }
 
+/* Other names for an already-cached file - a symlink and a hard link inside the root - share the first
+ * entry's SharedBody instead of reading and holding another copy; a different file with the same bytes
+ * does not. `/static/./file.txt` is not an alias at all: a "." segment is a 404 (no entry). */
+static void test_cache_aliases_share_one_body(void) {
+    StaticFixture fx;
+    setup_fixture(&fx);
+    Route route = make_static_route(&fx);
+    char target[PATH_MAX + 32];
+    char path[PATH_MAX + 32];
+    snprintf(target, sizeof(target), "%s/file.txt", fx.root);
+    snprintf(path, sizeof(path), "%s/sym.txt", fx.root);
+    assert(symlink(target, path) == 0);
+    snprintf(path, sizeof(path), "%s/hard.txt", fx.root);
+    assert(link(target, path) == 0);
+    snprintf(path, sizeof(path), "%s/twin.txt", fx.root);
+    write_file(path, "hello static\n"); /* same bytes, different file */
+
+    const SharedBody *original = serve_cached(&route, "file.txt", "hello static\n");
+    assert(serve_cached(&route, "sym.txt", "hello static\n") == original);
+    assert(serve_cached(&route, "hard.txt", "hello static\n") == original);
+    assert(serve_cached(&route, "twin.txt", "hello static\n") != original);
+    assert(original->refs == 3); /* file.txt, sym.txt and hard.txt entries; no connection holds it */
+
+    Request dot = make_request("/static/./file.txt");
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+    static_serve_file(&route, &dot, &res);
+    assert(res.status == 404 && conn->shared_body == NULL);
+    free_conn(conn);
+    assert(original->refs == 3);
+
+    static_cache_clear();
+    const char *extra[] = { "sym.txt", "hard.txt", "twin.txt" };
+    for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", fx.root, extra[i]);
+        unlink(path);
+    }
+    teardown_fixture(&fx);
+}
+
 int main(void) {
     test_resolve_literal_subpath();
     test_resolve_root_mount();
@@ -701,6 +741,7 @@ int main(void) {
     test_path_hash_matches_fnv1a_vectors();
     test_cache_lookup_finds_own_entry_across_evictions();
     test_cache_lookup_survives_crossing_hash_threshold();
+    test_cache_aliases_share_one_body();
 
     printf("all static tests passed\n");
     return 0;

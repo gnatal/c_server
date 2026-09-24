@@ -39,9 +39,9 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **P4** | ~~Cached static files are copied into the arena on every hit~~ **FIXED 2026-09-24** | Low–Medium | M | MEASURED |
 | **P5** | ~~`sendfile`/`writev` still not used for file bodies~~ **FIXED 2026-09-24** | Low–Medium | M | MEASURED |
 | **P6** | ~~One unnecessary syscall per connection close (`unwatch_all` before `close`)~~ **FIXED 2026-09-24** | Low | S | CODE |
-| **M4** | Arena growth always copies (yyjson realloc, `res_write` doubling) | Low–Medium | S | CODE |
-| **M5** | Static cache: `./` aliases create duplicate entries; 64 MiB per worker | Low | S | CODE |
-| **M6** | A partial request always costs a full 8 KiB owned buffer | Low | S | CODE |
+| **M4** | ~~Arena growth always copies (yyjson realloc, `res_write` doubling)~~ **FIXED 2026-09-24** | Low–Medium | S | CODE |
+| **M5** | ~~Static cache: `./` aliases create duplicate entries; 64 MiB per worker~~ **FIXED 2026-09-24** | Low | S | CODE |
+| **M6** | ~~A partial request always costs a full 8 KiB owned buffer~~ **FIXED 2026-09-24** | Low | S | CODE |
 | **P7** | ~~Static cache lookup is a linear `strcmp` scan over up to 256 entries~~ **FIXED 2026-09-24** | Low | S | CODE |
 | **S10** | ~~`arena_alloc` has no size-overflow check~~ **FIXED 2026-09-24** | Low (hardening) | S | CODE |
 
@@ -289,6 +289,14 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   add or subtract per allocation.
 
 ### M4 · Arena growth always copies (yyjson realloc, `res_write` doubling)
+- **Status: FIXED 2026-09-24.** New `arena_grow` (`arena.h`): the last block in the buffer is extended in place, the
+  newest fallback block is `realloc`'d, anything else is allocated and copied as before. Used by the yyjson realloc hook
+  and `append_to_out_buf`. The in-place check requires the pointer to lie inside `[buf, buf + offset)`, so a
+  connection-owned tail copy or a block that happens to end at `buf` is never extended. MEASURED (macOS, gcc-16 -O2,
+  `yyjson_mut_write_opts` of a 2.2 MB JSON array through `arena_yyjson_alc`): heap held by the arena during the write
+  4.5 MB → 2.7 MB. Tests: five `test_grow_*` cases in `tests/test_arena.c` (in place, shrink, non-last copied, one
+  fallback node reused up to 1.6 MB, foreign pointer copied, failure leaves the block intact) and
+  `test_res_write_grows_out_buf_in_place` in `tests/test_response.c`.
 - **Impact:** Low–Medium (large JSON responses, large `res_write` bodies)
 - **Effort:** S
 - **Where:** `lib/arena.c:62` (`arena_yyjson_realloc` always does `arena_alloc` + `memcpy`),
@@ -302,6 +310,14 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   sites. Test: grow the last block in place, grow a block that isn't last (copied), grow past capacity (fallback).
 
 ### M5 · Static cache: alias paths create duplicate entries; the cache is per worker
+- **Status: FIXED 2026-09-24.** The `./` shape was already closed: `static_resolve_relative_path` answers `-2` (404) for
+  any segment starting with `.`, and `//` collapses, so neither reaches the cache. The remaining aliases (a symlink or
+  hard link inside the root, a case variant on a case-insensitive filesystem) still took a slot each but now share one
+  body: entries record `st_dev`/`st_ino`, and a miss whose file matches a cached entry (same inode, mtime and size)
+  takes a reference to that `SharedBody` instead of reading the file again. The per-worker multiplier
+  (`workers × 64 MiB`) is documented in `lib/CLAUDE.md` rather than scaled down: the cap stays per process.
+  Test: `test_cache_aliases_share_one_body` in `tests/test_static.c` (symlink and hard link share the body, a
+  same-content twin file does not, `/static/./file.txt` is a 404 with no entry); fails with the sharing disabled.
 - **Impact:** Low (bounded at 64 MiB per worker)
 - **Effort:** S
 - **Where:** `lib/static.c:9-67` (keeps `.` segments), `lib/static.c:270` (key = `static_root/subpath`).
@@ -313,6 +329,17 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   `STATIC_CACHE_MAX_TOTAL_BYTES` when `workers > 1`.
 
 ### M6 · A partial request always costs a full 8 KiB owned buffer
+- **Status: FIXED 2026-09-24.** `stop_borrowing_read_buf` allocates the leftover + NUL rounded up to `IN_BUF_GRANULE`
+  (512, `app_types.h`), so 10,000 connections that have each sent 20 bytes hold 5 MiB instead of 80 MiB (`held_bytes`
+  is 512 per connection in the tests). A header block that fills the small buffer doubles it with `grow_head_buf`
+  (budget-checked) up to `BUF_SIZE`; the 431 check now requires `in_cap >= BUF_SIZE`, so the header limit is still
+  `BUF_SIZE`. Body growth (`grow_in_buf`) jumps a buffer below `BUF_SIZE` straight to `BUF_SIZE` (`next_in_cap`), so
+  uploads do not crawl through 1, 2, 4 KiB reallocs. Tests in `tests/test_read_buf.c`:
+  `test_partial_request_owns_right_sized_buffer` (20 bytes hold 512; a ~3 KB head dripped in grows to 4 KiB and is
+  served), `test_dripped_header_block_431_at_buf_size` (431 only once `BUF_SIZE - 1` bytes arrived) and
+  `test_head_growth_over_budget_503`; fails with the old unconditional 431. Four existing assertions that expected a
+  `BUF_SIZE` buffer after the headers alone (`test_connection.c`, `test_read_buf.c`, `test_buffer_budget.c`) now
+  expect the right-sized one. Passes on macOS (kqueue, epoll-shim, ASan, `make fuzz`) and Linux (epoll, io_uring).
 - **Impact:** Low
 - **Effort:** S
 - **Where:** `lib/connection.c:960` (`stop_borrowing_read_buf`: `malloc(BUF_SIZE)` whatever the size of the leftover).

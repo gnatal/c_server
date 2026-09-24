@@ -292,6 +292,45 @@ static void test_chunked_streaming_basic(void) {
     free_conn(conn);
 }
 
+/* res_write growth extends out_buf in place while it is the arena's last block: the same pointer, and the
+ * arena holds one out_cap-sized buffer instead of every doubling's dead copy. Past the arena's capacity it
+ * moves to one fallback node that is then realloc'd, never one node per doubling. */
+static void test_res_write_grows_out_buf_in_place(void) {
+    Connection *conn = make_conn();
+    Arena *const arena = conn->arena;
+    Response res = { .conn = conn, .status = 0 };
+    char chunk[1000];
+    memset(chunk, 'z', sizeof(chunk));
+
+    res_write(&res, chunk, sizeof(chunk));
+    char *const first = conn->out_buf;
+    const size_t start = (size_t)(first - arena->buf);
+    for (int i = 1; i < 40; i++) { /* ~40 KB: fits the 64 KiB arena only without dead copies */
+        res_write(&res, chunk, sizeof(chunk));
+        assert(conn->out_buf == first);
+        assert(arena->offset == start + conn->out_cap && arena->large == NULL);
+    }
+    for (int i = 40; i < 300; i++) { /* ~300 KB: past the arena */
+        res_write(&res, chunk, sizeof(chunk));
+    }
+    assert(arena->large != NULL && arena->large->next == NULL && conn->out_buf == arena->large->data);
+    res_end(&res);
+    const char *body = strstr(conn->out_buf, "\r\n\r\n");
+    assert(body != NULL);
+    body += 4;
+    for (int i = 0; i < 300; i++) {
+        assert(memcmp(body, "3e8\r\n", 5) == 0);
+        body += 5;
+        assert(memcmp(body, chunk, sizeof(chunk)) == 0);
+        body += sizeof(chunk);
+        assert(memcmp(body, "\r\n", 2) == 0);
+        body += 2;
+    }
+    assert(strcmp(body, "0\r\n\r\n") == 0);
+
+    free_conn(conn);
+}
+
 static void test_chunked_streaming_trailers(void) {
     Connection *conn = make_conn();
     Response res = { .conn = conn, .status = 0 };
@@ -778,6 +817,7 @@ int main(void) {
     test_long_redirect_location_sent_whole();
     test_long_trailer_value_sent_whole();
     test_unstorable_header_is_dropped_not_cut();
+    test_res_write_grows_out_buf_in_place();
 
     printf("all response tests passed\n");
     return 0;

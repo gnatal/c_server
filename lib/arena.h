@@ -28,6 +28,17 @@ void arena_init(Arena *a, char *buf, size_t cap);
  * (near SIZE_MAX) that aligning it or adding the fallback node header would overflow. */
 void *arena_alloc(Arena *a, size_t size);
 
+/*
+ * Resizes a block this arena returned, keeping its first min(old_size, new_size) bytes; `old_size` is the
+ * size it was allocated (or last grown) with. Never leaves a dead copy behind when it can avoid it:
+ *   - the last block in `buf` is extended (or shrunk) in place when the new size fits the remaining capacity;
+ *   - the newest fallback block (head of `large`) is realloc'd, so large growth costs 1x, not a copy per step;
+ *   - anything else is allocated anew and copied, the old block stays dead until arena_reset.
+ * `ptr` NULL behaves as arena_alloc(a, new_size). Returns NULL on the same failures as arena_alloc; `ptr` is
+ * then still valid and unchanged.
+ */
+void *arena_grow(Arena *a, void *ptr, size_t old_size, size_t new_size);
+
 /* Resets the arena offset to 0 and frees any fallback 'large' allocations.
  * Call this at the end of every request. */
 void arena_reset(Arena *a);

@@ -985,6 +985,31 @@ static void reject_request(App *app, Connection *conn, const int status) {
  * buffering and parse_http_request answered 413. A route-specific limit below MAX_BODY_SIZE
  * (app_use_body_limit) is enforced earlier still, in handle_readable, before this is ever called.
  */
+/* The next in_cap when a body outgrows in_buf: doubling, but at least BUF_SIZE, so a partial request's
+ * small owned buffer (IN_BUF_GRANULE-rounded, stop_borrowing_read_buf) does not crawl up through
+ * 1 KiB, 2 KiB, ... once a body is arriving. */
+static size_t next_in_cap(const size_t in_cap) {
+    return in_cap < BUF_SIZE ? BUF_SIZE : in_cap * 2;
+}
+
+/* A header block filled a small owned in_buf (below BUF_SIZE, see stop_borrowing_read_buf) before its
+ * blank line: double it, up to BUF_SIZE, the header limit - a full BUF_SIZE buffer with no blank line is
+ * still the only 431. Returns 1 grown, 0 realloc failed (-> 500), -2 over max_buffered_bytes (-> 503). */
+static int grow_head_buf(App *app, Connection *conn) {
+    const size_t needed = conn->in_cap * 2 > BUF_SIZE ? BUF_SIZE : conn->in_cap * 2;
+    if (!budget_allows(app, needed - conn->in_cap)) {
+        return -2;
+    }
+    char *grown = realloc(conn->in_buf, needed); /* owned: a borrowed App.read_buf is always BUF_SIZE */
+    if (grown == NULL) {
+        return 0;
+    }
+    conn->in_buf = grown;
+    conn->in_cap = needed;
+    sync_held_bytes(app, conn);
+    return 1;
+}
+
 static int grow_in_buf(App *app, Connection *conn, const size_t header_len, const int chunked,
                        const int content_length) {
     size_t needed;
@@ -994,13 +1019,13 @@ static int grow_in_buf(App *app, Connection *conn, const size_t header_len, cons
         if (conn->in_cap >= raw_cap) {
             return -1;
         }
-        needed = conn->in_cap * 2 > raw_cap ? raw_cap : conn->in_cap * 2;
+        needed = next_in_cap(conn->in_cap) > raw_cap ? raw_cap : next_in_cap(conn->in_cap);
     } else if (content_length >= 0) {
         const size_t target = header_len + (size_t)content_length + 1;
         if (conn->in_cap >= target) {
             return 1; /* already large enough (request_is_complete will pick this up next read) */
         }
-        needed = conn->in_cap * 2 > target ? target : conn->in_cap * 2;
+        needed = next_in_cap(conn->in_cap) > target ? target : next_in_cap(conn->in_cap);
     } else {
         return 0;
     }
@@ -1223,9 +1248,9 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
 /*
  * handle_readable is returning with conn still open. If in_buf is the borrowed App.read_buf,
  * either hand it back (nothing left to serve) or copy the unserved bytes - a partial request, or
- * requests pipelined behind a pending response - into an owned BUF_SIZE buffer, compacted to offset
- * 0 (request_len, chunk_scan and head_scan are relative to in_off, so they stay valid). The leftover always
- * fits: it came out of a BUF_SIZE buffer. Returns 0, or -1 (conn closed: malloc failed, or a partial
+ * requests pipelined behind a pending response - into an owned buffer of just that size (+ NUL, rounded up
+ * to IN_BUF_GRANULE), compacted to offset 0 (request_len, chunk_scan and head_scan are relative to in_off,
+ * so they stay valid). The leftover came out of a BUF_SIZE buffer, so the owned one is never larger. Returns 0, or -1 (conn closed: malloc failed, or a partial
  * request found the worker over ServerConfig.max_buffered_bytes - answered 503). Bytes pipelined behind
  * a pending response are copied even over budget: a response cannot be sent over the one in flight.
  */
@@ -1247,12 +1272,16 @@ static int stop_borrowing_read_buf(App *app, Connection *conn) {
         release_in_buf(app, conn);
         return 0;
     }
-    if (!response_pending(conn) && !budget_allows(app, BUF_SIZE)) {
+    /* sized to what is left (+ NUL), rounded up to IN_BUF_GRANULE - never above BUF_SIZE, since the leftover
+     * came out of a BUF_SIZE buffer. A slow client that has sent 20 bytes holds 512, not 8 KiB; a head that
+     * fills it grows through grow_head_buf, a body through grow_in_buf. */
+    const size_t owned_cap = (leftover + 1 + IN_BUF_GRANULE - 1) / IN_BUF_GRANULE * IN_BUF_GRANULE;
+    if (!response_pending(conn) && !budget_allows(app, owned_cap)) {
         release_in_buf(app, conn); /* the partial request is dropped; App.read_buf is handed back first */
         reject_request(app, conn, 503);
         return -1;
     }
-    char *owned = malloc(BUF_SIZE);
+    char *owned = malloc(owned_cap);
     if (owned == NULL) {
         connection_close(app, conn); /* leaves the borrowed App.read_buf alone */
         return -1;
@@ -1260,7 +1289,7 @@ static int stop_borrowing_read_buf(App *app, Connection *conn) {
     memcpy(owned, conn->in_buf + conn->in_off, leftover);
     owned[leftover] = '\0';
     conn->in_buf = owned;
-    conn->in_cap = BUF_SIZE;
+    conn->in_cap = owned_cap;
     conn->in_len = leftover;
     conn->in_off = 0;
     sync_held_bytes(app, conn);
@@ -1357,11 +1386,12 @@ static int read_and_serve(App *app, Connection *conn) {
         size_t header_len;
         int chunked;
         const int content_length = request_framing(conn->in_buf, conn->in_len, &header_len, &chunked, NULL, NULL);
-        if (header_len == 0) {
+        if (header_len == 0 && conn->in_cap >= BUF_SIZE) {
             reject_request(app, conn, 431);
             return -1;
         }
-        const int grown = grow_in_buf(app, conn, header_len, chunked, content_length);
+        const int grown = header_len == 0 ? grow_head_buf(app, conn)
+                                          : grow_in_buf(app, conn, header_len, chunked, content_length);
         if (grown == 1) {
             return 0; /* wait for more read events */
         }

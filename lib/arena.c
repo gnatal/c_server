@@ -42,6 +42,43 @@ void *arena_alloc(Arena *a, size_t size) {
     return node->data;
 }
 
+void *arena_grow(Arena *a, void *ptr, size_t old_size, size_t new_size) {
+    if (ptr == NULL) {
+        return arena_alloc(a, new_size);
+    }
+    if (new_size > SIZE_MAX - ALIGNMENT - sizeof(ArenaNode) || old_size > SIZE_MAX - ALIGNMENT) {
+        return NULL;
+    }
+    char *const p = ptr;
+
+    /* Last block in the fixed buffer: p lies inside [buf, buf + offset) and ends exactly at offset. The
+     * range check comes first so a pointer from elsewhere (a fallback node, a connection-owned malloc) is
+     * never compared as if it were inside buf. */
+    if (a->buf != NULL && p >= a->buf && p < a->buf + a->offset) {
+        const size_t start = (size_t)(p - a->buf);
+        if (start + align_up(old_size) == a->offset && align_up(new_size) <= a->cap - start) {
+            a->offset = start + align_up(new_size);
+            return ptr;
+        }
+    }
+
+    /* Newest fallback block: realloc keeps the list intact (the node's `next` moves with it). */
+    if (a->large != NULL && p == a->large->data) {
+        ArenaNode *node = realloc(a->large, sizeof(ArenaNode) + new_size);
+        if (node == NULL) {
+            return NULL;
+        }
+        a->large = node;
+        return node->data;
+    }
+
+    void *moved = arena_alloc(a, new_size);
+    if (moved != NULL) {
+        memcpy(moved, ptr, old_size < new_size ? old_size : new_size);
+    }
+    return moved;
+}
+
 void arena_reset(Arena *a) {
     a->offset = 0;
     
@@ -65,12 +102,7 @@ static void *arena_yyjson_malloc(void *ctx, size_t size) {
 }
 
 static void *arena_yyjson_realloc(void *ctx, void *ptr, size_t old_size, size_t size) {
-    void *new_ptr = arena_alloc((Arena *)ctx, size);
-    if (new_ptr && ptr) {
-        size_t copy_size = old_size < size ? old_size : size;
-        memcpy(new_ptr, ptr, copy_size);
-    }
-    return new_ptr;
+    return arena_grow((Arena *)ctx, ptr, old_size, size);
 }
 
 static void arena_yyjson_free(void *ctx, void *ptr) {

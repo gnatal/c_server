@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#include <sys/types.h>
 #include "app_types.h"
 
 /*
@@ -84,6 +85,8 @@ typedef struct {
     uint64_t path_hash;        /* static_path_hash(path), always set; compared before strcmp once the cache is large */
     SharedBody *body;          /* the file's bytes; the cache holds one reference, a response in flight may hold more */
     time_t mtime;              /* st_mtime when body was read, for change detection on revalidation */
+    dev_t dev;                 /* st_dev + st_ino of the file body was read from: another candidate naming the */
+    ino_t ino;                 /* same file (symlink, hard link, case variant) shares body instead of a copy */
     time_t last_checked;       /* wall-clock time body/mtime were last confirmed still current */
     const char *content_type;  /* points into static.c's MIME table string literals; never freed */
 } StaticCacheEntry;

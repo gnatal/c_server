@@ -68,6 +68,7 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 ## Per-request memory (`arena.h`)
 - `arena_yyjson_alc(Arena *)` — a `yyjson_alc` that allocates from an arena; use `res->conn->arena` (a pointer to the shared per-worker arena - not `&res->conn->arena`). Documents built or read with it need no free; the arena is reclaimed after the response is written.
 - `arena_alloc(Arena *, size)` — bump-allocate 8-byte-aligned bytes, valid until the request ends (falls back to `malloc` when the 64 KiB buffer is full; `NULL` only on OOM). Handlers may use it for scratch data.
+- `arena_grow(Arena *, ptr, old_size, new_size)` — resize an arena block (keeps its bytes): in place when it is the last block in the buffer, `realloc` when it is the newest fallback block, else allocate + copy. `NULL` on failure, `ptr` still valid. Used by yyjson's realloc hook and `res_write`.
 - `arena_init(Arena *, buf, cap)`, `arena_reset(Arena *)`, `arena_destroy(Arena *)` — engine/tests: lifecycle. Tests give a fake `Connection` a static buffer with `arena_init`.
 
 ## JSON (yyjson 0.13, `vendor/yyjson/yyjson.h`) — the subset this repo uses

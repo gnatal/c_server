@@ -154,7 +154,7 @@ static void test_partial_request_survives_another_connections_read(void) {
     send_all(fds_a[1], a_head);
     handle_readable(&app, a);
     assert(a->in_buf != NULL && a->in_buf != app.read_buf); /* copied off the shared buffer */
-    assert(a->in_cap == BUF_SIZE);
+    assert(a->in_cap == IN_BUF_GRANULE); /* the leftover + NUL, rounded up: not a whole BUF_SIZE */
     assert(a->in_off == 0 && a->in_len == strlen(a_head));
     assert(memcmp(a->in_buf, a_head, a->in_len) == 0 && a->in_buf[a->in_len] == '\0');
     assert(a->request_started != 0);
@@ -383,6 +383,107 @@ static void test_body_is_a_view_into_the_input_buffer(void) {
     app_destroy(&app);
 }
 
+/* handle_readable until the peer's bytes are all consumed: a small owned in_buf fills mid-write, and a
+ * turn that grows it returns before reading the rest (level-triggered readiness would bring it back). */
+static void pump_readable(App *app, const int fd) {
+    for (int turn = 0; turn < 8 && app->connections[fd] != NULL; turn++) {
+        handle_readable(app, app->connections[fd]);
+    }
+}
+
+/* A partial request owns a buffer sized to its bytes (+ NUL, rounded up to IN_BUF_GRANULE), not BUF_SIZE:
+ * a slow client that has sent 20 bytes holds 512. A header block dripped in past that grows the buffer
+ * (never past BUF_SIZE) and is served once its blank line arrives. */
+static void test_partial_request_owns_right_sized_buffer(void) {
+    App app;
+    setup_app(&app);
+    int fds[2];
+    Connection *conn = add_connection(&app, fds);
+
+    send_all(fds[1], "GET /a HTTP/1.1\r\nHo"); /* 20 bytes, the slowloris shape */
+    handle_readable(&app, conn);
+    assert(conn->in_buf != NULL && conn->in_buf != app.read_buf);
+    assert(conn->in_cap == IN_BUF_GRANULE && conn->held_bytes == IN_BUF_GRANULE);
+
+    send_all(fds[1], "st: x\r\n");
+    size_t sent = strlen("GET /a HTTP/1.1\r\nHost: x\r\n");
+    char line[128];
+    for (int i = 0; sent < 3000; i++) {
+        const int n = snprintf(line, sizeof(line), "X-Pad-%03d: %s\r\n", i,
+                               "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv");
+        send_bytes(fds[1], line, (size_t)n);
+        sent += (size_t)n;
+        pump_readable(&app, fds[0]);
+        assert(app.connections[fds[0]] == conn);
+        assert(conn->in_len == sent && conn->in_cap > conn->in_len && conn->in_cap <= BUF_SIZE);
+    }
+    assert(conn->in_cap == 4096); /* 512 doubled three times: ~3,000 bytes of head */
+
+    send_all(fds[1], "\r\n");
+    pump_readable(&app, fds[0]);
+    char out[1024];
+    read_available(fds[1], out, sizeof(out));
+    assert(strstr(out, "HTTP/1.1 200 OK") != NULL && strstr(out, "\r\n\r\n/a") != NULL);
+    assert(app.connections[fds[0]] == conn && conn->in_buf == NULL && conn->held_bytes == 0);
+
+    close(fds[1]);
+    app_destroy(&app);
+}
+
+/* The header limit is still BUF_SIZE: a header block dripped into a small owned buffer grows up to
+ * BUF_SIZE and gets 431 only once that is full, never at a smaller capacity. */
+static void test_dripped_header_block_431_at_buf_size(void) {
+    App app;
+    setup_app(&app);
+    int fds[2];
+    add_connection(&app, fds);
+
+    send_all(fds[1], "GET /a HTTP/1.1\r\nHost: x\r\nX-Pad: ");
+    size_t sent = strlen("GET /a HTTP/1.1\r\nHost: x\r\nX-Pad: ");
+    char piece[200];
+    memset(piece, 'p', sizeof(piece));
+    while (app.connections[fds[0]] != NULL) {
+        assert(sent < BUF_SIZE + sizeof(piece)); /* rejected by then at the latest */
+        send_bytes(fds[1], piece, sizeof(piece));
+        sent += sizeof(piece);
+        pump_readable(&app, fds[0]);
+    }
+    assert(sent >= BUF_SIZE - 1); /* not before the full header limit */
+    char out[1024];
+    read_available(fds[1], out, sizeof(out));
+    assert(strncmp(out, "HTTP/1.1 431 ", 13) == 0);
+    assert(app.buffered_bytes == 0);
+
+    close(fds[1]);
+    app_destroy(&app);
+}
+
+/* Growing a dripped header block is held to ServerConfig.max_buffered_bytes like any other growth: 503. */
+static void test_head_growth_over_budget_503(void) {
+    App app;
+    setup_app(&app);
+    app.config.max_buffered_bytes = IN_BUF_GRANULE; /* the first owned buffer fits, its growth does not */
+    int fds[2];
+    Connection *conn = add_connection(&app, fds);
+
+    send_all(fds[1], "GET /a HTTP/1.1\r\nHost: x\r\n");
+    handle_readable(&app, conn);
+    assert(conn->in_cap == IN_BUF_GRANULE);
+    char pad[600];
+    memset(pad, 'p', sizeof(pad));
+    memcpy(pad, "X-Pad: ", 7);
+    send_bytes(fds[1], pad, sizeof(pad));
+    pump_readable(&app, fds[0]);
+    assert(app.connections[fds[0]] == NULL);
+    char out[1024];
+    read_available(fds[1], out, sizeof(out));
+    assert(strncmp(out, "HTTP/1.1 503 ", 13) == 0);
+    assert(app.buffered_bytes == 0);
+
+    close(fds[1]);
+    app_destroy(&app);
+}
+
 int main(void) {
     test_idle_connection_owns_no_input_buffer();
     test_partial_request_survives_another_connections_read();
@@ -391,6 +492,9 @@ int main(void) {
     test_rejection_from_read_buf_keeps_shared_buffer();
     test_idle_sweep_408_with_owned_partial_buffer();
     test_body_is_a_view_into_the_input_buffer();
+    test_partial_request_owns_right_sized_buffer();
+    test_dripped_header_block_431_at_buf_size();
+    test_head_growth_over_budget_503();
     printf("all read_buf tests passed\n");
     return 0;
 }

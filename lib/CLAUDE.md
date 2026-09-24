@@ -62,7 +62,7 @@ header name/value has no length cap of its own - it is a view into the input buf
 only the whole header block fitting `BUF_SIZE` bounds it) ·
 cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
 body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 (name 63, value uncapped: copied into the arena) · Set-Cookie 16 (512 each) · trailers 8 (same as headers) · multipart parts 16 ·
-form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB each, 64 MiB total, 1 s revalidation
+form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB each, 64 MiB total per worker process, 1 s revalidation
 (`STATIC_CACHE_*`, `static.c`; a file over the per-entry cap is served but never cached; see "Static" below) ·
 producer stream output 16 KiB per producer call (`STREAM_CHUNK_SIZE`; one `stream_write` ≤ `STREAM_WRITE_MAX`) and no total cap · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
 pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response, logged; the only bound on a response header value) ·
@@ -96,11 +96,11 @@ an owned `in_buf` (`in_cap`; a borrowed `App.read_buf` is not counted), an owned
 the tail copy used to be). The arena is not counted (reset every
 dispatch cycle). Each connection records its share in `Connection.held_bytes`; `sync_held_bytes` (`connection.c`)
 recomputes that share from the fields and moves the total by the difference, so it is idempotent and runs after each
-ownership change (`grow_in_buf`, `stop_borrowing_read_buf`, `release_in_buf`, `wait_for_writable`, `park_stream`, the
+ownership change (`grow_in_buf`, `grow_head_buf`, `stop_borrowing_read_buf`, `release_in_buf`, `wait_for_writable`, `park_stream`, the
 end of `flush_connection`) instead of being paired with every `malloc`/`free`. `connection_close` subtracts the whole
 share, so a missed sync can only overstate the total until the connection closes, never leak it; the total is 0 with
 no connection open. Enforced against `ServerConfig.max_buffered_bytes` (`budget_allows`) in three places:
-`grow_in_buf` returns `-2` → 503 + close; `stop_borrowing_read_buf` answers a partial request 503 (after handing
+`grow_in_buf` and `grow_head_buf` return `-2` → 503 + close; `stop_borrowing_read_buf` answers a partial request 503 (after handing
 `App.read_buf` back) - but bytes pipelined behind a pending response are copied even over budget, since no response
 can be sent over the one in flight; and `flush_connection`'s tail copy closes the connection that just stalled instead
 of copying (the newest stalled writer is the one dropped). `stream_buf` allocation is counted but not refused. A
@@ -111,7 +111,8 @@ points `in_buf` at `App.read_buf` for the `recv`, and complete requests are pars
 views point into it; they are dead once the handler returns). Before `handle_readable` returns with the connection
 still open, `stop_borrowing_read_buf` either hands the buffer back (nothing left) or copies the unserved bytes
 `[in_off, in_len)` - a partial request, or requests pipelined behind a pending response - into a connection-owned
-`BUF_SIZE` malloc, compacted to offset 0 (`request_len`, `chunk_scan` and `head_scan` are relative to `in_off`, so they stay
+malloc of just that many bytes + NUL, rounded up to `IN_BUF_GRANULE` (512; never above `BUF_SIZE`, since the bytes came
+out of a `BUF_SIZE` buffer), compacted to offset 0 (`request_len`, `chunk_scan` and `head_scan` are relative to `in_off`, so they stay
 valid). Invariant: **`in_buf` never points at `App.read_buf` between event-loop turns**, so a single shared buffer is
 enough. `grow_in_buf` never reallocs the borrowed buffer (it mallocs the grown size and copies);
 `connection_close` never frees it (`app_destroy` does). `flush_connection`'s keep-alive reset frees the owned buffer
@@ -128,8 +129,13 @@ no per-allocation free. When the remaining space is too small (not only for a si
 allocation falls back to `malloc` and is chained in a list that `arena_reset` frees. A size above
 `SIZE_MAX - 8 - sizeof(ArenaNode)` returns `NULL` without touching the arena (the alignment and fallback-header
 arithmetic would otherwise wrap), the same as a failed fallback `malloc`. Consequences: nothing reached
-through `req` or `res` may be kept past the handler; a growing chunked response copies into a new arena block each
-doubling and leaves the old block in the arena until the request ends; a cached static file never enters the arena:
+through `req` or `res` may be kept past the handler; growth goes through `arena_grow` (`res_write`'s `out_buf`
+doubling, yyjson's realloc hook): the last block in the buffer is extended in place, the newest fallback block is
+`realloc`'d (the list head, so its `next` survives), and only a block with something allocated after it is copied,
+leaving the old one dead until the request ends. `arena_grow`'s in-place test requires the pointer to lie inside
+`[buf, buf + offset)` and `old_size` to be the size it was allocated with (`append_to_out_buf` passes `out_cap`, which
+is exact for every arena-backed `out_buf`; a connection-owned tail copy or `stream_buf` is outside the arena and is
+copied). A cached static file never enters the arena:
 only its head is built there and the body is written from the cache's `SharedBody` (`res_send_shared`, see "Static"),
 and `res_send_file` never copies the body into the arena either (see above).
 
@@ -138,7 +144,7 @@ and `res_send_file` never copies the body into the arena either (see above).
 |---|---|---|
 | `App.arena`'s 64 KiB buffer (one per worker process, not one per connection) | `app_init` (one malloc) | `app_destroy` (`arena_destroy` for fallback blocks, then a plain `free` of the buffer itself - `arena_destroy` never frees `buf`, same convention as a test's hand-built Arena) |
 | `Connection` | `connection_create` (one calloc; no arena buffer behind it any more) | `connection_close` (exactly once) |
-| `conn->in_buf` (NULL while nothing is buffered) | not allocated while it borrows `App.read_buf` (during one `handle_readable`); owned copy: `stop_borrowing_read_buf` (unserved bytes left at the end of `handle_readable`) or `grow_in_buf` (a body past `BUF_SIZE`; realloc on further growth) | the owned copy: `flush_connection`'s keep-alive reset once nothing is buffered, or `connection_close`. The borrowed `App.read_buf`: never through `conn` |
+| `conn->in_buf` (NULL while nothing is buffered) | not allocated while it borrows `App.read_buf` (during one `handle_readable`); owned copy: `stop_borrowing_read_buf` (unserved bytes left at the end of `handle_readable`, sized to them rounded up to `IN_BUF_GRANULE`), `grow_head_buf` (a header block filling that copy; realloc, up to `BUF_SIZE`) or `grow_in_buf` (a body past the buffer; realloc on further growth) | the owned copy: `flush_connection`'s keep-alive reset once nothing is buffered, or `connection_close`. The borrowed `App.read_buf`: never through `conn` |
 | `App.read_buf` (`BUF_SIZE`, one per worker process) | `app_init` | `app_destroy` |
 | `conn->arena` | not allocated - always `&app->arena`, set once at `connection_create` | nobody frees it through `conn`; `app_destroy` frees the one underlying `App.arena` after every connection is already closed |
 | `conn->stream_buf` (a connection-owned `STREAM_CHUNK_SIZE` turn buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response on the `pread` fallback (`file_no_sendfile`; never on the `sendfile` path) or the first producer call of a `res_stream` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
@@ -243,8 +249,16 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   entry's stored `path_hash` (`static_path_hash`, FNV-1a 64) is compared before `strcmp`, so a lookup runs about one
   `strcmp`, not one per entry. The candidate is hashed at most once per request (`memo_path_hash`, 0 = not yet) and the
   memo is shared by the fresh check, the revalidation lookup and the insert. Every insert stores `path_hash` whatever the
-  table size, so entries cached while it was small are found once it grows past the threshold. Eviction (stalest first) stays a linear scan
-  and moves the last entry into the freed slot, hash included.
+  table size, so entries cached while it was small are found once it grows past the threshold. Eviction (stalest first)
+  stays a linear scan and moves the last entry into the freed slot, hash included.
+  **Aliases share one body.** Each entry records the file's `st_dev`/`st_ino`. On a miss, before reading, an entry for
+  the same file with the same mtime and size (`cache_find_same_file`) lends its `SharedBody` (one more reference) to a
+  new entry for this candidate: a symlink or hard link inside the root, or a case variant on a case-insensitive
+  filesystem, costs an entry slot but no second copy. A `.` segment is never an alias (`static_resolve_relative_path`
+  answers `-2`, a 404) and `//` collapses in `strtok_r`, so neither creates an entry.
+  **Per worker.** The table is a process global that fills per request, so each forked worker process
+  fills its own: the worst case is `workers × STATIC_CACHE_MAX_TOTAL_BYTES` (64 MiB each), with the
+  same hot files cached once per worker. Size `workers` with that in mind on a memory-tight host.
   **Hits are sent by reference.** Each entry's bytes are a refcounted `SharedBody`; every response (miss or hit) builds
   only its head in the arena and pins the body on the connection (`res_send_shared`, `Connection.shared_body`).
   `flush_connection` writes the rest of `out_buf` and the body with one `writev`; on `EAGAIN` only the head's unsent
@@ -326,12 +340,16 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   any suffix/extension check performed on the path before use. Header and cookie values are not percent-decoded by this
   engine at all, so this vector does not apply to them (`req_get_header`/`req_get_cookie` already return raw bytes;
   header values have no length limit at all, see above; a cookie's own value, once split, still has one).
-- **Buffers.** Input is read into the shared `App.read_buf` (8 KiB) and only copied to a connection-owned 8 KiB
-  `in_buf` when bytes are left unserved (see Memory model); with headers complete and a body pending it grows by doubling, capped at the
+- **Buffers.** Input is read into the shared `App.read_buf` (8 KiB) and only copied to a connection-owned `in_buf`
+  sized to the unserved bytes (rounded up to `IN_BUF_GRANULE`, 512) when bytes are left unserved (see Memory model): a
+  slow client that has sent 20 bytes holds 512 B, not 8 KiB. A header block that fills that buffer before its blank line
+  doubles it (`grow_head_buf`, budget-checked like any growth) up to `BUF_SIZE`; only a full `BUF_SIZE` buffer with no
+  blank line is a 431, so the header limit is unchanged. With headers complete and a body pending it grows
+  (`grow_in_buf`; `next_in_cap` jumps a buffer below `BUF_SIZE` straight to `BUF_SIZE`, then doubles), capped at the
   known target size (`Content-Length` and chunked both work this way now - `Content-Length` used to realloc straight
   to `header_len + content_length + 1` in one step, reserving virtual memory proportional to what the client merely
   *declared* rather than what it had actually sent), and freed once nothing is buffered. No header
-  terminator within 8 KiB → 431.
+  terminator within `BUF_SIZE` (8 KiB) → 431.
 - **Pipelining.** Several requests may sit in `in_buf` at once. `serve_buffered_requests` answers them strictly in
   order, one `flush_connection` each, starting at `Connection.in_off`; `request_wire_len` (`http_parser.c`: `header_len` +
   `Content-Length`, or + `ChunkScanState.body_end` for chunked, which ends after the trailer's blank line) records where
@@ -658,7 +676,7 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
   is a small, session-eager array (embedded-NUL rejection requires validating every value for an embedded NUL at parse time regardless of
   whether a handler ever reads it, so there is no CPU to save by deferring the copy, only Request's overall size - and
   query/param storage together are under 3 KB, a small fraction of what headers used to cost).
-- **Multiple `res_send` calls, chunked growth and static files leave dead copies in the arena** until the request ends (see Memory model). For large bodies use `res_stream`, which never touches the arena past the head.
+- **Multiple `res_send` calls leave dead copies in the arena** until the request ends, and so does chunked or yyjson growth when another arena allocation sits after the growing block (see Memory model). For large bodies use `res_stream`, which never touches the arena past the head.
 - **`res_write` silently truncates at its cap** (MEASURED 2026-09-23 while measuring `res_stream`): `append_to_out_buf` refuses anything past `MAX_BODY_SIZE + 8 KiB` of *wire* bytes, chunk framing included, and `res_write` ignores the failure. A CSV of 450,000 short lines (8,426,423 body bytes, about 11 MB framed) went out as 7,947,523 bytes with status 200 and no error anywhere. The handler cannot tell. `res_stream` has no such cap.
 - **A parked `res_stream` producer whose client vanished silently is only noticed on its next write**. A FIN/RST is caught at once (`watch_stream_peer`), but once a pipelined request has arrived behind the stream, read interest is dropped and only a write can fail. A producer that parks indefinitely without ever writing holds its connection and ctx until shutdown; long-lived streams should write a heartbeat (an SSE comment line, `:\n\n`) every so often - the idle sweep calls them about once a second, so they can check the time.
 - **`app_wake_streams` is O(connection table) and wakes every paused stream on the worker**, not a channel's subscribers; producers with nothing new just park again. It is per process: in a cluster, a publish reaches only the worker that handled it.

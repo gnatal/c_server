@@ -458,9 +458,9 @@ static void test_handle_readable_large_body_grows_buffer(void) {
              "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: %zu\r\n\r\n", body_len);
     assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
     handle_readable(&app, conn);
-    /* Headers alone fit easily in the starting BUF_SIZE capacity, so no
-     * growth should have happened yet - still waiting on the body. */
-    assert(conn->in_cap == BUF_SIZE);
+    /* Headers alone: an owned buffer of just their bytes + NUL, rounded up to IN_BUF_GRANULE - still
+     * waiting on the body, no growth yet. */
+    assert(conn->in_cap == (strlen(head) + 1 + IN_BUF_GRANULE - 1) / IN_BUF_GRANULE * IN_BUF_GRANULE);
     assert(app.connections[fds[0]] == conn);
 
     /* Stream the body in chunks, like a real socket would deliver it, until
@@ -543,7 +543,7 @@ static void test_handle_readable_content_length_grows_geometrically(void) {
     snprintf(head, sizeof(head), "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", declared_len);
     assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
     handle_readable(&app, conn);
-    assert(conn->in_cap == BUF_SIZE); /* headers alone: no growth yet */
+    assert(conn->in_cap == IN_BUF_GRANULE); /* headers alone: a right-sized owned buffer, no growth yet */
 
     char *body = malloc((size_t)declared_len);
     assert(body != NULL);
@@ -905,7 +905,7 @@ static void test_handle_readable_chunked_grows_buffer(void) {
     const char *head = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
     assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
     handle_readable(&app, conn);
-    assert(conn->in_cap == BUF_SIZE);
+    assert(conn->in_cap == IN_BUF_GRANULE); /* headers alone: a right-sized owned buffer */
 
     /* Total decoded size well beyond BUF_SIZE (8192) with no Content-Length
      * to jump straight to an exact target - forces handle_readable to grow
