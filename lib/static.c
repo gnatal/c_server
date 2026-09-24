@@ -168,9 +168,38 @@ static char *dup_path(const char *s) {
     return out;
 }
 
-static StaticCacheEntry *cache_find(const char *path) {
+uint64_t static_path_hash(const char *path) {
+    uint64_t hash = 0xcbf29ce484222325ULL; /* FNV-1a 64-bit offset basis */
+    for (const unsigned char *p = (const unsigned char *)path; *p != '\0'; p++) {
+        hash ^= *p;
+        hash *= 0x100000001b3ULL; /* FNV-1a 64-bit prime */
+    }
+    return hash;
+}
+
+/* static_path_hash(path), computed at most once per request: `*memo` is 0 until the first call fills it
+ * (a path whose real hash is 0 is just rehashed, still correct). */
+static uint64_t memo_path_hash(const char *path, uint64_t *memo) {
+    if (*memo == 0) {
+        *memo = static_path_hash(path);
+    }
+    return *memo;
+}
+
+/* Below STATIC_CACHE_HASH_MIN_ENTRIES a plain strcmp scan is cheaper than hashing the candidate at all
+ * (MEASURED, improvements.md); at or above it, the stored path_hash is compared before strcmp. */
+static StaticCacheEntry *cache_find(const char *path, uint64_t *hash_memo) {
+    if (g_static_cache_count < STATIC_CACHE_HASH_MIN_ENTRIES) {
+        for (int i = 0; i < g_static_cache_count; i++) {
+            if (strcmp(g_static_cache[i].path, path) == 0) {
+                return &g_static_cache[i];
+            }
+        }
+        return NULL;
+    }
+    const uint64_t hash = memo_path_hash(path, hash_memo);
     for (int i = 0; i < g_static_cache_count; i++) {
-        if (strcmp(g_static_cache[i].path, path) == 0) {
+        if (g_static_cache[i].path_hash == hash && strcmp(g_static_cache[i].path, path) == 0) {
             return &g_static_cache[i];
         }
     }
@@ -199,8 +228,8 @@ static void cache_evict_stalest(void) {
  * fast path that closes most of the gap to an in-memory res_send_bytes response. NULL if there is no
  * entry for `path`, or its check is stale enough that the caller must fall back to resolve_and_stat.
  */
-static const StaticCacheEntry *cache_lookup_fresh(const char *path, time_t now) {
-    const StaticCacheEntry *entry = cache_find(path);
+static const StaticCacheEntry *cache_lookup_fresh(const char *path, uint64_t *hash_memo, time_t now) {
+    const StaticCacheEntry *entry = cache_find(path, hash_memo);
     if (entry != NULL && now - entry->last_checked < STATIC_CACHE_REVALIDATE_SECONDS) {
         return entry;
     }
@@ -214,12 +243,13 @@ static const StaticCacheEntry *cache_lookup_fresh(const char *path, time_t now) 
  * `content_type` must have static storage duration (static_mime_type's return value qualifies); nothing
  * here ever frees it.
  */
-static int cache_insert(const char *path, SharedBody *body, time_t mtime, const char *content_type, time_t now) {
+static int cache_insert(const char *path, uint64_t *hash_memo, SharedBody *body, time_t mtime,
+                        const char *content_type, time_t now) {
     if (body->len > STATIC_CACHE_MAX_ENTRY_BYTES) {
         return -1;
     }
 
-    StaticCacheEntry *entry = cache_find(path);
+    StaticCacheEntry *entry = cache_find(path, hash_memo);
     if (entry == NULL) {
         if (g_static_cache_count >= STATIC_CACHE_MAX_ENTRIES) {
             cache_evict_stalest();
@@ -230,6 +260,7 @@ static int cache_insert(const char *path, SharedBody *body, time_t mtime, const 
         }
         entry = &g_static_cache[g_static_cache_count++];
         entry->path = key;
+        entry->path_hash = memo_path_hash(path, hash_memo); /* always stored: the table may grow past the threshold */
         entry->body = NULL;
     }
 
@@ -275,7 +306,8 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
     }
 
     const time_t now = time(NULL);
-    const StaticCacheEntry *fresh = cache_lookup_fresh(candidate, now);
+    uint64_t candidate_hash = 0; /* filled by the first lookup that needs it (memo_path_hash) */
+    const StaticCacheEntry *fresh = cache_lookup_fresh(candidate, &candidate_hash, now);
     if (fresh != NULL) {
         res_status(res, 200);
         res_send_shared(res, fresh->content_type, fresh->body);
@@ -329,7 +361,7 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
      * more than STATIC_CACHE_REVALIDATE_SECONDS ago. If the file is unchanged since then, reuse its
      * cached bytes instead of paying for fopen/fread again - the common case once a server has been up
      * for more than a second: one stat per file per second, not one full read. */
-    StaticCacheEntry *existing = cache_find(candidate);
+    StaticCacheEntry *existing = cache_find(candidate, &candidate_hash);
     if (existing != NULL && existing->mtime == st.st_mtime && existing->body->len == (size_t)st.st_size) {
         existing->last_checked = now;
         res_status(res, 200);
@@ -383,7 +415,7 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
 
     /* cache_insert takes our reference on success (0); on failure (too big to cache, or out of memory for
      * the cache's own bookkeeping) we still hold it - never a double release, never a leak either way. */
-    if (cache_insert(candidate, body, st.st_mtime, content_type, now) != 0) {
+    if (cache_insert(candidate, &candidate_hash, body, st.st_mtime, content_type, now) != 0) {
         shared_body_release(body);
     }
 }

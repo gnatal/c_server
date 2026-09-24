@@ -42,7 +42,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **M4** | Arena growth always copies (yyjson realloc, `res_write` doubling) | Low–Medium | S | CODE |
 | **M5** | Static cache: `./` aliases create duplicate entries; 64 MiB per worker | Low | S | CODE |
 | **M6** | A partial request always costs a full 8 KiB owned buffer | Low | S | CODE |
-| **P7** | Static cache lookup is a linear `strcmp` scan over up to 256 entries | Low | S | CODE |
+| **P7** | ~~Static cache lookup is a linear `strcmp` scan over up to 256 entries~~ **FIXED 2026-09-24** | Low | S | CODE |
 | **S10** | ~~`arena_alloc` has no size-overflow check~~ **FIXED 2026-09-24** | Low (hardening) | S | CODE |
 
 **Suggested order:** S1, M1, S2 and M2 first (each S effort, each confirmed). Then S3, S4, S5, P1 and
@@ -186,6 +186,21 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   on Linux, so this saves about 1 in 7 (ESTIMATED).
 
 ### P7 · Static cache lookup is a linear `strcmp` over up to 256 entries
+- **Status: FIXED 2026-09-24 (hybrid).** Each `StaticCacheEntry` stores `path_hash` (`static_path_hash`, FNV-1a 64-bit).
+  Below `STATIC_CACHE_HASH_MIN_ENTRIES` (32, `app_types.h`) a lookup is the old plain `strcmp` scan and never hashes; at
+  or above it, the hash is compared before `strcmp`, with the candidate hashed at most once per request. A hash-always
+  first version regressed small caches by ~40 ns per request (hashing costs more than a short scan), and a threshold
+  of 16 still cost up to ~28 ns at 16–32 entries; break-even on this workload is between 32 and 64 entries.
+  MEASURED (macOS, M3 Pro, gcc-16 -O2, paths ~60 bytes under a shared prefix, 2M fresh hits spread across all
+  entries, best of 5, ns per `static_serve_file` call; differences under ~10 ns are noise):
+
+  | entries | 1 | 8 | 16 | 31 | 32 | 48 | 64 | 256 |
+  |---|---|---|---|---|---|---|---|---|
+  | before (strcmp scan) | 364 | 369 | 381 | 415 | 421 | 445 | 474 | 842 |
+  | hybrid, threshold 32 | 343 | 377 | 379 | 404 | 418 | 424 | 425 | 460 |
+
+  Tests: `test_path_hash_matches_fnv1a_vectors`, `test_cache_lookup_finds_own_entry_across_evictions`
+  and `test_cache_lookup_survives_crossing_hash_threshold` in `tests/test_static.c`.
 - **Impact:** Low
 - **Effort:** S
 - **Where:** `lib/static.c:177` (`cache_find`), used on every static request, and twice on a revalidation.

@@ -238,6 +238,13 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   is served normally but never cached (no behavior change for large files). The cache is a single process-lifetime table
   shared by every mount, not scoped to an `App` - see Ownership above and `static_cache_clear` (`static.h`) for the one thing
   that frees it (tests; not called anywhere in the engine itself).
+  Lookup is a scan of the (unordered) table. Below `STATIC_CACHE_HASH_MIN_ENTRIES` (32) entries it is a plain `strcmp`
+  scan and the candidate is never hashed (hashing a ~60-byte path costs more than a few `strcmp`s). At or above it, each
+  entry's stored `path_hash` (`static_path_hash`, FNV-1a 64) is compared before `strcmp`, so a lookup runs about one
+  `strcmp`, not one per entry. The candidate is hashed at most once per request (`memo_path_hash`, 0 = not yet) and the
+  memo is shared by the fresh check, the revalidation lookup and the insert. Every insert stores `path_hash` whatever the
+  table size, so entries cached while it was small are found once it grows past the threshold. Eviction (stalest first) stays a linear scan
+  and moves the last entry into the freed slot, hash included.
   **Hits are sent by reference.** Each entry's bytes are a refcounted `SharedBody`; every response (miss or hit) builds
   only its head in the arena and pins the body on the connection (`res_send_shared`, `Connection.shared_body`).
   `flush_connection` writes the rest of `out_buf` and the body with one `writev`; on `EAGAIN` only the head's unsent

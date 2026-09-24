@@ -76,6 +76,7 @@
 #define STATIC_CACHE_MAX_ENTRY_BYTES (256 * 1024)      /* a file bigger than this is streamed from disk (res_send_file), never cached */
 #define STATIC_CACHE_MAX_TOTAL_BYTES (64 * 1024 * 1024) /* combined cap across all cached entries; evicts the stalest first */
 #define STATIC_CACHE_REVALIDATE_SECONDS 1       /* a cache hit within this long of its last stat skips the filesystem entirely */
+#define STATIC_CACHE_HASH_MIN_ENTRIES 32   /* below this many entries a lookup is a plain strcmp scan; at or above, hash-first (static.c) */
 #define STREAM_CHUNK_SIZE (16 * 1024)           /* res_send_file reads this much per write, and a res_stream producer
                                                  * fills at most this much per call; 4 chunks per event-loop turn */
 #define STREAM_WRITE_MAX (STREAM_CHUNK_SIZE - 16) /* largest single stream_write that always fits an empty

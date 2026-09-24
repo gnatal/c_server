@@ -2,6 +2,7 @@
 #define STATIC_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
 #include "app_types.h"
 
@@ -38,6 +39,14 @@ int static_resolve_relative_path(const char *mount_pattern, const char *req_path
 const char *static_mime_type(const char *path);
 
 /*
+ * Pure 64-bit FNV-1a hash of a NUL-terminated path. The static cache stores it per entry; once the
+ * cache holds STATIC_CACHE_HASH_MIN_ENTRIES or more, a lookup compares it before strcmp, so it runs one
+ * strcmp per hit instead of one per entry (smaller caches skip hashing: a short strcmp scan is cheaper).
+ * Not a security boundary: a collision only costs an extra strcmp.
+ */
+uint64_t static_path_hash(const char *path);
+
+/*
  * Resolves req->path against route->static_root (an absolute, canonical
  * directory set by app_serve_static, router.h) and sends the matching file
  * as the response:
@@ -72,6 +81,7 @@ void static_serve_file(const Route *route, const Request *req, Response *res);
 /* One cached file (static.c's process-lifetime cache, see static_serve_file). */
 typedef struct {
     char *path;                /* malloc'd; the candidate string this entry was cached under */
+    uint64_t path_hash;        /* static_path_hash(path), always set; compared before strcmp once the cache is large */
     SharedBody *body;          /* the file's bytes; the cache holds one reference, a response in flight may hold more */
     time_t mtime;              /* st_mtime when body was read, for change detection on revalidation */
     time_t last_checked;       /* wall-clock time body/mtime were last confirmed still current */

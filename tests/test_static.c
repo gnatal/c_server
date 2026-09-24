@@ -555,6 +555,126 @@ static void test_cached_hit_is_sent_by_reference(void) {
     teardown_fixture(&fx);
 }
 
+/* Published FNV-1a 64-bit test vectors: the cache's hash must be the real function, not a lookalike. */
+static void test_path_hash_matches_fnv1a_vectors(void) {
+    assert(static_path_hash("") == 0xcbf29ce484222325ULL);
+    assert(static_path_hash("a") == 0xaf63dc4c8601ec8cULL);
+    assert(static_path_hash("foobar") == 0x85944171f73967e8ULL);
+    assert(static_path_hash("/srv/public/app.js") != static_path_hash("/srv/public/app.jS"));
+}
+
+/* More files than STATIC_CACHE_MAX_ENTRIES, all under one long shared prefix, so eviction moves entries
+ * around the array: every request still gets its own file, and a repeat request gets the SharedBody the
+ * first one cached (the hash-first lookup found that entry, not a neighbour's). */
+static void test_cache_lookup_finds_own_entry_across_evictions(void) {
+    char root_template[] = "/tmp/cexpress_static_many_XXXXXX";
+    char *made = mkdtemp(root_template);
+    assert(made != NULL);
+    char root[PATH_MAX];
+    assert(realpath(made, root) != NULL);
+    Route route;
+    memset(&route, 0, sizeof(route));
+    strncpy(route.method, "GET", sizeof(route.method) - 1);
+    strncpy(route.path, "/static/*", sizeof(route.path) - 1);
+    route.static_root = root;
+
+    const int file_count = STATIC_CACHE_MAX_ENTRIES + 8;
+    char path[PATH_MAX + 64];
+    char content[64];
+    for (int i = 0; i < file_count; i++) {
+        snprintf(path, sizeof(path), "%s/a_long_shared_prefix_for_every_asset_%04d.txt", root, i);
+        snprintf(content, sizeof(content), "content of file %04d\n", i);
+        write_file(path, content);
+    }
+
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < file_count; i++) {
+            char url[128];
+            snprintf(url, sizeof(url), "/static/a_long_shared_prefix_for_every_asset_%04d.txt", i);
+            snprintf(content, sizeof(content), "content of file %04d\n", i);
+            Request req = make_request(url);
+            Connection *first = make_conn();
+            Response res1 = { .conn = first, .status = 0 };
+            static_serve_file(&route, &req, &res1);
+            assert(res1.status == 200);
+            assert(strstr(sent_text(first), content) != NULL);
+            Connection *second = make_conn();
+            Response res2 = { .conn = second, .status = 0 };
+            static_serve_file(&route, &req, &res2);
+            assert(res2.status == 200);
+            assert(second->shared_body != NULL && second->shared_body == first->shared_body);
+            free_conn(first);
+            free_conn(second);
+        }
+    }
+
+    static_cache_clear();
+    for (int i = 0; i < file_count; i++) {
+        snprintf(path, sizeof(path), "%s/a_long_shared_prefix_for_every_asset_%04d.txt", root, i);
+        unlink(path);
+    }
+    rmdir(root);
+}
+
+/* Serves `/static/<name>` on a throwaway connection; returns the SharedBody it was sent from (kept alive
+ * by the cache, so the pointer stays comparable after the connection is freed). */
+static const SharedBody *serve_cached(const Route *route, const char *name, const char *want) {
+    char url[128];
+    snprintf(url, sizeof(url), "/static/%s", name);
+    Request req = make_request(url);
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+    static_serve_file(route, &req, &res);
+    assert(res.status == 200);
+    assert(strstr(sent_text(conn), want) != NULL);
+    const SharedBody *body = conn->shared_body;
+    assert(body != NULL);
+    free_conn(conn);
+    return body;
+}
+
+/* Entries cached while the table is below STATIC_CACHE_HASH_MIN_ENTRIES (plain strcmp lookups, the
+ * candidate never hashed) are still found once it grows past it and lookups compare path_hash first. */
+static void test_cache_lookup_survives_crossing_hash_threshold(void) {
+    char root_template[] = "/tmp/cexpress_static_threshold_XXXXXX";
+    char *made = mkdtemp(root_template);
+    assert(made != NULL);
+    char root[PATH_MAX];
+    assert(realpath(made, root) != NULL);
+    Route route;
+    memset(&route, 0, sizeof(route));
+    strncpy(route.method, "GET", sizeof(route.method) - 1);
+    strncpy(route.path, "/static/*", sizeof(route.path) - 1);
+    route.static_root = root;
+
+    enum { FILE_COUNT = STATIC_CACHE_HASH_MIN_ENTRIES * 2 };
+    const SharedBody *first_body[FILE_COUNT];
+    char name[64];
+    char content[64];
+    char path[PATH_MAX + 64];
+    for (int i = 0; i < FILE_COUNT; i++) {
+        snprintf(name, sizeof(name), "asset_%02d.css", i);
+        snprintf(content, sizeof(content), "body of asset %02d\n", i);
+        snprintf(path, sizeof(path), "%s/%s", root, name);
+        write_file(path, content);
+        first_body[i] = serve_cached(&route, name, content);
+        /* a hit right after the insert, in whichever mode the table is now in */
+        assert(serve_cached(&route, name, content) == first_body[i]);
+    }
+    for (int i = 0; i < FILE_COUNT; i++) { /* the table is past the threshold: every lookup hashes */
+        snprintf(name, sizeof(name), "asset_%02d.css", i);
+        snprintf(content, sizeof(content), "body of asset %02d\n", i);
+        assert(serve_cached(&route, name, content) == first_body[i]);
+    }
+
+    static_cache_clear();
+    for (int i = 0; i < FILE_COUNT; i++) {
+        snprintf(path, sizeof(path), "%s/asset_%02d.css", root, i);
+        unlink(path);
+    }
+    rmdir(root);
+}
+
 int main(void) {
     test_resolve_literal_subpath();
     test_resolve_root_mount();
@@ -578,6 +698,9 @@ int main(void) {
     test_cache_picks_up_change_after_window_expires();
     test_large_file_is_streamed_not_buffered();
     test_cached_hit_is_sent_by_reference();
+    test_path_hash_matches_fnv1a_vectors();
+    test_cache_lookup_finds_own_entry_across_evictions();
+    test_cache_lookup_survives_crossing_hash_threshold();
 
     printf("all static tests passed\n");
     return 0;
