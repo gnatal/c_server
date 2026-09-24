@@ -234,9 +234,12 @@ static int has_bare_lf(const char *block, const size_t len) {
  * ending picohttpparser accepts. A valid head ends at its first blank line, so when picohttpparser still
  * reports "incomplete" (-2) past one, no later byte can make the head valid. picohttpparser does that for
  * a short version token: parse_http_version asks for 9 bytes before looking at any of them, so
- * "GET / X\r\n\r\n" was "incomplete" forever and went unanswered until the request header deadline. */
-static int has_blank_line(const char *buf, const size_t len) {
-    const char *p = buf;
+ * "GET / X\r\n\r\n" was "incomplete" forever and went unanswered until the request header deadline.
+ * Starts at *scan_from; on 0 stores where the next call over a longer buf must restart: 2 bytes before
+ * len, since a blank line that began there ("\n\r" + a missing "\n") was not visible yet. Every earlier
+ * byte is known not to start one, so each head byte is searched a bounded number of times in total. */
+static int has_blank_line_from(const char *buf, const size_t len, size_t *scan_from) {
+    const char *p = buf + (*scan_from < len ? *scan_from : len);
     const char *const end = buf + len;
     const char *nl;
     while ((nl = memchr(p, '\n', (size_t)(end - p))) != NULL) {
@@ -245,6 +248,7 @@ static int has_blank_line(const char *buf, const size_t len) {
         }
         p = nl + 1;
     }
+    *scan_from = len > 2 ? len - 2 : 0;
     return 0;
 }
 
@@ -303,6 +307,11 @@ static int compute_content_length_and_chunked(const struct phr_header *headers, 
 }
 
 int parse_request_head(const char *buf, const size_t len, ParsedHead *head) {
+    size_t head_scan = 0;
+    return parse_request_head_resume(buf, len, head, &head_scan);
+}
+
+int parse_request_head_resume(const char *buf, const size_t len, ParsedHead *head, size_t *head_scan) {
     head->header_len = 0;
     head->method = NULL;
     head->method_len = 0;
@@ -313,12 +322,30 @@ int parse_request_head(const char *buf, const size_t len, ParsedHead *head) {
     head->chunked = 0;
     head->num_headers = MAX_FRAMING_HEADERS;
 
-    const int res = phr_parse_request(buf, len, &head->method, &head->method_len, &head->path, &head->path_len,
-                                      &head->minor_version, head->headers, &head->num_headers, 0);
+    /* Incomplete until a blank line has arrived: past the first look at a request, picohttpparser only
+     * runs once one has, so a head that trickles in one byte per recv costs one incremental blank-line
+     * search per recv plus a single parse, instead of a full re-parse from byte 0 on every recv
+     * (quadratic in the head size). The first look (*head_scan == 0) parses straight away, so a request
+     * that arrives whole is still a single pass: a complete head (res > 0) proves its blank line exists.
+     * The verdict is the same whichever way recv split the bytes. The price is that a request line or
+     * header picohttpparser would already reject is answered (400) only once its blank line arrives,
+     * or with 431 at BUF_SIZE / at the request header deadline if it never does. */
+    int res = -2;
+    const int first_look = *head_scan == 0;
+    if (first_look) {
+        res = phr_parse_request(buf, len, &head->method, &head->method_len, &head->path, &head->path_len,
+                                &head->minor_version, head->headers, &head->num_headers, 0);
+    }
+    if (res < 0) {
+        if (!has_blank_line_from(buf, len, head_scan)) return 0; /* header_len and content_length still 0 */
+        if (!first_look) {
+            res = phr_parse_request(buf, len, &head->method, &head->method_len, &head->path, &head->path_len,
+                                    &head->minor_version, head->headers, &head->num_headers, 0);
+        }
+    }
 
-    /* Incomplete: header_len stays 0. Unless a blank line has already arrived (see has_blank_line):
-     * then it is malformed, and falls through to the malformed path below. */
-    if (res == -2 && !has_blank_line(buf, len)) return 0;
+    /* A blank line is present, so "incomplete" (-2) cannot become valid with more bytes (see
+     * has_blank_line_from): it takes the malformed path below along with -1. */
     if (res < 0) {
         /* Malformed request line: header_len stays 0 too, distinguished from "incomplete" only by this
          * return value - content_length is set to -1 here (rather than left at its 0 default) precisely

@@ -677,6 +677,7 @@ int flush_connection(App *app, Connection *conn) {
         conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check */
         conn->continue_sent = 0; /* ... and its own 100 Continue */
         conn->chunk_scan = (ChunkScanState){0}; /* next request's chunked body scans from its own start */
+        conn->head_scan = 0; /* ... and its head's blank-line search too */
 
         /* nothing buffered - free the input buffer (however far it grew for a large body) or hand
          * App.read_buf back, so an idle keep-alive connection owns no input memory. Pipelined
@@ -865,7 +866,7 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
          * and the full parse - these used to each run their own independent pass over the same
          * bytes, up to four per request once the body-limit check added its own. */
         ParsedHead head;
-        parse_request_head(req_start, req_avail, &head);
+        parse_request_head_resume(req_start, req_avail, &head, &conn->head_scan);
 
         if (reject_if_over_body_limit(app, conn, &head)) {
             return SERVE_CLOSED;
@@ -952,7 +953,7 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
  * handle_readable is returning with conn still open. If in_buf is the borrowed App.read_buf,
  * either hand it back (nothing left to serve) or copy the unserved bytes - a partial request, or
  * requests pipelined behind a pending response - into an owned BUF_SIZE buffer, compacted to offset
- * 0 (request_len and chunk_scan are relative to in_off, so they stay valid). The leftover always
+ * 0 (request_len, chunk_scan and head_scan are relative to in_off, so they stay valid). The leftover always
  * fits: it came out of a BUF_SIZE buffer. Returns 0, or -1 (malloc failed, conn closed).
  */
 static int stop_borrowing_read_buf(App *app, Connection *conn) {

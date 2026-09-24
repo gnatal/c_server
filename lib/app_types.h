@@ -307,6 +307,12 @@ typedef struct Connection {
      * fully queued. Offsets only (see ChunkScanState), so in_buf growth never invalidates it. */
     ChunkScanState chunk_scan;
 
+    /* where serve_buffered_requests' search for the current request's end-of-head blank line resumes
+     * (parse_request_head_resume), so a head that trickles in one byte per recv is searched once in
+     * total and parsed once, not re-parsed from its first byte on every recv (was quadratic). Relative
+     * to in_off, like chunk_scan, and reset with it. */
+    size_t head_scan;
+
     /* Input: NULL (in_cap == 0) whenever nothing is buffered - an idle connection owns no input
      * memory. handle_readable borrows the worker's shared App.read_buf (BUF_SIZE) for the recv and
      * parses complete requests in place there. Before handle_readable returns with the connection

@@ -31,7 +31,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **S6** | Server always binds `0.0.0.0`, so a proxy-only deployment is exposed directly | Medium | S | CODE |
 | **P1** | ~~epoll issues one wasted `epoll_ctl` per keep-alive request~~ **FIXED 2026-09-24** | Medium (~25% of syscalls) | S | MEASURED |
 | **P2** | ~~io_uring is the Linux default but is 20–25% slower than epoll~~ **FIXED 2026-09-24** | Medium | S | MEASURED (`lib/CLAUDE.md`) |
-| **P3** | Incomplete headers are re-parsed from byte 0 on every `recv` (quadratic) | Medium (CPU DoS amplifier) | S–M | MEASURED |
+| **P3** | ~~Incomplete headers are re-parsed from byte 0 on every `recv` (quadratic)~~ **FIXED 2026-09-24** | Medium (CPU DoS amplifier) | S–M | MEASURED |
 | **M3** | No per-worker memory budget for buffered bodies and unsent output | Medium | M | CODE |
 | **S7** | Missing or duplicate `Host` header is accepted | Low–Medium | S | MEASURED |
 | **S8** | Form fields: `%00` not rejected (S6 gap), values silently truncated at 255 | Low–Medium | S | MEASURED |
@@ -100,6 +100,16 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   `send` SQEs), which is an L effort.
 
 ### P3 · Incomplete request heads are re-parsed from the start on every `recv` (quadratic)
+- **Status: FIXED 2026-09-24.** `parse_request_head_resume` (`lib/http_parser.c`) runs picohttpparser on the first
+  look at a request and then only once the end-of-head blank line has arrived; in between it resumes the blank-line
+  search from `Connection.head_scan` (2 bytes before where the last search stopped), which `serve_buffered_requests`
+  carries and the keep-alive reset zeroes. The result is identical to `parse_request_head` for every buffer. The
+  behavior change: a head that is already malformed but not yet terminated now waits for its blank line (then 400),
+  or gets 431 at `BUF_SIZE` / 408 at the header deadline, instead of an immediate 400. MEASURED with the `quad.c`
+  probe (8,130-byte unterminated head, byte at a time, macOS): 10–13 ms before, 0.04–0.05 ms after. `make bench`
+  browser GET: 658 vs 675 ns mean over 5 interleaved runs (overlapping, within noise). Tests:
+  `test_head_scan_resumes_and_matches_from_scratch` (`tests/test_http_hardening.c`),
+  `test_handle_readable_head_scan_resumes_and_resets` (`tests/test_connection.c`).
 - **Impact:** Medium. The CPU cost of a slowloris connection is quadratic in the head size. It's bounded by
   `BUF_SIZE` (8 KiB) and the 10 s header deadline, but still about 1,000–2,000× the normal cost.
 - **Effort:** S (pre-check) or M (true incremental parse)

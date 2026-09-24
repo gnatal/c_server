@@ -670,6 +670,62 @@ static void test_every_prefix_is_answered_or_waits_for_bytes(void) {
     }
 }
 
+/* A head that trickles in one byte per recv: parse_request_head_resume, fed every prefix with one
+ * head_scan carried across them (connection.c's path), gives exactly parse_request_head's answer at
+ * every prefix, while head_scan keeps up with the buffer (each byte is searched a bounded number of
+ * times, and picohttpparser runs only once a blank line is in) - it used to re-parse from byte 0 on every
+ * recv, quadratic in the head size. A head already malformed but not yet terminated waits for its blank
+ * line (0), then is rejected (-1) like any other. */
+static void test_head_scan_resumes_and_matches_from_scratch(void) {
+    static char big[BUF_SIZE];
+    size_t n = (size_t)snprintf(big, sizeof(big), "GET /a HTTP/1.1\r\n");
+    for (int i = 0; n + 64 < sizeof(big) - 4; i++) {
+        n += (size_t)snprintf(big + n, sizeof(big) - n, "X-H%d: 0000000000000000000000\r\n", i);
+    }
+    memcpy(big + n, "\r\n", 2);
+    n += 2;
+
+    const char *inputs[] = {
+        big,
+        "GET /a HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET /a HTTP/1.1\nHost: x\n\n",                    /* bare-LF blank line: found, then rejected */
+        "this is \x01 not a request\r\nX: y\r\n\r\n",  /* malformed long before its blank line */
+        "\r\nGET /a HTTP/1.1\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+        const size_t len = i == 0 ? n : strlen(inputs[i]);
+        size_t head_scan = 0;
+        for (size_t k = 1; k <= len; k++) {
+            char *exact = malloc(k); /* no NUL, no slack */
+            assert(exact != NULL);
+            memcpy(exact, inputs[i], k);
+            ParsedHead fresh;
+            ParsedHead resumed;
+            const int want = parse_request_head(exact, k, &fresh);
+            assert(parse_request_head_resume(exact, k, &resumed, &head_scan) == want);
+            assert(resumed.header_len == fresh.header_len);
+            assert(resumed.content_length == fresh.content_length);
+            assert(head_scan <= k);
+            if (fresh.header_len == 0 && fresh.content_length == 0) {
+                assert(!has_blank_line(exact, k));
+                assert(k < 2 || head_scan == k - 2); /* the next search starts at the new bytes */
+            }
+            free(exact);
+        }
+    }
+
+    /* malformed, unterminated: waits; the blank line then gets the same -1 a single read would. */
+    const char *bad = "GET / HTTP/9\x01\r\nX: y\r\n";
+    ParsedHead head;
+    size_t scan = 0;
+    assert(parse_request_head_resume(bad, strlen(bad), &head, &scan) == 0);
+    assert(head.header_len == 0 && head.content_length == 0);
+    assert(request_is_complete(bad, strlen(bad)) == 0);
+    const char *bad_done = "GET / HTTP/9\x01\r\nX: y\r\n\r\n";
+    assert(parse_request_head_resume(bad_done, strlen(bad_done), &head, &scan) == -1);
+    assert(request_is_complete(bad_done, strlen(bad_done)) == 1);
+}
+
 static void check_canonical(const char *in, const int rc, const char *out) {
     char buf[256];
     snprintf(buf, sizeof(buf), "%s", in);
@@ -767,6 +823,7 @@ int main(void) {
     test_transfer_encoding_token_matching();
     test_short_version_token_rejected();
     test_every_prefix_is_answered_or_waits_for_bytes();
+    test_head_scan_resumes_and_matches_from_scratch();
     test_chunk_size_line_is_strict();
     test_path_canonicalize();
     test_path_prefix_helpers();

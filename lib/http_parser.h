@@ -66,10 +66,21 @@ int parse_http_request(const char *raw, size_t raw_len, Request *req, Arena *are
  * value, exactly as request_framing already worked): every other field is then not meaningful.
  * a head picohttpparser still calls incomplete although buf already holds a blank line (e.g. a
  * version token under 9 bytes, "GET / X\r\n\r\n") is malformed (-1), never incomplete.
+ * picohttpparser runs only once buf holds a blank line: before that the head is incomplete (0), even
+ * when its request line or a header is already malformed (answered 400 once the blank line arrives).
  * request_framing and request_is_complete are now thin wrappers over this plus request_head_is_complete;
  * they keep their own signatures for existing callers and are unaffected in behavior.
  */
 int parse_request_head(const char *buf, size_t len, ParsedHead *head);
+
+/*
+ * parse_request_head_resume: parse_request_head, but the search for the head's terminating blank line
+ * resumes from *head_scan (an offset into buf, 0 = from the start) and advances it while none is found,
+ * so calling it once per recv as the SAME request's buf grows costs linear, not quadratic, time in the
+ * head size. Same result as parse_request_head for every buf. *head_scan is per request (reset to 0 when
+ * the request start moves, e.g. Connection.head_scan) and must never exceed a len it was used with.
+ */
+int parse_request_head_resume(const char *buf, size_t len, ParsedHead *head, size_t *head_scan);
 
 /*
  * request_head_is_complete: the request_is_complete logic against an already-parsed head instead of

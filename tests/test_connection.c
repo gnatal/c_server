@@ -756,6 +756,48 @@ static void test_handle_readable_chunked_round_trip(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+/* a head written one byte per read advances Connection.head_scan with the buffer (the blank-line
+ * search resumes where it left off instead of re-parsing the head from its first byte every read), the
+ * request is answered once its blank line arrives, and the keep-alive reset puts head_scan back to 0 so
+ * a second request on the same connection searches its own head from the start. */
+static void test_handle_readable_head_scan_resumes_and_resets(void) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+
+    app_get(&app, "/ping", ping_handler);
+
+    const char *req = "GET /ping HTTP/1.1\r\nHost: localhost\r\nX-Pad: abcdefgh\r\n\r\n";
+    const size_t len = strlen(req);
+    for (size_t i = 0; i + 1 < len; i++) {
+        assert(write(fds[1], req + i, 1) == 1);
+        handle_readable(&app, conn);
+        assert(app.connections[fds[0]] == conn);
+        assert(conn->in_len - conn->in_off == i + 1); /* still buffered, unanswered */
+        assert(i < 2 || conn->head_scan == i - 1);   /* 2 bytes behind the buffer's end */
+    }
+    assert(write(fds[1], req + len - 1, 1) == 1);
+    handle_readable(&app, conn);
+
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    assert(read(fds[1], resp, sizeof(resp) - 1) > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    assert(app.connections[fds[0]] == conn);
+    assert(conn->head_scan == 0);
+
+    /* Second, shorter request: a stale head_scan would start past its blank line and never find it. */
+    const char *second = "GET /ping HTTP/1.1\r\n\r\n";
+    assert(write(fds[1], second, strlen(second)) == (ssize_t)strlen(second));
+    handle_readable(&app, conn);
+    memset(resp, 0, sizeof(resp));
+    assert(read(fds[1], resp, sizeof(resp) - 1) > 0);
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+
+    teardown_test_connection(&app, fds, conn);
+}
+
 /* a chunked body dribbled in over several reads advances Connection.chunk_scan past each
  * completed chunk (so no read rescans the body before it), and a keep-alive response resets it -
  * a second chunked request on the same connection must scan from its own body start, not resume at
@@ -1897,6 +1939,7 @@ int main(void) {
     test_handle_readable_expect_continue_chunked();
     test_handle_readable_expect_continue_not_sent();
     test_handle_readable_chunked_round_trip();
+    test_handle_readable_head_scan_resumes_and_resets();
     test_handle_readable_chunked_scan_resumes_and_resets();
     test_handle_readable_chunked_grows_buffer();
     test_handle_readable_chunked_too_large_413();
