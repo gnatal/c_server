@@ -428,9 +428,12 @@ typedef struct {
 
 /* ---- response ---- */
 
+/* value is a NUL-terminated copy in the request arena (conn->arena), value_len bytes long: valid until
+ * that arena's reset at the end of the dispatch cycle, which outlives the stack-allocated Response. */
 typedef struct {
     char name[64];
-    char value[256];
+    const char *value;
+    size_t value_len;
 } ResponseHeader;
 
 /* SameSite for res_set_cookie; UNSET (zero) omits the attribute. */

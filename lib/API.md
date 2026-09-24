@@ -51,9 +51,9 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `path_canonicalize(path)` (in place, collapses repeated `/`; -1 for a `.`/`..` segment or a target not starting with `/`), `path_normalize_prefix(prefix, out, out_size)` (`""` or `/seg[/seg]`), `path_prefix_matches(prefix, path)` (segment-boundary match) — the one path shape shared by routing, prefix middleware, body limits and mounts. `req->path` is always canonical: the parser refuses (400) `%2F`, dot segments and non-origin-form targets.
 
 ## Build the response (`response.h`)
-- `res_status(res, code)`, `res_set_header(res, name, value)` — before sending `Content-Length`, `Connection` and `Date` are engine-managed. Status 1xx/204/304 sends the head only (no framing headers, no body).
+- `res_status(res, code)`, `res_set_header(res, name, value)` — before sending `Content-Length`, `Connection` and `Date` are engine-managed. Value copied whole (no length cap; the whole head must fit 8 KiB or the connection is dropped); name > 63 chars is dropped. Status 1xx/204/304 sends the head only (no framing headers, no body).
 - `res_send(res, text)`, `res_json(res, json_text)`, `res_send_bytes(res, type, data, len)` — send a whole body (copied).
-- `res_redirect(res, status, location)` — 3xx + Location (status 0 = 302).
+- `res_redirect(res, status, location)` — 3xx + Location (status 0 = 302). 500 if the Location has control chars or cannot be stored.
 - `res_set_cookie(res, name, value, const CookieOptions *)`, `res_clear_cookie(res, name, path)` — cookies.
 - `res_write(res, data, len)`, `res_end(res)`, `res_set_trailer(res, name, value)` — chunked response, buffered until the handler returns (at most `MAX_BODY_SIZE`, silently truncated past it); for big bodies use `res_stream`.
 - `res_send_file(res, content_type, path)` — stream a file; `0` ok, `-1` nothing sent.

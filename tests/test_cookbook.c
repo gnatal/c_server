@@ -18,11 +18,9 @@ char test_arena_buf[64 * 1024];
 static char *fetch(App *app, const char *raw, const size_t raw_len) {
     Connection conn;
     memset(&conn, 0, sizeof(conn));
-    /* Connection.arena is a pointer to a shared per-worker Arena (App.arena in the real engine)
-     * now, not one embedded per connection - point it at its own local Arena, same buffer as before. */
-    Arena conn_arena;
-    arena_init(&conn_arena, test_arena_buf, sizeof(test_arena_buf));
-    conn.arena = &conn_arena;
+    /* One arena for the request and the response, as in the engine (conn->arena == &App.arena, the
+     * arena parse_http_request is given): two Arena structs over one buffer would overwrite each other. */
+    conn.arena = &test_arena;
     conn.file_fd = -1;
     conn.keep_alive = 1;
 
@@ -37,7 +35,6 @@ static char *fetch(App *app, const char *raw, const size_t raw_len) {
     res_init(&res, &conn);
     res.is_head_request = strcmp(req.method, "HEAD") == 0;
     dispatch(app, match_route(app, &req), &req, &res);
-    arena_reset(&test_arena);
 
     size_t out_len = conn.out_len;
     char *out = malloc(out_len + 1);

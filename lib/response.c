@@ -10,11 +10,9 @@
 #include "http_parser.h"
 
 /*
- * Large enough for the status line, the three built-in headers, and up to
- * MAX_RESPONSE_HEADERS custom headers (bounded to the name/value sizes in
- * ResponseHeader) with room to spare - a fixed cap in the same spirit as the
- * other hard limits in this engine (BUF_SIZE, MAX_ROUTES, ...) rather than a
- * dynamically grown buffer.
+ * Cap on the whole response head (status line, built-in headers, custom headers, Set-Cookie lines).
+ * Header values have no per-value cap (they live in the arena), so this is the one bound: a head that
+ * does not fit is never sent shortened - the connection is dropped and logged.
  */
 #define RESPONSE_HEADER_BUF_SIZE 8192
 
@@ -55,6 +53,49 @@ void res_status(Response *res, int status) {
     res->status = status;
 }
 
+/*
+ * Shared by res_set_header and res_set_trailer (`what` names the caller in log lines). Same name
+ * (case-insensitive) overwrites. The value is copied whole into the request arena - never shortened; a
+ * name longer than 63 chars, a full table, or an arena out of space drops the entry (logged). An
+ * overwritten value's old copy stays in the arena until its reset.
+ */
+static void set_named_value(Response *res, ResponseHeader *table, int *count, const int max,
+                            const char *name, const char *value, const char *what) {
+    const size_t name_len = strlen(name);
+    if (name_len >= sizeof(table[0].name)) {
+        fprintf(stderr, "res_set_%s: %s name \"%.63s...\" is longer than %zu chars, dropped\n", what, what, name,
+                sizeof(table[0].name) - 1);
+        return;
+    }
+
+    ResponseHeader *entry = NULL;
+    for (int i = 0; i < *count; i++) {
+        if (strcasecmp(table[i].name, name) == 0) {
+            entry = &table[i];
+            break;
+        }
+    }
+    if (entry == NULL && *count >= max) {
+        fprintf(stderr, "res_set_%s: MAX_RESPONSE_%sS exceeded\n", what, strcmp(what, "header") == 0 ? "HEADER" : "TRAILER");
+        return;
+    }
+
+    const size_t value_len = strlen(value);
+    char *copy = (res->conn != NULL && res->conn->arena != NULL) ? arena_alloc(res->conn->arena, value_len + 1) : NULL;
+    if (copy == NULL) {
+        fprintf(stderr, "res_set_%s: no arena space for %s \"%s\" (%zu bytes), dropped\n", what, what, name, value_len);
+        return;
+    }
+    memcpy(copy, value, value_len + 1);
+
+    if (entry == NULL) {
+        entry = &table[(*count)++];
+        memcpy(entry->name, name, name_len + 1);
+    }
+    entry->value = copy;
+    entry->value_len = value_len;
+}
+
 void res_set_header(Response *res, const char *name, const char *value) {
     if (strcasecmp(name, "Content-Length") == 0 || strcasecmp(name, "Connection") == 0 ||
         strcasecmp(name, "Date") == 0) {
@@ -67,24 +108,7 @@ void res_set_header(Response *res, const char *name, const char *value) {
         return;
     }
 
-    for (int i = 0; i < res->header_count; i++) {
-        if (strcasecmp(res->headers[i].name, name) == 0) {
-            strncpy(res->headers[i].value, value, sizeof(res->headers[i].value) - 1);
-            res->headers[i].value[sizeof(res->headers[i].value) - 1] = '\0';
-            return;
-        }
-    }
-
-    if (res->header_count >= MAX_RESPONSE_HEADERS) {
-        fprintf(stderr, "res_set_header: MAX_RESPONSE_HEADERS exceeded\n");
-        return;
-    }
-
-    ResponseHeader *header = &res->headers[res->header_count++];
-    strncpy(header->name, name, sizeof(header->name) - 1);
-    header->name[sizeof(header->name) - 1] = '\0';
-    strncpy(header->value, value, sizeof(header->value) - 1);
-    header->value[sizeof(header->value) - 1] = '\0';
+    set_named_value(res, res->headers, &res->header_count, MAX_RESPONSE_HEADERS, name, value, "header");
 }
 
 static const char *find_header(const Response *res, const char *name) {
@@ -185,7 +209,7 @@ static size_t build_response_head(const Response *res, const char *content_type,
         }
         bad |= put_str(buf, cap, &off, name);
         bad |= put_str(buf, cap, &off, ": ");
-        bad |= put_str(buf, cap, &off, res->headers[i].value);
+        bad |= put_bytes(buf, cap, &off, res->headers[i].value, res->headers[i].value_len);
         bad |= put_str(buf, cap, &off, "\r\n");
     }
 
@@ -228,6 +252,8 @@ static void send_with_content_type(Response *res, const char *content_type, cons
 
     const size_t head_len = build_response_head(res, content_type, body_len, head, sizeof(head));
     if (head_len == 0) {
+        fprintf(stderr, "response head exceeds RESPONSE_HEADER_BUF_SIZE (%d bytes), connection dropped\n",
+                RESPONSE_HEADER_BUF_SIZE);
         conn->out_buf = NULL;
         conn->out_cap = 0;
         abort_response(conn); /* headers do not fit: drop rather than send a malformed response */
@@ -276,17 +302,32 @@ void res_send_bytes(Response *res, const char *content_type, const unsigned char
 }
 
 void res_redirect(Response *res, int status, const char *location) {
-    char body[300];
-
     if (!text_is_safe(location, 1, NULL)) {
         /* A Location with CR/LF is a response-splitting attempt: refuse instead of sending a broken redirect. */
         res_status(res, 500);
         res_send(res, "invalid redirect target");
         return;
     }
-    res_status(res, status != 0 ? status : 302);
     res_set_header(res, "Location", location);
-    snprintf(body, sizeof(body), "Redirecting to %s", location);
+    const char *set = find_header(res, "Location");
+    if (set == NULL || strcmp(set, location) != 0) {
+        /* Location was not stored (no arena space, header table full): never redirect without it. */
+        res_status(res, 500);
+        res_send(res, "redirect target could not be set");
+        return;
+    }
+    res_status(res, status != 0 ? status : 302);
+
+    /* body "Redirecting to <location>" in the arena, so a long target is not cut either */
+    static const char prefix[] = "Redirecting to ";
+    const size_t location_len = strlen(location);
+    char *body = arena_alloc(res->conn->arena, sizeof(prefix) - 1 + location_len + 1);
+    if (body == NULL) {
+        res_send(res, "Redirecting");
+        return;
+    }
+    memcpy(body, prefix, sizeof(prefix) - 1);
+    memcpy(body + sizeof(prefix) - 1, location, location_len + 1);
     res_send(res, body);
 }
 
@@ -422,6 +463,8 @@ static int commit_chunked_headers(Response *res) {
     char head[RESPONSE_HEADER_BUF_SIZE];
     const size_t head_len = build_response_head(res, "text/plain", CHUNKED_BODY, head, sizeof(head));
     if (head_len == 0) {
+        fprintf(stderr, "response head exceeds RESPONSE_HEADER_BUF_SIZE (%d bytes), connection dropped\n",
+                RESPONSE_HEADER_BUF_SIZE);
         conn->out_buf = NULL;
         conn->out_cap = 0;
         abort_response(conn);
@@ -483,24 +526,7 @@ void res_set_trailer(Response *res, const char *name, const char *value) {
         return;
     }
 
-    for (int i = 0; i < res->trailer_count; i++) {
-        if (strcasecmp(res->trailers[i].name, name) == 0) {
-            strncpy(res->trailers[i].value, value, sizeof(res->trailers[i].value) - 1);
-            res->trailers[i].value[sizeof(res->trailers[i].value) - 1] = '\0';
-            return;
-        }
-    }
-
-    if (res->trailer_count >= MAX_RESPONSE_TRAILERS) {
-        fprintf(stderr, "res_set_trailer: MAX_RESPONSE_TRAILERS exceeded\n");
-        return;
-    }
-
-    ResponseHeader *tr = &res->trailers[res->trailer_count++];
-    strncpy(tr->name, name, sizeof(tr->name) - 1);
-    tr->name[sizeof(tr->name) - 1] = '\0';
-    strncpy(tr->value, value, sizeof(tr->value) - 1);
-    tr->value[sizeof(tr->value) - 1] = '\0';
+    set_named_value(res, res->trailers, &res->trailer_count, MAX_RESPONSE_TRAILERS, name, value, "trailer");
 }
 
 void res_end(Response *res) {
@@ -520,11 +546,12 @@ void res_end(Response *res) {
         return;
     }
     for (int i = 0; i < res->trailer_count; i++) {
-        char tr_line[384];
-        int n = snprintf(tr_line, sizeof(tr_line), "%s: %s\r\n",
-                         res->trailers[i].name, res->trailers[i].value);
-        if (n > 0) {
-            append_to_out_buf(res->conn, tr_line, (size_t)n);
+        const ResponseHeader *tr = &res->trailers[i];
+        if (append_to_out_buf(res->conn, tr->name, strlen(tr->name)) != 0 ||
+            append_to_out_buf(res->conn, ": ", 2) != 0 ||
+            append_to_out_buf(res->conn, tr->value, tr->value_len) != 0 ||
+            append_to_out_buf(res->conn, "\r\n", 2) != 0) {
+            return;
         }
     }
     append_to_out_buf(res->conn, "\r\n", 2);

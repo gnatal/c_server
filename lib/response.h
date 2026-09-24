@@ -28,7 +28,8 @@ void res_status(Response *res, int status);
 /*
  * Sets a response header. Same name (case-insensitive) overwrites. Content-Length, Connection and Date are
  * computed by the engine and rejected here (logged). A custom Content-Type replaces the default one.
- * Limits: MAX_RESPONSE_HEADERS; name truncated to 63 chars, value to 255; excess is dropped (logged).
+ * Limits: MAX_RESPONSE_HEADERS; a name over 63 chars is dropped (logged). The value is copied whole into the
+ * request arena, never shortened; if the finished head exceeds 8 KiB the connection is dropped (logged).
  * Safe with request data: an empty name, or any control character (CR, LF, NUL ...) in name or value,
  * drops the header (logged) instead of allowing header injection / response splitting.
  */
@@ -44,7 +45,7 @@ void res_json(Response *res, const char *body);
 void res_send_bytes(Response *res, const char *content_type, const unsigned char *data, size_t len);
 
 /* Sets Location and sends a short text body. `status` should be 3xx; 0 means 302. A location containing
- * control characters is refused with 500. It is NOT checked against open redirects: validate untrusted targets. */
+ * control characters, or one that could not be stored (header table full), is refused with 500. It is NOT checked against open redirects: validate untrusted targets. */
 void res_redirect(Response *res, int status, const char *location);
 
 /*
@@ -66,7 +67,7 @@ void res_clear_cookie(Response *res, const char *name, const char *path);
  * Chunks accumulate in conn->out_buf (limit MAX_BODY_SIZE + header) and nothing is sent until the
  * handler returns; the handler never blocks on the socket. For large or unbounded bodies use res_stream. HEAD requests get the headers only. res_end writes the last chunk plus any trailers.
  * res_set_trailer: same-name overwrites; Transfer-Encoding, Content-Length and Trailer are rejected;
- * MAX_RESPONSE_TRAILERS.
+ * MAX_RESPONSE_TRAILERS; names and values follow res_set_header's rules (value copied whole, never cut).
  */
 void res_write(Response *res, const char *data, size_t len);
 void res_set_trailer(Response *res, const char *name, const char *value);

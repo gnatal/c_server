@@ -61,11 +61,11 @@ path params 8 (value 63) · query params 16 (63) · request headers 32 (`MAX_HEA
 header name/value has no length cap of its own - it is a view into the input buffer, not a fixed-size copy -
 only the whole header block fitting `BUF_SIZE` bounds it) ·
 cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
-body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 · Set-Cookie 16 (512 each) · trailers 8 · multipart parts 16 ·
+body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 (name 63, value uncapped: copied into the arena) · Set-Cookie 16 (512 each) · trailers 8 (same as headers) · multipart parts 16 ·
 form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB each, 64 MiB total, 1 s revalidation
 (`STATIC_CACHE_*`, `static.c`; a file over the per-entry cap is served but never cached; see "Static" below) ·
 producer stream output 16 KiB per producer call (`STREAM_CHUNK_SIZE`; one `stream_write` ≤ `STREAM_WRITE_MAX`) and no total cap · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
-pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response) ·
+pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response, logged; the only bound on a response header value) ·
 worker init hooks 4 · cluster workers 128 · arena 64 KiB, one per worker process, not per connection (see below; exceeding it falls back to malloc, it is not a limit) ·
 max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped) ·
 body limit prefixes 16 (`MAX_BODY_LIMITS`; `App.body_limits`, set at runtime by `app_use_body_limit`, unlike the other limits here - see "Body limits" below).
@@ -103,7 +103,8 @@ Measured on macOS (demo, one worker, 5,000 connections, RSS delta): about **239 
 after one request and **216 B** for an accepted-but-silent one, down from about 8.4 KB each before the shared receive buffer (44 MB → 1.2 MB
 for 5,000). Kernel socket buffers are not in RSS. `/ping` throughput unchanged (wrk, 50 connections, three rounds).
 The arena serves everything that lives for one request (except `Request.body`, a view into `in_buf` - see
-"Behavior reference, Request parsing"): the initial `conn->out_buf` build (`res_*`),
+"Behavior reference, Request parsing"): the initial `conn->out_buf` build (`res_*`), response header and trailer
+values (`ResponseHeader.value`, copied by `res_set_header`/`res_set_trailer`; an overwrite leaves the old copy until reset),
 chunked-response growth, and any yyjson document created with `arena_yyjson_alc`. Bump allocation, 8-byte aligned,
 no per-allocation free. When the remaining space is too small (not only for a single request over 64 KiB), the
 allocation falls back to `malloc` and is chained in a list that `arena_reset` frees. Consequences: nothing reached
@@ -338,6 +339,10 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   stayed at 1.6 MB.
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length`, `Connection` and `Date` are engine-owned.
+  Header and trailer values are never shortened: `set_named_value` (`response.c`) copies them whole into `conn->arena`
+  (pointer + length in `ResponseHeader`); a name over 63 chars or a full table drops the entry (logged); a head that
+  then exceeds `RESPONSE_HEADER_BUF_SIZE` drops the connection (logged). `res_redirect` answers 500 if its `Location`
+  was not stored, and builds its `Redirecting to <location>` body in the arena, so a long target is not cut either.
 - **Date and bodiless statuses.** Every head built by `build_response_head` (and the hand-built overload 503 in
   `connection.c`) carries `Date:` right after the status line, from `http_date_for(time(NULL))` (`http_parser.c`): one
   static per-process buffer reformatted only when the second changes (`format_http_date`, pure, locale-free, no

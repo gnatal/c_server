@@ -35,7 +35,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **M3** | No per-worker memory budget for buffered bodies and unsent output | Medium | M | CODE |
 | **S7** | ~~Missing or duplicate `Host` header is accepted~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **S8** | ~~Form fields: `%00` not rejected (S6 gap), values silently truncated at 255~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
-| **S9** | Response header values silently truncated at 255 chars (CSP, `Location`) | Low–Medium | S | MEASURED |
+| **S9** | ~~Response header values silently truncated at 255 chars (CSP, `Location`)~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **P4** | Cached static files are copied into the arena on every hit | Low–Medium | M | ESTIMATED |
 | **P5** | `sendfile`/`writev` still not used for file bodies | Low–Medium | M | CODE |
 | **P6** | One unnecessary syscall per connection close (`unwatch_all` before `close`) | Low | S | CODE |
@@ -449,6 +449,17 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   `lib/API.md` and the cookbook.)
 
 ### S9 · Response header values are silently truncated at 255 characters
+- **Status: FIXED 2026-09-24.** Took the arena option. `ResponseHeader` (`lib/app_types.h`) holds `const char *value`
+  + `value_len`; `res_set_header` and `res_set_trailer` share `set_named_value` (`lib/response.c`), which copies the
+  value whole into `conn->arena` (lives until the end-of-request reset, past the stack `Response`). No per-value cap:
+  the 8 KiB head buffer is the only bound, and a head over it drops the connection, now with a `stderr` line. A name
+  over 63 chars is dropped (logged) instead of being cut. `res_end` writes trailers with bounded appends (the old
+  384-byte `snprintf` line also cut them). `res_redirect` answers 500 when `Location` could not be stored, and builds
+  its body in the arena (the old `body[300]` cut long targets). `sizeof(Response)` 15,912 → 10,160 bytes; `make
+  bench` unchanged beyond noise. Tests: four new cases in `tests/test_response.c` (399-char CSP, overwrites, 600-char
+  redirect, 700-char trailer, 63/64-char names, full-table redirect, 9,000-char value). `tests/test_cookbook.c`'s fake
+  `Connection` had its own `Arena` over the same buffer the request was parsed into; it now shares the request's
+  arena, as the engine does.
 - **Impact:** Low–Medium. A `Content-Security-Policy` longer than 255 characters (common) is cut mid-directive,
   which weakens or breaks the policy. A redirect `Location` longer than 255 characters points somewhere else.
 - **Effort:** S (reject) or M (store in the arena)

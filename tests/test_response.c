@@ -435,7 +435,7 @@ static void test_second_send_replaces_first_without_leaking(void) {
 }
 
 static void test_oversized_head_drops_connection(void) {
-    /* 16 headers of ~300 bytes cannot exceed the 8 KB head buffer; a cookie storm plus headers can.
+    /* 16 headers of ~260 bytes plus a cookie storm exceed the 8 KB head buffer.
      * Whatever does not fit must abort the response cleanly rather than truncate it. */
     Connection *conn = make_conn();
     Response res;
@@ -635,6 +635,114 @@ static void test_bodiless_statuses_send_head_only(void) {
     free_conn(conn);
 }
 
+/* A value of `len` repetitions of `c`, malloc'd (caller frees). */
+static char *long_value(const size_t len, const char c) {
+    char *v = malloc(len + 1);
+    assert(v != NULL);
+    memset(v, c, len);
+    v[len] = '\0';
+    return v;
+}
+
+static void test_long_header_value_sent_whole(void) {
+    /* a 399-char CSP used to arrive cut to 255 chars, mid-directive */
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    char *csp = long_value(399, 'p');
+    memcpy(csp, "default-src 'self'; ", 20);
+    res_set_header(&res, "Content-Security-Policy", csp);
+    char *line = malloc(strlen("Content-Security-Policy: ") + 399 + 3);
+    snprintf(line, strlen("Content-Security-Policy: ") + 399 + 3, "Content-Security-Policy: %s\r\n", csp);
+    res_send(&res, "ok");
+    assert(strstr(conn->out_buf, line) != NULL);
+
+    /* overwrite with a longer value, then a shorter one: the last is sent whole, once */
+    char *longer = long_value(1500, 'q');
+    res_init(&res, conn);
+    res_set_header(&res, "X-Long", "short");
+    res_set_header(&res, "x-long", longer);
+    res_send(&res, "ok");
+    assert(strstr(conn->out_buf, longer) != NULL);
+    res_init(&res, conn);
+    res_set_header(&res, "X-Long", longer);
+    res_set_header(&res, "X-Long", "tiny");
+    res_send(&res, "ok");
+    assert(strstr(conn->out_buf, "X-Long: tiny\r\n") != NULL);
+    assert(strstr(conn->out_buf, "qqq") == NULL);
+    free(csp);
+    free(line);
+    free(longer);
+    free_conn(conn);
+}
+
+static void test_long_redirect_location_sent_whole(void) {
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    char *target = long_value(600, 'a');
+    target[0] = '/';
+    res_redirect(&res, 302, target);
+    assert(strncmp(conn->out_buf, "HTTP/1.1 302 Found\r\n", 20) == 0);
+    const char *loc = strstr(conn->out_buf, "Location: ");
+    assert(loc != NULL);
+    assert(strncmp(loc + 10, target, 600) == 0 && strncmp(loc + 610, "\r\n", 2) == 0);
+    const char *body = strstr(conn->out_buf, "\r\n\r\n") + 4;
+    assert(strncmp(body, "Redirecting to ", 15) == 0 && strcmp(body + 15, target) == 0);
+    free(target);
+    free_conn(conn);
+}
+
+static void test_long_trailer_value_sent_whole(void) {
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    char *value = long_value(700, 't');
+    res_set_trailer(&res, "X-Digest", value);
+    res_write(&res, "x", 1);
+    res_end(&res);
+    const char *tr = strstr(conn->out_buf, "0\r\nX-Digest: ");
+    assert(tr != NULL);
+    assert(strncmp(tr + 13, value, 700) == 0 && strcmp(tr + 713, "\r\n\r\n") == 0);
+    free(value);
+    free_conn(conn);
+}
+
+static void test_unstorable_header_is_dropped_not_cut(void) {
+    /* a name over 63 chars is dropped (it used to be cut to 63) */
+    Connection *conn = make_conn();
+    Response res;
+    res_init(&res, conn);
+    char *name = long_value(64, 'N');
+    res_set_header(&res, name, "v");
+    assert(res.header_count == 0);
+    name[63] = '\0';
+    res_set_header(&res, name, "v");
+    assert(res.header_count == 1);
+
+    /* a redirect whose Location cannot be stored (header table full) answers 500, never a 3xx without it */
+    res_init(&res, conn);
+    for (int i = 0; i < MAX_RESPONSE_HEADERS; i++) {
+        char h[16];
+        snprintf(h, sizeof(h), "X-H%d", i);
+        res_set_header(&res, h, "v");
+    }
+    res_redirect(&res, 302, "/next");
+    assert(strncmp(conn->out_buf, "HTTP/1.1 500 ", 13) == 0);
+    assert(strstr(conn->out_buf, "Location:") == NULL);
+
+    /* no per-value cap, but one value larger than the whole head buffer is never sent cut: connection dropped */
+    char *huge = long_value(9000, 'h');
+    res_init(&res, conn);
+    res_set_header(&res, "X-Huge", huge);
+    assert(res.header_count == 1 && res.headers[0].value_len == 9000);
+    res_send(&res, "body");
+    assert(conn->out_len == 0 && conn->keep_alive == 0);
+    free(name);
+    free(huge);
+    free_conn(conn);
+}
+
 int main(void) {
     test_date_header_present_and_reserved();
     test_bodiless_statuses_send_head_only();
@@ -666,6 +774,10 @@ int main(void) {
     test_redirect_refuses_injected_location();
     test_cookie_injection_is_refused();
     test_trailer_injection_is_refused();
+    test_long_header_value_sent_whole();
+    test_long_redirect_location_sent_whole();
+    test_long_trailer_value_sent_whole();
+    test_unstorable_header_is_dropped_not_cut();
 
     printf("all response tests passed\n");
     return 0;
