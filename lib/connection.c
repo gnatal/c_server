@@ -293,7 +293,7 @@ void connection_close(App *app, Connection *conn) {
     if (app != NULL) {
         app->buffered_bytes -= conn->held_bytes; /* everything it owns is freed below */
         conn->held_bytes = 0;
-        event_loop_unwatch_all(app, conn->fd);
+        event_loop_release_fd(app, conn->fd);
         if (app->connections != NULL && conn->fd >= 0 && conn->fd < app->connections_cap) {
             app->connections[conn->fd] = NULL;
         }

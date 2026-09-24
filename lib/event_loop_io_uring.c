@@ -85,7 +85,7 @@ static int arm_poll(struct io_uring *ring, const int fd, PollRegistration *reg) 
  * the in-flight poll is removed (its completion then carries a stale generation) and a new one armed.
  * Only queues SQEs: event_loop_poll submits them in one io_uring_enter per loop turn.
  * Invariant this relies on: an fd is unwatched (mask 0) before it is closed - connection_close does
- * unwatch_all first - so a reused fd number never inherits a stale "already armed" mask.
+ * release_fd first - so a reused fd number never inherits a stale "already armed" mask.
  */
 static int update_poll(App *app, const int fd, const uint32_t mask) {
     struct io_uring *ring = (struct io_uring *)app->ring;
@@ -258,7 +258,7 @@ static int uring_unwatch_write(App *app, int fd, void *udata) {
     return update_poll(app, fd, mask);
 }
 
-static int uring_unwatch_all(App *app, int fd) {
+static int uring_release_fd(App *app, int fd) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
     if (fd < app->connections_cap && app->connections != NULL && app->connections[fd] != NULL) {
         app->connections[fd]->events_watched = 0;
@@ -435,7 +435,7 @@ const EventLoopOps io_uring_loop_ops = {
     .unwatch_read = uring_unwatch_read,
     .watch_write = uring_watch_write,
     .unwatch_write = uring_unwatch_write,
-    .unwatch_all = uring_unwatch_all,
+    .release_fd = uring_release_fd,
     .arm_shutdown_timer = uring_arm_shutdown_timer,
     .poll_events = uring_poll,
 };

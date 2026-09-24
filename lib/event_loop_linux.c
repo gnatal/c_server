@@ -87,8 +87,8 @@ int event_loop_unwatch_write(App *app, int fd, void *udata) {
     return (app != NULL && app->loop_ops != NULL) ? app->loop_ops->unwatch_write(app, fd, udata) : -1;
 }
 
-int event_loop_unwatch_all(App *app, int fd) {
-    return (app != NULL && app->loop_ops != NULL) ? app->loop_ops->unwatch_all(app, fd) : -1;
+int event_loop_release_fd(App *app, int fd) {
+    return (app != NULL && app->loop_ops != NULL) ? app->loop_ops->release_fd(app, fd) : -1;
 }
 
 int event_loop_arm_shutdown_timer(App *app) {

@@ -302,7 +302,7 @@ static int epoll_unwatch_write(App *app, int fd, void *udata) {
     return epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
 }
 
-static int epoll_unwatch_all(App *app, int fd) {
+static int epoll_release_fd(App *app, int fd) {
     if (app == NULL || app->epoll_fd < 0 || fd < 0) {
         return -1;
     }
@@ -310,12 +310,9 @@ static int epoll_unwatch_all(App *app, int fd) {
     if (fd < app->connections_cap && app->connections != NULL && app->connections[fd] != NULL) {
         app->connections[fd]->events_watched = 0;
     }
-
-    int rc = epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-    if (rc < 0 && (errno == ENOENT || errno == EBADF)) {
-        return 0;
-    }
-    return rc;
+    /* No EPOLL_CTL_DEL: the caller closes fd next, and closing the last reference to the file
+     * removes it from the epoll set. */
+    return 0;
 }
 
 static int epoll_arm_shutdown_timer(App *app) {
@@ -448,7 +445,7 @@ const EventLoopOps epoll_loop_ops = {
     .unwatch_read = epoll_unwatch_read,
     .watch_write = epoll_watch_write,
     .unwatch_write = epoll_unwatch_write,
-    .unwatch_all = epoll_unwatch_all,
+    .release_fd = epoll_release_fd,
     .arm_shutdown_timer = epoll_arm_shutdown_timer,
     .poll_events = epoll_poll,
 };

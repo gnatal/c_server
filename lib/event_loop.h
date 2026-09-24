@@ -60,10 +60,15 @@ int event_loop_watch_write(App *app, int fd, void *udata);
 int event_loop_unwatch_write(App *app, int fd, void *udata);
 
 /*
- * Deregisters all event interest on the given descriptor (both read and write).
+ * Forgets all event interest on the given descriptor. Call it immediately before close(fd), never
+ * on a descriptor that stays open: kqueue and epoll only reset the tracked events_watched bits and
+ * leave the kernel removal to close() (saves one syscall per connection close), so the descriptor
+ * would keep reporting events. io_uring removes its in-flight poll, which its generation tracking
+ * needs. Relies on fd being the only reference to its open file (accept4 sets FD_CLOEXEC; epoll
+ * keeps a registration alive while a dup or forked copy of the fd exists).
  * Returns 0 on success, -1 on failure.
  */
-int event_loop_unwatch_all(App *app, int fd);
+int event_loop_release_fd(App *app, int fd);
 
 /*
  * Arms a oneshot shutdown deadline timer (SHUTDOWN_TIMEOUT_SECONDS) on the event

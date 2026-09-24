@@ -93,7 +93,7 @@ static void test_event_loop_watch_read_write(void) {
     assert(event_loop_unwatch_write(&app, fds[0], NULL) == 0);
 
     /* Unwatch all */
-    assert(event_loop_unwatch_all(&app, fds[0]) == 0);
+    assert(event_loop_release_fd(&app, fds[0]) == 0);
 
     close(fds[0]);
     close(fds[1]);
@@ -172,7 +172,7 @@ static void test_interest_changes_are_never_errors(void) {
         assert(read(fds[0], &c, 1) == 1);
     }
 
-    assert(event_loop_unwatch_all(&app, fds[0]) == 0);
+    assert(event_loop_release_fd(&app, fds[0]) == 0);
     app.connections[fds[0]] = NULL;
     free(conn);
     close(fds[0]);
@@ -205,7 +205,7 @@ static void test_noop_interest_changes_skip_the_kernel(void) {
     assert(event_loop_watch_write(&app, fds[0], conn) == 0);
     assert(conn->events_watched == EVENT_WRITE);
 
-    assert(event_loop_unwatch_all(&app, fds[0]) == 0);
+    assert(event_loop_release_fd(&app, fds[0]) == 0);
     app.connections[fds[0]] = NULL;
     free(conn);
     close(fds[0]);
@@ -240,7 +240,7 @@ static void test_readiness_is_level_triggered(void) {
         assert(count_events(events, n, fds[0], LOOP_EVENT_READ) == 0);  /* read interest was dropped */
     }
 
-    assert(event_loop_unwatch_all(&app, fds[0]) == 0);
+    assert(event_loop_release_fd(&app, fds[0]) == 0);
     app.connections[fds[0]] = NULL;
     free(conn);
     close(fds[0]);
@@ -264,7 +264,7 @@ static void test_reused_fd_gets_no_stale_events(void) {
     assert(count_events(events, n0, old_pair[0], LOOP_EVENT_READ) == 1);
 
     const int reused_fd = old_pair[0];
-    assert(event_loop_unwatch_all(&app, reused_fd) == 0); /* what connection_close does before close */
+    assert(event_loop_release_fd(&app, reused_fd) == 0); /* what connection_close does before close */
     app.connections[reused_fd] = NULL;
     free(old_conn);
     close(old_pair[0]);
@@ -283,11 +283,46 @@ static void test_reused_fd_gets_no_stale_events(void) {
     assert(count_events(events, n, new_fd, LOOP_EVENT_READ) == 0);  /* nothing was sent to it */
     assert(count_events(events, n, new_fd, LOOP_EVENT_ERROR) == 0);
 
-    assert(event_loop_unwatch_all(&app, new_fd) == 0);
+    assert(event_loop_release_fd(&app, new_fd) == 0);
     app.connections[new_fd] = NULL;
     free(new_conn);
     close(new_pair[0]);
     close(new_pair[1]);
+    app_destroy(&app);
+}
+
+/* release_fd runs right before close() in connection_close. kqueue and epoll leave the removal to
+ * close() (no syscall), so pending readiness is still reported until the close; io_uring removes its
+ * poll at once. After the close, no backend reports anything for the fd. */
+static void test_release_fd_leaves_removal_to_close(void) {
+    App app;
+    app_init(&app);
+    assert(event_loop_init(&app) == 0);
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    Connection *conn = register_fake_connection(&app, fds[0]);
+    assert(write(fds[1], "pending", 7) == 7);
+    assert(event_loop_watch_read(&app, fds[0], conn) == 0);
+    LoopEvent events[16];
+    int n = event_loop_poll(&app, events, 16, 200);
+    assert(count_events(events, n, fds[0], LOOP_EVENT_READ) == 1);
+
+    assert(event_loop_release_fd(&app, fds[0]) == 0);
+    assert(conn->events_watched == 0);
+    n = event_loop_poll(&app, events, 16, 100);
+    const int still_registered = strcmp(event_loop_backend_name(&app), "io_uring") != 0;
+    assert(count_events(events, n, fds[0], LOOP_EVENT_READ) == still_registered);
+
+    const int closed_fd = fds[0];
+    app.connections[closed_fd] = NULL;
+    free(conn);
+    close(fds[0]);
+    n = event_loop_poll(&app, events, 16, 100);
+    assert(n >= 0);
+    assert(count_events(events, n, closed_fd, LOOP_EVENT_READ) == 0);
+    assert(count_events(events, n, closed_fd, LOOP_EVENT_ERROR) == 0);
+
+    close(fds[1]);
     app_destroy(&app);
 }
 
@@ -352,6 +387,7 @@ static void run_contract_tests(void) {
     test_noop_interest_changes_skip_the_kernel();
     test_readiness_is_level_triggered();
     test_reused_fd_gets_no_stale_events();
+    test_release_fd_leaves_removal_to_close();
     test_event_loop_is_open();
 }
 

@@ -25,7 +25,7 @@ typedef struct EventLoopOps {
     int (*unwatch_read)(App *app, int fd);
     int (*watch_write)(App *app, int fd, void *udata);
     int (*unwatch_write)(App *app, int fd, void *udata);
-    int (*unwatch_all)(App *app, int fd);
+    int (*release_fd)(App *app, int fd);
     int (*arm_shutdown_timer)(App *app);
     int (*poll_events)(App *app, LoopEvent *out_events, int max_events, int timeout_ms);
 } EventLoopOps;

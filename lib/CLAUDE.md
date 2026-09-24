@@ -558,14 +558,20 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   interest change that matches what is already registered (a keep-alive response then costs no extra syscall or SQE:
   `flush_connection` drops write interest after every response even when it was never set). kqueue and epoll decide
   from the tracked `events_watched` bit alone, so a Connection's bits must never claim an interest the kernel lacks
-  (`connection_create` callocs them to 0; `unwatch_all` zeroes them). io_uring queues its SQEs and submits them once per
+  (`connection_create` callocs them to 0; `release_fd` zeroes them). io_uring queues its SQEs and submits them once per
   `event_loop_poll`, combined with the wait (`io_uring_submit_and_wait`).
+  **Releasing an fd.** `event_loop_release_fd` is only valid immediately before `close(fd)` (`connection_close` is its
+  one engine caller). kqueue and epoll make no syscall there: `close` drops the kqueue knotes, and drops the epoll
+  registration once the last reference to the open file goes. That holds because a client fd has no other reference
+  (`accept4` sets `FD_CLOEXEC`; SCM_RIGHTS fd passing exists only on macOS, where epoll-shim sits on kqueue). A handler
+  that `fork()`s without `exec` keeps the socket open in the child, so epoll could keep reporting it under a reused fd
+  number. io_uring still queues a poll removal, which the invariant below depends on.
   **io_uring stale completions.** Each poll's user_data is `(generation << 32) | (fd + 1)`, the generation taken from
   `App.poll_regs[fd]` (`PollRegistration`: `gen`, `mask`, `armed`) and bumped on every arm or removal. A completion whose
   generation is not the fd's current armed one - the kernel's `-ECANCELED` for a removed poll, readiness a removed poll
   reported first, or anything from a previous connection on a reused fd number - is dropped. Before this, the removed
   poll's `-ECANCELED` was reported as `LOOP_EVENT_ERROR` and closed every keep-alive connection after its first request
-  on Linux. Invariant: an fd is unwatched (`unwatch_all`) before it is closed - `connection_close` does so - or a reused
+  on Linux. Invariant: an fd is unwatched (`release_fd`) before it is closed - `connection_close` does so - or a reused
   fd number would inherit a stale "already armed" mask and never be polled.
   `event_loop_is_open(app)` is the only valid "is the loop up" test: `App.loop_fd` shares a union with the io_uring ring
   pointer and can read as negative while it is open (it did gate `app_stop`'s listen-socket unwatch and drain-deadline

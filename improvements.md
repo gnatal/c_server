@@ -38,7 +38,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **S9** | ~~Response header values silently truncated at 255 chars (CSP, `Location`)~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **P4** | ~~Cached static files are copied into the arena on every hit~~ **FIXED 2026-09-24** | Low–Medium | M | MEASURED |
 | **P5** | ~~`sendfile`/`writev` still not used for file bodies~~ **FIXED 2026-09-24** | Low–Medium | M | MEASURED |
-| **P6** | One unnecessary syscall per connection close (`unwatch_all` before `close`) | Low | S | CODE |
+| **P6** | ~~One unnecessary syscall per connection close (`unwatch_all` before `close`)~~ **FIXED 2026-09-24** | Low | S | CODE |
 | **M4** | Arena growth always copies (yyjson realloc, `res_write` doubling) | Low–Medium | S | CODE |
 | **M5** | Static cache: `./` aliases create duplicate entries; 64 MiB per worker | Low | S | CODE |
 | **M6** | A partial request always costs a full 8 KiB owned buffer | Low | S | CODE |
@@ -170,6 +170,11 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   which can carry the head in `hdtr`). Keep `read`/`write` as a fallback.
 
 ### P6 · One unnecessary syscall per connection close
+- **Status: FIXED 2026-09-24.** `event_loop_unwatch_all` is renamed `event_loop_release_fd` and documented as
+  "call immediately before `close(fd)`". On kqueue and epoll it only zeroes `events_watched` and leaves the removal to
+  `close`; io_uring still queues its poll removal. Test: `test_release_fd_leaves_removal_to_close` in
+  `tests/test_event_loop.c` (pending readiness is still reported after the release on kqueue/epoll, not on io_uring,
+  and on no backend after the close). Passes on kqueue (macOS) and on epoll and io_uring (Linux, Docker).
 - **Impact:** Low (larger for `Connection: close` or HTTP/1.0 traffic such as health checks)
 - **Effort:** S
 - **Where:** `lib/connection.c:142` → `lib/event_loop_kqueue.c:150` (`kevent(EV_DELETE × 2)`) /
