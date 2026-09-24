@@ -181,7 +181,7 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   Handlers get no chain and cannot call `chain_next` / `chain_error`. Code after `chain_next` sees the final `res->status`.
 - **Sub-routers.** `app_mount` copies routes (prefix prepended; `/` mounts at the bare prefix) and turns `router_use`
   middleware into prefix-scoped app middleware. The Router may be a stack local. No nesting.
-- **Static.** `app_serve_static` registers `GET <prefix>/*`, `realpath`s the root once (a missing root registers nothing and logs it, so every request under the prefix is a 404), refuses `..` (403), re-checks the
+- **Static.** `app_serve_static` registers `GET <prefix>/*`, `realpath`s the root once (a missing root registers nothing and logs it, so every request under the prefix is a 404), refuses `..` (403), answers 404 for any request segment starting with `.` (dotfiles like `.env`, `.git/config`; a dot-directory in the root path itself is fine), sends `X-Content-Type-Options: nosniff` on every answer, re-checks the
   resolved path stays under the root after symlink resolution (403), 404 for non-files, serves `index.html` for a directory,
   never lists. A file up to `STATIC_CACHE_MAX_ENTRY_BYTES` (256 KiB) is read whole and sent with `res_send_bytes` (and cached, below); a
   larger one (up to `MAX_STATIC_FILE_SIZE`, 50 MiB, else 500) goes through `res_send_file`, which streams it from an open fd in

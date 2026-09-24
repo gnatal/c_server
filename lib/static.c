@@ -46,6 +46,9 @@ int static_resolve_relative_path(const char *mount_pattern, const char *req_path
         if (strcmp(tok, "..") == 0) {
             return -1;
         }
+        if (tok[0] == '.') {
+            return -2; /* dotfile or dot-directory (.env, .git/config, .htpasswd): hidden, not forbidden */
+        }
         const size_t tok_len = strlen(tok);
         const size_t needed = tok_len + (wrote_any ? 1 : 0);
         if (offset + needed >= out_size) {
@@ -259,8 +262,17 @@ void static_cache_clear(void) {
 }
 
 void static_serve_file(const Route *route, const Request *req, Response *res) {
+    /* on every answer, so a browser never sniffs a served .txt or upload into HTML/script */
+    res_set_header(res, "X-Content-Type-Options", "nosniff");
+
     char subpath[PATH_MAX];
-    if (static_resolve_relative_path(route->path, req->path, subpath, sizeof(subpath)) != 0) {
+    const int resolved_rel = static_resolve_relative_path(route->path, req->path, subpath, sizeof(subpath));
+    if (resolved_rel == -2) {
+        res_status(res, 404);
+        res_send(res, "Not Found");
+        return;
+    }
+    if (resolved_rel != 0) {
         res_status(res, 403);
         res_send(res, "Forbidden");
         return;

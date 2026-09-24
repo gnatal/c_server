@@ -55,6 +55,23 @@ static void test_resolve_rejects_bare_mount_path(void) {
     assert(static_resolve_relative_path("/static/*", "/static/", out, sizeof(out)) == -1);
 }
 
+static void test_resolve_hides_dot_segments(void) {
+    char out[256];
+    assert(static_resolve_relative_path("/static/*", "/static/.env", out, sizeof(out)) == -2);
+    assert(static_resolve_relative_path("/static/*", "/static/.git/config", out, sizeof(out)) == -2);
+    assert(static_resolve_relative_path("/static/*", "/static/a/.htpasswd", out, sizeof(out)) == -2);
+    assert(static_resolve_relative_path("/static/*", "/static/a/.b/c.txt", out, sizeof(out)) == -2);
+    assert(static_resolve_relative_path("/static/*", "/static/./file.txt", out, sizeof(out)) == -2);
+    assert(static_resolve_relative_path("/static/*", "/static/..", out, sizeof(out)) == -1); /* still 403 */
+    /* a dot anywhere but a segment's first byte is an ordinary name */
+    assert(static_resolve_relative_path("/static/*", "/static/app.min.js", out, sizeof(out)) == 0);
+    assert(strcmp(out, "app.min.js") == 0);
+    assert(static_resolve_relative_path("/static/*", "/static/a./b.", out, sizeof(out)) == 0);
+    assert(strcmp(out, "a./b.") == 0);
+    /* a dot-directory above the mount is the root's business, not the request's */
+    assert(static_resolve_relative_path("/.well/*", "/.well/x.txt", out, sizeof(out)) == 0);
+}
+
 static void test_resolve_rejects_buffer_too_small(void) {
     char out[4];
     assert(static_resolve_relative_path("/static/*", "/static/css/app.css", out, sizeof(out)) == -1);
@@ -210,6 +227,49 @@ static void test_serve_missing_file_404(void) {
     assert(res.status == 404);
 
     free_conn(conn);
+    teardown_fixture(&fx);
+}
+
+/* .env and .git/config exist under the root and are still 404 - the same answer as a missing file, so
+ * their existence is not revealed. Every answer, 200 or not, carries nosniff. */
+static void test_serve_dotfiles_404(void) {
+    StaticFixture fx;
+    setup_fixture(&fx);
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof(path), "%s/.env", fx.root);
+    write_file(path, "SECRET_KEY=hunter2\n");
+    snprintf(path, sizeof(path), "%s/.git", fx.root);
+    assert(mkdir(path, 0755) == 0);
+    snprintf(path, sizeof(path), "%s/.git/config", fx.root);
+    write_file(path, "[core]\n");
+    Route route = make_static_route(&fx);
+
+    const char *hidden[] = {"/static/.env", "/static/.git/config", "/static/.git"};
+    for (size_t i = 0; i < sizeof(hidden) / sizeof(hidden[0]); i++) {
+        Request req = make_request(hidden[i]);
+        Connection *conn = make_conn();
+        Response res = { .conn = conn, .status = 0 };
+        static_serve_file(&route, &req, &res);
+        assert(res.status == 404);
+        assert(strstr(conn->out_buf, "SECRET_KEY") == NULL && strstr(conn->out_buf, "[core]") == NULL);
+        assert(strstr(conn->out_buf, "X-Content-Type-Options: nosniff\r\n") != NULL);
+        free_conn(conn);
+    }
+
+    Request req = make_request("/static/file.txt");
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+    static_serve_file(&route, &req, &res);
+    assert(res.status == 200);
+    assert(strstr(conn->out_buf, "X-Content-Type-Options: nosniff\r\n") != NULL);
+    free_conn(conn);
+
+    snprintf(path, sizeof(path), "%s/.git/config", fx.root);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/.git", fx.root);
+    rmdir(path);
+    snprintf(path, sizeof(path), "%s/.env", fx.root);
+    unlink(path);
     teardown_fixture(&fx);
 }
 
@@ -434,11 +494,13 @@ int main(void) {
     test_resolve_rejects_dotdot_at_end();
     test_resolve_rejects_path_outside_mount();
     test_resolve_rejects_bare_mount_path();
+    test_resolve_hides_dot_segments();
     test_resolve_rejects_buffer_too_small();
     test_mime_type_known_extensions();
     test_mime_type_defaults_to_octet_stream();
     test_serve_existing_file();
     test_serve_missing_file_404();
+    test_serve_dotfiles_404();
     test_serve_traversal_attempt_403();
     test_serve_symlink_escape_403();
     test_serve_directory_falls_back_to_index();

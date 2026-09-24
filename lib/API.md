@@ -28,7 +28,7 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `router_get_mw` / `router_post_mw` / `router_put_mw` / `router_patch_mw` / `router_delete_mw` / `router_head_mw` / `router_options_mw` `(Router *, path, Handler, const Middleware *, int count)` — same with per-route middleware.
 - `router_add_route(Router *, method, path, Handler)`, `router_add_route_mw(...)` — generic forms.
 - `app_mount(App *, prefix, const Router *)` — copy a router's routes and middleware into the app under a prefix.
-- `app_serve_static(App *, prefix, root_dir)` — serve files from a directory (traversal-safe; the root is resolved against the working directory).
+- `app_serve_static(App *, prefix, root_dir)` — serve files from a directory (traversal-safe; dotfiles are 404; `nosniff` on every answer; the root is resolved against the working directory).
 - `app_use_body_limit(App *, prefix, max_bytes)` — 413 for a body over `max_bytes` on paths under `prefix` (matched on the canonical path, so `?query`, `//` and `%XX` don't dodge it; clamped to `MAX_BODY_SIZE`). A declared `Content-Length` is refused before buffering; a chunked body once its chunks decode past the limit. `app_body_limit_for_path(const App *, path)` / `app_body_limit_for_target(const App *, target, len)` — the effective cap for a canonical path / a raw request-target (engine/tests).
 - `match_route(const App *, Request *)`, `match_path(pattern, path, Request *)`, `match_route_allowed_methods(...)` — matching (engine/tests).
 - `app_free_routes(App *)` — free the route trees (engine: `app_destroy` calls it).

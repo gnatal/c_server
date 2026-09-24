@@ -22,7 +22,9 @@
  * prefix, a remainder that resolves to nothing (a request for the mount
  * root itself, which a trailing "*" route never matches anyway - see
  * "Behavior reference, Routing", lib/CLAUDE.md), or a sanitized result that doesn't fit
- * out_size. On success (0), out holds the relative path (no leading slash)
+ * out_size. Returns -2 for a segment starting with '.' (".env", ".git/config",
+ * "a/.htpasswd"): dotfiles are never served, the serve-static default.
+ * On success (0), out holds the relative path (no leading slash)
  * to join onto the mount's root directory.
  */
 int static_resolve_relative_path(const char *mount_pattern, const char *req_path, char *out, size_t out_size);
@@ -41,11 +43,14 @@ const char *static_mime_type(const char *path);
  *   - 403 if static_resolve_relative_path rejects the path, or if the path
  *     resolves (via realpath) to somewhere outside static_root even after
  *     that check passes (a symlink escape).
+ *   - 404 for any path segment starting with '.' (static_resolve_relative_path's -2),
+ *     whether or not the file exists, so a dotfile's existence is not revealed.
  *   - 404 if nothing exists there, or if it resolves to a directory with no
  *     index.html inside it, or to something that isn't a regular file
  *     (device node, FIFO, ...). There is no directory listing.
  *   - 500 if the file exceeds MAX_STATIC_FILE_SIZE (app_types.h) or a read
  *     fails partway through.
+ *   - Every answer carries X-Content-Type-Options: nosniff.
  *   - 200 with a Content-Type from static_mime_type otherwise. A file up to
  *     STATIC_CACHE_MAX_ENTRY_BYTES is read whole and sent with res_send_bytes
  *     (not res_send: a served file can contain embedded NUL bytes); a larger

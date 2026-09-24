@@ -26,7 +26,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **S2** | ~~`app_use_body_limit` is bypassed by a query string, encoding, `//`, or chunked encoding~~ **FIXED 2026-09-23** | High | S | MEASURED |
 | **M2** | ~~Large static files: whole file read and copied twice; slow readers pin the full size each~~ **FIXED 2026-09-23** | High (memory DoS) | S | MEASURED |
 | **S3** | ~~Chunk-size parsing accepts `0x5`, `+5` and ` 5` (request smuggling behind a proxy)~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
-| **S4** | Static mounts serve dotfiles (`.env`, `.git/config`) | Medium | S | MEASURED |
+| **S4** | ~~Static mounts serve dotfiles (`.env`, `.git/config`)~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
 | **S5** | Multipart: quoted parameters parsed wrongly; `filename` returned with `../` | Medium | S | MEASURED |
 | **S6** | Server always binds `0.0.0.0`, so a proxy-only deployment is exposed directly | Medium | S | CODE |
 | **P1** | epoll issues one wasted `epoll_ctl` per keep-alive request | Medium (~25% of syscalls) | S | MEASURED |
@@ -334,6 +334,10 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   and the fuzzer seeds.
 
 ### S4 · Static mounts serve dotfiles
+- **Status: FIXED 2026-09-24.** `static_resolve_relative_path` (`lib/static.c`) returns `-2` for any request segment
+  starting with `.`, and `static_serve_file` answers it 404 (same as a missing file; `..` stays 403). Every static answer
+  now carries `X-Content-Type-Options: nosniff`. Tests: `test_resolve_hides_dot_segments` and `test_serve_dotfiles_404`
+  (`tests/test_static.c`), which fail on the old code. Not done: an opt-in for `.well-known`.
 - **Impact:** Medium. `.env`, `.git/`, `.htpasswd` and editor swap files are served if they exist under the root.
   Deny-by-default (`CLAUDE.md`) suggests these should be 404.
 - **Effort:** S
