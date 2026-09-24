@@ -180,6 +180,39 @@ static void test_interest_changes_are_never_errors(void) {
     app_destroy(&app);
 }
 
+/* A watch/unwatch that would not change the tracked interest set must not reach the kernel: every
+ * keep-alive response calls unwatch_write with write never armed. The fd is tracked but was never
+ * registered, so any syscall fails with ENOENT (-1 returned) where the skipped no-op returns 0. */
+static void test_noop_interest_changes_skip_the_kernel(void) {
+    App app;
+    app_init(&app);
+    assert(event_loop_init(&app) == 0);
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    Connection *conn = register_fake_connection(&app, fds[0]);
+
+    assert(event_loop_unwatch_write(&app, fds[0], conn) == 0); /* nothing watched */
+    assert(event_loop_unwatch_read(&app, fds[0]) == 0);
+    assert(conn->events_watched == 0);
+
+    conn->events_watched = EVENT_READ; /* tracked as read-only, unknown to the kernel */
+    assert(event_loop_unwatch_write(&app, fds[0], conn) == 0);
+    assert(event_loop_watch_read(&app, fds[0], conn) == 0);
+    assert(conn->events_watched == EVENT_READ);
+
+    conn->events_watched = EVENT_WRITE; /* tracked as write-only, unknown to the kernel */
+    assert(event_loop_unwatch_read(&app, fds[0]) == 0);
+    assert(event_loop_watch_write(&app, fds[0], conn) == 0);
+    assert(conn->events_watched == EVENT_WRITE);
+
+    assert(event_loop_unwatch_all(&app, fds[0]) == 0);
+    app.connections[fds[0]] = NULL;
+    free(conn);
+    close(fds[0]);
+    close(fds[1]);
+    app_destroy(&app);
+}
+
 /* connection.c assumes level-triggered readiness: it serves one request and returns, expecting to be
  * called again while unread bytes remain, and yields a still-writable socket expecting a write event
  * next turn. Readiness left in place must be reported again on every poll. */
@@ -311,6 +344,7 @@ static void run_contract_tests(void) {
     test_event_loop_watch_read_write();
     test_event_loop_shutdown_timer_arm();
     test_interest_changes_are_never_errors();
+    test_noop_interest_changes_skip_the_kernel();
     test_readiness_is_level_triggered();
     test_reused_fd_gets_no_stale_events();
     test_event_loop_is_open();

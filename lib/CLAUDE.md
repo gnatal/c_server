@@ -496,10 +496,11 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   that is already writable and rely on it firing. kqueue (default filters) and epoll (no `EPOLLET`) are level-triggered
   natively. io_uring polls fire on wakeups (edge), so `event_loop_io_uring.c` arms **one-shot** polls and re-arms each
   one right after its event (arming re-checks readiness, so a condition still true fires again next turn) - never
-  multishot. `tests/test_event_loop.c` checks this contract on all three backends. kqueue and io_uring skip an
+  multishot. `tests/test_event_loop.c` checks this contract on all three backends. All three backends skip an
   interest change that matches what is already registered (a keep-alive response then costs no extra syscall or SQE:
-  `flush_connection` drops write interest after every response even when it was never set); epoll still issues an
-  `epoll_ctl` for every `watch_*` / `unwatch_*` (epoll half open). io_uring queues its SQEs and submits them once per
+  `flush_connection` drops write interest after every response even when it was never set). kqueue and epoll decide
+  from the tracked `events_watched` bit alone, so a Connection's bits must never claim an interest the kernel lacks
+  (`connection_create` callocs them to 0; `unwatch_all` zeroes them). io_uring queues its SQEs and submits them once per
   `event_loop_poll`, combined with the wait (`io_uring_submit_and_wait`).
   **io_uring stale completions.** Each poll's user_data is `(generation << 32) | (fd + 1)`, the generation taken from
   `App.poll_regs[fd]` (`PollRegistration`: `gen`, `mask`, `armed`) and bumped on every arm or removal. A completion whose
@@ -568,7 +569,7 @@ this update). What to keep:
 - A Patricia node's static `children` stay sorted; find/insert through `find_child` (binary search), not a linear scan ("Behavior reference, Routing" above).
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
 - Allocate per-request data from `conn->arena`, not `malloc`. Emit JSON through yyjson with `arena_yyjson_alc`.
-- No syscall on a path that changes nothing (`events_watched`; enforced on kqueue only, see Event loop).
+- No syscall on a path that changes nothing (`events_watched`; enforced on every backend, see Event loop).
 Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
 `make fuzz` (mutation fuzzer over parser/router/response, then an end-to-end "every input is answered or closed" check through the real connection code), `make check-docs`. Run sanitizers and fuzz after touching
 `http_parser.c`, `router.c`, `response.c` or `arena.c`. The Makefile tracks header dependencies (`-MMD`).

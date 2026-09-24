@@ -164,6 +164,10 @@ static int epoll_watch_read(App *app, int fd, void *udata) {
         conn = app->connections[fd];
     }
 
+    if (conn != NULL && (conn->events_watched & EVENT_READ)) {
+        return 0; /* already registered: no epoll_ctl */
+    }
+
     int op = EPOLL_CTL_ADD;
     uint32_t events = EPOLLIN;
     if (conn != NULL) {
@@ -202,6 +206,9 @@ static int epoll_unwatch_read(App *app, int fd) {
     }
 
     Connection *conn = (fd < app->connections_cap && app->connections != NULL) ? app->connections[fd] : NULL;
+    if (conn != NULL && !(conn->events_watched & EVENT_READ)) {
+        return 0; /* not registered for read: no epoll_ctl */
+    }
     if (conn != NULL) {
         conn->events_watched &= ~EVENT_READ;
         if (conn->events_watched == 0) {
@@ -226,6 +233,10 @@ static int epoll_watch_write(App *app, int fd, void *udata) {
     Connection *conn = (Connection *)udata;
     if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
         conn = app->connections[fd];
+    }
+
+    if (conn != NULL && (conn->events_watched & EVENT_WRITE)) {
+        return 0; /* already registered: no epoll_ctl */
     }
 
     int op = EPOLL_CTL_ADD;
@@ -270,6 +281,11 @@ static int epoll_unwatch_write(App *app, int fd, void *udata) {
         conn = app->connections[fd];
     }
 
+    /* flush_connection unwatches write after every keep-alive response, usually with write never
+     * armed: skipping that no-op removed one epoll_ctl of the four syscalls per request. */
+    if (conn != NULL && !(conn->events_watched & EVENT_WRITE)) {
+        return 0;
+    }
     if (conn != NULL) {
         conn->events_watched &= ~EVENT_WRITE;
         if (conn->events_watched == 0) {

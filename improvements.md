@@ -29,7 +29,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **S4** | ~~Static mounts serve dotfiles (`.env`, `.git/config`)~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
 | **S5** | ~~Multipart: quoted parameters parsed wrongly; `filename` returned with `../`~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
 | **S6** | Server always binds `0.0.0.0`, so a proxy-only deployment is exposed directly | Medium | S | CODE |
-| **P1** | epoll issues one wasted `epoll_ctl` per keep-alive request | Medium (~25% of syscalls) | S | MEASURED |
+| **P1** | ~~epoll issues one wasted `epoll_ctl` per keep-alive request~~ **FIXED 2026-09-24** | Medium (~25% of syscalls) | S | MEASURED |
 | **P2** | io_uring is the Linux default but is 20–25% slower than epoll | Medium | S | MEASURED (`lib/CLAUDE.md`) |
 | **P3** | Incomplete headers are re-parsed from byte 0 on every `recv` (quadratic) | Medium (CPU DoS amplifier) | S–M | MEASURED |
 | **M3** | No per-worker memory budget for buffered bodies and unsent output | Medium | M | CODE |
@@ -56,6 +56,11 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
 ## P — Performance
 
 ### P1 · epoll issues a wasted `epoll_ctl` on every keep-alive response
+- **Status: FIXED 2026-09-24.** `epoll_watch_read`/`epoll_watch_write` return 0 when the bit is already set and
+  `epoll_unwatch_read`/`epoll_unwatch_write` when it is already clear (tracked connections only; untracked fds still
+  reach `epoll_ctl`), matching kqueue. Test: `test_noop_interest_changes_skip_the_kernel` (`tests/test_event_loop.c`,
+  runs on every backend; on epoll via `make test_epoll`) tracks an fd the kernel never saw, so any `epoll_ctl` fails
+  with `ENOENT`; it fails on the old code. The strace syscall count was not re-measured on Linux.
 - **Impact:** Medium. About 1 of 4 syscalls per request on the Linux backend that measured fastest.
 - **Effort:** S
 - **Where:** `lib/event_loop_epoll.c:263` (`epoll_unwatch_write`), called unconditionally by `flush_connection`'s
