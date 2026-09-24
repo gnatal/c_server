@@ -91,7 +91,8 @@ void res_set_trailer(Response *res, const char *name, const char *value);
 void res_end(Response *res);
 
 /*
- * Streams a file from disk in STREAM_CHUNK_SIZE pieces without loading it into memory. Sends
+ * Streams a file from disk without loading it into memory: sendfile(2) from the page cache (pread +
+ * write in STREAM_CHUNK_SIZE pieces where sendfile cannot serve the fd). Sends
  * Content-Length and `content_type`. Returns 0, or -1 if the file cannot be opened or is not a regular
  * file (nothing has been sent: respond with an error yourself). Caller must have validated `filepath`
  * (this does no traversal checking; use app_serve_static for untrusted paths).

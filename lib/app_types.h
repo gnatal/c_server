@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#include <sys/types.h>
 #include <limits.h>
 #include "arena.h"
 #include "vendor/picohttpparser/picohttpparser.h"
@@ -377,9 +378,16 @@ typedef struct Connection {
      * its arena and out_buf forever. Reset to 0 once a keep-alive response is fully queued. */
     time_t last_write_progress;
 
-    /* File streaming (res_send_file): >= 0 while flush_connection streams file_remaining bytes from disk. */
+    /* File streaming (res_send_file): >= 0 while flush_connection streams file_remaining bytes from disk,
+     * starting at file_offset (the fd's own position is never used). The body goes out with sendfile(2)
+     * straight from the page cache - no stream_buf, no copy through user memory; on macOS the response
+     * head rides in the same call. file_no_sendfile is set once sendfile reports it cannot serve this
+     * fd pair (ENOSYS/EINVAL/ENOTSOCK/EOPNOTSUPP before any byte): the rest then goes pread ->
+     * stream_buf -> write, STREAM_CHUNK_SIZE per step. res_send_file resets both. */
     int file_fd;
     size_t file_remaining;
+    off_t file_offset;
+    int file_no_sendfile;
 
     /* Producer streaming (res_stream): stream_fn != NULL from res_stream until STREAM_END/STREAM_ABORT
      * or close. flush_connection calls stream_fn(writer over stream_buf, stream_ctx) each time out_buf has

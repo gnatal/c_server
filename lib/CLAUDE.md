@@ -82,7 +82,8 @@ be freed by then) exactly once, right after each dispatch-and-flush cycle they r
 `flush_connection` has already copied any still-unsent response tail out to a connection-owned buffer if it
 couldn't fully drain in that same cycle (see `Connection.out_buf_owned`), so nothing any connection still needs
 is ever left in the shared arena when another connection's turn begins. File streaming (`res_send_file`) never
-touches the shared arena at all: each chunk is read into `Connection.stream_buf` (shared with `res_stream` producers), a connection-owned buffer
+touches the shared arena at all: the body goes out with `sendfile(2)` from the page cache, no user-space buffer; only the
+`pread` fallback (below) reads chunks into `Connection.stream_buf` (shared with `res_stream` producers), a connection-owned buffer
 malloc'd lazily on first use and reused turn to turn, precisely because a large file spans many event-loop turns
 during which other connections' dispatches would otherwise reuse and overwrite an arena-resident chunk buffer.
 Measured on macOS, 5,000 idle keep-alive connections on one worker now take about 8.2 KB RSS per connection (about
@@ -140,7 +141,7 @@ and `res_send_file` never copies the body into the arena either (see above).
 | `conn->in_buf` (NULL while nothing is buffered) | not allocated while it borrows `App.read_buf` (during one `handle_readable`); owned copy: `stop_borrowing_read_buf` (unserved bytes left at the end of `handle_readable`) or `grow_in_buf` (a body past `BUF_SIZE`; realloc on further growth) | the owned copy: `flush_connection`'s keep-alive reset once nothing is buffered, or `connection_close`. The borrowed `App.read_buf`: never through `conn` |
 | `App.read_buf` (`BUF_SIZE`, one per worker process) | `app_init` | `app_destroy` |
 | `conn->arena` | not allocated - always `&app->arena`, set once at `connection_create` | nobody frees it through `conn`; `app_destroy` frees the one underlying `App.arena` after every connection is already closed |
-| `conn->stream_buf` (a connection-owned `STREAM_CHUNK_SIZE` turn buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response or the first producer call of a `res_stream` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
+| `conn->stream_buf` (a connection-owned `STREAM_CHUNK_SIZE` turn buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response on the `pread` fallback (`file_no_sendfile`; never on the `sendfile` path) or the first producer call of a `res_stream` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
 | `conn->stream_ctx` (the application's producer state, handed over by `res_stream`) | the handler (application code), before `res_stream` | `stream_release` (`response.c`) calls `stream_ctx_free(ctx)` exactly once: after `STREAM_END` (in `flush_connection`), on `STREAM_ABORT` or any close (`connection_close`), when a later `res_*` in the same handler replaces the stream, or inside `res_stream` for HEAD. If `res_stream` returns -1 the caller still owns it |
 | Arena fallback blocks | `arena_alloc` when the buffer is full | `arena_reset` (each dispatch-and-flush cycle, in `handle_readable`/`reject_request`) or `arena_destroy` (`app_destroy`) |
 | `Request.body` | engine path (`parse_http_request_in_place`): not allocated - a view into `conn->in_buf`; `parse_http_request`/`_from_head` (tests, tools): copied into the arena. Always non-NULL after success | nobody: the input buffer's own lifecycle or the arena. Handlers never free it or keep it |
@@ -209,10 +210,19 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   middleware into prefix-scoped app middleware. The Router may be a stack local. No nesting.
 - **Static.** `app_serve_static` registers `GET <prefix>/*`, `realpath`s the root once (a missing root registers nothing and logs it, so every request under the prefix is a 404), refuses `..` (403), answers 404 for any request segment starting with `.` (dotfiles like `.env`, `.git/config`; a dot-directory in the root path itself is fine), sends `X-Content-Type-Options: nosniff` on every answer, re-checks the
   resolved path stays under the root after symlink resolution (403), 404 for non-files, serves `index.html` for a directory,
-  never lists. A file up to `STATIC_CACHE_MAX_ENTRY_BYTES` (256 KiB) is read whole and sent with `res_send_bytes` (and cached, below); a
-  larger one (up to `MAX_STATIC_FILE_SIZE`, 50 MiB, else 500) goes through `res_send_file`, which streams it from an open fd in
-  `STREAM_CHUNK_SIZE` pieces through `conn->stream_buf` - never read whole, never in the arena, so a slow reader costs 16 KiB,
-  not the file size, and the event loop never blocks on one big `fread`. MEASURED with a 40 MiB file: RSS 1.5 MB after one
+  never lists. A file up to `STATIC_CACHE_MAX_ENTRY_BYTES` (256 KiB) is read whole and sent with `res_send_shared` (and cached, below); a
+  larger one (up to `MAX_STATIC_FILE_SIZE`, 50 MiB, else 500) goes through `res_send_file`, which streams it from an open fd
+  with `sendfile(2)` - never read whole, never in the arena, no user-space copy, so a slow reader costs an fd, not the file
+  size, and the event loop never blocks on one big `fread`.
+  **File bodies (`flush_connection`).** `sendfile` from `Connection.file_offset` (the fd position is never used), at most
+  `4 * STREAM_CHUNK_SIZE` per call and per turn (the same fairness yield as before). macOS carries the unsent response head
+  in the same call (`hdtr`; its `len` counts head bytes both ways), so head + first file bytes are one syscall; Linux
+  writes the head with `write` first. `EAGAIN` copies only the unsent head out of the arena (`keep_unsent_and_wait`,
+  shared with the `writev` path). No error and no file bytes means the file shrank below its `Content-Length` →
+  close (not a spin). `ENOSYS`/`EINVAL`/`ENOTSOCK`/`EOPNOTSUPP` before any byte sets `file_no_sendfile`: the rest goes
+  `pread` (at `file_offset`) → `stream_buf` → `write`, `STREAM_CHUNK_SIZE` per step - also the only path on platforms
+  other than Linux and macOS. MEASURED (macOS, loopback, 50 × 40 MiB curl downloads): server CPU 0.55 s → 0.30 s,
+  wall 0.92 s → 0.67 s, against the same build with `sendfile` forced off. MEASURED with a 40 MiB file: RSS 1.5 MB after one
   download and 1.7 MB during ten 20 KiB/s downloads (was 83 MB and 452 MB). The root is resolved against the process's working directory.
   **File cache.** `static_serve_file` caches files up to `STATIC_CACHE_MAX_ENTRY_BYTES` after their first read, keyed by
   the pre-`realpath` candidate path (`static_root` + the already-traversal-checked subpath), not the resolved one - MEASURED
@@ -644,11 +654,9 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
   `-c1000`), on epoll and io_uring alike, with max latency in milliseconds and none on macOS/kqueue. Same size either
   backend, so not an engine-backend defect; not explained (see `improvements.md`).
 - No HTTP/2, compression, `Range`, or WebSocket. `Expect` values other than `100-continue` are ignored (no `417`).
-- **`res_send_file` and large (uncached) static files are still not optimized** (`improvements.md`, the static-file item's other sub-items,
-  not addressed by the static-file cache above): the response head and the file body still go out as separate `write`
-  calls (no single buffer / `writev`), and large files are read with plain `read`/`write` in `STREAM_CHUNK_SIZE` pieces
-  rather than `sendfile(2)`. The write-stall deadline fires only on zero progress, so a client reading a large file a
-  byte at a time holds its fd and 16 KiB `stream_buf` indefinitely (no minimum-rate rule). No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.
+- **File bodies on Linux still send the head in its own `write`** before `sendfile` (no `MSG_MORE`/`TCP_CORK`); macOS
+  carries it in the `sendfile` call. The write-stall deadline fires only on zero progress, so a client reading a large file a
+  byte at a time holds its fd indefinitely (no minimum-rate rule). No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.
 
 ## Where to change what
 Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`. Change producer streaming (`res_stream`, parking, waking) → `response.c` + `connection.c` (`flush_connection`, `park_stream`/`resume_stream`, `watch_stream_peer`) + `tests/test_stream.c`. Add a parser feature → `http_parser.c/h` +

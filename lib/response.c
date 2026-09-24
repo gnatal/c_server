@@ -637,6 +637,8 @@ int res_send_file(Response *res, const char *content_type, const char *filepath)
     } else {
         res->conn->file_fd = fd;
         res->conn->file_remaining = (size_t)st.st_size;
+        res->conn->file_offset = 0;
+        res->conn->file_no_sendfile = 0;
     }
     return 0;
 }

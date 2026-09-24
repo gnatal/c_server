@@ -8,6 +8,9 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#if defined(__linux__)
+#include <sys/sendfile.h>
+#endif
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -30,6 +33,64 @@ static ssize_t conn_write(Connection *conn, const void *buf, size_t count) {
 
 static ssize_t conn_writev(Connection *conn, const struct iovec *iov, int iovcnt) {
     return writev(conn->fd, iov, iovcnt);
+}
+
+/*
+ * Sends up to `count` bytes of conn->file_fd from conn->file_offset straight from the page cache
+ * (sendfile(2): no read into user memory). macOS also carries head[0..head_len) in front of the file
+ * bytes in the same call (hdtr); on Linux head_len must be 0 (the head goes out through conn_write
+ * first). *sent = bytes the socket accepted, head bytes first. Returns 0, or -1 with errno set - macOS
+ * can report EAGAIN with *sent > 0 (a partial send). The file position is never used or moved.
+ * Platforms without sendfile fail with ENOSYS, which flush_connection treats as "fall back to pread".
+ */
+#if defined(__APPLE__)
+#define SENDFILE_CARRIES_HEAD 1
+#else
+#define SENDFILE_CARRIES_HEAD 0
+#endif
+
+static int conn_sendfile(Connection *conn, const char *head, const size_t head_len, const size_t count,
+                         size_t *sent) {
+#if defined(__APPLE__)
+    struct iovec head_iov = { (void *)head, head_len };
+    struct sf_hdtr hdtr = { &head_iov, 1, NULL, 0 };
+    /* in: head + file bytes wanted (macOS counts hdtr bytes in len both ways; count is never 0 here,
+     * 0 would mean "to EOF"); out: all bytes sent, head first */
+    off_t len = (off_t)(head_len + count);
+    const int rc = sendfile(conn->file_fd, conn->fd, conn->file_offset, &len, head_len > 0 ? &hdtr : NULL, 0);
+    *sent = len > 0 ? (size_t)len : 0;
+    return rc == 0 ? 0 : -1;
+#elif defined(__linux__)
+    (void)head;
+    (void)head_len;
+    off_t off = conn->file_offset;
+    const ssize_t n = sendfile(conn->fd, conn->file_fd, &off, count);
+    *sent = n > 0 ? (size_t)n : 0;
+    return n < 0 ? -1 : 0;
+#else
+    (void)conn;
+    (void)head;
+    (void)head_len;
+    (void)count;
+    *sent = 0;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+/* errno values meaning "sendfile cannot serve this fd pair", not "the connection failed". */
+static int sendfile_unsupported(const int err) {
+    return err == ENOSYS || err == EINVAL || err == ENOTSOCK || err == EOPNOTSUPP
+#if defined(ENOTSUP) && ENOTSUP != EOPNOTSUPP
+           || err == ENOTSUP
+#endif
+        ;
+}
+
+/* 1 while the file body goes out through sendfile (not the pread fallback) and, on macOS, the unsent head
+ * rides in front of it in the same call instead of its own write. */
+static int head_rides_sendfile(const Connection *conn) {
+    return SENDFILE_CARRIES_HEAD && conn->file_fd >= 0 && conn->file_remaining > 0 && !conn->file_no_sendfile;
 }
 
 /* Bytes of conn's shared_body not yet written (0 when none is pinned). */
@@ -586,6 +647,58 @@ static void release_in_buf(App *app, Connection *conn) {
     sync_held_bytes(app, conn);
 }
 
+/*
+ * The socket is full (EAGAIN) mid-response: return to the event loop until it is writable again.
+ * out_buf is shared-arena-resident unless it's already a connection-owned copy (out_buf_owned) or the
+ * file-streaming chunk buffer (out_buf == stream_buf, never arena to begin with - see stream_buf's own
+ * comment). Returning now would let another connection's dispatch reset and reuse the shared arena
+ * before this response finishes draining, so its unsent part is copied out first; with nothing unsent,
+ * out_buf just stops pointing into the arena. A shared_body or a file is not copied: this connection's
+ * reference / fd keeps it. FLUSH_PENDING, or FLUSH_CLOSED (over budget or out of memory).
+ */
+static int keep_unsent_and_wait(App *app, Connection *conn) {
+    if (conn->out_buf != NULL && !conn->out_buf_owned && conn->out_buf != conn->stream_buf) {
+        const size_t out_left = conn->out_len - conn->out_sent;
+        if (!budget_allows(app, out_left + shared_body_left(conn))) {
+            /* over the worker's buffered-memory budget: this client is the one that just
+             * stopped reading, so it is dropped rather than every other connection. */
+            connection_close(app, conn);
+            return FLUSH_CLOSED;
+        }
+        char *tail = NULL;
+        if (out_left > 0) {
+            tail = malloc(out_left); /* freed once drained (flush_connection) or by connection_close */
+            if (tail == NULL) {
+                connection_close(app, conn);
+                return FLUSH_CLOSED;
+            }
+            memcpy(tail, conn->out_buf + conn->out_sent, out_left);
+        }
+        conn->out_buf = tail;
+        conn->out_len = out_left;
+        conn->out_sent = 0;
+        conn->out_cap = out_left;
+        conn->out_buf_owned = tail != NULL;
+    }
+    wait_for_writable(app, conn);
+    return FLUSH_PENDING;
+}
+
+/* out_buf is fully written and a file body follows: drop it (free a tail copy; an arena one is just
+ * forgotten) so nothing points into the arena across turns and no owned copy leaks. */
+static void release_drained_out_buf(Connection *conn) {
+    if (conn->out_buf_owned) {
+        free(conn->out_buf);
+        conn->out_buf_owned = 0;
+    }
+    if (conn->out_buf != conn->stream_buf) {
+        conn->out_buf = NULL;
+        conn->out_len = 0;
+        conn->out_sent = 0;
+        conn->out_cap = 0;
+    }
+}
+
 int flush_connection(App *app, Connection *conn) {
     size_t bytes_written_this_flush = 0;
     const size_t max_flush_bytes = 4 * STREAM_CHUNK_SIZE;
@@ -600,7 +713,7 @@ int flush_connection(App *app, Connection *conn) {
     while (1) {
         /* out_buf first, then a pinned shared_body (res_send_shared) straight from its bytes: one writev
          * for both, so a cached static file costs one syscall and no copy of its body. */
-        while (conn->out_sent < conn->out_len || conn->shared_body != NULL) {
+        while ((conn->out_sent < conn->out_len && !head_rides_sendfile(conn)) || conn->shared_body != NULL) {
             const size_t out_left = conn->out_len - conn->out_sent;
             ssize_t n;
             if (conn->shared_body == NULL) {
@@ -620,38 +733,7 @@ int flush_connection(App *app, Connection *conn) {
             }
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* out_buf is shared-arena-resident unless it's already a connection-owned
-                     * copy (out_buf_owned) or the file-streaming chunk buffer (out_buf == stream_buf,
-                     * never arena to begin with - see stream_buf's own comment). Returning to the event
-                     * loop now would let another connection's dispatch reset and reuse the shared
-                     * arena before this response finishes draining, so copy what's left out first.
-                     * A shared_body is not copied: this connection's reference keeps it alive. */
-                    if (conn->out_buf != NULL && !conn->out_buf_owned && conn->out_buf != conn->stream_buf) {
-                        if (!budget_allows(app, out_left + shared_body_left(conn))) {
-                            /* over the worker's buffered-memory budget: this client is the one that just
-                             * stopped reading, so it is dropped rather than every other connection. */
-                            connection_close(app, conn);
-                            return FLUSH_CLOSED;
-                        }
-                        char *tail = NULL;
-                        if (out_left > 0) {
-                            tail = malloc(out_left);
-                            if (tail == NULL) {
-                                connection_close(app, conn);
-                                return FLUSH_CLOSED;
-                            }
-                            memcpy(tail, conn->out_buf + conn->out_sent, out_left);
-                        }
-                        /* out_left == 0 (head sent, shared_body still pending): nothing arena-resident is
-                         * needed any more, so out_buf just stops pointing into the arena */
-                        conn->out_buf = tail;
-                        conn->out_len = out_left;
-                        conn->out_sent = 0;
-                        conn->out_cap = out_left;
-                        conn->out_buf_owned = tail != NULL;
-                    }
-                    wait_for_writable(app, conn);
-                    return FLUSH_PENDING;
+                    return keep_unsent_and_wait(app, conn);
                 }
                 connection_close(app, conn);
                 return FLUSH_CLOSED;
@@ -669,8 +751,53 @@ int flush_connection(App *app, Connection *conn) {
             bytes_written_this_flush += (size_t)n;
         }
 
-        /* The current out_buf has been fully drained to the socket */
+        /* The current out_buf has been fully drained to the socket (or, on macOS, rides in front of the
+         * file in the sendfile call below) */
         if (conn->file_fd >= 0) {
+            if (conn->file_remaining > 0 && !conn->file_no_sendfile) {
+                const size_t head_left = conn->out_len - conn->out_sent; /* > 0 only when it rides sendfile */
+                if (head_left == 0) {
+                    release_drained_out_buf(conn);
+                }
+                if (bytes_written_this_flush >= max_flush_bytes) {
+                    wait_for_writable(app, conn); /* same fairness yield as the pread path below */
+                    return FLUSH_PENDING;
+                }
+                const size_t want = conn->file_remaining < max_flush_bytes ? conn->file_remaining : max_flush_bytes;
+                size_t sent = 0;
+                const int rc = conn_sendfile(conn, head_left > 0 ? conn->out_buf + conn->out_sent : NULL,
+                                             head_left, want, &sent);
+                const int err = rc != 0 ? errno : 0;
+                const int blocked = err == EAGAIN || err == EWOULDBLOCK;
+                if (rc != 0 && !blocked) {
+                    if (sent == 0 && sendfile_unsupported(err)) {
+                        conn->file_no_sendfile = 1; /* this fd pair: pread + write from here on */
+                        continue;
+                    }
+                    connection_close(app, conn);
+                    return FLUSH_CLOSED;
+                }
+                const size_t head_part = sent < head_left ? sent : head_left;
+                const size_t file_part = sent - head_part;
+                conn->out_sent += head_part;
+                conn->file_offset += (off_t)file_part;
+                conn->file_remaining -= file_part;
+                if (sent > 0) {
+                    conn->last_activity = time(NULL);
+                    conn->last_write_progress = conn->last_activity;
+                    bytes_written_this_flush += sent;
+                }
+                if (blocked) {
+                    return keep_unsent_and_wait(app, conn);
+                }
+                if (file_part == 0) {
+                    /* no error, no file bytes: the file shrank since res_send_file's fstat (EOF) - the
+                     * promised Content-Length can no longer be met, so end the connection */
+                    connection_close(app, conn);
+                    return FLUSH_CLOSED;
+                }
+                continue;
+            }
             if (conn->file_remaining > 0) {
                 if (bytes_written_this_flush >= max_flush_bytes) {
                     /* Yield to event loop to share bandwidth fairly */
@@ -699,7 +826,9 @@ int flush_connection(App *app, Connection *conn) {
                     }
                 }
                 conn->out_buf = conn->stream_buf;
-                ssize_t r = read(conn->file_fd, conn->out_buf, to_read);
+                /* pread at file_offset: the sendfile path (which may have run first) never moves the
+                 * file position */
+                ssize_t r = pread(conn->file_fd, conn->out_buf, to_read, conn->file_offset);
                 if (r <= 0) {
                     connection_close(app, conn);
                     return FLUSH_CLOSED;
@@ -707,11 +836,13 @@ int flush_connection(App *app, Connection *conn) {
                 conn->out_len = (size_t)r;
                 conn->out_sent = 0;
                 conn->out_cap = STREAM_CHUNK_SIZE;
+                conn->file_offset += (off_t)r;
                 conn->file_remaining -= (size_t)r;
                 continue;
             } else {
                 close(conn->file_fd);
                 conn->file_fd = -1;
+                release_drained_out_buf(conn); /* a sendfile-path head tail copy, already written */
                 free(conn->stream_buf);
                 conn->stream_buf = NULL;
                 conn->out_buf = NULL;

@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <netinet/in.h>
@@ -1773,6 +1774,158 @@ static void test_flush_connection_file_stream_survives_another_connections_dispa
     app_destroy(&app);
 }
 
+/* ---- file bodies: sendfile(2), with a pread + write fallback ---- */
+
+/* How file_send_scenario perturbs the stream after the first flush_connection call. */
+typedef enum {
+    FILE_SEND_PLAIN,            /* nothing: sendfile all the way */
+    FILE_SEND_FALLBACK_ONLY,    /* file_no_sendfile before the first flush, fd position moved to EOF */
+    FILE_SEND_SWITCH_MIDWAY,    /* sendfile for the first turn, then the pread fallback for the rest */
+    FILE_SEND_TRUNCATE_MIDWAY   /* the file shrinks after the first turn: the connection must close, not spin */
+} FileSendTwist;
+
+/* Streams a STREAM_CHUNK_SIZE * 30 + 777 byte non-repeating file to a socketpair peer with small socket
+ * buffers (so several turns and real EAGAINs happen), draining the peer between flush_connection calls.
+ * Returns the body bytes received (after the head) in *body_out, malloc'd; *stream_buf_seen says whether
+ * stream_buf (the pread path's user-space buffer) was ever allocated. */
+static size_t file_send_scenario(const FileSendTwist twist, char **body_out, char **expected_out,
+                                 int *stream_buf_seen, int *closed_early) {
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+    const int small = 16 * 1024;
+    assert(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0);
+    assert(setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+    app.open_connections++;
+
+    char tmp_path[] = "/tmp/cexpress_sendfile_test_XXXXXX";
+    const int tmp_fd = mkstemp(tmp_path);
+    assert(tmp_fd >= 0);
+    const size_t file_len = STREAM_CHUNK_SIZE * 30 + 777;
+    char *expected = malloc(file_len);
+    assert(expected != NULL);
+    for (size_t i = 0; i < file_len; i++) {
+        expected[i] = (char)((i * 2654435761u) >> 24);
+    }
+    assert(write(tmp_fd, expected, file_len) == (ssize_t)file_len);
+    close(tmp_fd);
+
+    Response res;
+    res_init(&res, conn);
+    conn->keep_alive = 0; /* closes itself once fully sent: the loop's exit condition */
+    assert(res_send_file(&res, "application/octet-stream", tmp_path) == 0);
+    assert(conn->file_fd >= 0 && conn->file_offset == 0 && conn->file_no_sendfile == 0);
+    if (twist == FILE_SEND_FALLBACK_ONLY) {
+        conn->file_no_sendfile = 1;
+        assert(lseek(conn->file_fd, 0, SEEK_END) > 0); /* pread must not depend on the fd's position */
+    }
+
+    char *received = malloc(file_len + 4096);
+    assert(received != NULL);
+    size_t received_len = 0;
+    *stream_buf_seen = 0;
+    int rounds = 0;
+    while (app.connections[fds[0]] != NULL) {
+        assert(rounds++ < 100000);
+        if (conn->stream_buf != NULL) {
+            *stream_buf_seen = 1;
+        }
+        flush_connection(&app, conn);
+        if (rounds == 1 && app.connections[fds[0]] != NULL) {
+            assert(conn->file_fd >= 0); /* still streaming after one turn: the twists below land mid-file */
+            if (twist == FILE_SEND_SWITCH_MIDWAY) {
+                assert(conn->file_offset > 0);
+                conn->file_no_sendfile = 1;
+            } else if (twist == FILE_SEND_TRUNCATE_MIDWAY) {
+                assert(truncate(tmp_path, (off_t)conn->file_offset) == 0);
+            }
+        }
+        if (app.connections[fds[0]] != NULL && conn->stream_buf != NULL) {
+            *stream_buf_seen = 1;
+        }
+        char chunk[8192];
+        ssize_t n;
+        while ((n = read(fds[1], chunk, sizeof(chunk))) > 0) {
+            assert(received_len + (size_t)n <= file_len + 4096);
+            memcpy(received + received_len, chunk, (size_t)n);
+            received_len += (size_t)n;
+        }
+    }
+    assert(app.buffered_bytes == 0);
+
+    const char *body = skip_response_head(received, received_len);
+    assert(body != NULL);
+    char cl[64];
+    snprintf(cl, sizeof(cl), "Content-Length: %zu\r\n", file_len);
+    char head[1024];
+    const size_t head_len = (size_t)(body - received);
+    assert(head_len < sizeof(head));
+    memcpy(head, received, head_len);
+    head[head_len] = '\0';
+    assert(strstr(head, cl) != NULL);
+    const size_t body_len = received_len - (size_t)(body - received);
+    *body_out = malloc(body_len + 1);
+    assert(*body_out != NULL);
+    memcpy(*body_out, body, body_len);
+    *expected_out = expected;
+    *closed_early = body_len < file_len;
+
+    free(received);
+    unlink(tmp_path);
+    close(fds[1]);
+    app_destroy(&app);
+    return body_len;
+}
+
+/* The file body goes out through sendfile: byte-exact, and no user-space chunk buffer is ever allocated. */
+static void test_file_body_sent_with_sendfile(void) {
+    char *body, *expected;
+    int stream_buf_seen, closed_early;
+    const size_t len = file_send_scenario(FILE_SEND_PLAIN, &body, &expected, &stream_buf_seen, &closed_early);
+    assert(!closed_early && len == STREAM_CHUNK_SIZE * 30 + 777);
+    assert(memcmp(body, expected, len) == 0);
+    assert(!stream_buf_seen);
+    free(body);
+    free(expected);
+}
+
+/* The pread fallback (file_no_sendfile) reads at file_offset, not the fd position, through stream_buf. */
+static void test_file_body_pread_fallback(void) {
+    char *body, *expected;
+    int stream_buf_seen, closed_early;
+    const size_t len = file_send_scenario(FILE_SEND_FALLBACK_ONLY, &body, &expected, &stream_buf_seen, &closed_early);
+    assert(!closed_early && len == STREAM_CHUNK_SIZE * 30 + 777);
+    assert(memcmp(body, expected, len) == 0);
+    assert(stream_buf_seen);
+    free(body);
+    free(expected);
+}
+
+/* sendfile for part of the file, then the fallback: the offset carries over, nothing duplicated or lost. */
+static void test_file_body_switches_to_fallback_midway(void) {
+    char *body, *expected;
+    int stream_buf_seen, closed_early;
+    const size_t len = file_send_scenario(FILE_SEND_SWITCH_MIDWAY, &body, &expected, &stream_buf_seen, &closed_early);
+    assert(!closed_early && len == STREAM_CHUNK_SIZE * 30 + 777);
+    assert(memcmp(body, expected, len) == 0);
+    assert(stream_buf_seen);
+    free(body);
+    free(expected);
+}
+
+/* A file that shrinks under a response (sendfile reaches EOF early) closes the connection: the declared
+ * Content-Length can't be met, and flush_connection must not loop on zero-byte sends. */
+static void test_file_truncated_midway_closes(void) {
+    char *body, *expected;
+    int stream_buf_seen, closed_early;
+    const size_t len = file_send_scenario(FILE_SEND_TRUNCATE_MIDWAY, &body, &expected, &stream_buf_seen, &closed_early);
+    assert(closed_early && len < STREAM_CHUNK_SIZE * 30 + 777);
+    assert(memcmp(body, expected, len) == 0);
+    free(body);
+    free(expected);
+}
+
 /* accept_client is a single accept/accept4 call with no per-connection fcntl/setsockopt; the fd
  * it returns must still be non-blocking with TCP_NODELAY (inherited from create_server_socket's
  * listener on BSD/macOS; accept4 flags + listener inheritance on Linux, where FD_CLOEXEC comes free
@@ -2009,6 +2162,10 @@ int main(void) {
     test_handle_readable_during_shutdown_forces_connection_close();
     test_app_stop_drains_and_flushes_pending_write();
     test_res_send_file_streams_to_socket();
+    test_file_body_sent_with_sendfile();
+    test_file_body_pread_fallback();
+    test_file_body_switches_to_fallback_midway();
+    test_file_truncated_midway_closes();
     test_flush_connection_file_stream_survives_another_connections_dispatch();
     test_accept_client_socket_options();
     test_accept_connections_enforces_max_connections();

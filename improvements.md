@@ -37,7 +37,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **S8** | ~~Form fields: `%00` not rejected (S6 gap), values silently truncated at 255~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **S9** | ~~Response header values silently truncated at 255 chars (CSP, `Location`)~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **P4** | ~~Cached static files are copied into the arena on every hit~~ **FIXED 2026-09-24** | Low–Medium | M | MEASURED |
-| **P5** | `sendfile`/`writev` still not used for file bodies | Low–Medium | M | CODE |
+| **P5** | ~~`sendfile`/`writev` still not used for file bodies~~ **FIXED 2026-09-24** | Low–Medium | M | MEASURED |
 | **P6** | One unnecessary syscall per connection close (`unwatch_all` before `close`) | Low | S | CODE |
 | **M4** | Arena growth always copies (yyjson realloc, `res_write` doubling) | Low–Medium | S | CODE |
 | **M5** | Static cache: `./` aliases create duplicate entries; 64 MiB per worker | Low | S | CODE |
@@ -150,6 +150,16 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
 - **Expected gain:** ESTIMATED. Removes one `malloc`/`memcpy`/`free` of up to 256 KiB per hit.
 
 ### P5 · File bodies still use `read` + `write` and a separate head `write`
+- **Status: FIXED 2026-09-24.** `flush_connection` sends file bodies with `sendfile(2)` from
+  `Connection.file_offset` (`conn_sendfile`: Linux `sendfile(out, in, &off, n)`; macOS `sendfile` with the unsent head in
+  `hdtr`, so head + first file bytes are one syscall). Same per-turn fairness cap (`4 * STREAM_CHUNK_SIZE`); no
+  `stream_buf` on this path. `EAGAIN` copies only the unsent head (`keep_unsent_and_wait`, now shared with the P4 `writev`
+  path). A file that shrinks below its `Content-Length` closes the connection. `ENOSYS`/`EINVAL`/`ENOTSOCK`/`EOPNOTSUPP`
+  before any byte falls back to `pread` + `write` through `stream_buf` (`Connection.file_no_sendfile`), which is also the
+  only path on other platforms. MEASURED (macOS, loopback, 50 × 40 MiB downloads, same build with `sendfile` forced
+  off as baseline): server CPU 0.55 s → 0.30 s, wall 0.92 s → 0.67 s. Not done: Linux still writes the head in its own
+  `write` (no `MSG_MORE`); Linux paths not run here. Tests: four new cases in `tests/test_connection.c`
+  (`file_send_scenario`), mutation-checked.
 - **Impact:** Low–Medium
 - **Effort:** M
 - **Where:** `lib/connection.c:540-586` (file streaming loop), `lib/response.c:533` (`res_send_file`).
