@@ -127,6 +127,9 @@ static const char *seeds[] = {
   "POST /api/todos HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\nabcd",
   "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\nConnection: close\r\n\r\n",
   "\r\nGET / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+  "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0x5\r\nhello\r\n0\r\n\r\n",
+  "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n",
+  "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n 5\r\nhello\r\n0\r\nX: a\nY: b\r\n\r\n",
 };
 int main(int argc, char **argv) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));

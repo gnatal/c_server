@@ -239,7 +239,9 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   does, once, the first time it is called for a given request (`req->cookies_parsed`) - a request that carries a
   `Cookie` header but whose handler never reads one never pays for the split. Cookie storage itself (`cookie_names`/
   `cookie_values`, fixed 64/255-char slots) is unchanged; only *when* the split runs moved.
-  Chunked bodies: extensions ignored, trailers discarded, decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at `header_len + MAX_BODY_SIZE`.
+  Chunked bodies: a chunk-size line is exactly 1–16 hex digits, then nothing or BWS `;` extension (no `0x`, sign, leading or
+  trailing whitespace - a proxy that reads `0x5` as 0 would frame the body differently); extensions ignored but free of control
+  characters; trailer lines held to the header block's rules (CRLF only, no bare CR/LF, no control character but HTAB), then discarded; decoded size capped at `MAX_BODY_SIZE`, raw wire size capped at `header_len + MAX_BODY_SIZE`.
   **Body is not copied.** On the engine path `req->body` points at `in_buf + header_len`. A chunked body is decoded
   in place by `chunked_body_decode(body_start, avail, body_start)` (it uses `memmove`: decoded output never overtakes the
   framing being read, since each chunk moves left by at least its own size line). `body[content_length]` is set to

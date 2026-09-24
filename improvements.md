@@ -25,7 +25,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **M1** | ~~macOS cluster master never closes the fds it hands to workers~~ **FIXED 2026-09-23** | **High** (cluster stops accepting; no FIN) | S | MEASURED |
 | **S2** | ~~`app_use_body_limit` is bypassed by a query string, encoding, `//`, or chunked encoding~~ **FIXED 2026-09-23** | High | S | MEASURED |
 | **M2** | ~~Large static files: whole file read and copied twice; slow readers pin the full size each~~ **FIXED 2026-09-23** | High (memory DoS) | S | MEASURED |
-| **S3** | Chunk-size parsing accepts `0x5`, `+5` and ` 5` (request smuggling behind a proxy) | Medium | S | MEASURED |
+| **S3** | ~~Chunk-size parsing accepts `0x5`, `+5` and ` 5` (request smuggling behind a proxy)~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
 | **S4** | Static mounts serve dotfiles (`.env`, `.git/config`) | Medium | S | MEASURED |
 | **S5** | Multipart: quoted parameters parsed wrongly; `filename` returned with `../` | Medium | S | MEASURED |
 | **S6** | Server always binds `0.0.0.0`, so a proxy-only deployment is exposed directly | Medium | S | CODE |
@@ -311,6 +311,11 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   unnecessary (update `lib/API.md:32`).
 
 ### S3 · Chunk-size parsing is lenient (request-smuggling risk behind a proxy)
+- **Status: FIXED 2026-09-24.** `parse_chunk_size_line` (`lib/http_parser.c`) replaces `strtoul` in both
+  `chunked_body_scan_resume` and `chunked_body_decode`: 1–16 hex digits, then nothing or BWS `;` extension (no control
+  character but HTAB). Trailer lines are checked once the body is complete (`trailer_is_clean`): no bare CR/LF, no
+  control character but HTAB. Test: `test_chunk_size_line_is_strict` (`tests/test_http_hardening.c`), which fails on
+  the old code; the three repro requests are fuzzer seeds.
 - **Impact:** Medium. It matters whenever a proxy or load balancer sits in front, which is the recommended TLS
   deployment (`lib/CLAUDE.md`, "No TLS").
 - **Effort:** S

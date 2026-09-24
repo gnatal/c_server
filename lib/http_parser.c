@@ -801,6 +801,63 @@ static const char *find_double_crlf(const char *buf, const size_t len) {
     return NULL;
 }
 
+/* A chunk-size line without its CRLF (RFC 9112 7.1): 1*HEXDIG, then either nothing or BWS ";" chunk-ext.
+ * Hand-rolled, not strtoul: strtoul also takes leading whitespace, a sign and a "0x" prefix, so " 5",
+ * "+5" and "0x5" were read as sizes that a front-end proxy may read differently ("0x5" as 0) - the
+ * disagreement request smuggling needs. At most 2*sizeof(size_t) digits (leading zeros included), so
+ * the value cannot overflow. The extension is ignored, but it may not hold a control character other
+ * than HTAB (a CR or LF in it would already have ended the line). 0 ok, -1 malformed. */
+static int parse_chunk_size_line(const char *line, const size_t len, size_t *size_out) {
+    size_t i = 0;
+    size_t size = 0;
+    while (i < len && hex_value(line[i]) >= 0) {
+        if (i == 2 * sizeof(size_t)) {
+            return -1;
+        }
+        size = (size << 4) | (size_t)hex_value(line[i]);
+        i++;
+    }
+    if (i == 0) {
+        return -1;
+    }
+    while (i < len && is_ows(line[i])) {
+        i++;
+    }
+    if (i < len) {
+        if (line[i] != ';') {
+            return -1; /* also a lone trailing BWS: BWS is only allowed before ";" */
+        }
+        for (i++; i < len; i++) {
+            const unsigned char c = (unsigned char)line[i];
+            if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                return -1;
+            }
+        }
+    } else if (is_ows(line[len - 1])) {
+        return -1;
+    }
+    *size_out = size;
+    return 0;
+}
+
+/* The trailer-part's field lines, each with its CRLF (the terminating blank line excluded). Held to the
+ * same rules as the header block: every LF ends a CRLF, no bare CR, no control character but HTAB -
+ * the trailer is discarded, but a proxy that reads a bare LF as a line end would frame it differently. */
+static int trailer_is_clean(const char *p, const size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        const unsigned char c = (unsigned char)p[i];
+        if (c == '\r') {
+            if (i + 1 >= len || p[i + 1] != '\n') {
+                return 0;
+            }
+            i++;
+        } else if ((c < 0x20 && c != '\t') || c == 0x7f) {
+            return 0; /* includes a bare LF */
+        }
+    }
+    return 1;
+}
+
 int chunked_body_scan(const char *body_start, const size_t available, const size_t max_decoded_len,
                       size_t *decoded_len_out) {
     ChunkScanState state = {0};
@@ -831,22 +888,10 @@ int chunked_body_scan_resume(const char *body_start, const size_t available, con
             return -1;
         }
 
-        /* "<hex-size>[;ext]": extensions are accepted and ignored. */
-        char size_buf[MAX_CHUNK_SIZE_LINE_LEN + 1];
-        memcpy(size_buf, line_start, line_len);
-        size_buf[line_len] = '\0';
-        char *ext = strchr(size_buf, ';');
-        if (ext != NULL) {
-            *ext = '\0';
-        }
-        if (size_buf[0] == '\0') {
+        /* "<hex-size>[BWS;ext]": extensions are accepted and ignored. */
+        size_t chunk_size;
+        if (parse_chunk_size_line(line_start, line_len, &chunk_size) != 0) {
             return -1;
-        }
-
-        char *endptr;
-        const unsigned long chunk_size = strtoul(size_buf, &endptr, 16);
-        if (*endptr != '\0') {
-            return -1; /* non-hex characters in the size */
         }
 
         if (chunk_size == 0) {
@@ -856,6 +901,14 @@ int chunked_body_scan_resume(const char *body_start, const size_t available, con
             const size_t from = state->trailer_from > pos ? state->trailer_from : pos;
             const char *end = find_double_crlf(body_start + from, available - from);
             if (end != NULL) {
+                /* trailer lines run from after the last-chunk line to end's CRLF; none when end is that
+                 * line's own CRLF (end - body_start == pos + line_len) */
+                const size_t trailer_start = pos + line_len + 2;
+                const size_t trailer_end = (size_t)(end - body_start) + 2;
+                if (trailer_end > trailer_start &&
+                    !trailer_is_clean(body_start + trailer_start, trailer_end - trailer_start)) {
+                    return -1;
+                }
                 state->body_end = (size_t)(end - body_start) + 4; /* next pipelined request starts here */
                 return 1;
             }
@@ -893,14 +946,8 @@ size_t chunked_body_decode(const char *body_start, const size_t available, char 
         const char *line_end = find_crlf(line_start, available - pos);
         const size_t line_len = (size_t)(line_end - line_start);
 
-        char size_buf[MAX_CHUNK_SIZE_LINE_LEN + 1];
-        memcpy(size_buf, line_start, line_len);
-        size_buf[line_len] = '\0';
-        char *ext = strchr(size_buf, ';');
-        if (ext != NULL) {
-            *ext = '\0';
-        }
-        const unsigned long chunk_size = strtoul(size_buf, NULL, 16);
+        size_t chunk_size = 0;
+        parse_chunk_size_line(line_start, line_len, &chunk_size); /* the prior scan validated every line */
 
         pos += line_len + 2;
         if (chunk_size == 0) {

@@ -549,6 +549,71 @@ static int answer_for(const char *buf, const size_t len) {
     return answer;
 }
 
+/* A chunk-size line is 1*HEXDIG then optionally BWS ";" chunk-ext (RFC 9112 7.1), nothing else. strtoul
+ * used to accept "0x5", "+5" and " 5": a front-end that reads "0x5" as 0 thinks the body ended while this
+ * engine reads 5 more bytes - request smuggling. Trailer lines get the header block's line rules. */
+static void test_chunk_size_line_is_strict(void) {
+    const char *rejected[] = {
+        "0x5\r\nhello\r\n0\r\n\r\n",
+        "+5\r\nhello\r\n0\r\n\r\n",
+        " 5\r\nhello\r\n0\r\n\r\n",
+        "-5\r\nhello\r\n0\r\n\r\n",
+        "\t5\r\nhello\r\n0\r\n\r\n",
+        "5 \r\nhello\r\n0\r\n\r\n",                   /* BWS only before ";" */
+        "5 5\r\nhello\r\n0\r\n\r\n",
+        "5_\r\nhello\r\n0\r\n\r\n",
+        "5;a\x01\r\nhello\r\n0\r\n\r\n",               /* control character in the extension */
+        "5;a\rb\r\nhello\r\n0\r\n\r\n",                /* bare CR in the extension */
+        ";e\r\n0\r\n\r\n",                              /* no digits */
+        "0x0\r\n\r\n",
+        " 0\r\n\r\n",
+        "00000000000000005\r\nhello\r\n0\r\n\r\n",     /* 17 digits: more than size_t holds, even as zeros */
+        "0\r\nX: a\nY: b\r\n\r\n",                       /* bare LF inside the trailer */
+        "0\r\nX: a\rY: b\r\n\r\n",                       /* bare CR inside the trailer */
+        "0\r\nX: a\x7f\r\n\r\n",                         /* DEL in a trailer value */
+    };
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        size_t decoded_len = 99;
+        assert(chunked_body_scan(rejected[i], strlen(rejected[i]), MAX_BODY_SIZE, &decoded_len) == -1);
+    }
+    static const char nul_in_trailer[] = "0\r\nX: a\0b\r\n\r\n";
+    size_t nul_decoded;
+    assert(chunked_body_scan(nul_in_trailer, sizeof(nul_in_trailer) - 1, MAX_BODY_SIZE, &nul_decoded) == -1);
+
+    const struct { const char *body; size_t decoded; } accepted[] = {
+        {"5\r\nhello\r\n0\r\n\r\n", 5},
+        {"05\r\nhello\r\n000\r\n\r\n", 5},
+        {"a\r\n0123456789\r\n0\r\n\r\n", 10},
+        {"A\r\n0123456789\r\n0\r\n\r\n", 10},
+        {"5;ext\r\nhello\r\n0\r\n\r\n", 5},
+        {"5 ;ext=\"a b\"\r\nhello\r\n0\r\n\r\n", 5},  /* BWS before ";", HTAB / SP inside the extension */
+        {"5\t;ext=1\t\r\nhello\r\n0\r\n\r\n", 5},
+        {"0000000000000005\r\nhello\r\n0\r\n\r\n", 5},  /* 16 digits is the most accepted */
+        {"0\r\nX: a\tb\r\nY: c\r\n\r\n", 0},
+    };
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        size_t decoded_len = 99;
+        assert(chunked_body_scan(accepted[i].body, strlen(accepted[i].body), MAX_BODY_SIZE, &decoded_len) == 1);
+        assert(decoded_len == accepted[i].decoded);
+    }
+
+    /* The whole request from the report: 400, never dispatched with "hello" as its body. */
+    const char *heads[] = {"0x5", "+5", " 5"};
+    for (size_t i = 0; i < sizeof(heads) / sizeof(heads[0]); i++) {
+        char raw[256];
+        const int n = snprintf(raw, sizeof(raw), "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                               "Connection: close\r\n\r\n%s\r\nhello\r\n0\r\n\r\n", heads[i]);
+        assert(n > 0 && (size_t)n < sizeof(raw));
+        assert(request_is_complete(raw, (size_t)n) == 1);
+        assert(answer_for(raw, (size_t)n) == 400);
+    }
+    const char *ok = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    Request req;
+    assert(parse_http_request(ok, strlen(ok), &req, &test_arena) == 0);
+    assert(req.content_length == 5 && memcmp(req.body, "hello", 5) == 0);
+    arena_reset(&test_arena);
+}
+
 /* "every input is answered or closed", at the parser level, for every prefix of each input (every
  * point a recv() could stop at): request_is_complete says "wait" only before any blank line or while a
  * well-framed head's body is genuinely short; once it says "complete" it keeps saying so; the
@@ -702,6 +767,7 @@ int main(void) {
     test_transfer_encoding_token_matching();
     test_short_version_token_rejected();
     test_every_prefix_is_answered_or_waits_for_bytes();
+    test_chunk_size_line_is_strict();
     test_path_canonicalize();
     test_path_prefix_helpers();
     test_request_path_is_canonical();

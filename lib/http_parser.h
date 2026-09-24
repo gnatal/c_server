@@ -170,6 +170,8 @@ int request_wants_close(const Request *req);
  * Chunked request bodies (RFC 7230 4.1). chunked_body_scan validates framing without copying:
  *   1 complete (*decoded_len_out = decoded size), 0 need more bytes,
  *  -1 malformed framing, -2 decoded size would exceed max_decoded_len.
+ * A size line is 1*HEXDIG (at most 16 digits) then nothing or BWS ";" chunk-ext - never "0x5", "+5" or
+ * " 5". Trailer lines may hold no bare CR/LF and no control character but HTAB.
  * chunked_body_decode requires a prior scan result of 1 on the same input; `out` needs
  * decoded_len bytes and may be body_start itself (in-place decode); returns bytes written
  * (binary-safe: never strlen the result).
