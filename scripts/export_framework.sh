@@ -27,7 +27,7 @@ cat << 'MAKEFILE_EOF' > "${DEST_DIR}/Makefile"
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Linux)
-    # Linux: io_uring (liburing) with a runtime fallback to epoll: link -luring when you link libcexpress.a.
+    # Linux: epoll by default, io_uring (liburing) with CEXPRESS_EVENT_LOOP=io_uring: link -luring when you link libcexpress.a.
     # NO_URING=1 builds epoll only and needs no liburing.
     ifeq ($(origin CC),default)
         CC = gcc

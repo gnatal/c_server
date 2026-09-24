@@ -22,7 +22,7 @@ Rather than relying on thread pools with shared mutable state, mutexes, and race
 ┌──────────────▼──────────────┐ ┌──────────────▼──────────────┐
 │       Worker 0 (PID W0)     │ │       Worker 1 (PID W1)     │
 │ - Dedicated SO_REUSEPORT fd │ │ - Dedicated SO_REUSEPORT fd │
-│ - Private kqueue/io_uring   │ │ - Private kqueue/io_uring   │
+│ - Private kqueue/epoll      │ │ - Private kqueue/epoll      │
 │   event loop                │ │   event loop                │
 │ - Private connection table  │ │ - Private connection table  │
 │ - Zero-lock request routing │ │ - Zero-lock request routing │
@@ -31,7 +31,7 @@ Rather than relying on thread pools with shared mutable state, mutexes, and race
 ```
 
 ### Key Architectural Invariants
-1. **Zero Lock Contention**: Each worker process executes an isolated single-threaded event loop (`kqueue` on macOS/BSD, `io_uring` readiness polling on Linux) with its own private connection table and memory space. Request routing, HTTP parsing, and response serialization remain completely lock-free.
+1. **Zero Lock Contention**: Each worker process executes an isolated single-threaded event loop (`kqueue` on macOS/BSD, `epoll` on Linux) with its own private connection table and memory space. Request routing, HTTP parsing, and response serialization remain completely lock-free.
 2. **Total Fault Isolation**: A crash, assertion failure, or segmentation fault in one worker process cannot corrupt the memory space or bring down other workers or the master supervisor.
 3. **Hardware Scaling**: The design lets throughput scale with CPU cores, but linear scaling has not been demonstrated in this repository. On an Apple M3 Pro with `wrk` on the same machine, `GET /ping` at 100 connections reached about 222k req/s with 1 worker and about 250k with 4 (single runs, 21 Sep 2026): the load generator competes for the same cores, so those runs are client-bound. Measure on separate machines before quoting a scaling factor.
 
@@ -81,7 +81,7 @@ The multi-process architecture is specifically engineered to operate cleanly and
 * Linux kernel `SO_REUSEPORT` works natively within network namespaces:
   1. Docker forwards host traffic (`-p 8080:8080`) into `eth0:8080` inside the container.
   2. The Linux kernel distributes incoming TCP SYN packets across the container workers' sockets.
-  3. Workers accept connections directly from their individual event loops (`io_uring` on Linux) with zero virtualization overhead inside the container.
+  3. Workers accept connections directly from their individual event loops (`epoll` on Linux) with zero virtualization overhead inside the container.
 
 ### C. Dynamic CPU Detection
 * In container orchestration (Docker / Kubernetes), CPU limits are configured via `--cpus` or CPU quotas.
@@ -89,12 +89,12 @@ The multi-process architecture is specifically engineered to operate cleanly and
   * CExpress calls `sysconf(_SC_NPROCESSORS_ONLN)`.
   * It detects the actual number of online CPU cores allocated to the container environment and spawns the exact number of workers needed to saturate hardware.
 
-### D. io_uring in Containers
-* The Linux build polls for readiness with `io_uring` (liburing; multishot poll needs kernel 5.13 or newer) and falls back to `epoll` at runtime. The `Dockerfile` installs `liburing-dev` in the builder and `liburing` in the runtime image.
-* Docker's default seccomp profile blocks io_uring: `io_uring_setup` fails with `EPERM` (tested 2026-09-23, Docker Desktop, kernel 6.8). Each worker then logs `event_loop_init: io_uring unavailable (Operation not permitted), falling back to epoll` once and serves on epoll. The startup line names the backend in use, for example `Listening on port 8080 (epoll)`. The same fallback covers a kernel without io_uring (`ENOSYS`), `kernel.io_uring_disabled` (`EPERM`) and a small `RLIMIT_MEMLOCK` (`ENOMEM`).
-* Before this fallback existed, the server exited at startup in that environment, and in cluster mode the master respawned the failing worker until its restart budget ran out (reproduced: five respawns in 2 seconds, nothing served).
-* `CEXPRESS_EVENT_LOOP=epoll` or `CEXPRESS_EVENT_LOOP=io_uring` forces one backend, with no fallback. With io_uring forced where it is refused, the worker exits instead of silently running on epoll. `make NO_URING=1` builds without liburing and uses epoll only.
-* `scripts/docker_stress_test.sh` still runs the server with `--security-opt seccomp=unconfined --ulimit memlock=-1:-1`, so it benchmarks io_uring. Without those flags it now benchmarks epoll.
+### D. epoll and io_uring in Containers
+* The Linux build polls for readiness with `epoll` by default. `io_uring` (liburing; kernel 5.13 or newer) is built in too, but is used only with `CEXPRESS_EVENT_LOOP=io_uring`: it is only a readiness poller here and measured 20-25% slower than epoll (`lib/CLAUDE.md`, "Backend speed on Linux"). The `Dockerfile` installs `liburing-dev` in the builder and `liburing` in the runtime image.
+* The startup line names the backend in use, for example `Listening on port 8080 (epoll)`.
+* Docker's default seccomp profile blocks io_uring: `io_uring_setup` fails with `EPERM` (tested 2026-09-23, Docker Desktop, kernel 6.8). With `CEXPRESS_EVENT_LOOP=io_uring` in that environment, each worker logs `event_loop_init: CEXPRESS_EVENT_LOOP=io_uring, but io_uring is unavailable (Operation not permitted)` and exits; it never silently runs on epoll. Running it needs `--security-opt seccomp=unconfined --ulimit memlock=-1:-1`. A kernel without io_uring (`ENOSYS`), `kernel.io_uring_disabled` (`EPERM`) and a small `RLIMIT_MEMLOCK` (`ENOMEM`) fail the same way.
+* `CEXPRESS_EVENT_LOOP=epoll` names the default explicitly; an empty value means unset; any other value fails at startup. `make NO_URING=1` builds without liburing and uses epoll only.
+* `scripts/docker_stress_test.sh` runs the server with `--security-opt seccomp=unconfined --ulimit memlock=-1:-1` and passes `CEXPRESS_EVENT_LOOP` through, so `CEXPRESS_EVENT_LOOP=io_uring scripts/docker_stress_test.sh` benchmarks io_uring and a plain run benchmarks epoll.
 
 ### E. Orchestration Signals & Rolling Updates
 * When `docker stop` or Kubernetes pod termination occurs, the container runtime sends `SIGTERM` to PID 1 (the master process).

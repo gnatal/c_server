@@ -119,7 +119,7 @@ static int uring_init(App *app) {
     int ret = io_uring_queue_init(URING_ENTRIES, ring, 0);
     if (ret < 0) {
         /* the ring itself was refused (seccomp, io_uring_disabled, memlock, old kernel) and nothing
-         * else was touched yet: tell the dispatcher it may fall back to epoll. */
+         * else was touched yet: tell the dispatcher, which logs errno as the reason. */
         free(ring);
         errno = -ret;
         return EVENT_LOOP_UNAVAILABLE;

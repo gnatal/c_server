@@ -11,8 +11,8 @@
  * Every entry has the same contract as the event_loop.h function of the same name, except `init`:
  * it returns EVENT_LOOP_UNAVAILABLE (errno set) when the kernel mechanism itself cannot be created
  * (io_uring_setup refused: ENOSYS, EPERM under seccomp or kernel.io_uring_disabled, ENOMEM under a small
- * RLIMIT_MEMLOCK) and nothing was touched - the dispatcher then tries the next backend. Any other failure
- * is -1 (already cleaned up) and is final.
+ * RLIMIT_MEMLOCK) and nothing was touched - the dispatcher then logs errno as the reason; there is no
+ * fallback, since io_uring is only ever selected on request. Any other failure is -1 (already cleaned up).
  */
 #define EVENT_LOOP_UNAVAILABLE (-2)
 

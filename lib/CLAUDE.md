@@ -12,17 +12,17 @@ non-blocking TLS layer (`tls.c/h`, `TLS_CERT`/`TLS_KEY` in the demo) existed thr
 removed for this reason; see `../improvements_progress.md` for the removal record.
 
 ## Model
-A process runs one single-threaded, non-blocking event loop: kqueue on macOS/BSD, io_uring on Linux
-(readiness only: a one-shot `POLL_ADD` per fd, re-armed after every event to give level-triggered readiness, then ordinary
-`recv`/`write`; needs liburing, kernel 5.13+ tested only on 6.8) or epoll, chosen per process at runtime (see "Event loop"
-below); on macOS epoll is only built for `make test_epoll` through epoll-shim. `workers != 1` forks N such processes. On
+A process runs one single-threaded, non-blocking event loop: kqueue on macOS/BSD, epoll on Linux, or io_uring on Linux
+only with `CEXPRESS_EVENT_LOOP=io_uring` (readiness only: a one-shot `POLL_ADD` per fd, re-armed after every event to give
+level-triggered readiness, then ordinary `recv`/`write`; needs liburing, kernel 5.13+ tested only on 6.8), chosen per process
+at runtime (see "Backend selection" below); on macOS epoll is only built for `make test_epoll` through epoll-shim. `workers != 1` forks N such processes. On
 Linux, each opens its own listen socket sharing the port via `SO_REUSEPORT` (4-tuple hashing balances them). On macOS/BSD
 (`CEXPRESS_SINGLE_ACCEPTOR`: `SO_REUSEPORT` does not balance there, MEASURED over 90% of load on one worker of four),
 only the master binds and `accept()`s; each accepted fd is handed to a worker over a private socketpair via `SCM_RIGHTS`,
 round-robin (see "Behavior reference, Workers and fork"). Either way, a master respawns any worker that dies, with backoff
 and a restart budget (same section). Handlers run synchronously on the loop: a blocking call (DB,
 sleep) stalls that whole worker, so scale with workers, not threads. State is per process; there is no shared memory.
-If io_uring is refused (Docker's default seccomp profile does this: `EPERM`), `event_loop_init` logs it once per process and runs on epoll; `app_listen_worker` exits only if no backend can start.
+If io_uring is requested but refused (Docker's default seccomp profile does this: `EPERM`), `event_loop_init` logs why and fails, and `app_listen_worker` exits; it never falls back to epoll.
 
 Per request (`connection.c: handle_readable` → `serve_buffered_requests`, which repeats steps 1-6 for every complete request already in `in_buf`, starting at `conn->in_off` - pipelining, see "Behavior reference, Pipelining"):
 1. `recv` into `conn->in_buf` - the worker's shared `App.read_buf` when nothing is buffered for this connection (see Memory model) - then one `parse_request_head` call (`http_parser.c`: runs picohttpparser once over the headers) fills a `ParsedHead` reused by every check below - the body-limit check, `request_head_is_complete` (a chunked scan when the body is chunked, resumed from `conn->chunk_scan` so each body byte is scanned once per request, not once per `recv`), and the full parse, instead of each running its own independent pass over the same bytes (up to four per request previously).
@@ -473,19 +473,18 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   the child closes every *other* slot's inherited master-side `control_fd` right after `fork()` (it must not be able
   to read or write a sibling's fd-handoff channel), keeping only its own.
 - **Backend selection (Linux).** Both Linux backends are always compiled (unless `NO_URING=1`, which builds epoll
-  only, without liburing). `event_loop_init` (`event_loop_linux.c`) tries io_uring first; its init returns
-  `EVENT_LOOP_UNAVAILABLE` (errno set) only when `io_uring_queue_init` itself fails, before anything else is touched -
-  `ENOSYS`, `EPERM` (seccomp, `kernel.io_uring_disabled`), `ENOMEM` (`RLIMIT_MEMLOCK`) alike - and then epoll is tried.
-  Any later io_uring setup failure (signalfd, timerfd) is final, since epoll would fail the same way. The refusal is
-  remembered in a function-local static (`uring_refused`), so the fallback is logged once per process and later inits in
-  that process skip the failing syscall; cluster workers are forked before any loop exists, so each logs once.
-  `CEXPRESS_EVENT_LOOP=epoll|io_uring` forces a backend with no fallback, an empty value means automatic, and anything
-  else fails `event_loop_init` instead of guessing. The choice is `App.loop_ops`; every public `event_loop_*` forwards
+  only, without liburing). `event_loop_init` (`event_loop_linux.c`) opens epoll unless `CEXPRESS_EVENT_LOOP=io_uring`
+  (see "Backend speed on Linux" for why epoll is the default). With io_uring requested there is no fallback: its init
+  returns `EVENT_LOOP_UNAVAILABLE` (errno set) when `io_uring_queue_init` itself fails - `ENOSYS`, `EPERM` (seccomp,
+  `kernel.io_uring_disabled`), `ENOMEM` (`RLIMIT_MEMLOCK`) alike - which the dispatcher logs with the errno before
+  returning -1; any other io_uring setup failure is -1 too. `CEXPRESS_EVENT_LOOP=epoll` names the default, an empty value
+  means unset, and anything else fails `event_loop_init` instead of guessing. The selection is stateless (a pure function
+  of the environment variable and the build). The choice is `App.loop_ops`; every public `event_loop_*` forwards
   through it (one indirect call per event-loop operation, the same target for the process's life, so it predicts
   perfectly), and it is `NULL` whenever no loop is open, so `event_loop_is_open` never reads the union. The
   startup line names the backend: `Listening on port 8080 (epoll)`. MEASURED (Docker, Alpine, kernel 6.8, default
-  seccomp): before the fallback existed, `HEAD` exited at startup (`io_uring_queue_init failed: -1 (Operation not permitted)`), and in
-  cluster mode respawned worker 0 five times in 2 s serving nothing; now it logs the fallback and serves on epoll.
+  seccomp): with io_uring requested, each worker exits at startup with the refusal logged; in cluster mode the master
+  respawns it until the restart budget runs out (before 2026-09-23 that was also what happened by default).
   **Spurious `EINTR` after a ring is torn down:** once a process has closed an io_uring ring, the kernel may deliver
   task_work that makes its next `epoll_wait` return `EINTR` (seen on 6.8 when one test process ran io_uring then epoll).
   `event_loop_poll`'s contract already says to retry `EINTR` (`app_listen_worker` does); a serving process never
@@ -518,8 +517,9 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   re-watches it (one extra `watch`/`unwatch` pair per response that did not fit the socket buffer in one go, none otherwise).
   **Backend speed on Linux (MEASURED 2026-09-23, Docker on an M3 Pro, kernel 6.8, one worker, `wrk -t8 -c1000`, cookbook
   `/hello`):** epoll served 3.5-3.6 M requests in 12 s, io_uring 2.8-2.9 M - io_uring is 20-25% slower as a pure readiness
-  poller (one SQE and CQE per event on top of the same `recv`/`write`). io_uring is still the preferred backend on Linux
-  (the fallback kept that default); `CEXPRESS_EVENT_LOOP=epoll` selects the faster one without a rebuild.
+  poller (one SQE and CQE per event on top of the same `recv`/`write`). So epoll is the default since 2026-09-24 and
+  io_uring is opt-in (`CEXPRESS_EVENT_LOOP=io_uring`). It should become the default again only once it does the I/O
+  itself (multishot `recv` with provided buffers, `send` SQEs) and measures faster. Not re-measured after the switch.
 
 ## Hot-path rules (measured; do not undo)
 Per-request CPU cost of the pure path (parse, route, dispatch, response build; no sockets, one core; `make bench`, Apple M3 Pro,

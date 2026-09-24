@@ -1,7 +1,7 @@
 UNAME_S := $(shell uname -s)
 
-# Linux: io_uring and epoll are both built; event_loop_linux.c picks one at runtime (io_uring, falling
-# back to epoll when the ring cannot be created). NO_URING=1 builds epoll only and drops the liburing dependency.
+# Linux: io_uring and epoll are both built; event_loop_linux.c runs epoll unless CEXPRESS_EVENT_LOOP=io_uring
+# (io_uring is only a readiness poller here and measured slower). NO_URING=1 builds epoll only and drops liburing.
 ifeq ($(UNAME_S),Linux)
     CC = gcc
     CFLAGS = -Wall -Wextra -std=c11 -O2 -Ilib -D_GNU_SOURCE

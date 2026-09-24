@@ -31,7 +31,7 @@ A lightweight, high-performance HTTP/1.1 server and web framework written entire
 Modern backend applications often rely on high-level runtimes like Node.js or Go. This project brings the ergonomic, developer-friendly routing and middleware design of **Express.js** directly to **C**, providing:
 - **High Performance & Low Latency**: Native execution with minimal CPU overhead, sub-millisecond response times, and about 250,000 requests/sec on a minimal endpoint with 4 workers on an Apple M3 Pro laptop (single run, load generator on the same machine). See [Performance & Benchmarks](#performance--benchmarks).
 - **Small Footprint**: `lib/` has no system dependencies beyond standard C and POSIX APIs, and `liburing` on Linux. JSON ([yyjson](https://github.com/ibireme/yyjson)) and HTTP tokenizing ([picohttpparser](https://github.com/h2o/picohttpparser)) are vendored as source in `lib/vendor/`. The bundled demo app additionally links SQLite (embedded, no server process) for its Todo persistence layer.
-- **Event-Driven Non-Blocking I/O**: Native `kqueue` on macOS / BSD and `io_uring` readiness polling on Linux, following the same architectural pattern as Node.js's underlying `libuv`.
+- **Event-Driven Non-Blocking I/O**: Native `kqueue` on macOS / BSD and `epoll` on Linux (`io_uring` readiness polling opt-in with `CEXPRESS_EVENT_LOOP=io_uring`), following the same architectural pattern as Node.js's underlying `libuv`.
 - **Memory Control**: Explicit bounded buffers, aggressive `const` correctness, hard input limits, and a per-connection arena allocator so per-request data needs no individual `free`. The trade is a larger per-connection footprint (see [`tradeoffs.md`](tradeoffs.md)).
 
 ---
@@ -143,7 +143,7 @@ The codebase is split into two distinct tiers:
 ### 3. Non-Blocking Event-Driven Networking & Multi-Worker Concurrency
 - **Multi-Worker Process Model (`SO_REUSEPORT`)**: Dedicated listening socket per worker, no shared state or locks between workers (see [concurrency.md](concurrency.md); connection distribution across workers was uneven on macOS in the one test run).
 - **Master Process Supervision**: Automatically reaps dead children, prevents container zombie leaks, respawns crashed workers on the fly, and coordinates clean graceful drains.
-- **Cross-Platform Event Loop**: Native `kqueue` on macOS/BSD and `io_uring` readiness polling (with `timerfd` / `signalfd`) on Linux; an `epoll` backend is kept behind `-DCEXPRESS_USE_EPOLL`.
+- **Cross-Platform Event Loop**: Native `kqueue` on macOS/BSD and `epoll` (with `timerfd` / `signalfd`) on Linux; `io_uring` readiness polling is built in on Linux but only used with `CEXPRESS_EVENT_LOOP=io_uring`, since it measured 20-25% slower than epoll. `make NO_URING=1` builds epoll only.
 - **Dynamic Connection Table**: Bounded only by `RLIMIT_NOFILE`, growing dynamically via `ensure_connection_capacity`.
 - **HTTP/1.1 Keep-Alive**: Persistent connections with idle connection timeout sweeps.
 - **Graceful Shutdown**: Synchronous signal trapping (`SIGINT`/`SIGTERM`), stops accepting new connections, drains in-flight responses, and enforces a 5-second deadline timer before clean exit.
@@ -195,7 +195,7 @@ Verified against the current code on 21 Sep 2026 and not yet fixed (details and 
 
 ## Prerequisites
 
-- **Operating System**: macOS / BSD (native `kqueue`) or Linux (io_uring; kernel 5.13 or newer for multishot poll). Docker on any host runs the Linux build.
+- **Operating System**: macOS / BSD (native `kqueue`) or Linux (epoll; the opt-in io_uring backend needs kernel 5.13 or newer). Docker on any host runs the Linux build.
 - **Compiler**: C11 compliant compiler (`gcc-16` on macOS; `gcc` on Linux). The `Makefile` picks one by OS; override with `make CC=<compiler>`.
 - **Build Tool**: GNU `make`.
 - **liburing** (Linux only): `liburing-dev` on Debian/Ubuntu and on Alpine. The Linux `Makefile` links `-luring`.
@@ -246,14 +246,14 @@ Write endpoints (`POST`/`PUT`/`PATCH`/`DELETE`) need `Authorization: Bearer <API
 see [Quick Start & Example Usage](#quick-start--example-usage) for `curl` examples.
 
 ### 3. Run with Docker
-The multi-stage Alpine `Dockerfile` compiles the engine and the demo (`make all && make demo`) on Linux (musl, io_uring). It does **not** run the test suite. The runtime image copies `cexpress_demo` and `public/` into `/app`:
+The multi-stage Alpine `Dockerfile` compiles the engine and the demo (`make all && make demo`) on Linux (musl, epoll). It does **not** run the test suite. The runtime image copies `cexpress_demo` and `public/` into `/app`:
 ```bash
 docker build -t cexpress .
 docker run --rm -p 8080:8080 cexpress
 docker run --rm -p 8080:8080 -e WORKERS=4 -e API_KEY=change-me cexpress    # with options
 ```
 The database lives inside the container and is discarded with it; mount a volume and set `TODO_DB_PATH` to keep it
-(`-v cexpress-data:/data -e TODO_DB_PATH=/data/todos.db`). If the container's runtime blocks io_uring, the server exits at startup; `scripts/docker_stress_test.sh` runs it with `--security-opt seccomp=unconfined --ulimit memlock=-1:-1` (see [concurrency.md](concurrency.md)).
+(`-v cexpress-data:/data -e TODO_DB_PATH=/data/todos.db`). The server runs on epoll. `-e CEXPRESS_EVENT_LOOP=io_uring` selects io_uring instead, which Docker's default seccomp profile blocks (the server then exits at startup); add `--security-opt seccomp=unconfined --ulimit memlock=-1:-1` for it (see [concurrency.md](concurrency.md)).
 
 ---
 
@@ -522,7 +522,7 @@ All 11 original architectural milestones have been completed:
 - [x] Cookie helpers (`res_set_cookie`, `res_clear_cookie`, `req_get_cookie`)
 - [x] Graceful shutdown on `SIGINT`/`SIGTERM` with in-flight request draining
 - [x] Streaming & chunked responses (`res_write`, `res_end`, `res_set_trailer`, `res_send_file`)
-- [x] Cross-platform event backend (`kqueue` for macOS/BSD, `epoll` then `io_uring` for Linux)
+- [x] Cross-platform event backend (`kqueue` for macOS/BSD, `epoll` for Linux, `io_uring` opt-in)
 - [x] Multi-process worker model (`SO_REUSEPORT`)
 
 Engine changes since then (see [`tradeoffs.md`](tradeoffs.md)):
@@ -530,7 +530,7 @@ Engine changes since then (see [`tradeoffs.md`](tradeoffs.md)):
 - [x] Per-connection arena allocator
 - [x] picohttpparser replaces the handwritten request parser
 - [x] Patricia-tree router (no fixed route cap)
-- [x] io_uring event loop on Linux
+- [x] io_uring event loop on Linux (opt-in since 2026-09-24; epoll is the default)
 - [x] TLS / HTTPS support (OpenSSL/LibreSSL non-blocking handshake integration) added, then removed (2026-09-22): TLS termination belongs at a gateway or reverse proxy in front of this engine, not inside a library that only parses HTTP/1.1
 
 Open items are listed under [Known Gaps](#known-gaps).

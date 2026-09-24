@@ -1,6 +1,6 @@
 # CExpress API & Developer Documentation
 
-Welcome to the **CExpress** documentation. CExpress brings the developer ergonomics and modular architecture of [Express.js](https://expressjs.com/) to native C (C11), powered by non-blocking event-driven I/O: `kqueue` on macOS/BSD and `io_uring` readiness polling on Linux.
+Welcome to the **CExpress** documentation. CExpress brings the developer ergonomics and modular architecture of [Express.js](https://expressjs.com/) to native C (C11), powered by non-blocking event-driven I/O: `kqueue` on macOS/BSD and `epoll` on Linux (`io_uring` readiness polling opt-in).
 
 For a one-line-per-function index see [`lib/API.md`](lib/API.md); for engine internals, limits and known gaps see [`lib/CLAUDE.md`](lib/CLAUDE.md); for tested copy-paste recipes see [`lib/examples/cookbook.c`](lib/examples/cookbook.c).
 

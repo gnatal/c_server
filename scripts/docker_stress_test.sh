@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Stress-tests the Todo CRUD demo (examples/todo_sqlite/) running inside Docker, in cluster mode,
-# using wrk - the containerized counterpart to stress_test.sh, exercising the Linux io_uring backend
-# from a Mac. wrk runs as its own container on the same private Docker network as the server and
+# using wrk - the containerized counterpart to stress_test.sh, exercising the Linux backends from a
+# Mac (epoll by default; CEXPRESS_EVENT_LOOP=io_uring is passed through to the server to measure io_uring). wrk runs as its own container on the same private Docker network as the server and
 # talks to it container-to-container, bypassing Docker Desktop's localhost proxy (vpnkit) entirely
 # for the actual measurement traffic (only the readiness wait and seeding below go through the
 # host's port mapping).
@@ -86,6 +86,7 @@ docker run -d \
     -e PORT="$PORT" \
     -e TODO_DB_PATH="$DB_PATH" \
     -e API_KEY="$API_KEY" \
+    -e CEXPRESS_EVENT_LOOP="${CEXPRESS_EVENT_LOOP:-}" \
     "$IMAGE_NAME" >/dev/null
 
 STOPPED=0

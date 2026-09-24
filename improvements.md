@@ -30,7 +30,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **S5** | ~~Multipart: quoted parameters parsed wrongly; `filename` returned with `../`~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
 | **S6** | Server always binds `0.0.0.0`, so a proxy-only deployment is exposed directly | Medium | S | CODE |
 | **P1** | ~~epoll issues one wasted `epoll_ctl` per keep-alive request~~ **FIXED 2026-09-24** | Medium (~25% of syscalls) | S | MEASURED |
-| **P2** | io_uring is the Linux default but is 20–25% slower than epoll | Medium | S | MEASURED (`lib/CLAUDE.md`) |
+| **P2** | ~~io_uring is the Linux default but is 20–25% slower than epoll~~ **FIXED 2026-09-24** | Medium | S | MEASURED (`lib/CLAUDE.md`) |
 | **P3** | Incomplete headers are re-parsed from byte 0 on every `recv` (quadratic) | Medium (CPU DoS amplifier) | S–M | MEASURED |
 | **M3** | No per-worker memory budget for buffered bodies and unsent output | Medium | M | CODE |
 | **S7** | Missing or duplicate `Host` header is accepted | Low–Medium | S | MEASURED |
@@ -80,6 +80,14 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   was ~20% of syscall time in the trace).
 
 ### P2 · Linux defaults to io_uring, which measured 20–25% slower than epoll
+- **Status: FIXED 2026-09-24.** `event_loop_init` (`lib/event_loop_linux.c`) opens epoll unless
+  `CEXPRESS_EVENT_LOOP=io_uring`. A forced io_uring that the kernel or sandbox refuses fails init with the errno logged,
+  with no fallback, and the refusal-memo static is gone. Test: `test_backend_selection_env` (`tests/test_event_loop.c`)
+  asserts an unset and an empty `CEXPRESS_EVENT_LOOP` both give epoll. In Docker with `--security-opt seccomp=unconfined`
+  (io_uring available) it fails on the old selector (`backend io_uring` on the first pass, assertion at the unset case).
+  `main` now runs the full backend contract on the other Linux backend in a forked child, so io_uring keeps its coverage.
+  `scripts/docker_stress_test.sh` passes `CEXPRESS_EVENT_LOOP` through for the A/B `wrk` run. Throughput was not
+  re-measured after the switch. The L-effort part (io_uring doing real I/O) is still open.
 - **Impact:** Medium
 - **Effort:** S (switch the default) or L (make io_uring do real I/O)
 - **Where:** `lib/event_loop_linux.c` (tries io_uring first). The measurement is in `lib/CLAUDE.md`, "Backend speed on Linux".

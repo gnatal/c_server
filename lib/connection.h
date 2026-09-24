@@ -8,7 +8,7 @@
 
 /*
  * Server lifecycle. One process runs one single-threaded, non-blocking event loop (kqueue on
- * macOS/BSD, io_uring readiness polling on Linux; an epoll backend exists behind CEXPRESS_USE_EPOLL). Typical main():
+ * macOS/BSD, epoll on Linux; io_uring readiness polling with CEXPRESS_EVENT_LOOP=io_uring). Typical main():
  *   App app; app_init(&app); ...register middleware and routes...; app_listen(&app, port); app_destroy(&app);
  */
 

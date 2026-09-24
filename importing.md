@@ -58,7 +58,7 @@ From a checkout of the CExpress repository, `make export DEST=/path/to/my_app/ve
 | Dependency | Needed for | Notes |
 |---|---|---|
 | A C11 compiler and GNU `make` | everything | The engine's own Makefile uses `gcc-16` on macOS (Homebrew) and `gcc` on Linux. |
-| **liburing** (`liburing-dev`, `liburing` on Alpine) | Linux only | The Linux event loop prefers io_uring; link `-luring`. Where io_uring is refused (old kernel, a container's seccomp profile, `io_uring_disabled`) it falls back to epoll at runtime and logs it (see `concurrency.md`). Build with `NO_URING=1` to drop the liburing dependency and use epoll only. |
+| **liburing** (`liburing-dev`, `liburing` on Alpine) | Linux only | The Linux event loop runs on epoll by default; io_uring is built in for `CEXPRESS_EVENT_LOOP=io_uring` (see `concurrency.md`), so the default build links `-luring`. Build with `NO_URING=1` to drop the liburing dependency and use epoll only. |
 | yyjson, picohttpparser | always | Vendored inside `lib/vendor/`. Nothing to install. |
 | SQLite | never | Only the demo app in `examples/todo_sqlite/` uses it. |
 

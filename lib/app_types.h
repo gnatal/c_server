@@ -609,8 +609,8 @@ typedef struct {
      * of the ring pointer) - use event_loop_is_open (event_loop.h). */
     union {
         int kq;          /* macOS/BSD */
-        int epoll_fd;    /* Linux epoll backend (io_uring fallback, CEXPRESS_EVENT_LOOP=epoll, or NO_URING=1) */
-        void *ring;      /* Linux io_uring (struct io_uring*) */
+        int epoll_fd;    /* Linux epoll backend (the default) */
+        void *ring;      /* Linux io_uring (struct io_uring*), only with CEXPRESS_EVENT_LOOP=io_uring */
         int loop_fd;     /* platform-neutral int name */
     };
     /* Linux (and the macOS epoll-shim build): the backend event_loop_init chose (event_loop_backend.h),

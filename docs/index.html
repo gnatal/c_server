@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CExpress — High-Performance C11 Web Framework</title>
   <meta name="description"
-    content="A lightweight, high-performance, single-threaded HTTP/1.1 web framework and server written in C11, inspired by Express.js and powered by native kqueue (macOS/BSD) and io_uring (Linux).">
+    content="A lightweight, high-performance, single-threaded HTTP/1.1 web framework and server written in C11, inspired by Express.js and powered by native kqueue (macOS/BSD) and epoll (Linux).">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link
@@ -1040,7 +1040,7 @@
         <h1>The Simplicity of Express.js.<br>The Speed of Native C.</h1>
         <p>
           CExpress is a lightweight, single-threaded HTTP/1.1 web framework and server designed with Express.js
-          ergonomics, running directly on native BSD/macOS <code>kqueue</code> and Linux <code>io_uring</code> readiness polling.
+          ergonomics, running directly on native BSD/macOS <code>kqueue</code> and Linux <code>epoll</code> (<code>io_uring</code> readiness polling opt-in).
         </p>
 
         <div class="stats-grid">
@@ -1224,7 +1224,7 @@
                 Zero Runtime Overhead</div>
               <div style="font-size: 1.15rem; font-weight: 800; color: #a855f7; margin-top: 0.2rem;">0 ns GC <span
                   style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">C11 stack</span></div>
-              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Direct kqueue / io_uring
+              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Direct kqueue / epoll
                 readiness polling</div>
             </div>
           </div>
@@ -1292,7 +1292,7 @@
           </div>
           <div class="alert alert-note">
             <strong>Engine Architecture:</strong> Non-blocking sockets driven by <code>kqueue</code> (macOS/BSD) or
-            <code>io_uring</code> readiness polling (Linux), one event loop per worker process, requests parsed with
+            <code>epoll</code> (Linux; <code>io_uring</code> opt-in), one event loop per worker process, requests parsed with
             picohttpparser straight out of one 8 KiB receive buffer per worker and served from one 64 KiB arena per worker
             (not per connection); responses are written with plain
             <code>write()</code> calls.
@@ -1743,7 +1743,7 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
               <span class="test-status-pill">✓ Passing</span>
             </div>
             <div class="test-desc">Unified event loop abstraction verifying <code>kqueue</code> (macOS/BSD) and
-              <code>io_uring</code> (Linux) readiness registration and timers.</div>
+              <code>epoll</code> / <code>io_uring</code> (Linux) readiness registration and timers.</div>
           </div>
 
           <div class="test-card">
