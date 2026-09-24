@@ -584,11 +584,20 @@ static int parse_request_fields(const ParsedHead *head, Request *req, Arena *are
      * guaranteed by the ">MAX_HEADERS" check above, so this can never truncate; the guard is kept only
      * so this loop stays correct on its own if that invariant ever changes upstream. There is no longer
      * a per-header size check (the old -3): a view has no fixed capacity to overflow. */
+    size_t host_count = 0;
     for (size_t i = 0; i < head->num_headers; i++) {
+        const struct phr_header *h = &head->headers[i];
+        if (h->name_len == 4 && strncasecmp(h->name, "Host", 4) == 0) host_count++;
         if (req->header_count < MAX_HEADERS) {
-            req->headers[req->header_count] = head->headers[i];
+            req->headers[req->header_count] = *h;
             req->header_count++;
         }
+    }
+    /* RFC 9112 §3.2: an HTTP/1.1 request with no Host, or with more than one, MUST get a 400 - two
+     * Hosts let a proxy and the app disagree on which one the request is for (vhost routing, cache
+     * keys). HTTP/1.0 predates the requirement, so it is not enforced there. */
+    if (head->minor_version >= 1 && host_count != 1) {
+        return -1;
     }
     /* Cookie splitting is lazy now: req_get_cookie runs parse_cookies itself, once, the first
      * time a handler actually asks for a cookie by name - most requests that carry a Cookie header

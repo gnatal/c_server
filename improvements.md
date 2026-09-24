@@ -33,7 +33,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **P2** | ~~io_uring is the Linux default but is 20–25% slower than epoll~~ **FIXED 2026-09-24** | Medium | S | MEASURED (`lib/CLAUDE.md`) |
 | **P3** | ~~Incomplete headers are re-parsed from byte 0 on every `recv` (quadratic)~~ **FIXED 2026-09-24** | Medium (CPU DoS amplifier) | S–M | MEASURED |
 | **M3** | No per-worker memory budget for buffered bodies and unsent output | Medium | M | CODE |
-| **S7** | Missing or duplicate `Host` header is accepted | Low–Medium | S | MEASURED |
+| **S7** | ~~Missing or duplicate `Host` header is accepted~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **S8** | Form fields: `%00` not rejected (S6 gap), values silently truncated at 255 | Low–Medium | S | MEASURED |
 | **S9** | Response header values silently truncated at 255 chars (CSP, `Location`) | Low–Medium | S | MEASURED |
 | **P4** | Cached static files are copied into the arena on every hit | Low–Medium | M | ESTIMATED |
@@ -412,6 +412,13 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   change covers every path.
 
 ### S7 · A missing or duplicated `Host` header is accepted
+- **Status: FIXED 2026-09-24.** `parse_request_fields` (`lib/http_parser.c`) counts `Host` headers (name matched
+  exactly, case-insensitively) while copying the header views and returns -1 (400, connection closed) for
+  `minor_version >= 1` when the count is not exactly 1. HTTP/1.0 is not checked. An empty `Host:` value is accepted
+  (RFC 9112 allows it when the target has no authority). Every test request that was HTTP/1.1 without `Host` now
+  sends `Host: x`. Tests: `test_host_header_count` (`tests/test_http_hardening.c`),
+  `test_handle_readable_host_header_count_400` (`tests/test_connection.c`), and two seeds in `tests/test_answered.c`.
+  `make bench`: no change beyond noise.
 - **Impact:** Low–Medium. RFC 9112 §3.2 says a server MUST answer 400 for an HTTP/1.1 request with no `Host`
   or with more than one. Accepting them leaves room for host-header confusion behind a proxy (for example,
   virtual-host routing or cache keys computed from a different `Host` than the app sees).

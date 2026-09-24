@@ -120,16 +120,16 @@ static void check_answered(const char *buf, size_t len) {
 
 static const char *seeds[] = {
   "GET /api/todos/42?a=1&b=%41%20c&flag HTTP/1.1\r\nHost: x\r\nCookie: a=1; b=2;c\r\nConnection: keep-alive\r\n\r\n",
-  "POST /api/todos HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"title\":\"abc\"}",
-  "POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nTrailer: v\r\n\r\n",
-  "GET / HTTP/1.1\r\n\r\n", "GET\r\n\r\n", "HEAD /a/b/c/d/e/f/g/h/i HTTP/1.0\r\nX: y\r\n\r\n",
-  "PUT /files/x/y/z HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\nX-Content-Length: 9\r\n\r\n",
-  "POST /api/todos HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\nabcd",
-  "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\nConnection: close\r\n\r\n",
-  "\r\nGET / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
-  "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0x5\r\nhello\r\n0\r\n\r\n",
-  "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n",
-  "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n 5\r\nhello\r\n0\r\nX: a\nY: b\r\n\r\n",
+  "POST /api/todos HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"title\":\"abc\"}",
+  "POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nTrailer: v\r\n\r\n",
+  "GET / HTTP/1.1\r\nHost: x\r\n\r\n", "GET\r\n\r\n", "HEAD /a/b/c/d/e/f/g/h/i HTTP/1.0\r\nX: y\r\n\r\n",
+  "PUT /files/x/y/z HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\nX-Content-Length: 9\r\n\r\n",
+  "POST /api/todos HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\nabcd",
+  "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+  "\r\nGET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+  "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0x5\r\nhello\r\n0\r\n\r\n",
+  "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n",
+  "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n 5\r\nhello\r\n0\r\nX: a\nY: b\r\n\r\n",
 };
 int main(int argc, char **argv) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));

@@ -172,10 +172,10 @@ static void test_bypass_shapes_get_413(void) {
     char resp[1024];
 
     const char *cl_heads[] = {
-        "POST /upload HTTP/1.1\r\nContent-Length: 5000\r\n\r\n",
-        "POST /upload?x=1 HTTP/1.1\r\nContent-Length: 5000\r\n\r\n",
-        "POST //upload HTTP/1.1\r\nContent-Length: 5000\r\n\r\n",
-        "POST /%75pload HTTP/1.1\r\nContent-Length: 5000\r\n\r\n",
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n",
+        "POST /upload?x=1 HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n",
+        "POST //upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n",
+        "POST /%75pload HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n",
     };
     for (size_t i = 0; i < sizeof(cl_heads) / sizeof(cl_heads[0]); i++) {
         assert(!exchange(cl_heads[i], body, sizeof(body), resp, sizeof(resp)));
@@ -183,8 +183,8 @@ static void test_bypass_shapes_get_413(void) {
     }
 
     const char *chunked_heads[] = {
-        "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
-        "POST //upload?x=1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "POST //upload?x=1 HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
     };
     for (size_t i = 0; i < sizeof(chunked_heads) / sizeof(chunked_heads[0]); i++) {
         assert(!exchange(chunked_heads[i], chunked, chunked_len, resp, sizeof(resp)));
@@ -196,14 +196,14 @@ static void test_bypass_shapes_get_413(void) {
  * A chunked body of exactly the limit counts decoded bytes, not its (larger) framing. */
 static void test_within_limit_is_served(void) {
     char resp[1024];
-    assert(exchange("POST /upload?x=1 HTTP/1.1\r\nContent-Length: 16\r\n\r\n", "0123456789abcdef", 16, resp,
+    assert(exchange("POST /upload?x=1 HTTP/1.1\r\nHost: x\r\nContent-Length: 16\r\n\r\n", "0123456789abcdef", 16, resp,
                     sizeof(resp)));
     assert(strncmp(resp, "HTTP/1.1 200 ", 13) == 0);
     assert(strstr(resp, "received 16 bytes") != NULL);
 
     char chunked[256];
     const size_t chunked_len = build_chunked(chunked, sizeof(chunked), UPLOAD_LIMIT, 1);
-    assert(exchange("POST //upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", chunked, chunked_len, resp,
+    assert(exchange("POST //upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", chunked, chunked_len, resp,
                     sizeof(resp)));
     assert(strncmp(resp, "HTTP/1.1 200 ", 13) == 0);
     assert(strstr(resp, "received 16 bytes") != NULL);
@@ -217,7 +217,7 @@ static void test_unfinished_huge_chunk_hits_raw_cap(void) {
     const int prefix = snprintf(body, sizeof(body), "100000\r\n");
     memset(body + prefix, 'b', sizeof(body) - (size_t)prefix);
     char resp[1024];
-    assert(!exchange("POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", body, sizeof(body), resp,
+    assert(!exchange("POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", body, sizeof(body), resp,
                      sizeof(resp)));
     assert(strncmp(resp, "HTTP/1.1 413 ", 13) == 0);
 }
@@ -233,7 +233,7 @@ static void test_limit_is_rechecked_per_request(void) {
     static char chunked[8192];
     const size_t chunked_len = build_chunked(chunked, sizeof(chunked), 5000, 1000);
     static char req[16384];
-    size_t len = (size_t)snprintf(req, sizeof(req), "POST /other HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+    size_t len = (size_t)snprintf(req, sizeof(req), "POST /other HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n");
     memcpy(req + len, chunked, chunked_len);
     len += chunked_len;
     assert(pump(&app, fds, req, len));
@@ -242,7 +242,7 @@ static void test_limit_is_rechecked_per_request(void) {
     assert(strncmp(resp, "HTTP/1.1 200 ", 13) == 0);
     assert(strstr(resp, "received 5000 bytes") != NULL);
 
-    len = (size_t)snprintf(req, sizeof(req), "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+    len = (size_t)snprintf(req, sizeof(req), "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n");
     memcpy(req + len, chunked, chunked_len);
     len += chunked_len;
     assert(!pump(&app, fds, req, len));

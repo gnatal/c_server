@@ -189,7 +189,7 @@ static void test_growth_from_read_buf_moves_to_owned_buffer(void) {
     const size_t body_len = 20000;
     char *wire = malloc(256 + body_len);
     assert(wire != NULL);
-    const int head_len = snprintf(wire, 256, "POST /upload HTTP/1.1\r\nX-Tag: big\r\nContent-Length: %zu\r\n\r\n",
+    const int head_len = snprintf(wire, 256, "POST /upload HTTP/1.1\r\nHost: x\r\nX-Tag: big\r\nContent-Length: %zu\r\n\r\n",
                                   body_len);
     assert(head_len > 0);
     memset(wire + head_len, 'y', body_len);
@@ -295,7 +295,7 @@ static void test_rejection_from_read_buf_keeps_shared_buffer(void) {
     int fds_huge[2];
     Connection *huge = add_connection(&app, fds_huge);
     char big_headers[BUF_SIZE + 64];
-    const int n = snprintf(big_headers, sizeof(big_headers), "GET /a HTTP/1.1\r\nX-Pad: ");
+    const int n = snprintf(big_headers, sizeof(big_headers), "GET /a HTTP/1.1\r\nHost: x\r\nX-Pad: ");
     memset(big_headers + n, 'p', sizeof(big_headers) - (size_t)n);
     send_bytes(fds_huge[1], big_headers, sizeof(big_headers));
     handle_readable(&app, huge);
@@ -346,14 +346,14 @@ static void test_body_is_a_view_into_the_input_buffer(void) {
     Connection *conn = add_connection(&app, fds);
     char out[4096];
 
-    send_all(fds[1], "POST /where HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /a HTTP/1.1\r\n\r\n");
+    send_all(fds[1], "POST /where HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /a HTTP/1.1\r\nHost: x\r\n\r\n");
     handle_readable(&app, conn);
     read_available(fds[1], out, sizeof(out));
     assert(strstr(out, "in_input=1 len=5 nul=1 first=h") != NULL);
     assert(strstr(out, "\r\n\r\n/a") != NULL); /* 'G' restored after the body's NUL */
 
-    send_all(fds[1], "POST /where HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
-                     "GET /b HTTP/1.1\r\n\r\n");
+    send_all(fds[1], "POST /where HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
+                     "GET /b HTTP/1.1\r\nHost: x\r\n\r\n");
     handle_readable(&app, conn);
     read_available(fds[1], out, sizeof(out));
     assert(strstr(out, "in_input=1 len=5 nul=1 first=a") != NULL);
@@ -362,7 +362,7 @@ static void test_body_is_a_view_into_the_input_buffer(void) {
     const size_t body_len = 20000;
     char *wire = malloc(256 + body_len);
     assert(wire != NULL);
-    const int head_len = snprintf(wire, 256, "POST /where HTTP/1.1\r\nContent-Length: %zu\r\n\r\n", body_len);
+    const int head_len = snprintf(wire, 256, "POST /where HTTP/1.1\r\nHost: x\r\nContent-Length: %zu\r\n\r\n", body_len);
     memset(wire + head_len, 'z', body_len);
     const size_t wire_len = (size_t)head_len + body_len;
     size_t sent = 0;

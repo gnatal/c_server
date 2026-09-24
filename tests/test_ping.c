@@ -59,23 +59,23 @@ int main(void) {
     memset(&conn, 0, sizeof(conn));
     conn.file_fd = -1;
     Request req;
-    const char *close_req = "GET /ping HTTP/1.1\r\nConnection: close\r\n\r\n";
+    const char *close_req = "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
     assert(parse_http_request(close_req, strlen(close_req), &req, &test_arena) == 0);
     assert(request_wants_close(&req) == 1);
     arena_reset(&test_arena);
 
     /* HEAD: same headers, no body. */
-    resp = fetch(&app, "HEAD /ping HTTP/1.1\r\n\r\n");
+    resp = fetch(&app, "HEAD /ping HTTP/1.1\r\nHost: x\r\n\r\n");
     assert(strstr(resp, "Content-Length: 4\r\n") != NULL);
     assert(strcmp(strstr(resp, "\r\n\r\n") + 4, "") == 0);
     free(resp);
 
     /* Deny by default: other methods are 405 with Allow, other paths 404. */
-    resp = fetch(&app, "POST /ping HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    resp = fetch(&app, "POST /ping HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
     assert(strncmp(resp, "HTTP/1.1 405 Method Not Allowed", 31) == 0);
     assert(strstr(resp, "Allow: GET\r\n") != NULL);
     free(resp);
-    resp = fetch(&app, "GET /ping/extra HTTP/1.1\r\n\r\n");
+    resp = fetch(&app, "GET /ping/extra HTTP/1.1\r\nHost: x\r\n\r\n");
     assert(strncmp(resp, "HTTP/1.1 404 Not Found", 22) == 0);
     free(resp);
 

@@ -56,19 +56,19 @@ static void test_request_is_complete(void) {
     assert(request_is_complete(complete_head, strlen(complete_head)) == 1);
 
     /* Headers complete, Content-Length declared but body incomplete */
-    const char *partial_body = "POST /api HTTP/1.1\r\nContent-Length: 10\r\n\r\n12345";
+    const char *partial_body = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n12345";
     assert(request_is_complete(partial_body, strlen(partial_body)) == 0);
 
     /* Headers complete, Content-Length matches body length */
-    const char *exact_body = "POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\n12345";
+    const char *exact_body = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n12345";
     assert(request_is_complete(exact_body, strlen(exact_body)) == 1);
 
     /* Headers complete, Content-Length smaller than body (excess received) */
-    const char *excess_body = "POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\n123456789";
+    const char *excess_body = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n123456789";
     assert(request_is_complete(excess_body, strlen(excess_body)) == 1);
 
     /* Invalid Content-Length returns 1 to halt buffering and fail in parser */
-    const char *invalid_cl = "POST /api HTTP/1.1\r\nContent-Length: -1\r\n\r\n";
+    const char *invalid_cl = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n";
     assert(request_is_complete(invalid_cl, strlen(invalid_cl)) == 1);
 }
 
@@ -128,8 +128,8 @@ static void test_parse_http_request(void) {
      * header_start-to-header_end distance that wrapped to a huge size_t and
      * caused an out-of-bounds heap read while copying the header block
      * (found via ASan) - a header-less request is unusual but perfectly
-     * legal to receive and must not crash/over-read. */
-    const char *raw_no_headers = "GET /ping HTTP/1.1\r\n\r\n";
+     * legal to receive and must not crash/over-read. HTTP/1.0, since 1.1 requires Host. */
+    const char *raw_no_headers = "GET /ping HTTP/1.0\r\n\r\n";
     assert(parse_http_request(raw_no_headers, strlen(raw_no_headers), &req, &test_arena) == 0);
     assert(strcmp(req.path, "/ping") == 0);
     assert(req.header_count == 0);
@@ -206,7 +206,7 @@ static void test_parse_http_request(void) {
     memset(big_body, 'x', big_len);
     big_body[big_len] = '\0';
     char big_head[128];
-    snprintf(big_head, sizeof(big_head), "POST /upload HTTP/1.1\r\nContent-Length: %zu\r\n\r\n", big_len);
+    snprintf(big_head, sizeof(big_head), "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: %zu\r\n\r\n", big_len);
     size_t big_head_len = strlen(big_head);
     char *big_raw = malloc(big_head_len + big_len + 1);
     memcpy(big_raw, big_head, big_head_len);
@@ -228,13 +228,13 @@ static void test_parse_http_request(void) {
     assert(parse_http_request(no_term, strlen(no_term), &req, &test_arena) == -1);
 
     /* Negative Content-Length */
-    const char *bad_cl = "POST / HTTP/1.1\r\nContent-Length: -5\r\n\r\nbody";
+    const char *bad_cl = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\nbody";
     assert(parse_http_request(bad_cl, strlen(bad_cl), &req, &test_arena) == -1);
 
     /* Content-Length exceeding MAX_BODY_SIZE is still rejected, just at a
      * much higher ceiling than the old BUF_SIZE-based one. */
     char over_head[64];
-    snprintf(over_head, sizeof(over_head), "POST / HTTP/1.1\r\nContent-Length: %d\r\n\r\nbody", MAX_BODY_SIZE + 1);
+    snprintf(over_head, sizeof(over_head), "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\nbody", MAX_BODY_SIZE + 1);
     assert(parse_http_request(over_head, strlen(over_head), &req, &test_arena) == -1);
 
     /* A request-line path longer than req->path (256 bytes) can hold is
@@ -247,8 +247,8 @@ static void test_parse_http_request(void) {
     long_path[0] = '/';
     memset(long_path + 1, 'a', long_path_len - 1);
     long_path[long_path_len] = '\0';
-    char *long_raw = malloc(4 + long_path_len + 13 + 1);
-    snprintf(long_raw, 4 + long_path_len + 13 + 1, "GET %s HTTP/1.1\r\n\r\n", long_path);
+    char *long_raw = malloc(4 + long_path_len + 22 + 1);
+    snprintf(long_raw, 4 + long_path_len + 22 + 1, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", long_path);
     assert(parse_http_request(long_raw, strlen(long_raw), &req, &test_arena) == -2);
     free(long_path);
     free(long_raw);
@@ -260,8 +260,8 @@ static void test_parse_http_request(void) {
     fit_path[0] = '/';
     memset(fit_path + 1, 'a', fit_path_len - 1);
     fit_path[fit_path_len] = '\0';
-    char *fit_raw = malloc(4 + fit_path_len + 13 + 1);
-    snprintf(fit_raw, 4 + fit_path_len + 13 + 1, "GET %s HTTP/1.1\r\n\r\n", fit_path);
+    char *fit_raw = malloc(4 + fit_path_len + 22 + 1);
+    snprintf(fit_raw, 4 + fit_path_len + 22 + 1, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", fit_path);
     assert(parse_http_request(fit_raw, strlen(fit_raw), &req, &test_arena) == 0);
     assert(strlen(req.path) == fit_path_len);
     arena_reset(&test_arena);
@@ -275,7 +275,7 @@ static void test_parse_http_request(void) {
      * how many body bytes parse_http_request copies. */
     const char binary_body[6] = { 'a', 'b', '\0', 'c', 'd', 'e' };
     char binary_head[64];
-    snprintf(binary_head, sizeof(binary_head), "POST /upload HTTP/1.1\r\nContent-Length: %d\r\n\r\n",
+    snprintf(binary_head, sizeof(binary_head), "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n",
              (int)sizeof(binary_body));
     size_t binary_head_len = strlen(binary_head);
     char *binary_raw = malloc(binary_head_len + sizeof(binary_body));
@@ -303,7 +303,7 @@ static void test_request_has_chunked_encoding(void) {
     /* A raw connection buffer (headers + whatever body has arrived) is a
      * valid input too - the same dual-use extract_content_length has. */
     assert(request_has_chunked_encoding(
-        "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n") == 1);
+        "POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n") == 1);
 }
 
 static void test_chunked_body_scan(void) {
@@ -438,7 +438,7 @@ static void test_chunked_body_scan_resume(void) {
 /* request_wire_len is where a pipelined next request starts - headers plus the framed body,
  * never anything after it. */
 static void test_request_wire_len(void) {
-    const char *next = "GET /next HTTP/1.1\r\n\r\n";
+    const char *next = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
     char buf[512];
 
     const char *get = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -449,13 +449,13 @@ static void test_request_wire_len(void) {
     assert(request_head_is_complete(&head, buf, strlen(buf), &scan) == 1);
     assert(request_wire_len(&head, &scan) == strlen(get));
 
-    const char *post = "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+    const char *post = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
     snprintf(buf, sizeof(buf), "%s%s", post, next);
     parse_request_head(buf, strlen(buf), &head);
     assert(request_head_is_complete(&head, buf, strlen(buf), &scan) == 1);
     assert(request_wire_len(&head, &scan) == strlen(post));
 
-    const char *chunked = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    const char *chunked = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
                           "4\r\nWiki\r\n0\r\nX-T: v\r\n\r\n";
     snprintf(buf, sizeof(buf), "%s%s", chunked, next);
     scan = (ChunkScanState){0};
@@ -489,23 +489,23 @@ static void test_chunked_body_decode(void) {
 
 static void test_request_is_complete_chunked(void) {
     /* Complete chunked request. */
-    const char *complete = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
+    const char *complete = "POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
     assert(request_is_complete(complete, strlen(complete)) == 1);
 
     /* Incomplete: last-chunk terminator hasn't arrived yet. */
-    const char *incomplete = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n";
+    const char *incomplete = "POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n";
     assert(request_is_complete(incomplete, strlen(incomplete)) == 0);
 
     /* Malformed chunk framing stops buffering (like an invalid
      * Content-Length does) so parse_http_request can reject it as a 400
      * rather than waiting on bytes that will never form a valid body. */
-    const char *malformed = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nWiki\r\n0\r\n\r\n";
+    const char *malformed = "POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nWiki\r\n0\r\n\r\n";
     assert(request_is_complete(malformed, strlen(malformed)) == 1);
 
     /* A non-chunked request with no matching Transfer-Encoding header still
      * uses ordinary Content-Length-based completeness (regression guard for
      * the branch added alongside chunked support). */
-    const char *plain = "POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\n12345";
+    const char *plain = "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n12345";
     assert(request_is_complete(plain, strlen(plain)) == 1);
 }
 
@@ -524,7 +524,7 @@ static void test_parse_http_request_chunked(void) {
     arena_reset(&test_arena);
 
     /* Trailer headers are accepted but not surfaced anywhere on Request. */
-    const char *with_trailer = "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    const char *with_trailer = "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
                                 "4\r\nWiki\r\n0\r\nExpires: never\r\n\r\n";
     assert(parse_http_request(with_trailer, strlen(with_trailer), &req, &test_arena) == 0);
     assert(strcmp(req.body, "Wiki") == 0);
@@ -533,7 +533,7 @@ static void test_parse_http_request_chunked(void) {
     /* A chunked body can contain embedded NUL bytes - the caller must rely
      * on req.content_length, not strlen(req.body), same as the equivalent
      * Content-Length case (see the binary-body case above). */
-    const char chunked_binary_head[] = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const char chunked_binary_head[] = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
     const char chunked_binary_body[] = "3\r\na\0b\r\n0\r\n\r\n";
     char binary_raw[128];
     size_t head_len = strlen(chunked_binary_head);
@@ -548,14 +548,14 @@ static void test_parse_http_request_chunked(void) {
     /* RFC 7230 3.3.3: Transfer-Encoding and Content-Length together is an
      * ambiguous/smuggling-shaped message - rejected outright (400), not
      * resolved by preferring one header over the other. */
-    const char *both_headers = "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+    const char *both_headers = "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
                                 "Content-Length: 4\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
     assert(parse_http_request(both_headers, strlen(both_headers), &req, &test_arena) == -1);
     assert(req.body == NULL);
 
     /* Malformed chunk framing fails the parse (-1), same status family a
      * malformed Content-Length gets. */
-    const char *malformed = "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nWiki\r\n0\r\n\r\n";
+    const char *malformed = "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nWiki\r\n0\r\n\r\n";
     assert(parse_http_request(malformed, strlen(malformed), &req, &test_arena) == -1);
     assert(req.body == NULL);
 }
@@ -795,27 +795,27 @@ static void check_in_place_matches_copy(const char *wire, const size_t request_l
 
 static void test_parse_http_request_in_place(void) {
     /* Content-Length body followed by a pipelined request: the NUL lands on its 'G' and is restored. */
-    const char *pipelined = "POST /u HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n";
+    const char *pipelined = "POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\nHost: x\r\n\r\n";
     check_in_place_matches_copy(pipelined, strstr(pipelined, "GET /next") - pipelined);
 
     /* Body ends the buffer: the NUL goes on raw[raw_len], already '\0'. */
-    const char *at_end = "POST /u HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    const char *at_end = "POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
     check_in_place_matches_copy(at_end, strlen(at_end));
 
     /* No body: an empty, NUL-terminated view (used to be a 1-byte arena allocation). */
-    const char *no_body = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\n\r\n";
+    const char *no_body = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
     check_in_place_matches_copy(no_body, strstr(no_body, "GET /b") - no_body);
 
     /* Chunked with an extension, a trailer and a pipelined request behind it: decoded in place. */
-    const char *chunked = "POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    const char *chunked = "POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
                           "4;ext=1\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nX-T: 1\r\n\r\n"
-                          "GET /next HTTP/1.1\r\n\r\n";
+                          "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
     check_in_place_matches_copy(chunked, strstr(chunked, "GET /next") - chunked);
 
     /* Binary chunk data (embedded NULs), data longer than its own size line so source and destination
      * overlap during the in-place move. */
     char binary[512];
-    int n = snprintf(binary, sizeof(binary), "POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n40\r\n");
+    int n = snprintf(binary, sizeof(binary), "POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n40\r\n");
     for (int i = 0; i < 0x40; i++) binary[n++] = (char)(i % 7 == 0 ? 0 : 'a' + i % 26);
     n += snprintf(binary + n, sizeof(binary) - (size_t)n, "\r\n0\r\n\r\n");
     char *bin_buf = malloc((size_t)n + 1);
@@ -835,7 +835,7 @@ static void test_parse_http_request_in_place(void) {
     free(bin_buf);
 
     /* A failed parse writes nothing: a malformed chunk leaves the buffer byte-for-byte unchanged. */
-    const char *bad = "POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n";
+    const char *bad = "POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n";
     char bad_buf[128];
     memcpy(bad_buf, bad, strlen(bad) + 1);
     parse_request_head(bad_buf, strlen(bad), &head);
@@ -852,26 +852,26 @@ static int expects_continue(const char *raw) {
 }
 
 static void test_request_head_expects_continue(void) {
-    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n") == 1);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n") == 1);
     /* Name and value are case-insensitive; surrounding whitespace is not part of the value. */
-    assert(expects_continue("POST /u HTTP/1.1\r\nexpect:   100-Continue  \r\nContent-Length: 5\r\n\r\n") == 1);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nexpect:   100-Continue  \r\nContent-Length: 5\r\n\r\n") == 1);
     /* Chunked has a body to wait for, even with no Content-Length. */
-    assert(expects_continue("POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n") == 1);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n") == 1);
     /* HTTP/1.0: a 1xx must never be sent. */
     assert(expects_continue("POST /u HTTP/1.0\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n") == 0);
     /* No body to wait for. */
-    assert(expects_continue("POST /u HTTP/1.1\r\nExpect: 100-continue\r\n\r\n") == 0);
-    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n") == 0);
     /* No Expect, another expectation, or a value that merely contains the token. */
-    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\n\r\n") == 0);
-    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: something-else\r\n\r\n") == 0);
-    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continuex\r\n\r\n") == 0);
-    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nX-Expect: 100-continue\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: something-else\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continuex\r\n\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nX-Expect: 100-continue\r\n\r\n") == 0);
     /* Invalid framing is answered (400) without inviting a body. */
-    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n"
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n"
                             "Expect: 100-continue\r\n\r\n") == 0);
     /* Incomplete head: nothing known yet. */
-    assert(expects_continue("POST /u HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n") == 0);
+    assert(expects_continue("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n") == 0);
 }
 
 /* IMF-fixdate formatting, against reference values from Python's email.utils.formatdate(usegmt=True). */

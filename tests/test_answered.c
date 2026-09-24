@@ -373,38 +373,40 @@ static void run_random_cuts(const char *in, const size_t len) {
 
 static const char *seeds[] = {
     "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n",
-    "HEAD /ping HTTP/1.1\r\n\r\n",
-    "POST /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
-    "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nT: v\r\n\r\n",
-    "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc",
-    "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\n\r\n",
-    "POST /limited HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789",
-    "POST /limited HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nok",
+    "HEAD /ping HTTP/1.1\r\nHost: x\r\n\r\n",
+    "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+    "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nT: v\r\n\r\n",
+    "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc",
+    "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\n\r\n",
+    "POST /limited HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\n123456789",
+    "POST /limited HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nok",
     /* body-limit bypass shapes: the limit applies to the canonical path and to chunked bodies. */
-    "POST /limited?x=1 HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789",
-    "POST //limited HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789",
-    "POST /%6cimited HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789",
-    "POST /limited HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n12345\r\n4\r\n6789\r\n0\r\n\r\n",
-    "POST /limited HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n0\r\n\r\n",
-    "GET /items/42?a=1&b=%41 HTTP/1.1\r\nCookie: a=1\r\n\r\n",
-    "GET /nope HTTP/1.1\r\n\r\n",
-    "DELETE /ping HTTP/1.1\r\n\r\n",
-    "OPTIONS /ping HTTP/1.1\r\n\r\n",
+    "POST /limited?x=1 HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\n123456789",
+    "POST //limited HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\n123456789",
+    "POST /%6cimited HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\n123456789",
+    "POST /limited HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n12345\r\n4\r\n6789\r\n0\r\n\r\n",
+    "POST /limited HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n0\r\n\r\n",
+    "GET /items/42?a=1&b=%41 HTTP/1.1\r\nHost: x\r\nCookie: a=1\r\n\r\n",
+    "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n",
+    "DELETE /ping HTTP/1.1\r\nHost: x\r\n\r\n",
+    "OPTIONS /ping HTTP/1.1\r\nHost: x\r\n\r\n",
     "GET /ping HTTP/1.0\r\n\r\n",
     "GET /ping HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
-    "GET /ping HTTP/1.1\r\nConnection: close\r\n\r\n",
-    "\r\nGET /ping HTTP/1.1\r\n\r\n",
+    "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    "\r\nGET /ping HTTP/1.1\r\nHost: x\r\n\r\n",
     "GET / X\r\n\r\n",
     "GET /ping HTTP\r\n\r\n",
     "GET /ping\r\n\r\n",
     "hello there\r\n\r\n",
-    "GET /%00 HTTP/1.1\r\n\r\n",
+    "GET /%00 HTTP/1.1\r\nHost: x\r\n\r\n",
     "GET /ping HTTP/1.1\r\nHost: x\n\r\n",
-    "POST /echo HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
-    "POST /echo HTTP/1.1\r\nContent-Length: 99999999\r\n\r\n",
-    "POST /echo HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
-    "POST /echo HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
-    "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n\r\n",
+    "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n",
+    "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\n\r\n",
+    "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
+    "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n\r\n",
+    "GET /ping HTTP/1.1\r\n\r\n",
+    "GET /ping HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
 };
 #define NSEEDS (sizeof(seeds) / sizeof(seeds[0]))
 
@@ -415,14 +417,14 @@ static void run_corpus(void) {
     }
     static char buf[MAX_INPUT_LEN];
     const char *pipelines[][4] = {
-        {"GET /ping HTTP/1.1\r\n\r\n", "POST /echo HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi", "HEAD /ping HTTP/1.1\r\n\r\n", NULL},
-        {"GET /ping HTTP/1.1\r\n\r\n", "GET / X\r\n\r\n", "GET /ping HTTP/1.1\r\n\r\n", NULL},
-        {"POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n", "GET /nope HTTP/1.1\r\n\r\n", NULL, NULL},
-        {"GET /ping HTTP/1.1\r\n\r\n", "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\nabc", NULL, NULL},
-        {"GET /ping HTTP/1.1\r\n\r\n", "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab", NULL, NULL},
-        {"GET /ping HTTP/1.1\r\n\r\n", "GET /ping HTTP/1.1\r\nHost: x\r\n", NULL, NULL},
-        {"GET /ping HTTP/1.1\r\nConnection: close\r\n\r\n", "GET /ping HTTP/1.1\r\n\r\n", NULL, NULL},
-        {"GET /ping HTTP/1.1\r\n\r\n", "POST /limited HTTP/1.1\r\nContent-Length: 100\r\n\r\n", NULL, NULL},
+        {"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi", "HEAD /ping HTTP/1.1\r\nHost: x\r\n\r\n", NULL},
+        {"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", "GET / X\r\n\r\n", "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", NULL},
+        {"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n", "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n", NULL, NULL},
+        {"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\nabc", NULL, NULL},
+        {"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab", NULL, NULL},
+        {"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", "GET /ping HTTP/1.1\r\nHost: x\r\n", NULL, NULL},
+        {"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", NULL, NULL},
+        {"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", "POST /limited HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n", NULL, NULL},
     };
     for (size_t p = 0; p < sizeof(pipelines) / sizeof(pipelines[0]); p++) {
         size_t len = 0;
@@ -437,7 +439,7 @@ static void run_corpus(void) {
     /* More pipelined requests than MAX_PIPELINED_PER_EVENT: the rest is served on write readiness. */
     size_t len = 0;
     for (int j = 0; j < MAX_PIPELINED_PER_EVENT + 4; j++) {
-        static const char REQ[] = "GET /ping HTTP/1.1\r\n\r\n";
+        static const char REQ[] = "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n";
         memcpy(buf + len, REQ, sizeof(REQ) - 1);
         len += sizeof(REQ) - 1;
     }
@@ -447,7 +449,7 @@ static void run_corpus(void) {
     len = (size_t)snprintf(buf, sizeof(buf), "GET /");
     memset(buf + len, 'a', 300);
     len += 300;
-    len += (size_t)snprintf(buf + len, sizeof(buf) - len, " HTTP/1.1\r\n\r\n");
+    len += (size_t)snprintf(buf + len, sizeof(buf) - len, " HTTP/1.1\r\nHost: x\r\n\r\n");
     run_exhaustive(buf, len);
 }
 

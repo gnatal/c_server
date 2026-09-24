@@ -234,7 +234,7 @@ static void test_handle_readable_malformed_400(void) {
     Connection *conn;
     setup_test_connection(&app, fds, &conn);
 
-    const char *bad_req = "POST / HTTP/1.1\r\nContent-Length: -5\r\n\r\n";
+    const char *bad_req = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\n";
     assert(write(fds[1], bad_req, strlen(bad_req)) == (ssize_t)strlen(bad_req));
 
     int client_fd = fds[0];
@@ -346,7 +346,7 @@ static void test_handle_readable_long_header_value_is_not_capped(void) {
     int client_fd = fds[0];
 
     char req_line[1400];
-    int n = snprintf(req_line, sizeof(req_line), "GET / HTTP/1.1\r\nAuthorization: Bearer ");
+    int n = snprintf(req_line, sizeof(req_line), "GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ");
     const int token_len = 1100; /* past the old MAX_HEADER_VALUE_LEN (1024) cap */
     for (int i = 0; i < token_len; i++) req_line[n++] = 'x';
     n += snprintf(req_line + n, sizeof(req_line) - (size_t)n, "\r\n\r\n");
@@ -390,6 +390,48 @@ static void test_handle_readable_embedded_nul_in_path_400(void) {
     assert(strstr(resp, "HTTP/1.1 400") != NULL);
     assert(app.connections[client_fd] == NULL);
 
+    teardown_test_connection(&app, fds, conn);
+}
+
+/* RFC 9112 §3.2: an HTTP/1.1 request with no Host, or with two, is answered 400 and closed on the
+ * real in-place parse path; HTTP/1.0 without Host is still served. */
+static void test_handle_readable_host_header_count_400(void) {
+    const char *rejected[] = {
+        "GET /ping HTTP/1.1\r\n\r\n",
+        "GET /ping HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        App app;
+        int fds[2];
+        Connection *conn;
+        setup_test_connection(&app, fds, &conn);
+        const int client_fd = fds[0];
+
+        assert(write(fds[1], rejected[i], strlen(rejected[i])) == (ssize_t)strlen(rejected[i]));
+        handle_readable(&app, conn);
+
+        char resp[256];
+        memset(resp, 0, sizeof(resp));
+        const ssize_t r = read(fds[1], resp, sizeof(resp) - 1);
+        assert(r > 0);
+        assert(strstr(resp, "HTTP/1.1 400") != NULL);
+        assert(app.connections[client_fd] == NULL);
+
+        teardown_test_connection(&app, fds, conn);
+    }
+
+    App app;
+    int fds[2];
+    Connection *conn;
+    setup_test_connection(&app, fds, &conn);
+    app_get(&app, "/ping", ping_handler);
+    const char *http10 = "GET /ping HTTP/1.0\r\n\r\n";
+    assert(write(fds[1], http10, strlen(http10)) == (ssize_t)strlen(http10));
+    handle_readable(&app, conn);
+    char resp[256];
+    memset(resp, 0, sizeof(resp));
+    assert(read(fds[1], resp, sizeof(resp) - 1) > 0);
+    assert(strstr(resp, "HTTP/1.1 200") != NULL && strstr(resp, "pong") != NULL);
     teardown_test_connection(&app, fds, conn);
 }
 
@@ -467,7 +509,7 @@ static void test_handle_readable_body_too_large_413(void) {
      * body to trigger this (see lib/CLAUDE.md, "Behavior reference, Buffers"). */
     char req_line[128];
     snprintf(req_line, sizeof(req_line),
-             "POST /upload HTTP/1.1\r\nContent-Length: %d\r\n\r\n", MAX_BODY_SIZE + 1);
+             "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", MAX_BODY_SIZE + 1);
     assert(write(fds[1], req_line, strlen(req_line)) == (ssize_t)strlen(req_line));
     handle_readable(&app, conn);
 
@@ -497,7 +539,7 @@ static void test_handle_readable_content_length_grows_geometrically(void) {
 
     const int declared_len = 5 * 1024 * 1024; /* 5 MiB declared, well under MAX_BODY_SIZE */
     char head[128];
-    snprintf(head, sizeof(head), "POST /upload HTTP/1.1\r\nContent-Length: %d\r\n\r\n", declared_len);
+    snprintf(head, sizeof(head), "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", declared_len);
     assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
     handle_readable(&app, conn);
     assert(conn->in_cap == BUF_SIZE); /* headers alone: no growth yet */
@@ -558,7 +600,7 @@ static void test_handle_readable_route_body_limit_413(void) {
     int client_fd = fds[0];
     char req_line[160];
     snprintf(req_line, sizeof(req_line),
-             "POST /api/uploads/avatar HTTP/1.1\r\nContent-Length: %d\r\n\r\n", 2048);
+             "POST /api/uploads/avatar HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", 2048);
     assert(write(fds[1], req_line, strlen(req_line)) == (ssize_t)strlen(req_line));
     handle_readable(&app, conn);
 
@@ -587,7 +629,7 @@ static void test_handle_readable_route_body_limit_allows_within_limit(void) {
     char body[100];
     memset(body, 'z', sizeof(body));
     char head[160];
-    snprintf(head, sizeof(head), "POST /api/uploads/avatar HTTP/1.1\r\nContent-Length: %d\r\n\r\n", body_len);
+    snprintf(head, sizeof(head), "POST /api/uploads/avatar HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", body_len);
     assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
     assert(write(fds[1], body, sizeof(body)) == (ssize_t)sizeof(body));
     handle_readable(&app, conn);
@@ -623,7 +665,7 @@ static void test_handle_readable_expect_continue_sends_100_once(void) {
     app_post(&app, "/upload", echo_len_handler);
 
     for (int round = 0; round < 2; round++) {
-        const char *head = "POST /upload HTTP/1.1\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n";
+        const char *head = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n";
         assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
         handle_readable(&app, conn);
 
@@ -657,7 +699,7 @@ static void test_handle_readable_expect_continue_chunked(void) {
     setup_test_connection(&app, fds, &conn);
     app_post(&app, "/upload", echo_len_handler);
 
-    const char *head = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
+    const char *head = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
     assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
     handle_readable(&app, conn);
     char resp[256];
@@ -686,7 +728,7 @@ static void test_handle_readable_expect_continue_not_sent(void) {
     app_use_body_limit(&app, "/api/uploads", 1024);
 
     /* Body sent without waiting: the request is complete, answered directly. */
-    const char *whole = "POST /upload HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello";
+    const char *whole = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello";
     assert(write(fds[1], whole, strlen(whole)) == (ssize_t)strlen(whole));
     handle_readable(&app, conn);
     char resp[256];
@@ -707,7 +749,7 @@ static void test_handle_readable_expect_continue_not_sent(void) {
     assert(app.connections[fds[0]] == conn);
 
     /* Over the route limit: 413, and the connection closes without a 100. */
-    const char *big = "POST /api/uploads/avatar HTTP/1.1\r\nContent-Length: 2048\r\nExpect: 100-continue\r\n\r\n";
+    const char *big = "POST /api/uploads/avatar HTTP/1.1\r\nHost: x\r\nContent-Length: 2048\r\nExpect: 100-continue\r\n\r\n";
     assert(write(fds[1], big, strlen(big)) == (ssize_t)strlen(big));
     handle_readable(&app, conn);
     read_pending(fds[1], resp, sizeof(resp));
@@ -788,7 +830,7 @@ static void test_handle_readable_head_scan_resumes_and_resets(void) {
     assert(conn->head_scan == 0);
 
     /* Second, shorter request: a stale head_scan would start past its blank line and never find it. */
-    const char *second = "GET /ping HTTP/1.1\r\n\r\n";
+    const char *second = "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n";
     assert(write(fds[1], second, strlen(second)) == (ssize_t)strlen(second));
     handle_readable(&app, conn);
     memset(resp, 0, sizeof(resp));
@@ -917,7 +959,7 @@ static void test_handle_readable_chunked_too_large_413(void) {
     Connection *conn;
     setup_test_connection(&app, fds, &conn);
 
-    const char *head = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const char *head = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
     assert(write(fds[1], head, strlen(head)) == (ssize_t)strlen(head));
     handle_readable(&app, conn);
     assert(app.connections[fds[0]] == conn);
@@ -947,7 +989,7 @@ static void test_handle_readable_chunked_malformed_400(void) {
     Connection *conn;
     setup_test_connection(&app, fds, &conn);
 
-    const char *raw = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nWiki\r\n0\r\n\r\n";
+    const char *raw = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nWiki\r\n0\r\n\r\n";
     assert(write(fds[1], raw, strlen(raw)) == (ssize_t)strlen(raw));
     handle_readable(&app, conn);
 
@@ -970,7 +1012,7 @@ static void test_handle_readable_chunked_and_content_length_400(void) {
     /* RFC 7230 3.3.3: Transfer-Encoding + Content-Length together is
      * ambiguous/smuggling-shaped and rejected outright - see lib/CLAUDE.md,
      * "Behavior reference, Request parsing". */
-    const char *raw = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+    const char *raw = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
                        "Content-Length: 4\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
     assert(write(fds[1], raw, strlen(raw)) == (ssize_t)strlen(raw));
     handle_readable(&app, conn);
@@ -1015,7 +1057,7 @@ static void test_handle_readable_unsupported_transfer_encoding_501(void) {
     Connection *conn;
     setup_test_connection(&app, fds, &conn);
 
-    const char *raw = "POST /upload HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
+    const char *raw = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
     assert(write(fds[1], raw, strlen(raw)) == (ssize_t)strlen(raw));
     handle_readable(&app, conn);
 
@@ -1047,8 +1089,8 @@ static void test_handle_readable_path_too_long_414(void) {
     memset(path + 1, 'a', path_len - 1);
     path[path_len] = '\0';
 
-    char *req_line = malloc(4 + path_len + 13 + 1);
-    snprintf(req_line, 4 + path_len + 13 + 1, "GET %s HTTP/1.1\r\n\r\n", path);
+    char *req_line = malloc(4 + path_len + 22 + 1);
+    snprintf(req_line, 4 + path_len + 22 + 1, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
     assert(write(fds[1], req_line, strlen(req_line)) == (ssize_t)strlen(req_line));
     free(path);
     free(req_line);
@@ -1930,6 +1972,7 @@ int main(void) {
     test_handle_readable_header_overflow_431();
     test_handle_readable_long_header_value_is_not_capped();
     test_handle_readable_embedded_nul_in_path_400();
+    test_handle_readable_host_header_count_400();
     test_handle_readable_large_body_grows_buffer();
     test_handle_readable_body_too_large_413();
     test_handle_readable_content_length_grows_geometrically();

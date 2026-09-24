@@ -27,15 +27,15 @@ static void test_framing_is_line_anchored(void) {
     assert(extract_content_length(in_target) == 0);
     assert(request_is_complete(in_target, strlen(in_target)) == 1);
 
-    const char *in_value = "GET /a HTTP/1.1\r\nX-Note: Content-Length: 50\r\n\r\n";
+    const char *in_value = "GET /a HTTP/1.1\r\nHost: x\r\nX-Note: Content-Length: 50\r\n\r\n";
     assert(request_is_complete(in_value, strlen(in_value)) == 1);
 
     /* Same for Transfer-Encoding: only the real header counts. */
-    const char *te_lookalike = "POST /a HTTP/1.1\r\nX-Transfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n";
+    const char *te_lookalike = "POST /a HTTP/1.1\r\nHost: x\r\nX-Transfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n";
     assert(request_has_chunked_encoding(te_lookalike) == 0);
 
     /* A body that merely contains the text must not be scanned. */
-    const char *in_body = "POST /a HTTP/1.1\r\nContent-Length: 20\r\n\r\nContent-Length: 999999";
+    const char *in_body = "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 20\r\n\r\nContent-Length: 999999";
     assert(extract_content_length(in_body) == 20);
     assert(request_is_complete(in_body, strlen(in_body)) == 1);
 
@@ -63,7 +63,7 @@ static void test_content_length_is_strict(void) {
     assert(extract_content_length("Content-Length: 99999999999999999999999999\r\n") == -2);
 
     /* Content-Length together with chunked framing is rejected everywhere. */
-    const char *both = "POST /a HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
+    const char *both = "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
     size_t header_len;
     int chunked;
     assert(request_framing(both, strlen(both), &header_len, &chunked, NULL, NULL) == -1);
@@ -78,15 +78,15 @@ static void test_request_framing(void) {
     size_t header_len = 99;
     int chunked = 99;
 
-    const char *partial = "POST /a HTTP/1.1\r\nContent-Length: 3\r\n";
+    const char *partial = "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n";
     assert(request_framing(partial, strlen(partial), &header_len, &chunked, NULL, NULL) == 0);
     assert(header_len == 0 && chunked == 0);
 
-    const char *complete = "POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    const char *complete = "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
     assert(request_framing(complete, strlen(complete), &header_len, &chunked, NULL, NULL) == 3);
     assert(header_len == strlen(complete) - 3 && chunked == 0);
 
-    const char *no_headers = "GET / HTTP/1.1\r\n\r\n";
+    const char *no_headers = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     assert(request_framing(no_headers, strlen(no_headers), &header_len, &chunked, NULL, NULL) == 0);
     assert(header_len == strlen(no_headers));
 
@@ -94,7 +94,7 @@ static void test_request_framing(void) {
      * transfer-coding ("chunked", named alone), and layering an unimplemented coding like gzip on top
      * used to be silently accepted via a bare substring search for "chunked" in the header value. Now
      * rejected (-3, -> 501) - see test_transfer_encoding_token_matching for the full matrix. */
-    const char *te = "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+    const char *te = "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
     assert(request_framing(te, strlen(te), &header_len, &chunked, NULL, NULL) == -3);
     assert(chunked == 0 && header_len == strlen(te));
 }
@@ -108,14 +108,14 @@ static void test_request_framing_path_out(void) {
     const char *path;
     size_t path_len;
 
-    const char *req_line = "POST /api/uploads/avatar HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    const char *req_line = "POST /api/uploads/avatar HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
     assert(request_framing(req_line, strlen(req_line), &header_len, &chunked, &path, &path_len) == 3);
     assert(path_len == strlen("/api/uploads/avatar"));
     assert(memcmp(path, "/api/uploads/avatar", path_len) == 0);
 
     /* Headers incomplete: header_len == 0, path_out must not be trusted (not asserted here, just
      * confirmed request_framing doesn't crash when path_out is requested but unavailable). */
-    const char *partial = "POST /a HTTP/1.1\r\nContent-Length: 3\r\n";
+    const char *partial = "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n";
     assert(request_framing(partial, strlen(partial), &header_len, &chunked, &path, &path_len) == 0);
     assert(header_len == 0);
 }
@@ -147,21 +147,21 @@ static void test_request_line_limits(void) {
     Request req;
     /* Regression: a method token longer than req->method used to be silently truncated to its first
      * 7 characters, with the leftover characters then mis-read as the path. */
-    const char *long_method = "GETTTTTTTTTT /a HTTP/1.1\r\n\r\n";
+    const char *long_method = "GETTTTTTTTTT /a HTTP/1.1\r\nHost: x\r\n\r\n";
     assert(parse_http_request(long_method, strlen(long_method), &req, &test_arena) == -1);
     assert(req.body == NULL);
 
-    const char *seven = "OPTIONS /a HTTP/1.1\r\n\r\n";
+    const char *seven = "OPTIONS /a HTTP/1.1\r\nHost: x\r\n\r\n";
     assert(parse_http_request(seven, strlen(seven), &req, &test_arena) == 0);
     assert(strcmp(req.method, "OPTIONS") == 0);
     arena_reset(&test_arena);
 
-    const char *eight = "OPTIONSS /a HTTP/1.1\r\n\r\n";
+    const char *eight = "OPTIONSS /a HTTP/1.1\r\nHost: x\r\n\r\n";
     assert(parse_http_request(eight, strlen(eight), &req, &test_arena) == -1);
 
     const char *no_target = "GET\r\n\r\n";
     assert(parse_http_request(no_target, strlen(no_target), &req, &test_arena) == -1);
-    const char *leading_space = " GET /a HTTP/1.1\r\n\r\n";
+    const char *leading_space = " GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
     assert(parse_http_request(leading_space, strlen(leading_space), &req, &test_arena) == -1);
 
     /* Version is required by picohttpparser. */
@@ -173,7 +173,7 @@ static void test_request_line_limits(void) {
     char long_query[1200];
     int n = snprintf(long_query, sizeof(long_query), "GET /a?");
     for (int i = 0; i < 900; i++) long_query[n++] = 'q';
-    n += snprintf(long_query + n, sizeof(long_query) - (size_t)n, " HTTP/1.1\r\n\r\n");
+    n += snprintf(long_query + n, sizeof(long_query) - (size_t)n, " HTTP/1.1\r\nHost: x\r\n\r\n");
     assert(parse_http_request(long_query, (size_t)n, &req, &test_arena) == 0);
     assert(strlen(req.query) == sizeof(req.query) - 1);
     assert(req.query_count == 1);
@@ -185,7 +185,7 @@ static void test_request_line_limits(void) {
 static void test_parse_does_not_depend_on_zeroed_request(void) {
     Request req;
     memset(&req, 0xA5, sizeof(req));
-    const char *raw = "GET /plain HTTP/1.1\r\n\r\n";
+    const char *raw = "GET /plain HTTP/1.0\r\n\r\n";
     assert(parse_http_request(raw, strlen(raw), &req, &test_arena) == 0);
     assert(strcmp(req.method, "GET") == 0);
     assert(strcmp(req.path, "/plain") == 0);
@@ -253,7 +253,7 @@ static void test_parse_http_request_header_views_are_not_capped(void) {
      * truncated case improvements.md measured, at the original, smaller 255-byte cap) now parses fine
      * and round-trips exactly. */
     char oversized_value[1400];
-    int n = snprintf(oversized_value, sizeof(oversized_value), "POST /a HTTP/1.1\r\nAuthorization: Bearer ");
+    int n = snprintf(oversized_value, sizeof(oversized_value), "POST /a HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ");
     const int oversized_len = 1100;
     for (int i = 0; i < oversized_len; i++) oversized_value[n++] = 'x';
     n += snprintf(oversized_value + n, sizeof(oversized_value) - (size_t)n, "\r\nContent-Length: 0\r\n\r\n");
@@ -264,7 +264,7 @@ static void test_parse_http_request_header_views_are_not_capped(void) {
 
     /* A realistic ~600-char JWT-shaped token, comfortably within even the old cap, is unaffected. */
     char within_cap[1200];
-    n = snprintf(within_cap, sizeof(within_cap), "POST /a HTTP/1.1\r\nAuthorization: Bearer ");
+    n = snprintf(within_cap, sizeof(within_cap), "POST /a HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ");
     const int token_len = 600;
     for (int i = 0; i < token_len; i++) within_cap[n++] = 'a' + (i % 26);
     n += snprintf(within_cap + n, sizeof(within_cap) - (size_t)n, "\r\nContent-Length: 0\r\n\r\n");
@@ -276,7 +276,7 @@ static void test_parse_http_request_header_views_are_not_capped(void) {
 
     /* An over-long header NAME is unaffected the same way, for the same reason. */
     char oversized_name[400];
-    n = snprintf(oversized_name, sizeof(oversized_name), "POST /a HTTP/1.1\r\n");
+    n = snprintf(oversized_name, sizeof(oversized_name), "POST /a HTTP/1.1\r\nHost: x\r\n");
     for (int i = 0; i < 100; i++) oversized_name[n++] = 'N';
     n += snprintf(oversized_name + n, sizeof(oversized_name) - (size_t)n, ": v\r\nContent-Length: 0\r\n\r\n");
     assert(parse_http_request(oversized_name, (size_t)n, &req, &test_arena) == 0);
@@ -383,7 +383,7 @@ static void test_malformed_request_line_rejected(void) {
 
     /* A genuinely incomplete request line (no terminator yet) must still report "need more bytes" -
      * the fix must not widen "malformed" to cover this. */
-    const char *incomplete = "GET / HTTP/1.1\r\n";
+    const char *incomplete = "GET / HTTP/1.1\r\nHost: x\r\n";
     assert(request_is_complete(incomplete, strlen(incomplete)) == 0);
     size_t header_len;
     int chunked;
@@ -447,13 +447,13 @@ static void test_transfer_encoding_token_matching(void) {
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         char req_buf[256];
-        snprintf(req_buf, sizeof(req_buf), "POST /a HTTP/1.1\r\n%sContent-Length: 0\r\n\r\n",
+        snprintf(req_buf, sizeof(req_buf), "POST /a HTTP/1.1\r\nHost: x\r\n%sContent-Length: 0\r\n\r\n",
                  cases[i].expect_code == 0 ? "" : cases[i].header_line);
         /* Cases expected to be accepted as chunked must not also carry Content-Length (smuggling
          * shape: chunked + Content-Length together is its own -1, unrelated to what's being tested
          * here), so build those without one. */
         if (cases[i].expect_code == 0) {
-            snprintf(req_buf, sizeof(req_buf), "POST /a HTTP/1.1\r\n%s\r\n4\r\nWiki\r\n0\r\n\r\n",
+            snprintf(req_buf, sizeof(req_buf), "POST /a HTTP/1.1\r\nHost: x\r\n%s\r\n4\r\nWiki\r\n0\r\n\r\n",
                      cases[i].header_line);
         }
         size_t header_len = 99;
@@ -468,14 +468,14 @@ static void test_transfer_encoding_token_matching(void) {
 
     /* Splitting the coding list across two separate Transfer-Encoding header instances doesn't evade
      * the check: neither header line alone is the sole token "chunked". */
-    const char *split = "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const char *split = "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n";
     size_t header_len;
     int chunked;
     assert(request_framing(split, strlen(split), &header_len, &chunked, NULL, NULL) == -3);
 
     /* End to end: parse_http_request surfaces -3 as -1 (malformed) with req.content_length == -3, the
      * same generic "content_length < 0" plumbing the body-limit and malformed-line checks already use for their own sentinels. */
-    const char *gzip_only = "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip\r\nContent-Length: 0\r\n\r\n";
+    const char *gzip_only = "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\nContent-Length: 0\r\n\r\n";
     Request req;
     assert(parse_http_request(gzip_only, strlen(gzip_only), &req, &test_arena) == -1);
     assert(req.content_length == -3);
@@ -510,7 +510,7 @@ static void test_short_version_token_rejected(void) {
     /* No blank line yet: still "need more bytes", however short the version token so far. */
     const char *incomplete[] = {
         "GET / X\r\n", "GET / X\r\n\r", "GET / HTTP/1.1\r\nHost: x\r\n", "GET / HTTP/1.1\r\nHost: x\r\n\r", "\r\n",
-        "\r\nGET / HTTP/1.1\r\n",
+        "\r\nGET / HTTP/1.1\r\nHost: x\r\n",
     };
     for (size_t i = 0; i < sizeof(incomplete) / sizeof(incomplete[0]); i++) {
         assert(request_is_complete(incomplete[i], strlen(incomplete[i])) == 0);
@@ -623,19 +623,19 @@ static void test_chunk_size_line_is_strict(void) {
 static void test_every_prefix_is_answered_or_waits_for_bytes(void) {
     const char *inputs[] = {
         "GET /a HTTP/1.1\r\nHost: x\r\n\r\n",
-        "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
-        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nT: v\r\n\r\n",
-        "POST /a HTTP/1.1\r\nContent-Length: 4\r\n\r\n\n\n\r\n",       /* blank lines inside a body */
-        "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n",
-        "GET / X\r\n\r\nGET /a HTTP/1.1\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nT: v\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n\n\n\r\n",       /* blank lines inside a body */
+        "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET / X\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
         "GET /a HTTP/1.1\r\nHost: x\n\r\n",
         "GET /a HTTP/2.0\r\n\r\n",
-        "POST /a HTTP/1.1\r\nContent-Length: 99999999\r\n\r\n",
-        "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
-        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n\r\n",
-        "POST /a HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
-        "GET /%00 HTTP/1.1\r\n\r\n",
-        "\r\nGET /a HTTP/1.1\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
+        "GET /%00 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
         "not http at all\r\n\r\n",
     };
     for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
@@ -678,7 +678,7 @@ static void test_every_prefix_is_answered_or_waits_for_bytes(void) {
  * line (0), then is rejected (-1) like any other. */
 static void test_head_scan_resumes_and_matches_from_scratch(void) {
     static char big[BUF_SIZE];
-    size_t n = (size_t)snprintf(big, sizeof(big), "GET /a HTTP/1.1\r\n");
+    size_t n = (size_t)snprintf(big, sizeof(big), "GET /a HTTP/1.1\r\nHost: x\r\n");
     for (int i = 0; n + 64 < sizeof(big) - 4; i++) {
         n += (size_t)snprintf(big + n, sizeof(big) - n, "X-H%d: 0000000000000000000000\r\n", i);
     }
@@ -690,7 +690,7 @@ static void test_head_scan_resumes_and_matches_from_scratch(void) {
         "GET /a HTTP/1.1\r\nHost: x\r\n\r\n",
         "GET /a HTTP/1.1\nHost: x\n\n",                    /* bare-LF blank line: found, then rejected */
         "this is \x01 not a request\r\nX: y\r\n\r\n",  /* malformed long before its blank line */
-        "\r\nGET /a HTTP/1.1\r\n\r\n",
+        "\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
     };
     for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
         const size_t len = i == 0 ? n : strlen(inputs[i]);
@@ -805,6 +805,35 @@ static void test_request_path_is_canonical(void) {
     }
 }
 
+/* RFC 9112 §3.2: HTTP/1.1 needs exactly one Host (name matched case-insensitively, empty value
+ * allowed); HTTP/1.0 is exempt. */
+static void test_host_header_count(void) {
+    Request req;
+    const char *accepted[] = {
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nhOST: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost:\r\n\r\n",
+        "GET / HTTP/1.1\r\nX-Host: a\r\nHost: b\r\nHosts: c\r\n\r\n",
+        "GET / HTTP/1.0\r\n\r\n",
+        "GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        assert(parse_http_request(accepted[i], strlen(accepted[i]), &req, &test_arena) == 0);
+        arena_reset(&test_arena);
+    }
+    const char *rejected[] = {
+        "GET / HTTP/1.1\r\n\r\n",
+        "GET / HTTP/1.1\r\nX-Host: a\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nhost: a\r\n\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi",
+    };
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        assert(parse_http_request(rejected[i], strlen(rejected[i]), &req, &test_arena) == -1);
+        arena_reset(&test_arena);
+    }
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_framing_is_line_anchored();
@@ -828,6 +857,7 @@ int main(void) {
     test_path_canonicalize();
     test_path_prefix_helpers();
     test_request_path_is_canonical();
+    test_host_header_count();
     printf("all http hardening tests passed\n");
     return 0;
 }
