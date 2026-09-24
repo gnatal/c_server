@@ -7,6 +7,7 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -25,6 +26,15 @@ static ssize_t conn_read(Connection *conn, void *buf, size_t count) {
 
 static ssize_t conn_write(Connection *conn, const void *buf, size_t count) {
     return write(conn->fd, buf, count);
+}
+
+static ssize_t conn_writev(Connection *conn, const struct iovec *iov, int iovcnt) {
+    return writev(conn->fd, iov, iovcnt);
+}
+
+/* Bytes of conn's shared_body not yet written (0 when none is pinned). */
+static size_t shared_body_left(const Connection *conn) {
+    return conn->shared_body != NULL ? conn->shared_body->len - conn->shared_body_sent : 0;
 }
 
 int set_nonblocking(int fd) {
@@ -186,7 +196,8 @@ Connection *connection_create(App *app, int fd) {
 
 /* ---- per-worker buffered-memory budget (ServerConfig.max_buffered_bytes) ---- */
 
-/* Bytes conn owns across event-loop turns: a borrowed App.read_buf and an arena out_buf are not its own. */
+/* Bytes conn owns across event-loop turns: a borrowed App.read_buf and an arena out_buf are not its own.
+ * A pinned shared_body counts as a copy would: evicted from the cache, only this connection keeps it alive. */
 static size_t owned_bytes(const App *app, const Connection *conn) {
     size_t n = 0;
     if (conn->in_buf != NULL && conn->in_buf != app->read_buf) {
@@ -198,7 +209,7 @@ static size_t owned_bytes(const App *app, const Connection *conn) {
     if (conn->stream_buf != NULL) {
         n += STREAM_CHUNK_SIZE;
     }
-    return n;
+    return n + shared_body_left(conn);
 }
 
 /* Re-reads conn's ownership and moves App.buffered_bytes by the difference. Idempotent, so it is called
@@ -240,6 +251,7 @@ void connection_close(App *app, Connection *conn) {
         conn->file_fd = -1;
     }
     stream_release(conn); /* a producer stream cut short (peer gone, write error, shutdown) frees its ctx here */
+    shared_body_detach(conn); /* the cache (or nobody, if it was evicted meanwhile) keeps the rest */
     /* stream_buf and a still-owned malloc'd out_buf tail-copy are connection-owned, unlike the
      * (shared, App-owned) arena a normal out_buf lives in - free them here regardless of which exit
      * path got the connection closed (a hard write/read error mid-response, not just the ordinary
@@ -315,7 +327,7 @@ int app_count_connections(const App *app) {
 /* whether a response is still being written (built but not fully queued on the socket). a
  * producer stream counts for its whole life, paused or not - it has not sent its last chunk yet. */
 static int response_pending(const Connection *conn) {
-    return conn->out_buf != NULL || conn->file_fd >= 0 || conn->stream_fn != NULL;
+    return conn->out_buf != NULL || conn->shared_body != NULL || conn->file_fd >= 0 || conn->stream_fn != NULL;
 }
 
 void app_stop(App *app) {
@@ -586,34 +598,57 @@ int flush_connection(App *app, Connection *conn) {
     }
 
     while (1) {
-        while (conn->out_sent < conn->out_len) {
-            ssize_t n = conn_write(conn, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
+        /* out_buf first, then a pinned shared_body (res_send_shared) straight from its bytes: one writev
+         * for both, so a cached static file costs one syscall and no copy of its body. */
+        while (conn->out_sent < conn->out_len || conn->shared_body != NULL) {
+            const size_t out_left = conn->out_len - conn->out_sent;
+            ssize_t n;
+            if (conn->shared_body == NULL) {
+                n = conn_write(conn, conn->out_buf + conn->out_sent, out_left);
+            } else {
+                struct iovec iov[2];
+                int iovcnt = 0;
+                if (out_left > 0) {
+                    iov[iovcnt].iov_base = conn->out_buf + conn->out_sent;
+                    iov[iovcnt].iov_len = out_left;
+                    iovcnt++;
+                }
+                iov[iovcnt].iov_base = conn->shared_body->data + conn->shared_body_sent;
+                iov[iovcnt].iov_len = shared_body_left(conn);
+                iovcnt++;
+                n = conn_writev(conn, iov, iovcnt);
+            }
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     /* out_buf is shared-arena-resident unless it's already a connection-owned
                      * copy (out_buf_owned) or the file-streaming chunk buffer (out_buf == stream_buf,
                      * never arena to begin with - see stream_buf's own comment). Returning to the event
                      * loop now would let another connection's dispatch reset and reuse the shared
-                     * arena before this response finishes draining, so copy what's left out first. */
-                    if (!conn->out_buf_owned && conn->out_buf != conn->stream_buf) {
-                        size_t remaining = conn->out_len - conn->out_sent;
-                        if (!budget_allows(app, remaining)) {
+                     * arena before this response finishes draining, so copy what's left out first.
+                     * A shared_body is not copied: this connection's reference keeps it alive. */
+                    if (conn->out_buf != NULL && !conn->out_buf_owned && conn->out_buf != conn->stream_buf) {
+                        if (!budget_allows(app, out_left + shared_body_left(conn))) {
                             /* over the worker's buffered-memory budget: this client is the one that just
                              * stopped reading, so it is dropped rather than every other connection. */
                             connection_close(app, conn);
                             return FLUSH_CLOSED;
                         }
-                        char *tail = malloc(remaining);
-                        if (tail == NULL) {
-                            connection_close(app, conn);
-                            return FLUSH_CLOSED;
+                        char *tail = NULL;
+                        if (out_left > 0) {
+                            tail = malloc(out_left);
+                            if (tail == NULL) {
+                                connection_close(app, conn);
+                                return FLUSH_CLOSED;
+                            }
+                            memcpy(tail, conn->out_buf + conn->out_sent, out_left);
                         }
-                        memcpy(tail, conn->out_buf + conn->out_sent, remaining);
+                        /* out_left == 0 (head sent, shared_body still pending): nothing arena-resident is
+                         * needed any more, so out_buf just stops pointing into the arena */
                         conn->out_buf = tail;
-                        conn->out_len = remaining;
+                        conn->out_len = out_left;
                         conn->out_sent = 0;
-                        conn->out_cap = remaining;
-                        conn->out_buf_owned = 1;
+                        conn->out_cap = out_left;
+                        conn->out_buf_owned = tail != NULL;
                     }
                     wait_for_writable(app, conn);
                     return FLUSH_PENDING;
@@ -621,7 +656,14 @@ int flush_connection(App *app, Connection *conn) {
                 connection_close(app, conn);
                 return FLUSH_CLOSED;
             }
-            conn->out_sent += (size_t)n;
+            const size_t out_part = (size_t)n < out_left ? (size_t)n : out_left;
+            conn->out_sent += out_part;
+            if (conn->shared_body != NULL) {
+                conn->shared_body_sent += (size_t)n - out_part;
+                if (conn->shared_body_sent == conn->shared_body->len) {
+                    shared_body_detach(conn); /* last byte written: the cache (if still holding it) keeps it */
+                }
+            }
             conn->last_activity = time(NULL);
             conn->last_write_progress = conn->last_activity; /* only advances on actual bytes written */
             bytes_written_this_flush += (size_t)n;

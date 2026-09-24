@@ -90,7 +90,9 @@ Measured on macOS, 5,000 idle keep-alive connections on one worker now take abou
 the shared receive buffer below removed the remaining 8 KiB `in_buf`.
 **Buffered-memory budget.** `App.buffered_bytes` is the sum of what open connections hold across event-loop turns:
 an owned `in_buf` (`in_cap`; a borrowed `App.read_buf` is not counted), an owned `out_buf` tail copy (`out_cap` while
-`out_buf_owned`), and `STREAM_CHUNK_SIZE` while `stream_buf` is allocated. The arena is not counted (reset every
+`out_buf_owned`), `STREAM_CHUNK_SIZE` while `stream_buf` is allocated, and the unsent part of a pinned
+`shared_body` (counted as if it were a copy: it is what a slow reader keeps alive once the cache evicts it, and what
+the tail copy used to be). The arena is not counted (reset every
 dispatch cycle). Each connection records its share in `Connection.held_bytes`; `sync_held_bytes` (`connection.c`)
 recomputes that share from the fields and moves the total by the difference, so it is idempotent and runs after each
 ownership change (`grow_in_buf`, `stop_borrowing_read_buf`, `release_in_buf`, `wait_for_writable`, `park_stream`, the
@@ -126,9 +128,9 @@ allocation falls back to `malloc` and is chained in a list that `arena_reset` fr
 `SIZE_MAX - 8 - sizeof(ArenaNode)` returns `NULL` without touching the arena (the alignment and fallback-header
 arithmetic would otherwise wrap), the same as a failed fallback `malloc`. Consequences: nothing reached
 through `req` or `res` may be kept past the handler; a growing chunked response copies into a new arena block each
-doubling and leaves the old block in the arena until the request ends; a static file is read into a malloc'd buffer
-and copied again into the arena by `res_send_bytes` (unlike `res_send_file`, which never copies the body into the
-arena at all - see above).
+doubling and leaves the old block in the arena until the request ends; a cached static file never enters the arena:
+only its head is built there and the body is written from the cache's `SharedBody` (`res_send_shared`, see "Static"),
+and `res_send_file` never copies the body into the arena either (see above).
 
 ## Ownership (who frees what)
 | Thing | Allocated by | Freed by |
@@ -157,7 +159,9 @@ arena at all - see above).
 | `cluster.c`'s `listen_fd` (`CEXPRESS_SINGLE_ACCEPTOR` only - the master's one real listen socket, replacing per-worker binds) | `cluster_listen` (`create_server_socket`) | `cluster_listen`, after every worker has drained, at the end of the same function |
 | The master's copy of each accepted client fd (`CEXPRESS_SINGLE_ACCEPTOR` only) | `cluster_listen`'s accept loop (`accept_client`) | the same loop, right after `dispatch_client_fd`, success or not - the worker owns its own `SCM_RIGHTS` copy from then on |
 | `ClusterWorkerSlot.control_fd` per slot (the master-side end of that worker's socketpair; the worker keeps the other end, `sv[1]`, as its own `server_fd`) | `spawn_worker`, fresh on every spawn *and* every respawn | `spawn_worker`'s next respawn for that slot (closes the stale one first), or `cluster_listen`'s final cleanup once every worker has drained |
-| Static file cache entries (cached path string + file bytes, `static.c`'s own process-lifetime global, not tied to any `App`) | `static_serve_file`, on a cache miss or a changed file | replaced in place on the next change, evicted (stalest first) once `STATIC_CACHE_MAX_ENTRIES` is reached, or all of them via `static_cache_clear` (tests; nothing in the engine calls it) |
+| Static file cache entries (`StaticCacheEntry`, `static.h`: cached path string + one reference to the file's `SharedBody`; `static.c`'s own process-lifetime global, not tied to any `App`) | `static_serve_file`, on a cache miss or a changed file | replaced in place on the next change, evicted (stalest first) once `STATIC_CACHE_MAX_ENTRIES` is reached, or all of them via `static_cache_clear` (tests; nothing in the engine calls it). Each drops only the cache's reference: a body a connection is still sending lives on until that connection's reference goes |
+| `SharedBody` (refcounted, one malloc: header + bytes) | `shared_body_new` (refs 1: the static cache's reference once `cache_insert` takes it) | `shared_body_release` reaching 0: the cache's reference (above) plus one per connection sending it |
+| `conn->shared_body` (one reference, pinned by `res_send_shared`) | `res_send_shared` (`shared_body_retain`), not for HEAD / bodiless status / empty body | `shared_body_detach`: in `flush_connection` once its last byte is written, in `send_with_content_type`/`commit_chunked_headers` when a later `res_*` replaces the response, or in `connection_close` |
 
 ## Return conventions
 `0` ok / `-1` error for setup functions (`res_send_file`, `event_loop_*`, `create_*`).
@@ -224,6 +228,14 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   is served normally but never cached (no behavior change for large files). The cache is a single process-lifetime table
   shared by every mount, not scoped to an `App` - see Ownership above and `static_cache_clear` (`static.h`) for the one thing
   that frees it (tests; not called anywhere in the engine itself).
+  **Hits are sent by reference.** Each entry's bytes are a refcounted `SharedBody`; every response (miss or hit) builds
+  only its head in the arena and pins the body on the connection (`res_send_shared`, `Connection.shared_body`).
+  `flush_connection` writes the rest of `out_buf` and the body with one `writev`; on `EAGAIN` only the head's unsent
+  part is copied out of the arena (none, if the head already went), never the body. So a hit costs no `malloc`/`memcpy`
+  of the file at any size (it used to be copied into the arena - past 64 KiB through the arena's `malloc` fallback -
+  and copied a third time as the `EAGAIN` tail): MEASURED on macOS, `static_serve_file` for a cached 256 KiB file
+  3.8 µs → 0.2 µs, 128 KiB 1.9 µs → 0.2 µs, 32 KiB 0.5 µs → 0.2 µs, 1 KiB unchanged (handler only, no socket). A
+  file changed on disk replaces the entry's body; a connection still sending the old one keeps it until done.
 - **Request parsing.** picohttpparser does the request line and header block; it is strict about tokens and
   rejects HTTP versions other than 1.x. `Content-Length`
   must be plain digits; duplicates must agree; `Content-Length` together with chunked is 400 (smuggling shape). Header names are matched exactly and case-insensitively (never by substring). Method ≤ 7

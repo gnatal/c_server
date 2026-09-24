@@ -5,12 +5,15 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <limits.h>
 #include "app_types.h"
 #include "event_loop.h"
 #include "connection.h"
 #include "router.h"
 #include "response.h"
 #include "http_parser.h"
+#include "static.h"
 
 /*
  * ServerConfig.max_buffered_bytes / App.buffered_bytes: the per-worker budget for memory connections
@@ -287,6 +290,83 @@ static void test_stream_buf_counted(void) {
     app_destroy(&app);
 }
 
+/* A cached static file is sent by reference (res_send_shared): a client that stops reading pins the cache's
+ * body instead of getting a copy of it. Only the head's unsent part may be copied; the pinned remainder is
+ * counted against the budget as a copy would be; the pin survives static_cache_clear and drains intact. */
+static void test_static_body_pinned_not_copied(void) {
+    char root_template[] = "/tmp/cexpress_budget_static_XXXXXX";
+    char *const root = mkdtemp(root_template);
+    assert(root != NULL);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/blob.bin", root);
+    const size_t file_len = STATIC_CACHE_MAX_ENTRY_BYTES; /* largest cached size */
+    FILE *f = fopen(path, "wb");
+    assert(f != NULL);
+    for (size_t i = 0; i < file_len; i++) {
+        assert(fputc('a' + (int)(i % 26), f) != EOF);
+    }
+    fclose(f);
+
+    App app;
+    app_setup(&app);
+    app_serve_static(&app, "/s", root);
+    int peer;
+    const int fd = (open_conn(&app, &peer))->fd;
+    Connection *conn = app.connections[fd];
+    const int small = 16 * 1024; /* socketpair buffers far below the file, on every platform */
+    assert(setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0);
+    assert(setsockopt(peer, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+
+    const char *get = "GET /s/blob.bin HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(peer, get, strlen(get));
+    handle_readable(&app, conn);
+    assert(app.connections[fd] == conn);
+    SharedBody *const pinned = conn->shared_body;
+    assert(pinned != NULL && pinned->len == file_len && conn->shared_body_sent < file_len);
+    assert(pinned->refs == 2); /* the cache's and this connection's */
+    assert(!conn->out_buf_owned || conn->out_cap < 1024); /* at most the head was copied, never the body */
+    const size_t owned_head = conn->out_buf_owned ? conn->out_cap : 0;
+    assert(conn->held_bytes == owned_head + (file_len - conn->shared_body_sent));
+    assert(app.buffered_bytes == conn->held_bytes);
+
+    static_cache_clear(); /* evicts the entry: the connection's reference keeps the bytes alive */
+    assert(pinned->refs == 1);
+
+    char *const sink = malloc(file_len + 1024);
+    assert(sink != NULL);
+    size_t got = 0;
+    while (app.connections[fd] == conn && (conn->out_buf != NULL || conn->shared_body != NULL)) {
+        got += read_some(peer, sink + got, file_len + 1024 - got);
+        handle_writable(&app, conn);
+    }
+    got += read_some(peer, sink + got, file_len + 1024 - got);
+    assert(app.connections[fd] == conn && conn->shared_body == NULL);
+    assert(app.buffered_bytes == 0 && conn->held_bytes == 0);
+    const char *const body = strstr(sink, "\r\n\r\n");
+    assert(body != NULL);
+    char cl[64];
+    snprintf(cl, sizeof(cl), "Content-Length: %zu\r\n", file_len);
+    assert(strstr(sink, cl) != NULL);
+    assert((size_t)(sink + got - (body + 4)) == file_len);
+    for (size_t i = 0; i < file_len; i++) {
+        assert(body[4 + i] == 'a' + (int)(i % 26));
+    }
+
+    /* the pinned body is counted: with a budget below it, the stalled connection is closed instead */
+    app.config.max_buffered_bytes = 64 * 1024;
+    send_all(peer, get, strlen(get));
+    handle_readable(&app, conn);
+    assert(app.connections[fd] == NULL);
+    assert(app.buffered_bytes == 0);
+
+    free(sink);
+    close(peer);
+    app_destroy(&app);
+    static_cache_clear();
+    unlink(path);
+    rmdir(root);
+}
+
 int main(void) {
     test_app_init_sets_default_budget();
     test_upload_is_counted_and_released();
@@ -294,6 +374,7 @@ int main(void) {
     test_partial_request_over_budget_503();
     test_unread_response_tail();
     test_stream_buf_counted();
+    test_static_body_pinned_not_copied();
     printf("all buffer budget tests passed\n");
     return 0;
 }

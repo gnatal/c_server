@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -249,6 +250,7 @@ static void send_with_content_type(Response *res, const char *content_type, cons
         conn->file_remaining = 0;
     }
     stream_release(conn); /* last wins: a producer stream set earlier in this handler is dropped */
+    shared_body_detach(conn); /* ... and so is a shared body */
 
     const size_t head_len = build_response_head(res, content_type, body_len, head, sizeof(head));
     if (head_len == 0) {
@@ -261,8 +263,8 @@ static void send_with_content_type(Response *res, const char *content_type, cons
     }
 
     /* Content-Length is always the full body's: a HEAD response reports what GET would
-     * (RFC 7231 4.3.2) but sends no body bytes. body == NULL means a file stream (head only).
-     * A 1xx/204/304 sends neither. */
+     * (RFC 7231 4.3.2) but sends no body bytes. body == NULL means the body goes out separately
+     * (file stream or shared body): head only. A 1xx/204/304 sends neither. */
     const size_t sent_body_len = (body != NULL && !body_suppressed(res)) ? body_len : 0;
 
     /* A second res_send/res_json in the same request replaces the first response (last wins);
@@ -299,6 +301,50 @@ void res_json(Response *res, const char *body) {
 
 void res_send_bytes(Response *res, const char *content_type, const unsigned char *data, size_t len) {
     send_with_content_type(res, content_type, (const char *)data, len);
+}
+
+SharedBody *shared_body_new(const size_t len) {
+    if (len > SIZE_MAX - sizeof(SharedBody)) {
+        return NULL;
+    }
+    SharedBody *body = malloc(sizeof(SharedBody) + len); /* freed by the shared_body_release that reaches 0 */
+    if (body == NULL) {
+        return NULL;
+    }
+    body->refs = 1;
+    body->len = len;
+    return body;
+}
+
+void shared_body_retain(SharedBody *body) {
+    body->refs++;
+}
+
+void shared_body_release(SharedBody *body) {
+    if (body != NULL && --body->refs == 0) {
+        free(body);
+    }
+}
+
+void shared_body_detach(Connection *conn) {
+    if (conn == NULL || conn->shared_body == NULL) {
+        return;
+    }
+    shared_body_release(conn->shared_body);
+    conn->shared_body = NULL;
+    conn->shared_body_sent = 0;
+}
+
+void res_send_shared(Response *res, const char *content_type, SharedBody *body) {
+    /* body == NULL here builds the head only (the res_send_file convention), with body->len as Content-Length */
+    send_with_content_type(res, content_type, NULL, body->len);
+    Connection *conn = res->conn;
+    if (conn->out_buf == NULL || body_suppressed(res) || body->len == 0) {
+        return;
+    }
+    shared_body_retain(body); /* dropped by shared_body_detach: last byte written, replaced, or connection_close */
+    conn->shared_body = body;
+    conn->shared_body_sent = 0;
 }
 
 void res_redirect(Response *res, int status, const char *location) {
@@ -456,6 +502,7 @@ static int commit_chunked_headers(Response *res) {
         conn->file_remaining = 0;
     }
     stream_release(conn); /* last wins: a producer stream set earlier in this handler is dropped */
+    shared_body_detach(conn); /* ... and so is a shared body */
     if (res->status == 0) {
         res->status = 200;
     }

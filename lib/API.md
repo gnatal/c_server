@@ -53,6 +53,7 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 ## Build the response (`response.h`)
 - `res_status(res, code)`, `res_set_header(res, name, value)` — before sending `Content-Length`, `Connection` and `Date` are engine-managed. Value copied whole (no length cap; the whole head must fit 8 KiB or the connection is dropped); name > 63 chars is dropped. Status 1xx/204/304 sends the head only (no framing headers, no body).
 - `res_send(res, text)`, `res_json(res, json_text)`, `res_send_bytes(res, type, data, len)` — send a whole body (copied).
+- `res_send_shared(res, type, SharedBody *)` — send a reference-counted body without copying it: the connection pins it (one reference) until written; you keep yours. `shared_body_new(len)` (refs 1, `NULL` on OOM), `shared_body_retain(b)`, `shared_body_release(b)` (frees at 0). The bytes must not change while referenced. The static-file cache sends every hit this way.
 - `res_redirect(res, status, location)` — 3xx + Location (status 0 = 302). 500 if the Location has control chars or cannot be stored.
 - `res_set_cookie(res, name, value, const CookieOptions *)`, `res_clear_cookie(res, name, path)` — cookies.
 - `res_write(res, data, len)`, `res_end(res)`, `res_set_trailer(res, name, value)` — chunked response, buffered until the handler returns (at most `MAX_BODY_SIZE`, silently truncated past it); for big bodies use `res_stream`.
@@ -61,6 +62,7 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `stream_write(StreamWriter *, data, len)` — inside a producer: append one chunk; `-1` (nothing written) when this turn is full: return `STREAM_MORE` and retry. At most `STREAM_WRITE_MAX` per call.
 - `app_wake_streams(App *)` (`connection.h`) — resume every paused producer on this worker (e.g. from a publishing handler); paused producers are also resumed about once a second.
 - `stream_release(Connection *)` — engine: detach a producer stream and free its ctx.
+- `shared_body_detach(Connection *)` — engine: drop a connection's pinned shared body.
 - `res_init(res, conn)` — engine/tests: prepare a Response.
 
 ## Per-request memory (`arena.h`)

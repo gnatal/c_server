@@ -36,7 +36,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **S7** | ~~Missing or duplicate `Host` header is accepted~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **S8** | ~~Form fields: `%00` not rejected (S6 gap), values silently truncated at 255~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **S9** | ~~Response header values silently truncated at 255 chars (CSP, `Location`)~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
-| **P4** | Cached static files are copied into the arena on every hit | Low–Medium | M | ESTIMATED |
+| **P4** | ~~Cached static files are copied into the arena on every hit~~ **FIXED 2026-09-24** | Low–Medium | M | MEASURED |
 | **P5** | `sendfile`/`writev` still not used for file bodies | Low–Medium | M | CODE |
 | **P6** | One unnecessary syscall per connection close (`unwatch_all` before `close`) | Low | S | CODE |
 | **M4** | Arena growth always copies (yyjson realloc, `res_write` doubling) | Low–Medium | S | CODE |
@@ -127,6 +127,17 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   blank line exists. **(M)** Alternatively, pass picohttpparser's `last_len` so it resumes.
 
 ### P4 · Every cached static hit copies the whole file into the arena
+- **Status: FIXED 2026-09-24.** Cache entries hold a refcounted `SharedBody` (`app_types.h`; `shared_body_new` /
+  `_retain` / `_release`, `response.h`). `static_serve_file` answers every cached-size file with `res_send_shared`: the
+  head is built in the arena and the connection pins the body (`Connection.shared_body`, one reference) instead of
+  copying it. `flush_connection` sends head remainder + body with one `writev`; on `EAGAIN` only the head's unsent part is
+  copied (nothing if it already went), never the body. Eviction, replacement and `static_cache_clear` drop only the
+  cache's reference, so a body still being sent stays valid. The pinned remainder is counted in `held_bytes` like the old
+  tail copy, so the M3 budget still bounds it. MEASURED (macOS, `static_serve_file` on a cached file, handler only):
+  256 KiB 3.8 µs → 0.2 µs, 128 KiB 1.9 µs → 0.2 µs, 32 KiB 0.5 µs → 0.2 µs, 1 KiB unchanged. `make bench` unchanged
+  beyond noise. Tests: `test_cached_hit_is_sent_by_reference` (`tests/test_static.c`), `test_static_body_pinned_not_copied`
+  (`tests/test_buffer_budget.c`, a real partial `writev` over socketpair); both mutation-checked (no retain in
+  `res_send_shared`; pinned body left out of `owned_bytes`).
 - **Impact:** Low–Medium (hurts files between ~64 KiB and 256 KiB most)
 - **Effort:** M
 - **Where:** `lib/static.c:281` and `:336` → `res_send_bytes` → `lib/response.c:249-259` (`arena_alloc` + `memcpy`).

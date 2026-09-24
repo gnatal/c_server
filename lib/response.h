@@ -7,6 +7,7 @@
 /*
  * Building a response. A handler produces exactly one response through ONE of:
  *   res_send / res_json / res_send_bytes / res_redirect   (whole body at once)
+ *   res_send_shared                                        (whole body by reference, not copied)
  *   res_write ... res_end                                  (chunked streaming)
  *   res_send_file                                          (file streamed from disk)
  *   res_stream                                             (producer called by the event loop)
@@ -43,6 +44,22 @@ void res_json(Response *res, const char *body);
 
 /* Sends `len` raw bytes (may contain NULs) with an explicit content type. data may be NULL only if len is 0. */
 void res_send_bytes(Response *res, const char *content_type, const unsigned char *data, size_t len);
+
+/*
+ * Sends `body` by reference: only the head is built (in the arena); the connection pins `body` (one
+ * reference, taken here) and flush_connection writes it straight from body->data, never copying it.
+ * The caller keeps its own reference. Nothing is pinned for HEAD, a bodiless status, an empty body or a
+ * head that did not fit. The bytes must not change while any reference is held.
+ */
+void res_send_shared(Response *res, const char *content_type, SharedBody *body);
+
+/* A SharedBody of `len` bytes (data uninitialized) with refs == 1, or NULL on OOM / a len so large the
+ * header would overflow size_t. */
+SharedBody *shared_body_new(size_t len);
+
+/* Takes / drops one reference. Release frees the buffer when the count reaches 0; NULL is a no-op. */
+void shared_body_retain(SharedBody *body);
+void shared_body_release(SharedBody *body);
 
 /* Sets Location and sends a short text body. `status` should be 3xx; 0 means 302. A location containing
  * control characters, or one that could not be stored (header table full), is refused with 500. It is NOT checked against open redirects: validate untrusted targets. */
@@ -105,5 +122,8 @@ int stream_write(StreamWriter *out, const void *data, size_t len);
 
 /* Engine-internal: detaches a producer stream from conn and calls its ctx_free once. No-op if none. */
 void stream_release(Connection *conn);
+
+/* Engine-internal: drops conn's reference to its shared_body (res_send_shared) and clears it. No-op if none. */
+void shared_body_detach(Connection *conn);
 
 #endif /* RESPONSE_H */

@@ -249,6 +249,19 @@ typedef int (*StreamProducer)(StreamWriter *out, void *ctx);
  * connection closes for any other reason, when a later res_* replaces the stream, or at once for HEAD. */
 typedef void (*StreamCtxFree)(void *ctx);
 
+/*
+ * A reference-counted, immutable byte buffer: one malloc (header + data). The static-file cache owns
+ * one reference per entry; a response that sends it pins another (Connection.shared_body) until its
+ * last byte is written, so eviction, replacement or static_cache_clear never frees bytes still being
+ * sent. Created with refs == 1 by shared_body_new; freed by the shared_body_release that drops refs to 0
+ * (response.h). Single-threaded per worker process, so refs is a plain counter.
+ */
+typedef struct {
+    size_t refs;
+    size_t len;
+    unsigned char data[];
+} SharedBody;
+
 /* ---- connection and event loop ---- */
 
 struct EventLoopOps; /* defined in event_loop_backend.h (private to the Linux event loop) */
@@ -341,7 +354,7 @@ typedef struct Connection {
 
     /* Output: one response built by res_send / res_json / res_write into memory from `arena` (a
      * pointer to the single shared per-worker arena, not a per-connection one - see `arena` below).
-     * out_buf != NULL means a response is pending. For responses built by the response layer,
+     * out_buf != NULL (or shared_body != NULL) means a response is pending. For responses built by the response layer,
      * out_buf[out_len] == '\0' (not sent).
      * Ownership: normally arena-resident (freed implicitly by the next arena_reset, same as
      * before) - `out_buf_owned` is 0. If a response can't be fully written in one `flush_connection`
@@ -387,8 +400,18 @@ typedef struct Connection {
      * overwrite it. Freed when streaming ends (success or error) or on connection_close. */
     char *stream_buf;
 
+    /* Body sent by reference after out_buf (res_send_shared: cached static files), never copied into the
+     * arena. Non-NULL while shared_body_sent < shared_body->len; this connection holds one reference,
+     * dropped (shared_body_detach, response.h) once the last byte is written, when a later res_* replaces
+     * the response, or on connection_close. flush_connection writes the rest of out_buf and the body with
+     * one writev; on EAGAIN only out_buf's unsent part is copied (out_buf_owned), never the body. */
+    SharedBody *shared_body;
+    size_t shared_body_sent;
+
     /* This connection's share of App.buffered_bytes as last synced: owned in_cap + owned out_cap
-     * (out_buf_owned) + STREAM_CHUNK_SIZE if stream_buf is allocated. 0 from calloc. */
+     * (out_buf_owned) + STREAM_CHUNK_SIZE if stream_buf is allocated + the unsent part of shared_body
+     * (counted as if it were a copy: a pinned body evicted from the cache is memory this connection
+     * alone keeps alive). 0 from calloc. */
     size_t held_bytes;
 
     int events_watched;     /* EVENT_READ | EVENT_WRITE currently registered with the event loop */

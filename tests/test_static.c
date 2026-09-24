@@ -107,7 +107,28 @@ static Connection *make_conn(void) {
     return conn;
 }
 
+/* What flush_connection would put on the wire: out_buf, then the pinned shared_body (res_send_shared)
+ * if any, NUL-terminated in a static buffer so tests can strstr it. */
+static const char *sent_text(const Connection *conn) {
+    static char wire[STATIC_CACHE_MAX_ENTRY_BYTES + 16 * 1024];
+    size_t len = 0;
+    if (conn->out_buf != NULL) {
+        assert(conn->out_len - conn->out_sent < sizeof(wire));
+        memcpy(wire, conn->out_buf + conn->out_sent, conn->out_len - conn->out_sent);
+        len = conn->out_len - conn->out_sent;
+    }
+    if (conn->shared_body != NULL) {
+        const size_t body_left = conn->shared_body->len - conn->shared_body_sent;
+        assert(len + body_left < sizeof(wire));
+        memcpy(wire + len, conn->shared_body->data + conn->shared_body_sent, body_left);
+        len += body_left;
+    }
+    wire[len] = '\0';
+    return wire;
+}
+
 static void free_conn(Connection *conn) {
+    shared_body_detach(conn);
     void *buf = conn->arena->buf;
     arena_reset(conn->arena);
     free(buf);
@@ -207,8 +228,8 @@ static void test_serve_existing_file(void) {
 
     assert(res.status == 200);
     assert(conn->out_buf != NULL);
-    assert(strstr(conn->out_buf, "Content-Type: text/plain\r\n") != NULL);
-    assert(strstr(conn->out_buf, "hello static\n") != NULL);
+    assert(strstr(sent_text(conn), "Content-Type: text/plain\r\n") != NULL);
+    assert(strstr(sent_text(conn), "hello static\n") != NULL);
 
     free_conn(conn);
     teardown_fixture(&fx);
@@ -251,8 +272,8 @@ static void test_serve_dotfiles_404(void) {
         Response res = { .conn = conn, .status = 0 };
         static_serve_file(&route, &req, &res);
         assert(res.status == 404);
-        assert(strstr(conn->out_buf, "SECRET_KEY") == NULL && strstr(conn->out_buf, "[core]") == NULL);
-        assert(strstr(conn->out_buf, "X-Content-Type-Options: nosniff\r\n") != NULL);
+        assert(strstr(sent_text(conn), "SECRET_KEY") == NULL && strstr(sent_text(conn), "[core]") == NULL);
+        assert(strstr(sent_text(conn), "X-Content-Type-Options: nosniff\r\n") != NULL);
         free_conn(conn);
     }
 
@@ -261,7 +282,7 @@ static void test_serve_dotfiles_404(void) {
     Response res = { .conn = conn, .status = 0 };
     static_serve_file(&route, &req, &res);
     assert(res.status == 200);
-    assert(strstr(conn->out_buf, "X-Content-Type-Options: nosniff\r\n") != NULL);
+    assert(strstr(sent_text(conn), "X-Content-Type-Options: nosniff\r\n") != NULL);
     free_conn(conn);
 
     snprintf(path, sizeof(path), "%s/.git/config", fx.root);
@@ -317,8 +338,8 @@ static void test_serve_directory_falls_back_to_index(void) {
 
     assert(res.status == 200);
     assert(conn->out_buf != NULL);
-    assert(strstr(conn->out_buf, "Content-Type: text/html\r\n") != NULL);
-    assert(strstr(conn->out_buf, "<h1>index</h1>") != NULL);
+    assert(strstr(sent_text(conn), "Content-Type: text/html\r\n") != NULL);
+    assert(strstr(sent_text(conn), "<h1>index</h1>") != NULL);
 
     free_conn(conn);
     teardown_fixture(&fx);
@@ -334,7 +355,7 @@ static void test_cache_serves_stale_content_within_revalidate_window(void) {
 
     static_serve_file(&route, &req, &res); /* populates the cache */
     assert(res.status == 200);
-    assert(strstr(conn->out_buf, "hello static\n") != NULL);
+    assert(strstr(sent_text(conn), "hello static\n") != NULL);
 
     /* Overwrite the file with different content and, separately, prove the cache - not the filesystem -
      * is what answered the second request by removing the file outright: within the revalidation
@@ -346,7 +367,7 @@ static void test_cache_serves_stale_content_within_revalidate_window(void) {
     Response res2 = { .conn = conn, .status = 0 };
     static_serve_file(&route, &req, &res2);
     assert(res2.status == 200);
-    assert(strstr(conn->out_buf, "hello static\n") != NULL);
+    assert(strstr(sent_text(conn), "hello static\n") != NULL);
 
     /* Restore the file so teardown_fixture's own unlink doesn't fail. */
     write_file(path, "hello static\n");
@@ -374,7 +395,7 @@ static void test_cache_revalidates_after_window_and_serves_unchanged_content(voi
     Response res2 = { .conn = conn, .status = 0 };
     static_serve_file(&route, &req, &res2);
     assert(res2.status == 200);
-    assert(strstr(conn->out_buf, "hello static\n") != NULL);
+    assert(strstr(sent_text(conn), "hello static\n") != NULL);
 
     free_conn(conn);
     teardown_fixture(&fx);
@@ -391,7 +412,7 @@ static void test_cache_picks_up_change_after_window_expires(void) {
 
     static_serve_file(&route, &req, &res);
     assert(res.status == 200);
-    assert(strstr(conn->out_buf, "hello static\n") != NULL);
+    assert(strstr(sent_text(conn), "hello static\n") != NULL);
 
     sleep_past_revalidate_window();
 
@@ -402,8 +423,8 @@ static void test_cache_picks_up_change_after_window_expires(void) {
     Response res2 = { .conn = conn, .status = 0 };
     static_serve_file(&route, &req, &res2);
     assert(res2.status == 200);
-    assert(strstr(conn->out_buf, "updated content, different size\n") != NULL);
-    assert(strstr(conn->out_buf, "hello static\n") == NULL);
+    assert(strstr(sent_text(conn), "updated content, different size\n") != NULL);
+    assert(strstr(sent_text(conn), "hello static\n") == NULL);
 
     free_conn(conn);
     teardown_fixture(&fx);
@@ -431,7 +452,7 @@ static void remove_fixture_file(const StaticFixture *fx, const char *name) {
 /* A file past STATIC_CACHE_MAX_ENTRY_BYTES is streamed from disk: the response holds only the head,
  * with the file's full Content-Length, and the connection holds an open fd for the whole body - never
  * the file's bytes in memory (it used to be read whole and copied up to three times per request).
- * A file of exactly the cap is still read into out_buf and cached, as before. */
+ * A file of exactly the cap is still read whole and cached. */
 static void test_large_file_is_streamed_not_buffered(void) {
     StaticFixture fx;
     setup_fixture(&fx);
@@ -451,22 +472,23 @@ static void test_large_file_is_streamed_not_buffered(void) {
     assert(conn->out_len < 512); /* the head only */
     char cl[64];
     snprintf(cl, sizeof(cl), "Content-Length: %zu\r\n", big);
-    assert(strstr(conn->out_buf, cl) != NULL);
-    assert(strstr(conn->out_buf, "Content-Type: application/octet-stream\r\n") != NULL);
+    assert(strstr(sent_text(conn), cl) != NULL);
+    assert(strstr(sent_text(conn), "Content-Type: application/octet-stream\r\n") != NULL);
     char first[16];
     assert(read(conn->file_fd, first, sizeof(first)) == (ssize_t)sizeof(first));
     assert(memcmp(first, "abcdefghijklmnop", sizeof(first)) == 0);
     close(conn->file_fd);
     free_conn(conn);
 
-    /* the cap itself: buffered in full, no fd */
+    /* the cap itself: cached in full and sent by reference (head in out_buf, body pinned), no fd */
     req = make_request("/static/edge.bin");
     conn = make_conn();
     Response res2 = { .conn = conn, .status = 0 };
     static_serve_file(&route, &req, &res2);
     assert(res2.status == 200);
     assert(conn->file_fd == -1);
-    assert(conn->out_len > (size_t)STATIC_CACHE_MAX_ENTRY_BYTES);
+    assert(conn->out_len < 512);
+    assert(conn->shared_body != NULL && conn->shared_body->len == (size_t)STATIC_CACHE_MAX_ENTRY_BYTES);
     free_conn(conn);
 
     /* HEAD on a large file: head only, no fd kept open */
@@ -477,13 +499,60 @@ static void test_large_file_is_streamed_not_buffered(void) {
     static_serve_file(&route, &req, &res3);
     assert(res3.status == 200);
     assert(conn->file_fd == -1);
-    assert(strstr(conn->out_buf, cl) != NULL);
+    assert(strstr(sent_text(conn), cl) != NULL);
     free_conn(conn);
 
     remove_fixture_file(&fx, "big.bin");
     remove_fixture_file(&fx, "edge.bin");
     teardown_fixture(&fx);
     static_cache_clear();
+}
+
+/* A cached hit is sent by reference: out_buf holds only the head, every response pins the cache's one
+ * SharedBody (no per-request copy), static_cache_clear leaves a pinned body alive, and a later res_* or
+ * the connection's end drops the pin. HEAD pins nothing. */
+static void test_cached_hit_is_sent_by_reference(void) {
+    StaticFixture fx;
+    setup_fixture(&fx);
+    Route route = make_static_route(&fx);
+    Request req = make_request("/static/file.txt");
+
+    Connection *a = make_conn();
+    Response res_a = { .conn = a, .status = 0 };
+    static_serve_file(&route, &req, &res_a); /* miss: read, cached, sent by reference */
+    Connection *b = make_conn();
+    Response res_b = { .conn = b, .status = 0 };
+    static_serve_file(&route, &req, &res_b); /* fresh hit */
+
+    assert(res_a.status == 200 && res_b.status == 200);
+    SharedBody *const body = a->shared_body;
+    assert(body != NULL && b->shared_body == body);
+    assert(body->refs == 3); /* cache + a + b */
+    assert(body->len == strlen("hello static\n") && memcmp(body->data, "hello static\n", body->len) == 0);
+    assert(strstr(a->out_buf, "Content-Length: 13\r\n") != NULL);
+    assert(strstr(a->out_buf, "hello static") == NULL); /* head only: the body was not copied */
+    assert(a->shared_body_sent == 0);
+
+    Request head_req = make_request("/static/file.txt");
+    strncpy(head_req.method, "HEAD", sizeof(head_req.method) - 1);
+    Connection *h = make_conn();
+    Response res_h = { .conn = h, .status = 0, .is_head_request = 1 };
+    static_serve_file(&route, &head_req, &res_h);
+    assert(h->shared_body == NULL && body->refs == 3);
+    assert(strstr(h->out_buf, "Content-Length: 13\r\n") != NULL);
+    free_conn(h);
+
+    static_cache_clear();
+    assert(body->refs == 2);
+    assert(memcmp(body->data, "hello static\n", body->len) == 0); /* still valid (ASan: no use-after-free) */
+
+    Response res_a2 = { .conn = a, .status = 0 };
+    res_send(&res_a2, "replaced"); /* last wins: drops a's pin */
+    assert(a->shared_body == NULL && body->refs == 1);
+    free_conn(a);
+    free_conn(b); /* last reference: freed here */
+
+    teardown_fixture(&fx);
 }
 
 int main(void) {
@@ -508,6 +577,7 @@ int main(void) {
     test_cache_revalidates_after_window_and_serves_unchanged_content();
     test_cache_picks_up_change_after_window_expires();
     test_large_file_is_streamed_not_buffered();
+    test_cached_hit_is_sent_by_reference();
 
     printf("all static tests passed\n");
     return 0;

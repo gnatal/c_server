@@ -153,15 +153,6 @@ static int resolve_and_stat(const char *root, const char *candidate, char *resol
  * STATIC_CACHE_MAX_ENTRY_BYTES <= STATIC_CACHE_MAX_TOTAL_BYTES (app_types.h; asserted below), so there is
  * no separate per-insert total-bytes accounting to get wrong - capping entry count alone caps total bytes.
  */
-typedef struct {
-    char *path;                /* malloc'd; the candidate string this entry was cached under */
-    unsigned char *data;       /* malloc'd file bytes; NULL only when size == 0 */
-    size_t size;
-    time_t mtime;               /* st_mtime when data was read, for change detection on revalidation */
-    time_t last_checked;        /* wall-clock time data/mtime were last confirmed still current */
-    const char *content_type;   /* points into MIME_TABLE's string literals above; never freed */
-} StaticCacheEntry;
-
 _Static_assert((size_t)STATIC_CACHE_MAX_ENTRIES * STATIC_CACHE_MAX_ENTRY_BYTES <= STATIC_CACHE_MAX_TOTAL_BYTES,
                "static cache: entries * per-entry cap must not exceed the total cap (cache_insert relies on this)");
 
@@ -198,7 +189,7 @@ static void cache_evict_stalest(void) {
         }
     }
     free(g_static_cache[oldest].path);
-    free(g_static_cache[oldest].data);
+    shared_body_release(g_static_cache[oldest].body); /* a response still sending it holds its own reference */
     g_static_cache[oldest] = g_static_cache[g_static_cache_count - 1];
     g_static_cache_count--;
 }
@@ -217,15 +208,14 @@ static const StaticCacheEntry *cache_lookup_fresh(const char *path, time_t now) 
 }
 
 /*
- * Takes ownership of `data` (size bytes, malloc'd by the caller, or NULL iff size == 0) on success (0):
- * the cache now owns it and frees it on eviction, replacement or static_cache_clear. On failure (-1: the
- * file is too large for the cache, or the cache is out of memory for its own bookkeeping) the caller
- * keeps ownership and must free `data` itself. `content_type` must have static storage duration
- * (static_mime_type's return value qualifies); nothing here ever frees it.
+ * Takes over the caller's reference to `body` on success (0): the cache releases it on eviction,
+ * replacement or static_cache_clear. On failure (-1: the file is too large for the cache, or the cache is
+ * out of memory for its own bookkeeping) the caller still holds that reference and must release it.
+ * `content_type` must have static storage duration (static_mime_type's return value qualifies); nothing
+ * here ever frees it.
  */
-static int cache_insert(const char *path, unsigned char *data, size_t size, time_t mtime,
-                         const char *content_type, time_t now) {
-    if (size > STATIC_CACHE_MAX_ENTRY_BYTES) {
+static int cache_insert(const char *path, SharedBody *body, time_t mtime, const char *content_type, time_t now) {
+    if (body->len > STATIC_CACHE_MAX_ENTRY_BYTES) {
         return -1;
     }
 
@@ -240,13 +230,11 @@ static int cache_insert(const char *path, unsigned char *data, size_t size, time
         }
         entry = &g_static_cache[g_static_cache_count++];
         entry->path = key;
-        entry->data = NULL;
-        entry->size = 0;
+        entry->body = NULL;
     }
 
-    free(entry->data);
-    entry->data = data;
-    entry->size = size;
+    shared_body_release(entry->body);
+    entry->body = body;
     entry->mtime = mtime;
     entry->last_checked = now;
     entry->content_type = content_type;
@@ -256,7 +244,7 @@ static int cache_insert(const char *path, unsigned char *data, size_t size, time
 void static_cache_clear(void) {
     for (int i = 0; i < g_static_cache_count; i++) {
         free(g_static_cache[i].path);
-        free(g_static_cache[i].data);
+        shared_body_release(g_static_cache[i].body);
     }
     g_static_cache_count = 0;
 }
@@ -290,7 +278,7 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
     const StaticCacheEntry *fresh = cache_lookup_fresh(candidate, now);
     if (fresh != NULL) {
         res_status(res, 200);
-        res_send_bytes(res, fresh->content_type, fresh->data, fresh->size);
+        res_send_shared(res, fresh->content_type, fresh->body);
         return;
     }
 
@@ -342,10 +330,10 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
      * cached bytes instead of paying for fopen/fread again - the common case once a server has been up
      * for more than a second: one stat per file per second, not one full read. */
     StaticCacheEntry *existing = cache_find(candidate);
-    if (existing != NULL && existing->mtime == st.st_mtime && existing->size == (size_t)st.st_size) {
+    if (existing != NULL && existing->mtime == st.st_mtime && existing->body->len == (size_t)st.st_size) {
         existing->last_checked = now;
         res_status(res, 200);
-        res_send_bytes(res, existing->content_type, existing->data, existing->size);
+        res_send_shared(res, existing->content_type, existing->body);
         return;
     }
 
@@ -374,34 +362,28 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
     }
 
     const size_t size = (size_t)st.st_size;
-    unsigned char *buf = NULL;
-    if (size > 0) {
-        buf = malloc(size);
-        if (buf == NULL) {
-            fclose(f);
-            res_status(res, 500);
-            res_send(res, "Internal Server Error");
-            return;
-        }
-        const size_t read_bytes = fread(buf, 1, size, f);
+    SharedBody *body = shared_body_new(size); /* our reference: handed to the cache, or released below */
+    if (body == NULL) {
         fclose(f);
-        if (read_bytes != size) {
-            free(buf);
-            res_status(res, 500);
-            res_send(res, "Internal Server Error");
-            return;
-        }
-    } else {
-        fclose(f);
+        res_status(res, 500);
+        res_send(res, "Internal Server Error");
+        return;
+    }
+    const size_t read_bytes = size > 0 ? fread(body->data, 1, size, f) : 0;
+    fclose(f);
+    if (read_bytes != size) {
+        shared_body_release(body);
+        res_status(res, 500);
+        res_send(res, "Internal Server Error");
+        return;
     }
 
     res_status(res, 200);
-    res_send_bytes(res, content_type, buf, size);
+    res_send_shared(res, content_type, body); /* the connection takes its own reference */
 
-    /* cache_insert takes ownership of buf on success (0); on failure (too big to cache, or out of
-     * memory for the cache's own bookkeeping) it leaves buf untouched, so free it ourselves based on
-     * the return value - never a double free, never a leak either way. */
-    if (cache_insert(candidate, buf, size, st.st_mtime, content_type, now) != 0) {
-        free(buf);
+    /* cache_insert takes our reference on success (0); on failure (too big to cache, or out of memory for
+     * the cache's own bookkeeping) we still hold it - never a double release, never a leak either way. */
+    if (cache_insert(candidate, body, st.st_mtime, content_type, now) != 0) {
+        shared_body_release(body);
     }
 }

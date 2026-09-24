@@ -2,6 +2,7 @@
 #define STATIC_H
 
 #include <stddef.h>
+#include <time.h>
 #include "app_types.h"
 
 /*
@@ -52,8 +53,9 @@ const char *static_mime_type(const char *path);
  *     fails partway through.
  *   - Every answer carries X-Content-Type-Options: nosniff.
  *   - 200 with a Content-Type from static_mime_type otherwise. A file up to
- *     STATIC_CACHE_MAX_ENTRY_BYTES is read whole and sent with res_send_bytes
- *     (not res_send: a served file can contain embedded NUL bytes); a larger
+ *     STATIC_CACHE_MAX_ENTRY_BYTES is read whole into a cached SharedBody and
+ *     sent with res_send_shared: the connection pins the cache's bytes and
+ *     writes them from there, never copying them into the arena. A larger
  *     one is streamed from disk with res_send_file (response.h), never held
  *     in memory. 404 if it vanished between the stat and that open.
  * Called from chain_next's final fallback (lib/middleware.c) in place of a
@@ -67,8 +69,18 @@ const char *static_mime_type(const char *path);
  */
 void static_serve_file(const Route *route, const Request *req, Response *res);
 
+/* One cached file (static.c's process-lifetime cache, see static_serve_file). */
+typedef struct {
+    char *path;                /* malloc'd; the candidate string this entry was cached under */
+    SharedBody *body;          /* the file's bytes; the cache holds one reference, a response in flight may hold more */
+    time_t mtime;              /* st_mtime when body was read, for change detection on revalidation */
+    time_t last_checked;       /* wall-clock time body/mtime were last confirmed still current */
+    const char *content_type;  /* points into static.c's MIME table string literals; never freed */
+} StaticCacheEntry;
+
 /*
- * Frees every entry in the static-file cache described above (static_serve_file). The cache is
+ * Frees every entry in the static-file cache described above (static_serve_file): drops the cache's
+ * reference to each body (one still being sent survives until its connection is done with it). The cache is
  * process-lifetime and shared across every mount, so this is for tests that need a clean slate between
  * runs and for an application that wants to force a reload (e.g. after redeploying static assets)
  * without restarting the worker; nothing in the engine itself calls it.
