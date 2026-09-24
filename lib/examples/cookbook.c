@@ -302,6 +302,7 @@ static void recipe_form(const Request *req, Response *res) {
  * RECIPE 10 - file upload (multipart/form-data).
  *   POST /upload  part "file" (filename=a.txt) -> {"filename":"a.txt","bytes":5}
  * Part data points INTO req->body, is NOT NUL-terminated, and may hold NUL bytes: use data_len.
+ * file->filename is the client's raw string ("../../x" included): multipart_safe_filename first.
  * ------------------------------------------------------------------------------------------- */
 static void recipe_upload(const Request *req, Response *res) {
     char boundary[MAX_BOUNDARY_LEN];
@@ -312,7 +313,8 @@ static void recipe_upload(const Request *req, Response *res) {
     MultipartForm form;
     parse_multipart_body(req->body, (size_t)req->content_length, boundary, &form);
     const MultipartPart *file = multipart_get_part(&form, "file");
-    if (file == NULL || file->filename[0] == '\0') {
+    char filename[sizeof(file->filename)];
+    if (file == NULL || !multipart_safe_filename(file, filename, sizeof(filename))) {
         send_error(res, 400, "missing file part");
         return;
     }
@@ -320,7 +322,7 @@ static void recipe_upload(const Request *req, Response *res) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, obj);
-    yyjson_mut_obj_add_str(doc, obj, "filename", file->filename);
+    yyjson_mut_obj_add_strcpy(doc, obj, "filename", filename); /* strcpy: filename is a stack buffer */
     yyjson_mut_obj_add_int(doc, obj, "bytes", (long long)file->data_len);
     send_json(res, 200, doc);
 }

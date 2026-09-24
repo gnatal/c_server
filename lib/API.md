@@ -79,7 +79,7 @@ serialize once, `free` the string.
 
 ## Forms and uploads (`urlencoded.h`, `multipart.h`)
 - `parse_urlencoded_body(body, len, UrlEncodedForm *)`, `urlencoded_get_field(form, name)`.
-- `multipart_parse_boundary(content_type, out, out_size)` → 1/0, `parse_multipart_body(body, len, boundary, MultipartForm *)` → part count or -1, `multipart_get_part(form, name)`.
+- `multipart_parse_boundary(content_type, out, out_size)` → 1/0, `parse_multipart_body(body, len, boundary, MultipartForm *)` → part count or -1, `multipart_get_part(form, name)`, `multipart_safe_filename(part, out, out_size)` → 1/0 (basename, no control chars, never `.`/`..`: the only form of `part->filename` safe for a filesystem - the raw field is exactly what the client sent).
 
 ## Parser internals (`http_parser.h`) — engine and tests
 - `parse_http_request(raw, raw_len, Request *, Arena *)`, `request_is_complete(buf, len)`, `request_framing(buf, len, &header_len, &chunked, &path, &path_len)` (`path`/`path_len` out params optional, pass `NULL`), `request_wants_close(req)`.

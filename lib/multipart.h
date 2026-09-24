@@ -31,7 +31,12 @@ int multipart_parse_boundary(const char *content_type, char *boundary_out, size_
  *
  * Each part's own header block (Content-Disposition, optionally
  * Content-Type) is parsed for its form field `name` and, for a file part,
- * `filename` and `content_type` (app_types.h: MultipartPart). A part with
+ * `filename` and `content_type` (app_types.h: MultipartPart). Parameters
+ * are parsed as a ";"-separated list of name=token or name="quoted-string"
+ * (\" and \\ unescaped), names matched exactly - "filename=" inside a
+ * quoted name value is text, not a parameter. `filename` is the client's
+ * string as sent (it may hold "../" or a Windows path): never use it as a
+ * path, use multipart_safe_filename. A part with
  * no Content-Disposition name= parameter is skipped outright - it's
  * malformed, there's no field to key it by. MultipartPart.data points
  * directly into body (never copied) and is NOT NUL-terminated - callers
@@ -50,5 +55,13 @@ int parse_multipart_body(const char *body, size_t body_len, const char *boundary
  * (lib/http_parser.h).
  */
 const MultipartPart *multipart_get_part(const MultipartForm *form, const char *name);
+
+/*
+ * The only form of part->filename safe to use on a filesystem: its basename (after the last '/' or
+ * '\\'), with control characters dropped. Returns 1 and a NUL-terminated name in out; 0 (out = "")
+ * when the result is empty, "." or "..", or doesn't fit out_size. It is still client-chosen - pick
+ * the directory, and check for an existing file, yourself.
+ */
+int multipart_safe_filename(const MultipartPart *part, char *out, size_t out_size);
 
 #endif /* MULTIPART_H */

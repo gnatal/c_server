@@ -140,11 +140,91 @@ static void test_parse_multipart_body_edge_cases(void) {
     assert(form.part_count == MAX_MULTIPART_PARTS);
 }
 
+/* One part with the given Content-Disposition line, parsed; returns the part or NULL. */
+static const MultipartPart *parse_one(const char *disposition, MultipartForm *form) {
+    char body[1024];
+    const int n = snprintf(body, sizeof(body), "--B\r\n%s\r\n\r\nv\r\n--B--\r\n", disposition);
+    assert(n > 0 && (size_t)n < sizeof(body));
+    parse_multipart_body(body, (size_t)n, "B", form);
+    return form->part_count == 1 ? &form->parts[0] : NULL;
+}
+
+/* Parameters are a ";"-separated list, not substrings: "filename=" inside the quoted name is part of
+ * the name, and a quoted value runs to its own closing quote (with \" escapes). */
+static void test_disposition_params_are_parsed_not_searched(void) {
+    MultipartForm form;
+    const MultipartPart *p = parse_one("Content-Disposition: form-data; name=\"avatar; filename=../../etc/cron.d/x\"", &form);
+    assert(p != NULL);
+    assert(strcmp(p->name, "avatar; filename=../../etc/cron.d/x") == 0);
+    assert(p->filename[0] == '\0');
+
+    p = parse_one("Content-Disposition: form-data; name=\"f\"; filename=\"a \\\"q\\\".txt\"", &form);
+    assert(p != NULL && strcmp(p->filename, "a \"q\".txt") == 0);
+
+    p = parse_one("Content-Disposition: form-data; filename=\"x.txt\"; name=f", &form); /* order, token value */
+    assert(p != NULL && strcmp(p->name, "f") == 0 && strcmp(p->filename, "x.txt") == 0);
+
+    p = parse_one("content-disposition: form-data ; NAME = \"f\" ; FileName=\"C:\\Users\\me\\a.txt\"", &form);
+    assert(p != NULL && strcmp(p->name, "f") == 0);
+    assert(strcmp(p->filename, "C:\\Users\\me\\a.txt") == 0); /* unescaped backslashes are kept */
+
+    p = parse_one("Content-Disposition: form-data; name=\"f\"; filename*=UTF-8''x.txt", &form);
+    assert(p != NULL && p->filename[0] == '\0'); /* filename* is not filename */
+
+    p = parse_one("Content-Disposition: form-data; xname=\"a\"; name=\"b\"", &form);
+    assert(p != NULL && strcmp(p->name, "b") == 0);
+
+    /* Malformed: unterminated quote, junk after a value, a control character. No name, so skipped. */
+    assert(parse_one("Content-Disposition: form-data; name=\"f", &form) == NULL);
+    assert(parse_one("Content-Disposition: form-data; name=\"f\"x", &form) == NULL);
+    assert(parse_one("Content-Disposition: form-data; name=\"a\x01" "b\"", &form) == NULL);
+
+    /* Header names are matched at a line start only, not inside another header's value. */
+    p = parse_one("X-Note: Content-Disposition: form-data; name=\"evil\"\r\n"
+                  "Content-Disposition: form-data; name=\"real\"", &form);
+    assert(p != NULL && strcmp(p->name, "real") == 0);
+    p = parse_one("Content-Disposition: form-data; name=\"f\"\r\nX-Note: Content-Type: text/evil\r\n"
+                  "Content-Type: text/plain", &form);
+    assert(p != NULL && strcmp(p->content_type, "text/plain") == 0);
+}
+
+static void test_safe_filename(void) {
+    MultipartPart part;
+    char out[64];
+    const struct { const char *in; int ok; const char *out; } cases[] = {
+        {"a.txt", 1, "a.txt"},
+        {"../../../root/.ssh/authorized_keys", 1, "authorized_keys"},
+        {"C:\\Users\\me\\report.pdf", 1, "report.pdf"},
+        {"/etc/passwd", 1, "passwd"},
+        {"a\x01" "b\x7f.txt", 1, "ab.txt"},
+        {"", 0, ""},
+        {".", 0, ""},
+        {"..", 0, ""},
+        {"dir/..", 0, ""},
+        {"dir/", 0, ""},
+        {"x\\..", 0, ""},
+        {"\x01\x02", 0, ""},
+        {".hidden", 1, ".hidden"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        memset(&part, 0, sizeof(part));
+        strncpy(part.filename, cases[i].in, sizeof(part.filename) - 1);
+        assert(multipart_safe_filename(&part, out, sizeof(out)) == cases[i].ok);
+        assert(strcmp(out, cases[i].out) == 0);
+    }
+    memset(&part, 0, sizeof(part));
+    strncpy(part.filename, "a-name-longer-than-eight.txt", sizeof(part.filename) - 1);
+    char tiny[8];
+    assert(multipart_safe_filename(&part, tiny, sizeof(tiny)) == 0);
+}
+
 int main(void) {
     test_multipart_parse_boundary();
     test_parse_multipart_body_fields_and_file();
     test_parse_multipart_body_binary_with_embedded_nul();
     test_parse_multipart_body_edge_cases();
+    test_disposition_params_are_parsed_not_searched();
+    test_safe_filename();
     printf("all multipart tests passed\n");
     return 0;
 }

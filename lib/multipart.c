@@ -1,54 +1,106 @@
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include "multipart.h"
 
+static int is_ows(const char c) {
+    return c == ' ' || c == '\t';
+}
+
+/* RFC 9110 tchar: the characters a parameter name or an unquoted value may hold. */
+static int is_tchar(const unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c != 0 && strchr("!#$%&'*+-.^_`|~", c) != NULL);
+}
+
 /*
- * Finds "param_name=" within header_value (case-insensitive on the name
- * itself, per RFC 2045 parameter-name matching) and copies its value into
- * out: everything up to the matching closing '"' when the value is
- * double-quoted, or up to the next ';' (or end of string) otherwise.
- * Requires the match to be a real parameter occurrence - preceded by the
- * start of the string, ';', or a space, not just a substring inside a
- * longer name or value (e.g. looking up "name" must not match inside
- * "filename=") - so it re-scans past a rejected candidate rather than
- * stopping there. Returns 1 on success, 0 if param_name isn't present or
- * its value doesn't fit in out_size (out is left untouched on failure).
+ * Looks up parameter param_name in v[0..len), a header value of the form
+ * "<type> *( OWS ";" OWS name "=" value )" (Content-Type's media type, or
+ * Content-Disposition's "form-data"), and copies its value into out.
+ * Parsed left to right as parameters, never searched as text: a value is a
+ * token, or a quoted-string running to its closing '"', so "name=" or
+ * "filename=" inside a quoted value is part of that value, never a
+ * parameter of its own. Names match case-insensitively and exactly
+ * ("name" is not "filename"); the first occurrence wins. In a quoted value,
+ * \" and \\ are escapes; any other backslash is kept (browsers send
+ * Windows paths unescaped, and multipart_safe_filename splits on it).
+ * Returns 1 on success; 0 if the parameter is absent, its value doesn't fit
+ * out_size or holds a control character, or the parameter list is
+ * malformed at or before it (out is left untouched on failure).
  */
-static int extract_param(const char *header_value, const char *param_name, char *out, size_t out_size) {
-    if (header_value == NULL || param_name == NULL || out_size == 0) {
+static int extract_param(const char *v, const size_t len, const char *param_name, char *out, const size_t out_size) {
+    if (v == NULL || param_name == NULL || out_size == 0) {
         return 0;
     }
+    const size_t want_len = strlen(param_name);
+    size_t i = 0;
+    while (i < len && v[i] != ';') {
+        if (v[i] == '"') {
+            return 0; /* the type itself is a token, never quoted */
+        }
+        i++;
+    }
+    while (i < len) {
+        i++; /* past ';' */
+        while (i < len && is_ows(v[i])) i++;
+        const size_t name_start = i;
+        while (i < len && is_tchar((unsigned char)v[i])) i++;
+        const size_t name_len = i - name_start;
+        while (i < len && is_ows(v[i])) i++;
+        if (name_len == 0 || i >= len || v[i] != '=') {
+            return 0;
+        }
+        i++;
+        while (i < len && is_ows(v[i])) i++;
+        const int wanted = name_len == want_len && strncasecmp(v + name_start, param_name, want_len) == 0;
 
-    const size_t name_len = strlen(param_name);
-    const char *cursor = header_value;
-    while ((cursor = strcasestr(cursor, param_name)) != NULL) {
-        const char *after_name = cursor + name_len;
-        const int left_ok = (cursor == header_value) || cursor[-1] == ';' || cursor[-1] == ' ';
-        if (left_ok && *after_name == '=') {
-            const char *value = after_name + 1;
-            const char *end;
-            if (*value == '"') {
-                value++;
-                end = strchr(value, '"');
-                if (end == NULL) {
+        char tmp[512];
+        size_t tmp_len = 0;
+        if (i < len && v[i] == '"') {
+            i++;
+            for (;;) {
+                if (i >= len) {
+                    return 0; /* unterminated quoted-string */
+                }
+                unsigned char c = (unsigned char)v[i];
+                if (c == '"') {
+                    i++;
+                    break;
+                }
+                if (c == '\\' && i + 1 < len && (v[i + 1] == '"' || v[i + 1] == '\\')) {
+                    c = (unsigned char)v[++i];
+                } else if ((c < 0x20 && c != '\t') || c == 0x7f) {
                     return 0;
                 }
-            } else {
-                end = value;
-                while (*end != '\0' && *end != ';') {
-                    end++;
+                if (tmp_len + 1 >= sizeof(tmp)) {
+                    return 0;
                 }
+                tmp[tmp_len++] = (char)c;
+                i++;
             }
-
-            const size_t len = (size_t)(end - value);
-            if (len >= out_size) {
+        } else {
+            while (i < len && is_tchar((unsigned char)v[i])) {
+                if (tmp_len + 1 >= sizeof(tmp)) {
+                    return 0;
+                }
+                tmp[tmp_len++] = v[i++];
+            }
+            if (tmp_len == 0) {
+                return 0; /* "name=" with no value */
+            }
+        }
+        while (i < len && is_ows(v[i])) i++;
+        if (i < len && v[i] != ';') {
+            return 0; /* junk after the value */
+        }
+        if (wanted) {
+            if (tmp_len >= out_size) {
                 return 0;
             }
-            memcpy(out, value, len);
-            out[len] = '\0';
+            memcpy(out, tmp, tmp_len);
+            out[tmp_len] = '\0';
             return 1;
         }
-        cursor = after_name;
     }
     return 0;
 }
@@ -58,7 +110,7 @@ int multipart_parse_boundary(const char *content_type, char *boundary_out, size_
     if (content_type == NULL || strncasecmp(content_type, prefix, strlen(prefix)) != 0) {
         return 0;
     }
-    return extract_param(content_type, "boundary", boundary_out, boundary_out_size);
+    return extract_param(content_type, strlen(content_type), "boundary", boundary_out, boundary_out_size);
 }
 
 /*
@@ -71,27 +123,45 @@ int multipart_parse_boundary(const char *content_type, char *boundary_out, size_
  * client sends, so truncation would only ever lose an already-unusual
  * trailing header).
  */
+/* The value of header `name` in a NUL-terminated CRLF header block: matched only at a line start and
+ * case-insensitively, leading OWS skipped; *len_out is the value's length up to its line's CRLF. NULL
+ * if absent. Line-anchored, so a header name quoted inside another header's value is never found. */
+static const char *find_header_value(const char *block, const char *name, size_t *len_out) {
+    const size_t name_len = strlen(name);
+    const char *line = block;
+    while (*line != '\0') {
+        const char *eol = strstr(line, "\r\n");
+        const size_t line_len = eol != NULL ? (size_t)(eol - line) : strlen(line);
+        if (line_len > name_len && strncasecmp(line, name, name_len) == 0 && line[name_len] == ':') {
+            const char *v = line + name_len + 1;
+            const char *end = line + line_len;
+            while (v < end && is_ows(*v)) v++;
+            *len_out = (size_t)(end - v);
+            return v;
+        }
+        if (eol == NULL) {
+            break;
+        }
+        line = eol + 2;
+    }
+    return NULL;
+}
+
 static void parse_part_headers(const char *header_block, size_t header_block_len, MultipartPart *part) {
     char buf[512];
     size_t copy_len = header_block_len < sizeof(buf) - 1 ? header_block_len : sizeof(buf) - 1;
     memcpy(buf, header_block, copy_len);
     buf[copy_len] = '\0';
 
-    const char *disposition = strcasestr(buf, "Content-Disposition:");
+    size_t len;
+    const char *disposition = find_header_value(buf, "Content-Disposition", &len);
     if (disposition != NULL) {
-        disposition += strlen("Content-Disposition:");
-        extract_param(disposition, "name", part->name, sizeof(part->name));
-        extract_param(disposition, "filename", part->filename, sizeof(part->filename));
+        extract_param(disposition, len, "name", part->name, sizeof(part->name));
+        extract_param(disposition, len, "filename", part->filename, sizeof(part->filename));
     }
 
-    const char *type_header = strcasestr(buf, "Content-Type:");
+    const char *type_header = find_header_value(buf, "Content-Type", &len);
     if (type_header != NULL) {
-        type_header += strlen("Content-Type:");
-        while (*type_header == ' ') {
-            type_header++;
-        }
-        const char *line_end = strstr(type_header, "\r\n");
-        size_t len = line_end != NULL ? (size_t)(line_end - type_header) : strlen(type_header);
         if (len >= sizeof(part->content_type)) {
             len = sizeof(part->content_type) - 1;
         }
@@ -175,4 +245,33 @@ const MultipartPart *multipart_get_part(const MultipartForm *form, const char *n
         }
     }
     return NULL;
+}
+
+int multipart_safe_filename(const MultipartPart *part, char *out, const size_t out_size) {
+    if (part == NULL || out == NULL || out_size == 0) {
+        return 0;
+    }
+    const char *base = part->filename;
+    for (const char *p = part->filename; *p != '\0'; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + 1; /* basename only: a client's directory (Unix or Windows) is never kept */
+        }
+    }
+    size_t n = 0;
+    for (const char *p = base; *p != '\0'; p++) {
+        const unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == 0x7f) {
+            continue;
+        }
+        if (n + 1 >= out_size) {
+            return 0;
+        }
+        out[n++] = (char)c;
+    }
+    out[n] = '\0';
+    if (n == 0 || strcmp(out, ".") == 0 || strcmp(out, "..") == 0) {
+        out[0] = '\0';
+        return 0;
+    }
+    return 1;
 }

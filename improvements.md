@@ -27,7 +27,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **M2** | ~~Large static files: whole file read and copied twice; slow readers pin the full size each~~ **FIXED 2026-09-23** | High (memory DoS) | S | MEASURED |
 | **S3** | ~~Chunk-size parsing accepts `0x5`, `+5` and ` 5` (request smuggling behind a proxy)~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
 | **S4** | ~~Static mounts serve dotfiles (`.env`, `.git/config`)~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
-| **S5** | Multipart: quoted parameters parsed wrongly; `filename` returned with `../` | Medium | S | MEASURED |
+| **S5** | ~~Multipart: quoted parameters parsed wrongly; `filename` returned with `../`~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
 | **S6** | Server always binds `0.0.0.0`, so a proxy-only deployment is exposed directly | Medium | S | CODE |
 | **P1** | epoll issues one wasted `epoll_ctl` per keep-alive request | Medium (~25% of syscalls) | S | MEASURED |
 | **P2** | io_uring is the Linux default but is 20–25% slower than epoll | Medium | S | MEASURED (`lib/CLAUDE.md`) |
@@ -349,6 +349,13 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   `X-Content-Type-Options: nosniff` on static responses.
 
 ### S5 · Multipart: quoted parameters are parsed wrongly and `filename` is returned unsanitized
+- **Status: FIXED 2026-09-24.** `extract_param` (`lib/multipart.c`) now walks the value as a `;`-separated list of
+  `name=token` / `name="quoted-string"` pairs (`\"` and `\\` unescaped, other backslashes kept for Windows paths),
+  names matched exactly; used for both `Content-Disposition` and the `boundary`. Part headers are found at line starts
+  only (`find_header_value`). New `multipart_safe_filename` (basename after `/` or `\`, control characters dropped,
+  empty / `.` / `..` rejected), documented in `lib/API.md`; the cookbook upload recipe uses it. `part->filename` itself
+  is still the raw client string. Tests: `test_disposition_params_are_parsed_not_searched` (fails on the old code) and
+  `test_safe_filename` (`tests/test_multipart.c`).
 - **Impact:** Medium. Any app that saves an upload under `part->filename` has a path traversal, and the
   cookbook's upload recipe (`lib/examples/cookbook.c:303-323`) shows `filename` being used.
 - **Effort:** S

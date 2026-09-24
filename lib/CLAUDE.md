@@ -50,7 +50,7 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals). On Linux `event_loop_linux.c` implements `event_loop.h` by forwarding through `App.loop_ops` to the static functions behind `io_uring_loop_ops` / `epoll_loop_ops` (`event_loop_backend.h`, private); kqueue implements it directly |
 | `cluster.c/h` | fork workers, respawn (with backoff and a restart budget), drain; on macOS/BSD (`CEXPRESS_SINGLE_ACCEPTOR`) also the single acceptor - binds the one listen socket, `accept()`s, and hands fds to workers round-robin over per-worker socketpairs |
 | `static.c/h` | traversal-safe file serving, with an in-memory cache of recently served files |
-| `multipart.c/h`, `urlencoded.c/h` | form body parsers (handler-invoked, not automatic) |
+| `multipart.c/h`, `urlencoded.c/h` | form body parsers (handler-invoked, not automatic). Multipart part headers are found line-anchored and their parameters parsed as a `;`-list of token / quoted-string values, never substring-searched; `MultipartPart.filename` stays the raw client string, `multipart_safe_filename` is the filesystem-safe basename |
 | `vendor/picohttpparser/` | vendored HTTP/1.x request parser (MIT/Perl) |
 | `vendor/yyjson/` | vendored yyjson 0.13.0; JSON reading and writing. `cexpress.h` includes it. There is no engine JSON layer of its own |
 | `examples/cookbook.c` | tested few-shot recipes; `tests/test_cookbook.c` runs every one |
