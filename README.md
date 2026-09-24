@@ -203,7 +203,7 @@ Verified against the current code on 21 Sep 2026 and not yet fixed (details and 
 - **Optional**: Docker (containerized run), and [`wrk`](https://github.com/wg/wrk) for load testing (`brew install wrk` / `apt install wrk`).
 
 > [!NOTE]
-> This engine is plaintext HTTP/1.1 only; there is no TLS support. Terminate TLS at a gateway or reverse proxy in front of it (nginx, an ALB, a sidecar).
+> This engine is plaintext HTTP/1.1 only; there is no TLS support. Terminate TLS at a gateway or reverse proxy in front of it (nginx, an ALB, a sidecar). With the proxy on the same host, set `app.config.bind_address = "127.0.0.1"` (the demo: `BIND_ADDRESS=127.0.0.1`) so the plaintext port cannot be reached around it; the default listens on every IPv4 interface.
 
 > [!TIP]
 > On macOS, `gcc-16` is installed via Homebrew (`brew install gcc`). The `Makefile` detects macOS (`Darwin`) or Linux (`Linux`), selecting `gcc-16` on Darwin and `gcc` on Linux.
@@ -320,6 +320,7 @@ The demo app supports runtime environment variables; the engine itself is config
 | Environment Variable | Default Value | Description |
 |---|---|---|
 | `PORT` | `8080` | TCP port the server binds to (valid range: `1`–`65535`). |
+| `BIND_ADDRESS` | unset (every IPv4 interface) | Numeric address to listen on: `127.0.0.1` behind a reverse proxy on the same host, `::` for every IPv4 and IPv6 interface. Hostnames are refused at startup. |
 | `WORKERS` | `1` | Number of worker processes (`1` = single process, `auto` or `0` = CPU core auto-detection, `N` = fixed count, at most 128). |
 | `API_KEY` | `my-secret-api-key` | Bearer token verified by the demo authentication middleware. |
 | `TODO_DB_PATH` | `todos.db` | Path to the SQLite database file backing the Todo CRUD demo. |

@@ -63,12 +63,14 @@ READ_BUF_TEST_BIN    = $(BIN_DIR)/test_read_buf
 STREAM_TEST_BIN      = $(BIN_DIR)/test_stream
 ANSWERED_TEST_BIN    = $(BIN_DIR)/test_answered
 BODY_LIMIT_TEST_BIN  = $(BIN_DIR)/test_body_limit
+LISTEN_TEST_BIN      = $(BIN_DIR)/test_listen
 
 TEST_BINS = $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
             $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN) $(URLENCODED_TEST_BIN) \
             $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) \
             $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN) $(PIPELINING_TEST_BIN) \
-            $(READ_BUF_TEST_BIN) $(STREAM_TEST_BIN) $(ANSWERED_TEST_BIN) $(BODY_LIMIT_TEST_BIN)
+            $(READ_BUF_TEST_BIN) $(STREAM_TEST_BIN) $(ANSWERED_TEST_BIN) $(BODY_LIMIT_TEST_BIN) \
+            $(LISTEN_TEST_BIN)
 
 .PHONY: all demo test clean test_epoll bench fuzz check-docs
 
@@ -164,6 +166,11 @@ $(COOKBOOK_TEST_BIN): $(OBJ_DIR)/tests/test_cookbook.o $(OBJ_DIR)/lib/examples/c
 $(PING_TEST_BIN): $(OBJ_DIR)/tests/test_ping.o $(LIB)
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/tests/test_ping.o $(LIB) $(LDFLAGS)
+
+# Listening socket address (ServerConfig.bind_address): real loopback sockets and forked servers.
+$(LISTEN_TEST_BIN): $(OBJ_DIR)/tests/test_listen.o $(LIB)
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/tests/test_listen.o $(LIB) $(LDFLAGS)
 
 # Per-request CPU cost of the pure path (parse -> route -> dispatch -> response), no sockets.
 $(BENCH_BIN): $(OBJ_DIR)/tests/bench_hotpath.o $(LIB)
@@ -283,6 +290,7 @@ test: $(TEST_BINS)
 	./$(STREAM_TEST_BIN)
 	./$(ANSWERED_TEST_BIN)
 	./$(BODY_LIMIT_TEST_BIN)
+	./$(LISTEN_TEST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer

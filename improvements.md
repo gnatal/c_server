@@ -28,7 +28,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **S3** | ~~Chunk-size parsing accepts `0x5`, `+5` and ` 5` (request smuggling behind a proxy)~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
 | **S4** | ~~Static mounts serve dotfiles (`.env`, `.git/config`)~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
 | **S5** | ~~Multipart: quoted parameters parsed wrongly; `filename` returned with `../`~~ **FIXED 2026-09-24** | Medium | S | MEASURED |
-| **S6** | Server always binds `0.0.0.0`, so a proxy-only deployment is exposed directly | Medium | S | CODE |
+| **S6** | ~~Server always binds `0.0.0.0`, so a proxy-only deployment is exposed directly~~ **FIXED 2026-09-24** | Medium | S | CODE |
 | **P1** | ~~epoll issues one wasted `epoll_ctl` per keep-alive request~~ **FIXED 2026-09-24** | Medium (~25% of syscalls) | S | MEASURED |
 | **P2** | ~~io_uring is the Linux default but is 20–25% slower than epoll~~ **FIXED 2026-09-24** | Medium | S | MEASURED (`lib/CLAUDE.md`) |
 | **P3** | ~~Incomplete headers are re-parsed from byte 0 on every `recv` (quadratic)~~ **FIXED 2026-09-24** | Medium (CPU DoS amplifier) | S–M | MEASURED |
@@ -394,6 +394,13 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   as the only name safe for a filesystem.
 
 ### S6 · The listening socket always binds every interface (`INADDR_ANY`, IPv4 only)
+- **Status: FIXED 2026-09-24.** `ServerConfig.bind_address` (`lib/app_types.h`; `app_init` sets `NULL`, which keeps
+  the old `0.0.0.0` listener) is passed to `create_server_socket(bind_address, port)` by `app_listen_worker` and both
+  `cluster_listen` paths. Only numeric literals are accepted (`inet_pton`; hostnames and `127.1`-style shorthands exit
+  at startup), bound through `getaddrinfo(AI_PASSIVE | AI_NUMERICHOST)`, so IPv6 works; `::` has `IPV6_V6ONLY` off and
+  also takes IPv4. The demo reads `BIND_ADDRESS`; README recommends `127.0.0.1` behind a same-host proxy. Test:
+  `tests/test_listen.c`: with `127.0.0.1`, a connection to this host's own non-loopback IPv4 address is refused
+  (a `NULL` listener accepts it), directly and through a forked `app_listen` with 1 and 2 workers. Linux not re-run.
 - **Impact:** Medium. The engine is plaintext by design and expects a TLS proxy in front, but it cannot be
   bound to `127.0.0.1` or a private interface. Anyone who can reach the host can talk to it directly, bypassing
   the proxy's TLS, authentication and rate limits.

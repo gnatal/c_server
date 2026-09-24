@@ -23,6 +23,12 @@ int main(void) {
     }
   }
 
+  /* getenv's string lives for the whole process, so it outlives app_listen as bind_address requires. */
+  const char *bind_env = getenv("BIND_ADDRESS");
+  if (bind_env != NULL && bind_env[0] != '\0') {
+    app.config.bind_address = bind_env;
+  }
+
   const char *workers_env = getenv("WORKERS");
   if (workers_env != NULL) {
     if (strcmp(workers_env, "auto") == 0) {

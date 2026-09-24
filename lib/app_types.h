@@ -578,6 +578,12 @@ typedef struct {
     int port;
     int workers;        /* 1 = single process (default); > 1 = cluster; 0 = one worker per CPU core */
 
+    /* Address the listening socket binds: a numeric IPv4/IPv6 literal, not a hostname. NULL (app_init's
+     * default) = every IPv4 interface, the historical behavior. Behind a TLS proxy on the same host,
+     * set "127.0.0.1" (or "::1") so clients cannot reach the plaintext port around the proxy; "::"
+     * listens on every interface, IPv4 and IPv6. Not copied: the string must outlive app_listen. */
+    const char *bind_address;
+
     /* Per-worker cap on concurrently open connections (accepted but not yet closed). Beyond it,
      * accept_connections (connection.c) still accept()s the fd - it has to, to say anything at all -
      * but answers 503 + Connection: close immediately and closes it, without allocating a Connection

@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #include "connection.h"
 #include "cluster.h"
 #include "event_loop.h"
@@ -44,10 +46,48 @@ int set_nonblocking(int fd) {
  * here is fatal and exit() themselves, same convention event_loop_init already uses (see lib/CLAUDE.md,
  * "Workers and fork"/"Return conventions") - the decision just now lives at that outer boundary
  * instead of being forced deep inside socket setup. */
-int create_server_socket(int port) {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+/* 1 when s is a canonical numeric address: dotted-quad IPv4, or IPv6 with an optional "%scope" suffix
+ * (link-local). getaddrinfo's AI_NUMERICHOST alone would also take inet_aton's legacy shorthands
+ * ("1.2.3", "127.1", "0x7f.1"), which name addresses nobody reading the config would expect. */
+static int is_numeric_address(const char *s) {
+    unsigned char addr[sizeof(struct in6_addr)];
+    if (inet_pton(AF_INET, s, addr) == 1) return 1;
+    char v6[INET6_ADDRSTRLEN];
+    const size_t n = strcspn(s, "%");
+    if (n >= sizeof(v6)) return 0;
+    memcpy(v6, s, n);
+    v6[n] = '\0';
+    return inet_pton(AF_INET6, v6, addr) == 1 && (s[n] == '\0' || s[n + 1] != '\0');
+}
+
+int create_server_socket(const char *bind_address, const int port) {
+    /* NULL keeps the historical listener, every IPv4 interface. A literal address only
+     * (AI_NUMERICHOST): no DNS lookup at startup, and no name like "localhost" that resolves to
+     * several addresses of which only the first would be bound. */
+    const char *const node = bind_address != NULL ? bind_address : "0.0.0.0";
+    if (!is_numeric_address(node)) {
+        fprintf(stderr, "create_server_socket: bind address \"%s\" is not a numeric IPv4/IPv6 address\n", node);
+        return -1;
+    }
+    char service[8];
+    snprintf(service, sizeof(service), "%d", port);
+    const struct addrinfo hints = {
+        .ai_family = AF_UNSPEC,
+        .ai_socktype = SOCK_STREAM,
+        .ai_flags = AI_PASSIVE | AI_NUMERICHOST | AI_NUMERICSERV,
+    };
+    struct addrinfo *addr = NULL; /* freed by freeaddrinfo below, on every path past this call */
+    const int gai = getaddrinfo(node, service, &hints, &addr);
+    if (gai != 0) {
+        fprintf(stderr, "create_server_socket: bind address \"%s\" is not a numeric IPv4/IPv6 address: %s\n",
+                node, gai_strerror(gai));
+        return -1;
+    }
+
+    int server_fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
     if (server_fd < 0) {
         perror("socket");
+        freeaddrinfo(addr);
         return -1;
     }
 
@@ -55,7 +95,20 @@ int create_server_socket(int port) {
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt SO_REUSEADDR");
         close(server_fd);
+        freeaddrinfo(addr);
         return -1;
+    }
+
+    if (addr->ai_family == AF_INET6) {
+        /* "::" means every interface, IPv4 (as mapped addresses) included, on every platform:
+         * Linux defaults IPV6_V6ONLY to 0, the BSDs and macOS to 1. */
+        const int v6only = 0;
+        if (setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0) {
+            perror("setsockopt IPV6_V6ONLY");
+            close(server_fd);
+            freeaddrinfo(addr);
+            return -1;
+        }
     }
 
 #ifdef SO_REUSEPORT
@@ -71,16 +124,13 @@ int create_server_socket(int port) {
     if (setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
         perror("setsockopt TCP_NODELAY");
         close(server_fd);
+        freeaddrinfo(addr);
         return -1;
     }
 
-    struct sockaddr_in address;
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    const int bound = bind(server_fd, addr->ai_addr, addr->ai_addrlen);
+    freeaddrinfo(addr);
+    if (bound < 0) {
         perror("bind");
         close(server_fd);
         return -1;
@@ -1224,9 +1274,10 @@ void app_listen_worker(App *app, int port) {
      * own - it never accept()s directly. Every other caller (standalone, or a Linux cluster worker)
      * is unaffected: accept_via_fd_passing is 0 for them, same bind-here behavior as before. */
     if (!app->accept_via_fd_passing) {
-        app->server_fd = create_server_socket(port);
+        app->server_fd = create_server_socket(app->config.bind_address, port);
         if (app->server_fd < 0) {
-            fprintf(stderr, "app_listen_worker: could not create listening socket on port %d\n", port);
+            fprintf(stderr, "app_listen_worker: could not create listening socket on %s port %d\n",
+                    app->config.bind_address != NULL ? app->config.bind_address : "0.0.0.0", port);
             exit(EXIT_FAILURE);
         }
     }

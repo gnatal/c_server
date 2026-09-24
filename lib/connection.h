@@ -99,9 +99,11 @@ void app_wake_streams(App *app);
  *   allocating one of its own.
  */
 int set_nonblocking(int fd);
-int create_server_socket(int port); /* -1 on failure; does not exit() the process itself.
-                                     * The listener is non-blocking with TCP_NODELAY (inherited
-                                     * by accepted sockets) */
+/* create_server_socket: listens on bind_address:port. bind_address is a numeric IPv4 or IPv6 literal
+ * ("127.0.0.1", "10.0.0.5", "::1", "::" = every interface, IPv4 included), or NULL = every IPv4
+ * interface. -1 on failure (a hostname or malformed address included); does not exit() the process
+ * itself. The listener is non-blocking with TCP_NODELAY (inherited by accepted sockets) */
+int create_server_socket(const char *bind_address, int port);
 /* accept_client: one syscall per connection - accept4(SOCK_NONBLOCK | SOCK_CLOEXEC) on Linux,
  * plain accept() on BSD/macOS where the listener's O_NONBLOCK carries over. The returned fd is
  * non-blocking with TCP_NODELAY when listen_fd came from create_server_socket. -1 with accept's

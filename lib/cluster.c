@@ -315,15 +315,17 @@ void cluster_listen(App *app, int port, int num_workers) {
 #ifdef CEXPRESS_SINGLE_ACCEPTOR
     /* kept open (not closed like the preflight-only check below) - this is the one real listen
      * socket for the whole cluster's lifetime; only the master accepts on it. */
-    int listen_fd = create_server_socket(port);
+    int listen_fd = create_server_socket(app->config.bind_address, port);
     if (listen_fd < 0) {
-        fprintf(stderr, "cluster_listen: could not create listening socket on port %d\n", port);
+        fprintf(stderr, "cluster_listen: could not create listening socket on %s port %d\n",
+                app->config.bind_address != NULL ? app->config.bind_address : "0.0.0.0", port);
         exit(EXIT_FAILURE);
     }
 #else
-    int preflight_fd = create_server_socket(port);
+    int preflight_fd = create_server_socket(app->config.bind_address, port);
     if (preflight_fd < 0) {
-        fprintf(stderr, "cluster_listen: could not create listening socket on port %d\n", port);
+        fprintf(stderr, "cluster_listen: could not create listening socket on %s port %d\n",
+                app->config.bind_address != NULL ? app->config.bind_address : "0.0.0.0", port);
         exit(EXIT_FAILURE);
     }
     close(preflight_fd);

@@ -69,7 +69,7 @@ static void teardown_test_connection(App *app, int fds[2], Connection *conn) {
 static void setup_test_server(App *app) {
     app_init(app);
     assert(event_loop_init(app) == 0);
-    app->server_fd = create_server_socket(0);
+    app->server_fd = create_server_socket(NULL, 0);
     assert(app->server_fd >= 0);
 }
 

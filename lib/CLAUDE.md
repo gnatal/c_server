@@ -134,6 +134,8 @@ arena at all - see above).
 | `App.loop_ops` (the selected Linux backend's static `EventLoopOps` table; decides which member of the `kq`/`epoll_fd`/`ring` union is live) | not allocated: `event_loop_init` points it at `io_uring_loop_ops` or `epoll_loop_ops` on success | nothing to free; `event_loop_close` sets it back to `NULL` after the backend's own close |
 | `App.poll_regs` (io_uring backend only: one `PollRegistration` per fd) | `event_loop_io_uring.c`'s `registration_for`, grown by doubling on the first interest change for an fd past its size | `event_loop_close` |
 | `app->spare_fd` (one `/dev/null` fd held in reserve for `EMFILE`) | `app_init` | `app_destroy`; also closed-then-reopened across its life by `accept_connections` (on `EMFILE`) and `connection_close` (opportunistic re-arm) - see Behavior reference, Overload |
+| `ServerConfig.bind_address` | the application (`app.config`; `app_init` sets `NULL`) | never by the engine: borrowed, read by `create_server_socket` at bind time, so it must outlive `app_listen` |
+| `create_server_socket`'s `addrinfo` list | `getaddrinfo` (libc) | `freeaddrinfo`, inside `create_server_socket` on every path past the call (right after `bind`, or on a failed `socket`/`setsockopt`) |
 | `cluster.c`'s `listen_fd` (`CEXPRESS_SINGLE_ACCEPTOR` only - the master's one real listen socket, replacing per-worker binds) | `cluster_listen` (`create_server_socket`) | `cluster_listen`, after every worker has drained, at the end of the same function |
 | The master's copy of each accepted client fd (`CEXPRESS_SINGLE_ACCEPTOR` only) | `cluster_listen`'s accept loop (`accept_client`) | the same loop, right after `dispatch_client_fd`, success or not - the worker owns its own `SCM_RIGHTS` copy from then on |
 | `ClusterWorkerSlot.control_fd` per slot (the master-side end of that worker's socketpair; the worker keeps the other end, `sv[1]`, as its own `server_fd`) | `spawn_worker`, fresh on every spawn *and* every respawn | `spawn_worker`'s next respawn for that slot (closes the stale one first), or `cluster_listen`'s final cleanup once every worker has drained |
@@ -422,7 +424,14 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
 - **Workers and fork.** Never open a database or socket in `main()` before `app_listen`; register `app_on_worker_start`
   and open there (runs once per serving process, after fork). `SIGPIPE` is ignored per process in `app_listen_worker`
   (and, under `CEXPRESS_SINGLE_ACCEPTOR`, in the master too - see below). `cluster_listen` always calls
-  `create_server_socket(port)` once itself before forking anyone - this doubles as the respawn preflight validation.
+  `create_server_socket(app->config.bind_address, port)` once itself before forking anyone - this doubles as the respawn preflight validation.
+  **Listen address.** Every listener comes from `create_server_socket(bind_address, port)`: `app_listen_worker`, the
+  cluster preflight, and the single acceptor's `listen_fd`, so `ServerConfig.bind_address` reaches every process model.
+  `NULL` = `0.0.0.0` (the historical, IPv4-only listener). Anything else must pass `inet_pton` as IPv4 or IPv6 (optional
+  `%scope`) - hostnames and `inet_aton` shorthands like `127.1` are refused, so no DNS at startup and no name that
+  resolves to several addresses - and is turned into a `sockaddr` by `getaddrinfo(AI_PASSIVE | AI_NUMERICHOST)`. An
+  IPv6 listener gets `IPV6_V6ONLY` = 0 on every platform (BSD/macOS default to 1), so `::` also accepts IPv4. A refused
+  address is a startup failure like a taken port: `-1`, and the caller exits once, before any fork.
   `create_server_socket` itself just `perror`s and returns `-1` on a bind/listen failure (fixed
   2026-09-23 - it no longer `exit()`s the process on its own); `cluster_listen` is what checks that return
   and `exit()`s with one clear message, so a fatal, permanent misconfiguration still stops the master
