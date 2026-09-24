@@ -223,6 +223,9 @@ const char *req_get_cookie(const Request *req, const char *name); /* case-sensit
  * A '%' without two hex digits is copied literally. Returns 0 ok, -1 if a decoded byte is NUL -
  * dst is still fully written and NUL-terminated, but the caller should treat it as invalid input. */
 int url_decode(const char *src, char *dst, size_t dst_size, int decode_plus);
+/* url_decode over src[0..src_len) (not NUL-terminated). Returns 0 ok, -1 a decoded byte is NUL,
+ * -2 the decoded bytes did not fit dst (dst holds the truncated prefix). Either error: invalid input. */
+int url_decode_span(const char *src, size_t src_len, char *dst, size_t dst_size, int decode_plus);
 
 /* one path shape for routing, middleware and body limits. In place, on an already-decoded path:
  * collapses repeated '/', keeps at most one trailing '/'. Returns -1 (caller answers 400) for a path

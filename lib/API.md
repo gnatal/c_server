@@ -46,7 +46,7 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `req_get_header(req, name)` — header value, case-insensitive name. No length limit of its own (views into the raw request, not fixed-size copies) other than the whole header block fitting `BUF_SIZE`.
 - `req_get_cookie(req, name)` — cookie value, case-sensitive name. Splits the `Cookie` header on its first call per request, not eagerly for every request.
 - Also on `Request`: `method`, `path`, `version`, `query` (raw), `body` (NUL-terminated; binary-safe with `content_length`; lives in the connection arena, never free it), `content_length`.
-- `url_decode(src, dst, dst_size, decode_plus)` — percent-decode a string.
+- `url_decode(src, dst, dst_size, decode_plus)` — percent-decode a string. `url_decode_span(src, len, dst, dst_size, decode_plus)` — same over a length, -2 if it does not fit.
 - `request_target_path(target, len, out, out_size)` — raw request-target to canonical path (query dropped, decoded, `path_canonicalize`d; -2 too long, -4 invalid): the one step the parser and the body-limit check share.
 - `path_canonicalize(path)` (in place, collapses repeated `/`; -1 for a `.`/`..` segment or a target not starting with `/`), `path_normalize_prefix(prefix, out, out_size)` (`""` or `/seg[/seg]`), `path_prefix_matches(prefix, path)` (segment-boundary match) — the one path shape shared by routing, prefix middleware, body limits and mounts. `req->path` is always canonical: the parser refuses (400) `%2F`, dot segments and non-origin-form targets.
 
@@ -78,7 +78,7 @@ serialize once, `free` the string.
 - Finish with `yyjson_doc_free(doc)` for reads.
 
 ## Forms and uploads (`urlencoded.h`, `multipart.h`)
-- `parse_urlencoded_body(body, len, UrlEncodedForm *)`, `urlencoded_get_field(form, name)`.
+- `parse_urlencoded_body(body, len, UrlEncodedForm *)` → field count, -1 a decoded `%00`, -2 a name > 63 or value > 255 bytes (either: 400, form is empty), `urlencoded_get_field(form, name)`.
 - `multipart_parse_boundary(content_type, out, out_size)` → 1/0, `parse_multipart_body(body, len, boundary, MultipartForm *)` → part count or -1, `multipart_get_part(form, name)`, `multipart_safe_filename(part, out, out_size)` → 1/0 (basename, no control chars, never `.`/`..`: the only form of `part->filename` safe for a filesystem - the raw field is exactly what the client sent).
 
 ## Parser internals (`http_parser.h`) — engine and tests

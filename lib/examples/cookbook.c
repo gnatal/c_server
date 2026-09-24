@@ -276,6 +276,7 @@ static void recipe_logout(const Request *req, Response *res) {
  * RECIPE 9 - HTML form (application/x-www-form-urlencoded).
  *   POST /form  body: name=Ada+L&age=36  ->  "Hello, Ada L (36)"
  * The parser copies and decodes into the form struct; req->body is untouched.
+ * It returns < 0 for a %00 or a field too long for its slot: answer 400, never use the form.
  * ------------------------------------------------------------------------------------------- */
 static void recipe_form(const Request *req, Response *res) {
     const char *content_type = req_get_header(req, "Content-Type");
@@ -285,7 +286,11 @@ static void recipe_form(const Request *req, Response *res) {
         return;
     }
     UrlEncodedForm form;
-    parse_urlencoded_body(req->body, (size_t)req->content_length, &form);
+    if (parse_urlencoded_body(req->body, (size_t)req->content_length, &form) < 0) {
+        res_status(res, 400);
+        res_send(res, "malformed form field");
+        return;
+    }
     const char *name = urlencoded_get_field(&form, "name");
     const char *age = urlencoded_get_field(&form, "age");
     if (name == NULL || name[0] == '\0') {

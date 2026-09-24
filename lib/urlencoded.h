@@ -21,8 +21,14 @@
  *
  * body may be NULL (treated the same as an empty body: form->field_count is
  * left at 0, not an error).
+ *
+ * Returns the field count (>= 0), or -1 if a decoded name/value contains a
+ * NUL ("file=shell.php%00.png" would otherwise read as "shell.php"), or -2
+ * if a decoded name exceeds 63 or a value 255 bytes. On either error
+ * form->field_count is 0, so no field is usable: answer 400, never act on a
+ * shortened value.
  */
-void parse_urlencoded_body(const char *body, size_t body_len, UrlEncodedForm *form);
+int parse_urlencoded_body(const char *body, size_t body_len, UrlEncodedForm *form);
 
 /*
  * Looks up the first field with the given name, or NULL if absent - mirrors

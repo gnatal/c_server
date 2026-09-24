@@ -198,10 +198,14 @@ static void test_cookie_recipes(App *app) {
 
 static void test_form_and_upload_recipes(App *app) {
     expect(app,
-           "POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 18\r\n\r\nname=Ada+L&age=36",
+           "POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 17\r\n\r\nname=Ada+L&age=36",
            "HTTP/1.1 200 OK", "Hello, Ada L (36)");
     expect(app, "POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
            "HTTP/1.1 415 Unsupported Media Type", "expected application/x-www-form-urlencoded");
+    /* %00 would have cut the name to "Ada"; the recipe answers 400 instead */
+    expect(app,
+           "POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 21\r\n\r\nname=Ada%00.png&age=1",
+           "HTTP/1.1 400 Bad Request", "malformed form field");
 
     /* multipart with a binary payload (embedded NUL) - data_len, not strlen, is what counts. */
     const char part_head[] =

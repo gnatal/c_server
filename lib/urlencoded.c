@@ -2,10 +2,10 @@
 #include "urlencoded.h"
 #include "http_parser.h"
 
-void parse_urlencoded_body(const char *body, size_t body_len, UrlEncodedForm *form) {
+int parse_urlencoded_body(const char *body, size_t body_len, UrlEncodedForm *form) {
     form->field_count = 0;
     if (body == NULL || body_len == 0) {
-        return;
+        return 0;
     }
 
     size_t pos = 0;
@@ -23,24 +23,26 @@ void parse_urlencoded_body(const char *body, size_t body_len, UrlEncodedForm *fo
             const char *value_start = eq != NULL ? eq + 1 : body + pair_end;
             size_t value_len = eq != NULL ? pair_end - (size_t)(value_start - body) : 0;
 
-            char *name_slot = form->field_names[form->field_count];
-            char *value_slot = form->field_values[form->field_count];
-
-            size_t copy_name = name_len < sizeof(form->field_names[0]) - 1 ? name_len : sizeof(form->field_names[0]) - 1;
-            memcpy(name_slot, body + pos, copy_name);
-            name_slot[copy_name] = '\0';
-
-            size_t copy_value = value_len < sizeof(form->field_values[0]) - 1 ? value_len : sizeof(form->field_values[0]) - 1;
-            memcpy(value_slot, value_start, copy_value);
-            value_slot[copy_value] = '\0';
-
-            url_decode(name_slot, name_slot, sizeof(form->field_names[0]), 1);
-            url_decode(value_slot, value_slot, sizeof(form->field_values[0]), 1);
+            /* decoded straight from body into the slots, so the slot limit applies to the
+             * decoded length, and an escape is never split by a pre-decode cut. */
+            const int name_rc = url_decode_span(body + pos, name_len, form->field_names[form->field_count],
+                                                sizeof(form->field_names[0]), 1);
+            const int value_rc = url_decode_span(value_start, value_len, form->field_values[form->field_count],
+                                                 sizeof(form->field_values[0]), 1);
+            if (name_rc == -1 || value_rc == -1) {
+                form->field_count = 0;
+                return -1;
+            }
+            if (name_rc == -2 || value_rc == -2) {
+                form->field_count = 0;
+                return -2;
+            }
             form->field_count++;
         }
 
         pos = pair_end + 1;
     }
+    return form->field_count;
 }
 
 const char *urlencoded_get_field(const UrlEncodedForm *form, const char *name) {

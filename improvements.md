@@ -34,7 +34,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **P3** | ~~Incomplete headers are re-parsed from byte 0 on every `recv` (quadratic)~~ **FIXED 2026-09-24** | Medium (CPU DoS amplifier) | S–M | MEASURED |
 | **M3** | No per-worker memory budget for buffered bodies and unsent output | Medium | M | CODE |
 | **S7** | ~~Missing or duplicate `Host` header is accepted~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
-| **S8** | Form fields: `%00` not rejected (S6 gap), values silently truncated at 255 | Low–Medium | S | MEASURED |
+| **S8** | ~~Form fields: `%00` not rejected (S6 gap), values silently truncated at 255~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **S9** | Response header values silently truncated at 255 chars (CSP, `Location`) | Low–Medium | S | MEASURED |
 | **P4** | Cached static files are copied into the arena on every hit | Low–Medium | M | ESTIMATED |
 | **P5** | `sendfile`/`writev` still not used for file bodies | Low–Medium | M | CODE |
@@ -430,6 +430,15 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   return -1 (400) when the count is not exactly 1.
 
 ### S8 · Form fields: `%00` is not rejected, and values are cut at 255 without notice
+- **Status: FIXED 2026-09-24.** `parse_urlencoded_body` (`lib/urlencoded.c`) now returns `int`: the field count,
+  -1 when a decoded name or value holds a NUL (`%00` or a raw NUL byte), -2 when a decoded name exceeds 63 or a
+  value 255 bytes; on either error `field_count` is 0. Fields are decoded straight from the body with the new
+  `url_decode_span` (`lib/http_parser.h`, `url_decode` over a length, -2 when the output does not fit), so the
+  limit applies to the decoded length and an escape is never split by a pre-decode cut. The query string keeps
+  its old behavior (reject NUL, keep the truncated prefix). Cookbook recipe 9 answers 400 on `< 0`; `lib/API.md`
+  updated. Tests: `tests/test_urlencoded.c` (NUL, 255/256 values, 63/64 names, 255 `%41` escapes, overlong field
+  after valid ones, `url_decode_span`) and a `%00` form request in `tests/test_cookbook.c`, whose recipe-9 request
+  had declared `Content-Length: 18` for a 17-byte body (the stray NUL was truncated away before).
 - **Impact:** Low–Medium. It's the same bypass S6 closed for the path and query, in form bodies:
   `file=shell.php%00.png` reads as `shell.php`.
 - **Effort:** S

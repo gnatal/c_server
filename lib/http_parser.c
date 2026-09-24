@@ -34,7 +34,9 @@ static void copy_bounded(char *dst, const size_t dst_size, const char *src, size
  * still fully written and NUL-terminated in that case, but every C-string function downstream
  * (strlen, strcmp, the router, a handler's own strstr/strcmp on req->path) would silently see only the
  * bytes up to that NUL, treating "/style.css%00.png" as "/style.css" with no error and no indication
- * anything was cut. Callers must reject such input (400) rather than use dst). */
+ * anything was cut. Callers must reject such input (400) rather than use dst). -2 if dst filled up
+ * before src was consumed (dst holds the NUL-terminated prefix); path decoding sizes dst so this cannot
+ * happen, the query string keeps the prefix, url_decode_span's callers reject it. */
 static int decode_bounded(char *dst, const size_t dst_size, const char *src, const size_t src_len,
                           const int decode_plus) {
     if (dst_size == 0) {
@@ -42,7 +44,8 @@ static int decode_bounded(char *dst, const size_t dst_size, const char *src, con
     }
     size_t out = 0;
     int has_embedded_nul = 0;
-    for (size_t i = 0; i < src_len && out + 1 < dst_size; i++) {
+    size_t i = 0;
+    for (; i < src_len && out + 1 < dst_size; i++) {
         char c;
         if (src[i] == '%' && i + 2 < src_len && hex_value(src[i + 1]) >= 0 && hex_value(src[i + 2]) >= 0) {
             c = (char)((hex_value(src[i + 1]) << 4) | hex_value(src[i + 2]));
@@ -58,11 +61,18 @@ static int decode_bounded(char *dst, const size_t dst_size, const char *src, con
         dst[out++] = c;
     }
     dst[out] = '\0';
-    return has_embedded_nul ? -1 : 0;
+    if (has_embedded_nul) {
+        return -1;
+    }
+    return i < src_len ? -2 : 0;
 }
 
 int url_decode(const char *src, char *dst, const size_t dst_size, const int decode_plus) {
-    return decode_bounded(dst, dst_size, src, strlen(src), decode_plus);
+    return decode_bounded(dst, dst_size, src, strlen(src), decode_plus) == -1 ? -1 : 0;
+}
+
+int url_decode_span(const char *src, const size_t src_len, char *dst, const size_t dst_size, const int decode_plus) {
+    return decode_bounded(dst, dst_size, src, src_len, decode_plus);
 }
 
 /* ---- path canonicalization ---- */
@@ -1009,8 +1019,8 @@ int parse_query_string(const char *query, Request *req) {
             const char *value = eq != NULL ? eq + 1 : p + pair_len;
             const size_t value_len = eq != NULL ? pair_len - name_len - 1 : 0;
 
-            const int name_ok = decode_bounded(req->query_names[req->query_count], sizeof(req->query_names[0]), p, name_len, 1) == 0;
-            const int value_ok = decode_bounded(req->query_values[req->query_count], sizeof(req->query_values[0]), value, value_len, 1) == 0;
+            const int name_ok = decode_bounded(req->query_names[req->query_count], sizeof(req->query_names[0]), p, name_len, 1) != -1;
+            const int value_ok = decode_bounded(req->query_values[req->query_count], sizeof(req->query_values[0]), value, value_len, 1) != -1;
             req->query_count++;
             if (!name_ok || !value_ok) {
                 /* a %00 (or a raw NUL byte) decoded into this pair - reject the whole request (400)
