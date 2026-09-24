@@ -68,6 +68,7 @@ producer stream output 16 KiB per producer call (`STREAM_CHUNK_SIZE`; one `strea
 pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response, logged; the only bound on a response header value) ·
 worker init hooks 4 · cluster workers 128 · arena 64 KiB, one per worker process, not per connection (see below; exceeding it falls back to malloc, it is not a limit) ·
 max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped) ·
+buffered memory 256 MiB per worker (`ServerConfig.max_buffered_bytes`, `DEFAULT_MAX_BUFFERED_BYTES`, runtime, `0` = no budget; see "Buffered-memory budget" below) ·
 body limit prefixes 16 (`MAX_BODY_LIMITS`; `App.body_limits`, set at runtime by `app_use_body_limit`, unlike the other limits here - see "Body limits" below).
 
 ## Memory model
@@ -87,6 +88,20 @@ during which other connections' dispatches would otherwise reuse and overwrite a
 Measured on macOS, 5,000 idle keep-alive connections on one worker now take about 8.2 KB RSS per connection (about
 44 MB total for 5,000), down from about 25 KB per connection (about 121 MB) before this fix (Linux not measured);
 the shared receive buffer below removed the remaining 8 KiB `in_buf`.
+**Buffered-memory budget.** `App.buffered_bytes` is the sum of what open connections hold across event-loop turns:
+an owned `in_buf` (`in_cap`; a borrowed `App.read_buf` is not counted), an owned `out_buf` tail copy (`out_cap` while
+`out_buf_owned`), and `STREAM_CHUNK_SIZE` while `stream_buf` is allocated. The arena is not counted (reset every
+dispatch cycle). Each connection records its share in `Connection.held_bytes`; `sync_held_bytes` (`connection.c`)
+recomputes that share from the fields and moves the total by the difference, so it is idempotent and runs after each
+ownership change (`grow_in_buf`, `stop_borrowing_read_buf`, `release_in_buf`, `wait_for_writable`, `park_stream`, the
+end of `flush_connection`) instead of being paired with every `malloc`/`free`. `connection_close` subtracts the whole
+share, so a missed sync can only overstate the total until the connection closes, never leak it; the total is 0 with
+no connection open. Enforced against `ServerConfig.max_buffered_bytes` (`budget_allows`) in three places:
+`grow_in_buf` returns `-2` → 503 + close; `stop_borrowing_read_buf` answers a partial request 503 (after handing
+`App.read_buf` back) - but bytes pipelined behind a pending response are copied even over budget, since no response
+can be sent over the one in flight; and `flush_connection`'s tail copy closes the connection that just stalled instead
+of copying (the newest stalled writer is the one dropped). `stream_buf` allocation is counted but not refused. A
+whole request served straight from `App.read_buf` never needs budget.
 **One receive buffer per worker process, borrowed per read.** `app_init` also mallocs `App.read_buf`
 (`BUF_SIZE`, 8 KiB). A connection with nothing buffered has `in_buf == NULL`; `handle_readable` (`read_and_serve`)
 points `in_buf` at `App.read_buf` for the `recv`, and complete requests are parsed and served in place there (header

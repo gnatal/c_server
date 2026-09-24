@@ -11,7 +11,9 @@ void app_init(App *app) {
     app->config.workers = 1;
     app->config.bind_address = NULL; /* every IPv4 interface */
     app->config.max_connections = DEFAULT_MAX_CONNECTIONS;
+    app->config.max_buffered_bytes = DEFAULT_MAX_BUFFERED_BYTES;
     app->open_connections = 0;
+    app->buffered_bytes = 0;
     /* Best effort: a failed open just means EMFILE gets the pre-existing silent behavior -
      * see App.spare_fd. */
     app->spare_fd = open("/dev/null", O_RDONLY);

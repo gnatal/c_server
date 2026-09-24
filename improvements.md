@@ -32,7 +32,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **P1** | ~~epoll issues one wasted `epoll_ctl` per keep-alive request~~ **FIXED 2026-09-24** | Medium (~25% of syscalls) | S | MEASURED |
 | **P2** | ~~io_uring is the Linux default but is 20–25% slower than epoll~~ **FIXED 2026-09-24** | Medium | S | MEASURED (`lib/CLAUDE.md`) |
 | **P3** | ~~Incomplete headers are re-parsed from byte 0 on every `recv` (quadratic)~~ **FIXED 2026-09-24** | Medium (CPU DoS amplifier) | S–M | MEASURED |
-| **M3** | No per-worker memory budget for buffered bodies and unsent output | Medium | M | CODE |
+| **M3** | ~~No per-worker memory budget for buffered bodies and unsent output~~ **FIXED 2026-09-24** | Medium | M | CODE |
 | **S7** | ~~Missing or duplicate `Host` header is accepted~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **S8** | ~~Form fields: `%00` not rejected (S6 gap), values silently truncated at 255~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
 | **S9** | ~~Response header values silently truncated at 255 chars (CSP, `Location`)~~ **FIXED 2026-09-24** | Low–Medium | S | MEASURED |
@@ -224,6 +224,17 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   deadline (for example, close if fewer than 1 KiB/s over 30 s).
 
 ### M3 · No per-worker budget for memory held by in-flight requests and responses
+- **Status: FIXED 2026-09-24.** `ServerConfig.max_buffered_bytes` (`app_init`: `DEFAULT_MAX_BUFFERED_BYTES`, 256 MiB;
+  0 = off) bounds `App.buffered_bytes`, the sum of each connection's `held_bytes`: owned `in_buf`, owned `out_buf` tail
+  and `stream_buf`. `connection.c`'s `sync_held_bytes` recomputes a connection's share after each ownership change,
+  and `connection_close` subtracts it whole, so the total cannot drift upward past a close. Over budget: `grow_in_buf`
+  → 503 + close; a partial request needing its first owned `BUF_SIZE` buffer → 503 + close (bytes pipelined behind a
+  pending response are exempt); a response needing a tail copy → that connection is closed. `stream_buf` is counted,
+  not refused. Tests: `tests/test_buffer_budget.c` (new suite): the default, an upload counted as it grows and back to
+  0 once answered, growth past a 20,000-byte budget → 503 (and served with budget 0), a second partial request over
+  an 8 KiB budget → 503 while the first completes, a 1 MiB unread response's tail counted and released as it drains
+  and closed under a 64 KiB budget, a parked stream's `stream_buf` counted. Mutation-checked: `budget_allows`
+  always true fails it. `make bench` unchanged beyond noise (the pure path does not touch it).
 - **Impact:** Medium
 - **Effort:** M
 - **Where:** `lib/connection.c:721` (`grow_in_buf`, up to ~10 MiB per uploading connection),

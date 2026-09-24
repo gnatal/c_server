@@ -64,6 +64,7 @@
 #define BACKLOG 128                   /* listen() backlog floor; create_server_socket takes max(BACKLOG, SOMAXCONN) */
 #define DEFAULT_PORT 8080
 #define DEFAULT_MAX_CONNECTIONS 10000 /* ServerConfig.max_connections default, applied by app_init (see below) */
+#define DEFAULT_MAX_BUFFERED_BYTES ((size_t)256 * 1024 * 1024) /* ServerConfig.max_buffered_bytes default (app_init) */
 
 #define ARENA_SIZE (64 * 1024)        /* App.arena's fixed buffer: one shared per-worker bump allocator, not one
                                         * per connection; reset once per request, falls back to malloc beyond this */
@@ -386,6 +387,10 @@ typedef struct Connection {
      * overwrite it. Freed when streaming ends (success or error) or on connection_close. */
     char *stream_buf;
 
+    /* This connection's share of App.buffered_bytes as last synced: owned in_cap + owned out_cap
+     * (out_buf_owned) + STREAM_CHUNK_SIZE if stream_buf is allocated. 0 from calloc. */
+    size_t held_bytes;
+
     int events_watched;     /* EVENT_READ | EVENT_WRITE currently registered with the event loop */
 
     /* Per-request bump allocator: a pointer to the single arena shared by every connection this
@@ -593,6 +598,14 @@ typedef struct {
      * or touching the event loop. app_init sets DEFAULT_MAX_CONNECTIONS; set to 0 to opt out
      * (uncapped, bounded only by RLIMIT_NOFILE, the old behavior). */
     int max_connections;
+
+    /* Per-worker budget for memory connections hold across event-loop turns: owned in_bufs (partial
+     * requests, bodies being uploaded), owned out_buf tail copies (responses a client is slow to read)
+     * and stream_bufs (App.buffered_bytes). Past it, a request that needs more input memory is answered
+     * 503 and closed, and a response that would need a tail copy closes its connection instead. The
+     * per-request arena (reset every dispatch) is not counted. app_init sets DEFAULT_MAX_BUFFERED_BYTES;
+     * 0 = no budget (the old behavior). */
+    size_t max_buffered_bytes;
 } ServerConfig;
 
 /* The whole server. About 4.6 KB on macOS, routes live on the heap: a local or static App is fine. A
@@ -653,6 +666,11 @@ typedef struct {
      * authoritative count for anything that walks `connections` directly, e.g. a test harness that
      * pokes it by hand. */
     int open_connections;
+
+    /* Sum of every open connection's Connection.held_bytes: the memory ServerConfig.max_buffered_bytes
+     * bounds. Kept in step by connection.c's sync_held_bytes at each ownership change, and by
+     * connection_close subtracting the connection's whole share, so it returns to 0 with no connection open. */
+    size_t buffered_bytes;
 
     /* One fd (opened once, up front) held in reserve and not otherwise used: on EMFILE/ENFILE from
      * accept() (connection.c: accept_connections), closing it frees exactly one descriptor, just

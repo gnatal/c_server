@@ -184,11 +184,43 @@ Connection *connection_create(App *app, int fd) {
     return conn;
 }
 
+/* ---- per-worker buffered-memory budget (ServerConfig.max_buffered_bytes) ---- */
+
+/* Bytes conn owns across event-loop turns: a borrowed App.read_buf and an arena out_buf are not its own. */
+static size_t owned_bytes(const App *app, const Connection *conn) {
+    size_t n = 0;
+    if (conn->in_buf != NULL && conn->in_buf != app->read_buf) {
+        n += conn->in_cap;
+    }
+    if (conn->out_buf_owned) {
+        n += conn->out_cap;
+    }
+    if (conn->stream_buf != NULL) {
+        n += STREAM_CHUNK_SIZE;
+    }
+    return n;
+}
+
+/* Re-reads conn's ownership and moves App.buffered_bytes by the difference. Idempotent, so it is called
+ * after every change of in_buf/out_buf_owned/stream_buf rather than paired with each malloc and free. */
+static void sync_held_bytes(App *app, Connection *conn) {
+    const size_t now = owned_bytes(app, conn);
+    app->buffered_bytes = app->buffered_bytes - conn->held_bytes + now;
+    conn->held_bytes = now;
+}
+
+/* 1 if the worker may hold `extra` more bytes. */
+static int budget_allows(const App *app, const size_t extra) {
+    return app->config.max_buffered_bytes == 0 || app->buffered_bytes + extra <= app->config.max_buffered_bytes;
+}
+
 void connection_close(App *app, Connection *conn) {
     if (conn == NULL) {
         return;
     }
     if (app != NULL) {
+        app->buffered_bytes -= conn->held_bytes; /* everything it owns is freed below */
+        conn->held_bytes = 0;
         event_loop_unwatch_all(app, conn->fd);
         if (app->connections != NULL && conn->fd >= 0 && conn->fd < app->connections_cap) {
             app->connections[conn->fd] = NULL;
@@ -499,6 +531,7 @@ void accept_passed_connections(App *app) {
  * re-watches read once the response is fully queued (a closed connection needs neither).
  */
 static void wait_for_writable(App *app, Connection *conn) {
+    sync_held_bytes(app, conn); /* a tail copy or stream_buf may have just been taken */
     event_loop_watch_write(app, conn->fd, conn);
     if (conn->events_watched & EVENT_READ) {
         event_loop_unwatch_read(app, conn->fd);
@@ -512,6 +545,7 @@ static void wait_for_writable(App *app, Connection *conn) {
  * nothing is being written. app_wake_streams / close_idle_connections resume it (resume_stream).
  */
 static int park_stream(App *app, Connection *conn) {
+    sync_held_bytes(app, conn); /* a parked stream keeps its stream_buf */
     event_loop_unwatch_write(app, conn->fd, conn);
     if (!(conn->events_watched & EVENT_READ)) {
         event_loop_watch_read(app, conn->fd, conn);
@@ -529,7 +563,7 @@ static void resume_stream(App *app, Connection *conn) {
 
 /* nothing is buffered any more - drop the input memory so an idle connection holds none. An
  * owned buffer is freed; a borrowed App.read_buf is just handed back. */
-static void release_in_buf(const App *app, Connection *conn) {
+static void release_in_buf(App *app, Connection *conn) {
     if (conn->in_buf != app->read_buf) {
         free(conn->in_buf);
     }
@@ -537,6 +571,7 @@ static void release_in_buf(const App *app, Connection *conn) {
     conn->in_cap = 0;
     conn->in_len = 0;
     conn->in_off = 0;
+    sync_held_bytes(app, conn);
 }
 
 int flush_connection(App *app, Connection *conn) {
@@ -562,6 +597,12 @@ int flush_connection(App *app, Connection *conn) {
                      * arena before this response finishes draining, so copy what's left out first. */
                     if (!conn->out_buf_owned && conn->out_buf != conn->stream_buf) {
                         size_t remaining = conn->out_len - conn->out_sent;
+                        if (!budget_allows(app, remaining)) {
+                            /* over the worker's buffered-memory budget: this client is the one that just
+                             * stopped reading, so it is dropped rather than every other connection. */
+                            connection_close(app, conn);
+                            return FLUSH_CLOSED;
+                        }
                         char *tail = malloc(remaining);
                         if (tail == NULL) {
                             connection_close(app, conn);
@@ -735,6 +776,7 @@ int flush_connection(App *app, Connection *conn) {
         if (conn->in_len == 0) {
             release_in_buf(app, conn);
         }
+        sync_held_bytes(app, conn); /* tail copy and stream_buf are freed above */
         return FLUSH_DONE;
     }
     connection_close(app, conn);
@@ -758,7 +800,8 @@ static void reject_request(App *app, Connection *conn, const int status) {
 /*
  * in_buf is full with headers complete: grow it to fit the body (a borrowed App.read_buf is
  * copied into a new owned buffer instead of realloc'd). Returns 1 grown (keep reading),
- * 0 realloc failed (-> 500), -1 chunked raw-size cap hit (-> 413).
+ * 0 realloc failed (-> 500), -1 chunked raw-size cap hit (-> 413), -2 the growth would exceed the
+ * worker's ServerConfig.max_buffered_bytes (-> 503).
  * Both Content-Length and chunked grow the same way: doubling, capped at the known target size
  * (header_len + content_length + 1, or header_len + the route's body limit for chunked's raw wire size) - never
  * one realloc straight to the full size a client merely *declared*. A client that sends a 10 MiB
@@ -769,7 +812,7 @@ static void reject_request(App *app, Connection *conn, const int status) {
  * buffering and parse_http_request answered 413. A route-specific limit below MAX_BODY_SIZE
  * (app_use_body_limit) is enforced earlier still, in handle_readable, before this is ever called.
  */
-static int grow_in_buf(const App *app, Connection *conn, const size_t header_len, const int chunked,
+static int grow_in_buf(App *app, Connection *conn, const size_t header_len, const int chunked,
                        const int content_length) {
     size_t needed;
     if (chunked) {
@@ -788,6 +831,10 @@ static int grow_in_buf(const App *app, Connection *conn, const size_t header_len
     } else {
         return 0;
     }
+    const size_t held_now = conn->in_buf == app->read_buf ? 0 : conn->in_cap;
+    if (!budget_allows(app, needed - held_now)) {
+        return -2;
+    }
     char *grown;
     if (conn->in_buf == app->read_buf) {
         /* a borrowed App.read_buf is never realloc'd - move to an owned buffer of the grown size. */
@@ -804,6 +851,7 @@ static int grow_in_buf(const App *app, Connection *conn, const size_t header_len
     }
     conn->in_buf = grown;
     conn->in_cap = needed;
+    sync_held_bytes(app, conn);
     return 1;
 }
 
@@ -1004,7 +1052,9 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
  * either hand it back (nothing left to serve) or copy the unserved bytes - a partial request, or
  * requests pipelined behind a pending response - into an owned BUF_SIZE buffer, compacted to offset
  * 0 (request_len, chunk_scan and head_scan are relative to in_off, so they stay valid). The leftover always
- * fits: it came out of a BUF_SIZE buffer. Returns 0, or -1 (malloc failed, conn closed).
+ * fits: it came out of a BUF_SIZE buffer. Returns 0, or -1 (conn closed: malloc failed, or a partial
+ * request found the worker over ServerConfig.max_buffered_bytes - answered 503). Bytes pipelined behind
+ * a pending response are copied even over budget: a response cannot be sent over the one in flight.
  */
 static int stop_borrowing_read_buf(App *app, Connection *conn) {
     if (response_pending(conn) && conn->request_len > 0 && conn->in_off + conn->request_len >= conn->in_len) {
@@ -1024,6 +1074,11 @@ static int stop_borrowing_read_buf(App *app, Connection *conn) {
         release_in_buf(app, conn);
         return 0;
     }
+    if (!response_pending(conn) && !budget_allows(app, BUF_SIZE)) {
+        release_in_buf(app, conn); /* the partial request is dropped; App.read_buf is handed back first */
+        reject_request(app, conn, 503);
+        return -1;
+    }
     char *owned = malloc(BUF_SIZE);
     if (owned == NULL) {
         connection_close(app, conn); /* leaves the borrowed App.read_buf alone */
@@ -1035,6 +1090,7 @@ static int stop_borrowing_read_buf(App *app, Connection *conn) {
     conn->in_cap = BUF_SIZE;
     conn->in_len = leftover;
     conn->in_off = 0;
+    sync_held_bytes(app, conn);
     return 0;
 }
 
@@ -1136,7 +1192,7 @@ static int read_and_serve(App *app, Connection *conn) {
         if (grown == 1) {
             return 0; /* wait for more read events */
         }
-        reject_request(app, conn, grown == -1 ? 413 : 500);
+        reject_request(app, conn, grown == -1 ? 413 : grown == -2 ? 503 : 500);
         return -1;
     }
     return 0;
