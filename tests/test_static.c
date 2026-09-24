@@ -350,6 +350,82 @@ static void test_cache_picks_up_change_after_window_expires(void) {
     static_cache_clear();
 }
 
+/* Writes `size` bytes of a repeating pattern to <root>/<name>. */
+static void write_sized_file(const StaticFixture *fx, const char *name, const size_t size) {
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof(path), "%s/%s", fx->root, name);
+    FILE *f = fopen(path, "wb");
+    assert(f != NULL);
+    for (size_t i = 0; i < size; i++) {
+        assert(fputc('a' + (int)(i % 26), f) != EOF);
+    }
+    fclose(f);
+}
+
+static void remove_fixture_file(const StaticFixture *fx, const char *name) {
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof(path), "%s/%s", fx->root, name);
+    unlink(path);
+}
+
+/* A file past STATIC_CACHE_MAX_ENTRY_BYTES is streamed from disk: the response holds only the head,
+ * with the file's full Content-Length, and the connection holds an open fd for the whole body - never
+ * the file's bytes in memory (it used to be read whole and copied up to three times per request).
+ * A file of exactly the cap is still read into out_buf and cached, as before. */
+static void test_large_file_is_streamed_not_buffered(void) {
+    StaticFixture fx;
+    setup_fixture(&fx);
+    const size_t big = (size_t)STATIC_CACHE_MAX_ENTRY_BYTES + 1;
+    write_sized_file(&fx, "big.bin", big);
+    write_sized_file(&fx, "edge.bin", STATIC_CACHE_MAX_ENTRY_BYTES);
+    Route route = make_static_route(&fx);
+
+    Request req = make_request("/static/big.bin");
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+    static_serve_file(&route, &req, &res);
+    assert(res.status == 200);
+    assert(conn->file_fd >= 0);
+    assert(conn->file_remaining == big);
+    assert(conn->out_buf != NULL);
+    assert(conn->out_len < 512); /* the head only */
+    char cl[64];
+    snprintf(cl, sizeof(cl), "Content-Length: %zu\r\n", big);
+    assert(strstr(conn->out_buf, cl) != NULL);
+    assert(strstr(conn->out_buf, "Content-Type: application/octet-stream\r\n") != NULL);
+    char first[16];
+    assert(read(conn->file_fd, first, sizeof(first)) == (ssize_t)sizeof(first));
+    assert(memcmp(first, "abcdefghijklmnop", sizeof(first)) == 0);
+    close(conn->file_fd);
+    free_conn(conn);
+
+    /* the cap itself: buffered in full, no fd */
+    req = make_request("/static/edge.bin");
+    conn = make_conn();
+    Response res2 = { .conn = conn, .status = 0 };
+    static_serve_file(&route, &req, &res2);
+    assert(res2.status == 200);
+    assert(conn->file_fd == -1);
+    assert(conn->out_len > (size_t)STATIC_CACHE_MAX_ENTRY_BYTES);
+    free_conn(conn);
+
+    /* HEAD on a large file: head only, no fd kept open */
+    req = make_request("/static/big.bin");
+    strncpy(req.method, "HEAD", sizeof(req.method) - 1);
+    conn = make_conn();
+    Response res3 = { .conn = conn, .status = 0, .is_head_request = 1 };
+    static_serve_file(&route, &req, &res3);
+    assert(res3.status == 200);
+    assert(conn->file_fd == -1);
+    assert(strstr(conn->out_buf, cl) != NULL);
+    free_conn(conn);
+
+    remove_fixture_file(&fx, "big.bin");
+    remove_fixture_file(&fx, "edge.bin");
+    teardown_fixture(&fx);
+    static_cache_clear();
+}
+
 int main(void) {
     test_resolve_literal_subpath();
     test_resolve_root_mount();
@@ -369,6 +445,7 @@ int main(void) {
     test_cache_serves_stale_content_within_revalidate_window();
     test_cache_revalidates_after_window_and_serves_unchanged_content();
     test_cache_picks_up_change_after_window_expires();
+    test_large_file_is_streamed_not_buffered();
 
     printf("all static tests passed\n");
     return 0;

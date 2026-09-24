@@ -337,6 +337,23 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
         return;
     }
 
+    const char *content_type = static_mime_type(resolved);
+
+    /* Too big to cache: stream it from disk (res_send_file, STREAM_CHUNK_SIZE per turn through
+     * conn->stream_buf) instead of reading it whole. Reading it would block the event loop for the
+     * whole fread, then hold the file's size in memory up to three times per request (the read buffer,
+     * the arena copy, and flush_connection's owned tail on the first EAGAIN) for as long as a slow
+     * client takes to read it - MEASURED 452 MB RSS for ten rate-limited downloads of a 40 MiB file. */
+    if ((size_t)st.st_size > (size_t)STATIC_CACHE_MAX_ENTRY_BYTES) {
+        res_status(res, 200);
+        if (res_send_file(res, content_type, resolved) != 0) {
+            /* gone or replaced by a non-regular file since the stat above; nothing was sent */
+            res_status(res, 404);
+            res_send(res, "Not Found");
+        }
+        return;
+    }
+
     FILE *f = fopen(resolved, "rb");
     if (f == NULL) {
         res_status(res, 404);
@@ -366,7 +383,6 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
         fclose(f);
     }
 
-    const char *content_type = static_mime_type(resolved);
     res_status(res, 200);
     res_send_bytes(res, content_type, buf, size);
 

@@ -183,7 +183,11 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   middleware into prefix-scoped app middleware. The Router may be a stack local. No nesting.
 - **Static.** `app_serve_static` registers `GET <prefix>/*`, `realpath`s the root once (a missing root registers nothing and logs it, so every request under the prefix is a 404), refuses `..` (403), re-checks the
   resolved path stays under the root after symlink resolution (403), 404 for non-files, serves `index.html` for a directory,
-  never lists. Reads the whole file into memory (≤ 50 MiB) and sends it with `res_send_bytes`. The root is resolved against the process's working directory.
+  never lists. A file up to `STATIC_CACHE_MAX_ENTRY_BYTES` (256 KiB) is read whole and sent with `res_send_bytes` (and cached, below); a
+  larger one (up to `MAX_STATIC_FILE_SIZE`, 50 MiB, else 500) goes through `res_send_file`, which streams it from an open fd in
+  `STREAM_CHUNK_SIZE` pieces through `conn->stream_buf` - never read whole, never in the arena, so a slow reader costs 16 KiB,
+  not the file size, and the event loop never blocks on one big `fread`. MEASURED with a 40 MiB file: RSS 1.5 MB after one
+  download and 1.7 MB during ten 20 KiB/s downloads (was 83 MB and 452 MB). The root is resolved against the process's working directory.
   **File cache.** `static_serve_file` caches files up to `STATIC_CACHE_MAX_ENTRY_BYTES` after their first read, keyed by
   the pre-`realpath` candidate path (`static_root` + the already-traversal-checked subpath), not the resolved one - MEASURED
   a 6.6x gap between the static-mount path and an equivalent in-memory response, almost entirely
@@ -591,7 +595,8 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
 - **`res_send_file` and large (uncached) static files are still not optimized** (`improvements.md`, the static-file item's other sub-items,
   not addressed by the static-file cache above): the response head and the file body still go out as separate `write`
   calls (no single buffer / `writev`), and large files are read with plain `read`/`write` in `STREAM_CHUNK_SIZE` pieces
-  rather than `sendfile(2)`. No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.
+  rather than `sendfile(2)`. The write-stall deadline fires only on zero progress, so a client reading a large file a
+  byte at a time holds its fd and 16 KiB `stream_buf` indefinitely (no minimum-rate rule). No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.
 
 ## Where to change what
 Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`. Change producer streaming (`res_stream`, parking, waking) → `response.c` + `connection.c` (`flush_connection`, `park_stream`/`resume_stream`, `watch_stream_peer`) + `tests/test_stream.c`. Add a parser feature → `http_parser.c/h` +

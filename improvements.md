@@ -24,7 +24,7 @@ Most repro steps use a small probe server, listed in [Appendix A](#appendix-a-pr
 | **S1** | ~~Prefix middleware (auth) is bypassed with `//admin/...` or `/%2Fadmin/...`~~ **FIXED 2026-09-23** | **High** | S | MEASURED |
 | **M1** | ~~macOS cluster master never closes the fds it hands to workers~~ **FIXED 2026-09-23** | **High** (cluster stops accepting; no FIN) | S | MEASURED |
 | **S2** | ~~`app_use_body_limit` is bypassed by a query string, encoding, `//`, or chunked encoding~~ **FIXED 2026-09-23** | High | S | MEASURED |
-| **M2** | Large static files: whole file read and copied twice; slow readers pin the full size each | High (memory DoS) | S | MEASURED |
+| **M2** | ~~Large static files: whole file read and copied twice; slow readers pin the full size each~~ **FIXED 2026-09-23** | High (memory DoS) | S | MEASURED |
 | **S3** | Chunk-size parsing accepts `0x5`, `+5` and ` 5` (request smuggling behind a proxy) | Medium | S | MEASURED |
 | **S4** | Static mounts serve dotfiles (`.env`, `.git/config`) | Medium | S | MEASURED |
 | **S5** | Multipart: quoted parameters parsed wrongly; `filename` returned with `../` | Medium | S | MEASURED |
@@ -172,6 +172,11 @@ S1 and S2 share a root cause and one fix: **canonicalize the request path once, 
   produce EOF at the client.
 
 ### M2 · Large static files are read whole and copied twice; each slow reader pins the full size
+- **Status: FIXED 2026-09-23.** `static_serve_file` (`lib/static.c`) sends a file over `STATIC_CACHE_MAX_ENTRY_BYTES`
+  with `res_send_file` (streamed from an open fd through the 16 KiB `stream_buf`) instead of reading it. Re-measured with
+  the probe and a 40 MiB file: RSS 1.44 MB → **1.52 MB** after one download (byte-exact), **1.68 MB** during ten
+  `--limit-rate 20k` downloads, 1.68 MB after. Test: `test_large_file_is_streamed_not_buffered` (`tests/test_static.c`),
+  which fails on the old code. Not done: `sendfile` (P5) and the optional minimum-rate write deadline.
 - **Impact:** High. Memory DoS. The whole event loop also blocks while a large file is read.
 - **Effort:** S (use the existing streaming path)
 - **Where:** `lib/static.c:340-371`: files above the 256 KiB cache cap (up to `MAX_STATIC_FILE_SIZE`, 50 MiB)

@@ -46,9 +46,11 @@ const char *static_mime_type(const char *path);
  *     (device node, FIFO, ...). There is no directory listing.
  *   - 500 if the file exceeds MAX_STATIC_FILE_SIZE (app_types.h) or a read
  *     fails partway through.
- *   - 200 with the file's bytes (via res_send_bytes, response.h - not
- *     res_send, since a served file can contain embedded NUL bytes) and a
- *     Content-Type from static_mime_type otherwise.
+ *   - 200 with a Content-Type from static_mime_type otherwise. A file up to
+ *     STATIC_CACHE_MAX_ENTRY_BYTES is read whole and sent with res_send_bytes
+ *     (not res_send: a served file can contain embedded NUL bytes); a larger
+ *     one is streamed from disk with res_send_file (response.h), never held
+ *     in memory. 404 if it vanished between the stat and that open.
  * Called from chain_next's final fallback (lib/middleware.c) in place of a
  * Handler - a static route has none, see Route.static_root (app_types.h).
  *

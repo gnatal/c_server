@@ -104,7 +104,8 @@ void app_mount(App *app, const char *prefix, const Router *router);
  * realpath()'d at registration; a missing directory registers nothing (logged). Requests are refused
  * with 403 if they contain a ".." segment or resolve (symlinks included) outside root_dir, 404 if not
  * a regular file; a directory serves its index.html; there is never a directory listing. Files over
- * MAX_STATIC_FILE_SIZE (50 MiB) get 500. Counts as one route. App-level only (no router twin).
+ * MAX_STATIC_FILE_SIZE (50 MiB) get 500; files over 256 KiB (STATIC_CACHE_MAX_ENTRY_BYTES) are streamed
+ * from disk rather than read into memory. Counts as one route. App-level only (no router twin).
  */
 void app_serve_static(App *app, const char *prefix, const char *root_dir);
 
