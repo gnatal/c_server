@@ -16,19 +16,23 @@
 # Phases (PHASES, space-separated, default "ping churn read write"):
 #   ping   GET /ping over keep-alive connections: pure engine throughput, no DB, no JSON
 #   churn  GET /ping with "Connection: close": a new TCP connection per request, which
-#          stresses accept/close. Every closed connection leaves a TIME_WAIT socket, and in
-#          longer runs (observed on macOS at 1000+ conns / 5 s+) wrk starts reporting
-#          "connect" errors as they pile up; a 2 s run from a clean state showed none.
-#          Shorten DURATION, lower CONNS, or let TIME_WAIT drain between runs
-#          (`netstat -an -p tcp | grep -c TIME_WAIT`) before trusting a churn number.
+#          stresses accept/close. Every closed connection holds its client port in TIME_WAIT
+#          for 2 x MSL (30 s on macOS), and the client has only ~16k ephemeral ports
+#          (49152-65535 on macOS): at ~20k connections/s they are all gone in about a second
+#          (MEASURED: 32,604 TIME_WAIT sockets after a 15 s run, then "connect" errors or wrk's
+#          "Can't assign requested address"). So churn runs for CHURN_DURATION (default 2s,
+#          not DURATION), and the script waits for TIME_WAIT to drain (below TIME_WAIT_MAX,
+#          at most TIME_WAIT_WAIT seconds) before each churn run and before the next phase.
 #   read   GET / and GET /api/todos (SQLite read path)
 #   write  POST /api/todos (SQLite write path)
 #
 # Usage: scripts/stress_test.sh
 #        PHASES=ping scripts/stress_test.sh          # connection stress only
 #        PHASES="ping churn" CONNS="1000 5000" DURATION=10s scripts/stress_test.sh
-# Tunable via env vars: PORT, WORKERS, THREADS, DURATION, CONNS, PHASES, DB_PATH,
-# API_KEY, MEASURE_MEMORY.
+# Tunable via env vars: PORT, WORKERS, THREADS, DURATION, CHURN_DURATION, CONNS, PHASES,
+# DB_PATH, API_KEY, MEASURE_MEMORY, TIME_WAIT_MAX, TIME_WAIT_WAIT.
+# A wrk run that fails (exit status != 0) is reported and the remaining runs still happen;
+# the script then exits 1 after the summary.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -39,6 +43,9 @@ PORT="${PORT:-8080}"
 WORKERS="${WORKERS:-4}"
 THREADS="${THREADS:-8}"
 DURATION="${DURATION:-15s}"
+CHURN_DURATION="${CHURN_DURATION:-2s}"
+TIME_WAIT_MAX="${TIME_WAIT_MAX:-1000}"  # churn waits until fewer TIME_WAIT sockets than this remain
+TIME_WAIT_WAIT="${TIME_WAIT_WAIT:-45}"  # ... but at most this many seconds (2 x MSL is 30 s on macOS)
 CONNS="${CONNS:-100 1000 5000}"
 PHASES="${PHASES:-ping churn read write}"
 DB_PATH="${DB_PATH:-stress_todos.db}"
@@ -187,10 +194,39 @@ if [ "$MEASURE_MEMORY" = "1" ]; then
 fi
 
 PEAK_SUMMARY=""
+FAILED_RUNS=""
 
+# TCP sockets in TIME_WAIT on this host (both ends of a loopback connection count).
+time_wait_count() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -tan state time-wait 2>/dev/null | tail -n +2 | wc -l | tr -d ' '
+    else
+        netstat -an -p tcp 2>/dev/null | grep -c TIME_WAIT || true
+    fi
+}
+
+# Waits until TIME_WAIT sockets drop below TIME_WAIT_MAX (at most TIME_WAIT_WAIT seconds), so a churn run
+# starts with free client ports and the next phase does not inherit exhausted ones.
+wait_for_time_wait_drain() {
+    local count waited=0
+    count="$(time_wait_count)"
+    if [ "$count" -lt "$TIME_WAIT_MAX" ]; then
+        return
+    fi
+    echo "==> Waiting for TIME_WAIT sockets to drain ($count, want < $TIME_WAIT_MAX, up to ${TIME_WAIT_WAIT}s)"
+    while [ "$count" -ge "$TIME_WAIT_MAX" ] && [ "$waited" -lt "$TIME_WAIT_WAIT" ]; do
+        sleep 1
+        waited=$((waited + 1))
+        count="$(time_wait_count)"
+    done
+    echo "==> TIME_WAIT sockets: $count after ${waited}s"
+}
+
+# run_bench LABEL DURATION WRK_ARGS...
 run_bench() {
     local label="$1"
-    shift
+    local duration="$2"
+    shift 2
     echo
     echo "=== $label ==="
 
@@ -218,7 +254,12 @@ run_bench() {
         sampler=$!
     fi
 
-    wrk -t"$THREADS" -d"$DURATION" "$@"
+    local wrk_status=0
+    wrk -t"$THREADS" -d"$duration" "$@" || wrk_status=$?
+    if [ "$wrk_status" -ne 0 ]; then
+        echo "warning: wrk exited with status $wrk_status - continuing with the next run" >&2
+        FAILED_RUNS+="  $label (wrk exit $wrk_status)"$'\n'
+    fi
 
     if [ -n "$sampler" ]; then
         kill "$sampler" 2>/dev/null || true
@@ -242,26 +283,28 @@ phase_enabled() {
 # if the phases were interleaved.
 if phase_enabled ping; then
     for c in $CONNS; do
-        run_bench "GET /ping (keep-alive)  threads=$THREADS conns=$c" -c"$c" "$BASE/ping"
+        run_bench "GET /ping (keep-alive)  threads=$THREADS conns=$c" "$DURATION" -c"$c" "$BASE/ping"
     done
 fi
 
 if phase_enabled churn; then
     for c in $CONNS; do
-        run_bench "GET /ping (conn: close) threads=$THREADS conns=$c" -c"$c" -H "Connection: close" "$BASE/ping"
+        wait_for_time_wait_drain
+        run_bench "GET /ping (conn: close) threads=$THREADS conns=$c" "$CHURN_DURATION" -c"$c" -H "Connection: close" "$BASE/ping"
     done
+    wait_for_time_wait_drain # the next phase needs client ports too
 fi
 
 if phase_enabled read; then
     for c in $CONNS; do
-        run_bench "GET / (Todo UI)         threads=$THREADS conns=$c" -c"$c" "$BASE/"
-        run_bench "GET /api/todos (read)   threads=$THREADS conns=$c" -c"$c" "$BASE/api/todos"
+        run_bench "GET / (Todo UI)         threads=$THREADS conns=$c" "$DURATION" -c"$c" "$BASE/"
+        run_bench "GET /api/todos (read)   threads=$THREADS conns=$c" "$DURATION" -c"$c" "$BASE/api/todos"
     done
 fi
 
 if phase_enabled write; then
     for c in $CONNS; do
-        run_bench "POST /api/todos (write) threads=$THREADS conns=$c" -c"$c" -s scripts/wrk_create_todo.lua "$BASE/api/todos"
+        run_bench "POST /api/todos (write) threads=$THREADS conns=$c" "$DURATION" -c"$c" -s scripts/wrk_create_todo.lua "$BASE/api/todos"
     done
 fi
 
@@ -300,3 +343,9 @@ fi
 crashes="$(grep -c 'terminated by signal' "$SERVER_LOG" || true)"
 echo
 echo "Worker crashes during run: $crashes"
+if [ -n "$FAILED_RUNS" ]; then
+    echo
+    echo "Failed wrk runs (see their warnings above):"
+    printf '%s' "$FAILED_RUNS"
+    exit 1
+fi
