@@ -37,11 +37,13 @@ Utility and load-testing scripts used to benchmark latency, throughput, and memo
   MEASURE_MEMORY=0 ./scripts/stress_test.sh` now reports `GET / (Todo UI)` transferring ~6.27 KB/request
   (850.83 MB / 135,773 requests), matching the real page size; `MEASURE_MEMORY=1` (the `time(1)`-wrapped,
   `pgrep -P`-based master-PID resolution path) was also re-verified working end to end after the subshell change.
-- **The memory rows from the 2026-09-21 run are not credible** (separate, still-open problem - not touched by the
-  fix above). They report 7-12 MB total across 5 processes during the 5,000-connection phases; a direct measurement
-  (below) puts one worker with 5,000 idle connections at about 121 MB RSS. The `time -l` footer also shows 0.01 s
-  user CPU for a 230 s run. The cause was not investigated (the sampler and the `time`/`pgrep -P` PID resolution are
-  the places to look).
+- **Resolved 2026-09-24: the memory rows agree with independent measurements again.** The 2026-09-21 run reported
+  7-12 MB total at 5,000 connections while a direct measurement then put one worker at ~121 MB (25 KB/connection),
+  and `time -l` showed 0.01 s user CPU for a 230 s run. The engine has since moved to one arena and one receive
+  buffer per worker (~239 B per idle connection), so small totals are now expected. The full default run on
+  2026-09-24 cross-checks: sampler peak largest-single-process 4.2 MB vs `time -l` maximum RSS 4,407,296 bytes
+  (4.2 MB), and `time -l` user CPU 107 s over a 287 s run, so the `pgrep -P` master resolution is collecting the
+  real server.
 
 ## Memory tracking (`stress_test.sh`, on by default, `MEASURE_MEMORY=0` to disable)
 Two independent measurements, because neither alone is accurate for a forked cluster:
@@ -49,7 +51,11 @@ Two independent measurements, because neither alone is accurate for a forked clu
 - **A `ps`-based sampler** (every 250 ms, per benchmark) sums RSS across the master and all its children and records the peak total plus the peak single process. This is the whole-server number; the single-process peak should agree with `time -l`'s maximum RSS, which is the cross-check (it did not in the 2026-09-21 run, see above).
 - **RSS is a high-water mark**: the allocator does not return freed pages to the OS, so a later benchmark inherits memory grown by an earlier, higher-connection one. Summed RSS also counts shared pages (binary, libc, SQLite, fork copy-on-write) once per process, so totals overstate physical memory.
 - **Per-connection cost** (direct measurement, macOS, one worker, N idle keep-alive connections opened from a script, RSS from `ps`): 5,000 connections took about 121 MB, about 25 KB each, whether idle or after one `GET /ping` each. That is the 8 KiB `in_buf` plus the touched part of the 64 KiB per-connection arena (`../tradeoffs.md`). The earlier engine measured about 7 KB per connection.
-- Known open item: at 5,000 connections `wrk` intermittently reports read errors (0.2-0.7% of requests) in longer runs; seen again on 2026-09-21 in `ping` (2,219 / 1,624 errors), `GET /` and `POST`; no worker crashes, cause unidentified.
+- Known open item: at 5,000 connections `wrk` reports read errors in longer runs; seen on 2026-09-21 in `ping` (2,219 / 1,624 errors), `GET /` and `POST`, and on 2026-09-24 in every 5,000-connection row (`ping` 1,344, `GET /` 655, `GET /api/todos` 994, `POST` 5,283 plus 3,008 timeouts at 307 ms average latency); no worker crashes, cause unidentified.
+
+## Recorded runs
+- **2026-09-24, `stress_test.sh` defaults, macOS M3 Pro** (host busy: load average 7-8 before the run, `sysmond` ~76% CPU): exit 0, 0 connect errors, 0 worker crashes. keep-alive `/ping` 158,730 / 181,403 / 172,327 req/s at 100 / 1,000 / 5,000 connections (short re-runs: 175-180k / 191-193k); churn 35,445 / 23,627 / 22,542 conn/s (2 s rows; 13-19k TIME_WAIT left after each, drained in 31-32 s); `GET /` 117,244 / 118,832 / 110,533; `GET /api/todos` 154,644 / 169,478 / 163,515 (about the `/ping` rate, so client-bound); `POST` 20,818 / 19,741 / 19,748. Memory: idle 13.0 MB total, peak 18.3 MB total, 4.2 MB largest process. These `/ping` numbers are below the 250-257k of 21-23 Sep on the same machine; the host load is the likely cause, not verified by an A/B run.
+- **2026-09-24, `docker_stress_test.sh` defaults (epoll)**: exit 0, 0 worker crashes. `/ping` 240,019 / 251,306 req/s at 100 / 1,000 connections; churn 47,132 / 43,806 conn/s; `GET /` 110,212 / 105,454; `GET /api/todos` 72,901 / 68,206; `POST` 7,891 / 7,665 (240 timeouts at 1,000). Memory 11.2-11.8 MB total, 2.6 MB largest process. On Linux, SQLite reads and writes are well below macOS while `/ping` is higher; not investigated (the container's filesystem for the database file is one candidate).
 
 ## Execution & Concurrency
 - Designed to test keep-alive connection reuse, routing/middleware overhead, and SQLite read/write throughput under high concurrent connection loads (e.g. 5,000 connections over 8 threads) and multi-process cluster contention (`stress_test.sh`'s default `WORKERS=4` is the scenario `lib/CLAUDE.md`'s "Behavior reference, Workers and fork" fork-safety fix specifically has to hold up under - multiple worker processes hitting the same SQLite file concurrently).

@@ -960,7 +960,7 @@
     </div>
 
     <div class="nav-right">
-      <div class="stat-pill" title="Tested on Apple Silicon with wrk (WORKERS=4)">
+      <div class="stat-pill" title="wrk /ping, WORKERS=4: 250,055 req/s on macOS (21 Sep 2026), 251,306 req/s on Linux epoll in Docker (24 Sep 2026)">
         <span class="stat-dot"></span>
         <span>250k req/sec</span>
       </div>
@@ -1045,27 +1045,27 @@
 
         <div class="stats-grid">
           <div class="stat-card">
-            <div class="stat-val" style="color: #38bdf8;">250,055</div>
-            <div class="stat-label">Req/Sec (4 Workers, /ping, 100 conns)</div>
+            <div class="stat-val" style="color: #38bdf8;">251,306</div>
+            <div class="stat-label">Req/Sec (Linux epoll, 4 Workers, /ping, 1,000 conns, 24 Sep)</div>
           </div>
           <div class="stat-card">
             <div class="stat-val" style="color: #34d399;">393 µs</div>
-            <div class="stat-label">Average Latency (100 conns)</div>
+            <div class="stat-label">Average Latency (macOS, 100 conns, 21 Sep)</div>
           </div>
           <div class="stat-card">
             <div class="stat-val" style="color: #a855f7;">~0.3 KB</div>
             <div class="stat-label">RAM per Idle Keep-Alive Connection (was 25 KB)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #fb923c;">208 ns</div>
+            <div class="stat-val" style="color: #fb923c;">226 ns</div>
             <div class="stat-label">Hotpath CPU Cycle (make bench)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #10b981;">15 / 15</div>
+            <div class="stat-val" style="color: #10b981;">21 / 21</div>
             <div class="stat-label">Passing Test Suites (ASan/UBSan)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #ec4899;">130</div>
+            <div class="stat-val" style="color: #ec4899;">155</div>
             <div class="stat-label">Audited Engine Functions (Zero Drift)</div>
           </div>
         </div>
@@ -1089,6 +1089,47 @@
           <br><strong>Refreshed again (23 Sep 2026):</strong> the <em>Memory</em> tab and the 1,000-connection
           <code>/ping</code> card were re-measured after the switch to one arena per worker and one receive buffer per
           worker, same method and machine as before.
+          <br><strong>Full re-run (24 Sep 2026):</strong> <code>scripts/stress_test.sh</code> (macOS, defaults: 15 s per
+          row, churn 2 s per row) and <code>scripts/docker_stress_test.sh</code> (Linux epoll in Docker, defaults: 10 s
+          per row, 100 and 1,000 connections) were run end to end, plus <code>make bench</code>. The <em>Ping</em>,
+          <em>SQLite</em>, <em>Static</em> and <em>Churn</em> tabs and the <em>Hotpath</em> tab now show those runs.
+          The macOS machine was busy during this run (load average 7–8 before the benchmark started, <code>sysmond</code>
+          at ~76% CPU), and <code>wrk</code> shares its cores, so the macOS <code>/ping</code> figures are lower than
+          the 21–23 Sep ones. Two shorter re-runs gave 176–180k req/s at 100 connections and 191–193k at 1,000. The
+          framework comparison chart is still from an earlier revision.
+        </div>
+
+        <!-- Spotlight: Linux epoll inside Docker -->
+        <div class="bench-highlight">
+          <div class="bench-highlight-header">
+            <div class="bench-highlight-title">
+              <span>🐧 Linux <code>epoll</code> in Docker: <code>scripts/docker_stress_test.sh</code></span>
+            </div>
+            <span class="bench-highlight-badge">24 Sep 2026</span>
+          </div>
+          <p style="margin-bottom: 1.25rem; font-size: 0.92rem;">
+            The server (4 workers) and <code>wrk</code> (8 threads, built natively for arm64) each run in their own
+            container on one private Docker network, inside Docker Desktop's Linux VM on the same M3 Pro. Traffic goes
+            container to container. Each row is one 10 s run. Zero worker crashes; peak memory for master plus 4 workers
+            was 11.8 MB in total (largest single process 2.6 MB).
+          </p>
+          <div class="bench-highlight-grid">
+            <div class="bench-metric-card">
+              <div class="bench-metric-val" style="color: var(--primary);">251,306 <span
+                  style="font-size: 1rem; font-weight: 600;">req/s</span></div>
+              <div class="bench-metric-sub"><strong><code>/ping</code>, 1,000 connections</strong> · 6.24 ms avg latency · 0 errors (240,019 req/s at 100 connections)</div>
+            </div>
+            <div class="bench-metric-card">
+              <div class="bench-metric-val" style="color: #34d399;">110,212 <span
+                  style="font-size: 1rem; font-weight: 600;">req/s</span></div>
+              <div class="bench-metric-sub"><strong><code>GET /</code> (6.5 KB page), 100 connections</strong> · 2.92 ms avg · 694.54 MB/s</div>
+            </div>
+            <div class="bench-metric-card">
+              <div class="bench-metric-val" style="color: #a855f7;">72,901 <span
+                  style="font-size: 1rem; font-weight: 600;">req/s</span></div>
+              <div class="bench-metric-sub"><strong><code>GET /api/todos</code> (SQLite + JSON), 100 connections</strong> · 3.70 ms avg · <code>POST</code>: 7,891 req/s</div>
+            </div>
+          </div>
         </div>
 
         <!-- Spotlight: idle-connection memory after the shared arena and receive buffer -->
@@ -1128,7 +1169,7 @@
         <div class="bench-highlight">
           <div class="bench-highlight-header">
             <div class="bench-highlight-title">
-              <span>🚀 Standalone Engine Peak: <code>wrk /ping</code></span>
+              <span>🚀 Standalone Engine Peak: <code>wrk /ping</code> (macOS, 21–23 Sep 2026)</span>
             </div>
             <span class="bench-highlight-badge">QUIET=1 WORKERS=4 ./cexpress_demo</span>
           </div>
@@ -1244,7 +1285,9 @@
         <div id="tab-ping" class="bench-pane active">
           <p>
             The <code>/ping</code> endpoint measures raw server event-loop throughput and kernel socket multiplexing
-            with zero disk or database overhead. The response is a pre-formatted 4-byte payload.
+            with zero disk or database overhead. The response is a pre-formatted 4-byte payload. macOS, <code>scripts/stress_test.sh</code>,
+            24 Sep 2026, 15 s per row, on a busy machine (see the note above); the 21–23 Sep peak on the same machine was
+            250–257k req/s.
           </p>
           <div class="table-container">
             <table>
@@ -1263,29 +1306,29 @@
                 <tr>
                   <td><strong>100 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">250,500 req/s</strong></td>
-                  <td>357.66 µs</td>
-                  <td>3.92 ms</td>
-                  <td>18.35 MB/s (277.1 MB read)</td>
+                  <td><strong style="color: var(--primary);">158,730 req/s</strong></td>
+                  <td>1.94 ms</td>
+                  <td>81.44 ms</td>
+                  <td>19.53 MB/s (295.0 MB read)</td>
                   <td><span class="test-status-pill">✓ 0 errors</span></td>
                 </tr>
                 <tr>
                   <td><strong>1,000 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">260,000 req/s</strong></td>
-                  <td>4.35 ms</td>
-                  <td>12.09 ms</td>
-                  <td>19.06 MB/s (286.2 MB read)</td>
+                  <td><strong style="color: var(--primary);">181,403 req/s</strong></td>
+                  <td>6.01 ms</td>
+                  <td>139.25 ms</td>
+                  <td>22.32 MB/s (337.0 MB read)</td>
                   <td><span class="test-status-pill">✓ 0 errors</span></td>
                 </tr>
                 <tr>
                   <td><strong>5,000 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">250,000 req/s</strong></td>
-                  <td>18.71 ms</td>
-                  <td>58.26 ms</td>
-                  <td>18.08 MB/s (181.6 MB read)</td>
-                  <td><span class="test-status-pill">✓ 0 crashes</span></td>
+                  <td><strong style="color: var(--primary);">172,327 req/s</strong></td>
+                  <td>36.22 ms</td>
+                  <td>1.22 s</td>
+                  <td>21.20 MB/s (320.1 MB read)</td>
+                  <td>1,344 <code>wrk</code> read errors · 0 crashes</td>
                 </tr>
               </tbody>
             </table>
@@ -1304,7 +1347,8 @@
           <p>
             Real-world CRUD benchmark against an embedded SQLite database in WAL (Write-Ahead Logging) mode with
             <code>busy_timeout=5000</code>. Four worker processes concurrently execute reads and writes against the same
-            shared SQLite database file.
+            shared SQLite database file. macOS, <code>scripts/stress_test.sh</code>, 24 Sep 2026, 15 s per row; reads
+            run against the 20 seeded rows, before any write phase.
           </p>
           <div class="table-container">
             <table>
@@ -1323,64 +1367,67 @@
                 <tr>
                   <td><strong>GET /api/todos (Read)</strong></td>
                   <td>100 conns</td>
-                  <td><strong style="color: var(--accent-emerald);">11,060 req/s</strong></td>
-                  <td>8.45 ms</td>
-                  <td>38.11 ms</td>
-                  <td>352.52 MB/s</td>
+                  <td><strong style="color: var(--accent-emerald);">154,644 req/s</strong></td>
+                  <td>705.68 µs</td>
+                  <td>39.03 ms</td>
+                  <td>388.90 MB/s</td>
                   <td><span class="test-status-pill">✓ 0 locks</span></td>
                 </tr>
                 <tr>
                   <td><strong>GET /api/todos (Read)</strong></td>
                   <td>1,000 conns</td>
-                  <td><strong style="color: var(--accent-emerald);">10,862 req/s</strong></td>
-                  <td>91.31 ms</td>
-                  <td>186.81 ms</td>
-                  <td>346.21 MB/s</td>
+                  <td><strong style="color: var(--accent-emerald);">169,478 req/s</strong></td>
+                  <td>6.02 ms</td>
+                  <td>71.47 ms</td>
+                  <td>426.21 MB/s</td>
                   <td><span class="test-status-pill">✓ 0 locks</span></td>
                 </tr>
                 <tr>
                   <td><strong>GET /api/todos (Read)</strong></td>
                   <td>5,000 conns</td>
-                  <td><strong style="color: var(--accent-emerald);">9,402 req/s</strong></td>
-                  <td>376.51 ms</td>
-                  <td>936.72 ms</td>
-                  <td>299.68 MB/s</td>
-                  <td><span class="test-status-pill">✓ 0 locks</span></td>
+                  <td><strong style="color: var(--accent-emerald);">163,515 req/s</strong></td>
+                  <td>26.29 ms</td>
+                  <td>446.36 ms</td>
+                  <td>411.21 MB/s</td>
+                  <td>994 <code>wrk</code> read errors</td>
                 </tr>
                 <tr>
                   <td><strong>POST /api/todos (Write)</strong></td>
                   <td>100 conns</td>
-                  <td><strong style="color: var(--accent-amber);">22,374 req/s</strong></td>
-                  <td>9.48 ms</td>
-                  <td>449.19 ms</td>
-                  <td>5.01 MB/s</td>
+                  <td><strong style="color: var(--accent-amber);">20,818 req/s</strong></td>
+                  <td>96.22 ms</td>
+                  <td>1.65 s</td>
+                  <td>5.37 MB/s</td>
                   <td><span class="test-status-pill">✓ 0 locks</span></td>
                 </tr>
                 <tr>
                   <td><strong>POST /api/todos (Write)</strong></td>
                   <td>1,000 conns</td>
-                  <td><strong style="color: var(--accent-amber);">22,574 req/s</strong></td>
-                  <td>43.97 ms</td>
-                  <td>97.74 ms</td>
-                  <td>5.06 MB/s</td>
-                  <td><span class="test-status-pill">✓ 0 locks</span></td>
+                  <td><strong style="color: var(--accent-amber);">19,741 req/s</strong></td>
+                  <td>121.54 ms</td>
+                  <td>1.25 s</td>
+                  <td>5.10 MB/s</td>
+                  <td>301 <code>wrk</code> read errors</td>
                 </tr>
                 <tr>
                   <td><strong>POST /api/todos (Write)</strong></td>
                   <td>5,000 conns</td>
-                  <td><strong style="color: var(--accent-amber);">19,902 req/s</strong></td>
-                  <td>139.63 ms</td>
-                  <td>369.37 ms</td>
-                  <td>4.46 MB/s</td>
-                  <td><span class="test-status-pill">✓ 0 locks</span></td>
+                  <td><strong style="color: var(--accent-amber);">19,748 req/s</strong></td>
+                  <td>306.66 ms</td>
+                  <td>1.81 s</td>
+                  <td>5.10 MB/s</td>
+                  <td>5,283 read errors, 3,008 timeouts</td>
                 </tr>
               </tbody>
             </table>
           </div>
           <div class="alert alert-tip">
             <strong>Fork-Safe SQLite & WAL:</strong> Each worker maintains a private SQLite connection opened after
-            <code>fork()</code>. Over 750,000 concurrent rows were inserted across the write phases with <strong>zero
-              SQLITE_BUSY locking errors</strong> and <strong>zero worker crashes</strong>.
+            <code>fork()</code>. About 907,000 <code>POST</code> requests completed across the three write rows with
+            <strong>zero worker crashes</strong>. The errors in the last column are reported by <code>wrk</code> on the
+            client side; at 5,000 connections the average write latency (307 ms) approaches <code>wrk</code>'s timeout,
+            so some requests time out. Reads now run at about the <code>/ping</code> rate, which suggests the load
+            generator, not SQLite, limits them on this machine.
           </div>
         </div>
 
@@ -1388,7 +1435,8 @@
         <div id="tab-static" class="bench-pane">
           <p>
             Serves the responsive single-page Todo application HTML directly from disk via CExpress's bounded streaming
-            engine (<code>res_send_file_custom</code>).
+            engine (<code>res_send_file_custom</code>). The page is 6,481 bytes. macOS, <code>scripts/stress_test.sh</code>,
+            24 Sep 2026, 15 s per row.
           </p>
           <div class="table-container">
             <table>
@@ -1407,29 +1455,29 @@
                 <tr>
                   <td><strong>100 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">55,262 req/s</strong></td>
-                  <td>1.74 ms</td>
-                  <td>10.61 ms</td>
-                  <td>346.31 MB/s</td>
-                  <td>5.11 GB</td>
+                  <td><strong style="color: var(--primary);">117,244 req/s</strong></td>
+                  <td>0.91 ms</td>
+                  <td>44.01 ms</td>
+                  <td>738.86 MB/s</td>
+                  <td>10.90 GB</td>
                 </tr>
                 <tr>
                   <td><strong>1,000 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">52,227 req/s</strong></td>
-                  <td>19.04 ms</td>
-                  <td>60.83 ms</td>
-                  <td>327.29 MB/s</td>
-                  <td>4.80 GB</td>
+                  <td><strong style="color: var(--primary);">118,832 req/s</strong></td>
+                  <td>8.39 ms</td>
+                  <td>59.79 ms</td>
+                  <td>748.87 MB/s</td>
+                  <td>10.98 GB</td>
                 </tr>
                 <tr>
                   <td><strong>5,000 conns</strong></td>
                   <td>8</td>
-                  <td><strong style="color: var(--primary);">50,635 req/s</strong></td>
-                  <td>81.94 ms</td>
-                  <td>242.00 ms</td>
-                  <td>317.31 MB/s</td>
-                  <td>4.66 GB</td>
+                  <td><strong style="color: var(--primary);">110,533 req/s</strong></td>
+                  <td>42.18 ms</td>
+                  <td>366.67 ms</td>
+                  <td>696.57 MB/s</td>
+                  <td>10.25 GB (655 read errors)</td>
                 </tr>
               </tbody>
             </table>
@@ -1437,7 +1485,7 @@
           <div class="alert alert-note">
             <strong>Bounded Buffer Streaming:</strong> File content is streamed in 64 KB chunks directly from disk
             descriptor to client socket, ensuring RAM consumption stays bounded even when saturation pushes throughput
-            past 390 megabytes per second.
+            past 740 megabytes per second.
           </div>
         </div>
 
@@ -1446,6 +1494,8 @@
           <p>
             Benchmarks server performance when clients send <code>Connection: close</code>, requiring a full TCP
             handshake, HTTP request parsing, response delivery, and connection teardown on every single transaction.
+            24 Sep 2026. The macOS rows run for 2 s each, and the script waits for <code>TIME_WAIT</code> sockets to drain
+            between them (13–19k were left after each run; draining took 31–32 s).
           </p>
           <div class="table-container">
             <table>
@@ -1463,10 +1513,42 @@
                 <tr>
                   <td><strong>GET /ping (Connection: close)</strong></td>
                   <td>100 conns</td>
-                  <td><strong style="color: var(--accent-purple);">19,207 conn/s</strong></td>
-                  <td>2.66 ms</td>
-                  <td>35.25 ms</td>
-                  <td>Clean accept/close lifecycle; 288k connections completed in 15s</td>
+                  <td><strong style="color: var(--accent-purple);">35,445 conn/s</strong></td>
+                  <td>2.06 ms</td>
+                  <td>88.53 ms</td>
+                  <td>74,501 connections in 2 s · 0 connect errors</td>
+                </tr>
+                <tr>
+                  <td><strong>GET /ping (Connection: close)</strong></td>
+                  <td>1,000 conns</td>
+                  <td><strong style="color: var(--accent-purple);">23,627 conn/s</strong></td>
+                  <td>4.82 ms</td>
+                  <td>93.39 ms</td>
+                  <td>48,505 connections in 2 s · 0 connect errors</td>
+                </tr>
+                <tr>
+                  <td><strong>GET /ping (Connection: close)</strong></td>
+                  <td>5,000 conns</td>
+                  <td><strong style="color: var(--accent-purple);">22,542 conn/s</strong></td>
+                  <td>6.14 ms</td>
+                  <td>39.89 ms</td>
+                  <td>46,175 connections in 2 s · 0 connect errors</td>
+                </tr>
+                <tr>
+                  <td><strong>Linux epoll in Docker</strong></td>
+                  <td>100 conns</td>
+                  <td><strong style="color: var(--accent-purple);">47,132 conn/s</strong></td>
+                  <td>3.52 ms</td>
+                  <td>150.18 ms</td>
+                  <td>10 s run, container to container</td>
+                </tr>
+                <tr>
+                  <td><strong>Linux epoll in Docker</strong></td>
+                  <td>1,000 conns</td>
+                  <td><strong style="color: var(--accent-purple);">43,806 conn/s</strong></td>
+                  <td>10.99 ms</td>
+                  <td>210.85 ms</td>
+                  <td>10 s run, container to container</td>
                 </tr>
               </tbody>
             </table>
@@ -1537,8 +1619,15 @@
             <strong>239 B</strong> per idle keep-alive connection and <strong>216 B</strong> for one that never sent a
             byte. <code>/ping</code> throughput did not change. Kernel socket buffers are not part of RSS.
           </div>
+          <div class="alert alert-note">
+            <strong>Under load (24 Sep 2026 stress runs):</strong> on macOS the cluster idled at 13.0 MB (5 processes)
+            after startup and seeding, and peaked at 18.3 MB in total (largest single process 4.2 MB) during the
+            5,000-connection <code>POST</code> row, after about 907,000 inserts. <code>/usr/bin/time -l</code> reported a
+            maximum RSS of 4.2 MB (4,407,296 bytes) for the largest process, which matches the <code>ps</code> sampler. In
+            the Linux Docker run the whole cluster stayed between 11.2 and 11.8 MB. Zero worker crashes in either run.
+          </div>
           <div class="alert alert-tip">
-            <strong>Memory safety:</strong> all 15 suites pass under AddressSanitizer and UndefinedBehaviorSanitizer and a
+            <strong>Memory safety:</strong> all 21 suites pass under AddressSanitizer and UndefinedBehaviorSanitizer and a
             300,000-iteration mutation fuzz run finished clean. LeakSanitizer is not available on macOS, so no leak check has
             been run on this platform.
           </div>
@@ -1547,7 +1636,7 @@
         <!-- Tab 6: Hotpath Microbenchmarks -->
         <div id="tab-micro" class="bench-pane">
           <p>
-            Measured with <code>make bench</code> (compiled with <code>-O2</code>). Gauges the raw CPU cycle cost of the
+            Measured with <code>make bench</code> (compiled with <code>-O2</code>) on 24 Sep 2026, single run. Gauges the raw CPU cycle cost of the
             core framework pipeline (parsing, routing, dispatching, response generation) isolated from operating system
             socket I/O.
           </p>
@@ -1564,31 +1653,37 @@
               <tbody>
                 <tr>
                   <td><strong>Minimal GET (2 headers)</strong></td>
-                  <td><strong style="color: var(--primary);">208 ns</strong></td>
-                  <td>~4,800,000 requests / sec</td>
+                  <td><strong style="color: var(--primary);">226 ns</strong></td>
+                  <td>~4,400,000 requests / sec</td>
                   <td>0 heap allocs</td>
                 </tr>
                 <tr>
                   <td><strong>404 Route Miss</strong></td>
-                  <td><strong>186 ns</strong></td>
-                  <td>~5,400,000 requests / sec</td>
+                  <td><strong>318 ns</strong></td>
+                  <td>~3,100,000 requests / sec</td>
                   <td>0 heap allocs</td>
                 </tr>
                 <tr>
                   <td><strong>POST with JSON Body</strong></td>
-                  <td><strong>315 ns</strong></td>
-                  <td>~3,200,000 requests / sec</td>
+                  <td><strong>244 ns</strong></td>
+                  <td>~4,100,000 requests / sec</td>
                   <td>0 heap allocs</td>
                 </tr>
                 <tr>
                   <td><strong>Browser GET (10 headers, cookies, query)</strong></td>
-                  <td><strong>781 ns</strong></td>
-                  <td>~1,280,000 requests / sec</td>
+                  <td><strong>763 ns</strong></td>
+                  <td>~1,310,000 requests / sec</td>
+                  <td>0 heap allocs</td>
+                </tr>
+                <tr>
+                  <td><strong>…same, handler reads a cookie and a header</strong></td>
+                  <td><strong>770 ns</strong></td>
+                  <td>~1,300,000 requests / sec</td>
                   <td>0 heap allocs</td>
                 </tr>
                 <tr>
                   <td><strong>yyjson (20-row list serialization)</strong></td>
-                  <td><strong>659 ns</strong></td>
+                  <td><strong>696 ns</strong></td>
                   <td>Default (libc) allocator in the benchmark</td>
                   <td>Heap allocations (not the arena)</td>
                 </tr>
@@ -1596,10 +1691,9 @@
             </table>
           </div>
           <div class="alert alert-note">
-            <strong>Arena Allocation:</strong> <code>sizeof(Request) = 19,000 B</code>,
-            <code>sizeof(Response) = 15,912 B</code>, <code>sizeof(Connection) = 152 B</code>. Per-request data (request body,
-            response bytes, yyjson documents) comes from a 64 KiB bump-allocator arena allocated together with each
-            connection, so the request path needs no <code>malloc()</code> or <code>free()</code> unless a request outgrows the
+            <strong>Arena Allocation:</strong> <code>sizeof(Request) = 9,792 B</code>,
+            <code>sizeof(Response) = 10,160 B</code>, <code>sizeof(Connection) = 288 B</code>. Per-request data (request body,
+            response bytes, yyjson documents) comes from one 64 KiB bump-allocator arena per worker, so the request path needs no <code>malloc()</code> or <code>free()</code> unless a request outgrows the
             arena. These figures exclude socket I/O and use a static arena.
           </div>
         </div>
@@ -1621,7 +1715,13 @@ wrk -t8 -c100 -d15s http://127.0.0.1:8080/ping
 wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
 
 <span class="com"># 4. Or run the full automated stress battery with memory profiling</span>
-./scripts/stress_test.sh</code></pre>
+./scripts/stress_test.sh
+
+<span class="com"># 5. Same battery against Linux (epoll; CEXPRESS_EVENT_LOOP=io_uring for io_uring) in Docker</span>
+./scripts/docker_stress_test.sh
+
+<span class="com"># 6. Pure request-path microbenchmark (no sockets)</span>
+make bench</code></pre>
         </div>
       </section>
 
@@ -1630,17 +1730,17 @@ wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
         <h2>🛡️ Reliability, Hardening & Test Matrix</h2>
         <p>
           High throughput is meaningless without correctness and rock-solid memory safety. CExpress is rigorously
-          verified across 15 dedicated automated test suites, AddressSanitizer and UndefinedBehaviorSanitizer
+          verified across 21 dedicated automated test suites, AddressSanitizer and UndefinedBehaviorSanitizer
           instrumentation, continuous mutation fuzzing, and automated API documentation audits.
         </p>
 
         <div class="stats-grid" style="margin-bottom: 2rem;">
           <div class="stat-card">
-            <div class="stat-val" style="color: #10b981;">15 / 15</div>
+            <div class="stat-val" style="color: #10b981;">21 / 21</div>
             <div class="stat-label">Automated Test Suites Passing</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #38bdf8;">130 / 130</div>
+            <div class="stat-val" style="color: #38bdf8;">155 / 155</div>
             <div class="stat-label">Public APIs Audited (check_docs.sh)</div>
           </div>
           <div class="stat-card">

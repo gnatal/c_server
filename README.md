@@ -32,58 +32,64 @@ Modern backend applications often rely on high-level runtimes like Node.js or Go
 - **High Performance & Low Latency**: Native execution with minimal CPU overhead, sub-millisecond response times, and about 250,000 requests/sec on a minimal endpoint with 4 workers on an Apple M3 Pro laptop (single run, load generator on the same machine). See [Performance & Benchmarks](#performance--benchmarks).
 - **Small Footprint**: `lib/` has no system dependencies beyond standard C and POSIX APIs, and `liburing` on Linux. JSON ([yyjson](https://github.com/ibireme/yyjson)) and HTTP tokenizing ([picohttpparser](https://github.com/h2o/picohttpparser)) are vendored as source in `lib/vendor/`. The bundled demo app additionally links SQLite (embedded, no server process) for its Todo persistence layer.
 - **Event-Driven Non-Blocking I/O**: Native `kqueue` on macOS / BSD and `epoll` on Linux (`io_uring` readiness polling opt-in with `CEXPRESS_EVENT_LOOP=io_uring`), following the same architectural pattern as Node.js's underlying `libuv`.
-- **Memory Control**: Explicit bounded buffers, aggressive `const` correctness, hard input limits, and a per-connection arena allocator so per-request data needs no individual `free`. The trade is a larger per-connection footprint (see [`tradeoffs.md`](tradeoffs.md)).
+- **Memory Control**: Explicit bounded buffers, aggressive `const` correctness, hard input limits, and a per-worker arena allocator so per-request data needs no individual `free` (see [`tradeoffs.md`](tradeoffs.md)).
 
 ---
 
 ## Performance & Benchmarks
 
-**Method.** Measured on 21 Sep 2026 with `wrk` (8 threads, keep-alive, 15 s per row) against the demo started as `QUIET=1 WORKERS=4 ./cexpress_demo` from `examples/todo_sqlite/`, on an Apple M3 Pro laptop (macOS, gcc-16 -O2) with `wrk` running on the same machine, so both compete for the same cores. **Each row is a single run**; earlier runs of the same command on this machine varied by several percent, and results move with whatever else the laptop is doing. Linux (io_uring) was not benchmarked.
+**Method.** Measured on 24 Sep 2026 with `scripts/stress_test.sh` at its defaults: `wrk` (8 threads, keep-alive, 15 s per row) against the demo started as `QUIET=1 WORKERS=4 ./cexpress_demo` from `examples/todo_sqlite/`, on an Apple M3 Pro laptop (macOS, gcc-16 -O2), with `wrk` running on the same machine so both compete for the same cores. **Each row is a single run.** The machine was busy during this run (load average 7-8 before it started, `sysmond` at ~76% CPU), and results move with whatever else the laptop is doing. On 21-23 Sep the same `/ping` test reached 250,055 req/sec at 100 connections and 256,864 at 1,000 (best of 3); on 24 Sep two shorter re-runs gave 175-180k at 100 connections and 191-193k at 1,000.
 
 **`GET /ping`**: a fixed 4-byte reply, no database, no JSON. This is the engine's connection and request path on its own.
 
 | Concurrency | Throughput | Avg Latency | Max Latency | Notes |
 |---|---|---|---|---|
-| **100 connections** | **250,055 req/sec** | **393 µs** | 19.07 ms | |
-| **1,000 connections** | **207,903 req/sec** | **4.81 ms** | 19.54 ms | |
-| **5,000 connections** | **238,859 req/sec** | **14.72 ms** | 175.88 ms | 2,219 `wrk` read errors |
+| **100 connections** | **158,730 req/sec** | **1.94 ms** | 81.44 ms | |
+| **1,000 connections** | **181,403 req/sec** | **6.01 ms** | 139.25 ms | |
+| **5,000 connections** | **172,327 req/sec** | **36.22 ms** | 1.22 s | 1,344 `wrk` read errors |
+| **churn** (`Connection: close`, 2 s rows) | 35,445 / 23,627 / 22,542 conn/sec | 2.06 / 4.82 / 6.14 ms | | 100 / 1,000 / 5,000 connections, 0 connect errors |
 
-With `WORKERS=1` the same test at 100 connections gave 221,611 req/sec (359 µs average), close to the 4-worker figure. Two things follow: these runs are limited by the load generator sharing the machine, and on macOS the workers did not share connections evenly (see [`concurrency.md`](concurrency.md)), so this table says little about multi-core scaling.
+With `WORKERS=1` the 21 Sep test at 100 connections gave 221,611 req/sec, close to the 4-worker figure: these runs are limited by the load generator sharing the machine, and on macOS the workers did not share connections evenly (see [`concurrency.md`](concurrency.md)), so this table says little about multi-core scaling.
 
-**Todo demo endpoints** (4 workers):
+**Todo demo endpoints** (4 workers; reads run against the 20 seeded rows before any write row):
 
 | Endpoint | Concurrency | Throughput | Avg Latency | Max Latency |
 |---|---|---|---|---|
-| `GET /`: the Todo UI, a 6,481-byte HTML page streamed from disk with `res_send_file` | 100 | 60,466 req/sec | 1.60 ms | 19.16 ms |
-| `GET /api/todos`: 20 rows, SQLite read, JSON via yyjson | 100 | 69,011 req/sec | 1.39 ms | 5.70 ms |
-| `GET /api/todos`: same | 1,000 | 61,999 req/sec | 16.05 ms | 40.73 ms |
-| `POST /api/todos`: SQLite write, WAL mode | 100 | 23,846 req/sec | 4.13 ms | 42.85 ms |
+| `GET /`: the Todo UI, a 6,481-byte HTML page streamed from disk | 100 | 117,244 req/sec | 0.91 ms | 44.01 ms |
+| `GET /`: same | 1,000 | 118,832 req/sec | 8.39 ms | 59.79 ms |
+| `GET /api/todos`: 20 rows, SQLite read, JSON via yyjson | 100 | 154,644 req/sec | 706 µs | 39.03 ms |
+| `GET /api/todos`: same | 1,000 | 169,478 req/sec | 6.02 ms | 71.47 ms |
+| `POST /api/todos`: SQLite write, WAL mode | 100 | 20,818 req/sec | 96.22 ms | 1.65 s |
+| `POST /api/todos`: same | 1,000 | 19,741 req/sec | 121.54 ms | 1.25 s |
 
-At 5,000 connections `wrk` reported read errors in every long run recorded so far (2,219 here on `/ping`; 1,624 to 2,393 in the earlier script run); there were no connect errors and no worker-crash messages in the final run's log. The cause is not identified.
+At 5,000 connections `GET /` did 110,533 req/sec, `GET /api/todos` 163,515 and `POST` 19,748. At 5,000 connections `wrk` reported read errors in every row (655 to 5,283), plus 3,008 timeouts on `POST`, whose average latency there was 307 ms; there were no connect errors and no worker crashes. The cause of the read errors is not identified.
 
-**Pure request path, no sockets** (`make bench`, one core): minimal GET 208 ns, browser-shaped GET (10 headers, cookies, query) 781 ns, JSON POST 315 ns, 404 186 ns; emitting a 20-row JSON list with yyjson 659 ns.
+**Linux, `epoll`, in Docker** (`scripts/docker_stress_test.sh` at its defaults, 24 Sep 2026: server and a natively built `wrk` in separate containers on one Docker network inside Docker Desktop's VM on the same laptop, 10 s per row, single runs):
 
-**Memory** (macOS, `ps` RSS): the 5-process cluster idles at 11.5 MB. Each open keep-alive connection costs about 25 KB resident (8 KiB input buffer plus the touched part of a 64 KiB arena): 5,000 connections took about 121 MB on a single worker. The earlier engine measured about 7 KB per connection.
+| Endpoint | 100 connections | 1,000 connections |
+|---|---|---|
+| `GET /ping` | 240,019 req/sec (2.32 ms avg) | 251,306 req/sec (6.24 ms avg) |
+| `GET /ping`, `Connection: close` | 47,132 conn/sec | 43,806 conn/sec |
+| `GET /` | 110,212 req/sec | 105,454 req/sec |
+| `GET /api/todos` | 72,901 req/sec | 68,206 req/sec |
+| `POST /api/todos` | 7,891 req/sec | 7,665 req/sec (240 timeouts) |
+
+The `io_uring` backend (`CEXPRESS_EVENT_LOOP=io_uring`) was not benchmarked in this run.
+
+**Pure request path, no sockets** (`make bench`, one core, 24 Sep 2026): minimal GET 226 ns, browser-shaped GET (10 headers, cookies, query) 763 ns, JSON POST 244 ns, 404 318 ns; emitting a 20-row JSON list with yyjson 696 ns.
+
+**Memory** (`ps` RSS, master + 4 workers): on macOS the cluster idled at 13.0 MB after startup and seeding and peaked at 18.3 MB in total (largest single process 4.2 MB, which `/usr/bin/time -l` confirms) during the 5,000-connection `POST` row. In the Linux Docker run it stayed between 11.2 and 11.8 MB. An idle keep-alive connection costs about 239 bytes (measured 23 Sep 2026 on a single worker with 5,000 connections), because each worker shares one 64 KiB arena and one 8 KiB receive buffer across its connections.
 
 These figures are not comparable with the ones this README carried before the engine rework (for example 287k req/sec on `/ping` at 100 connections): the setup, the engine and the machine's state all differ, and no A/B run of the old commit was made.
 
 > [!TIP]
-> Reproduce the tables above manually (this is the setup they were measured with):
+> Reproduce the tables above:
 > ```bash
-> make demo                                   # from the repository root
-> cd examples/todo_sqlite
-> # Terminal 1: 4-worker cluster, no access logging
-> QUIET=1 WORKERS=4 ./cexpress_demo
->
-> # Terminal 2:
-> wrk -t8 -c100  -d15s http://127.0.0.1:8080/ping
-> wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping
-> wrk -t8 -c5000 -d15s http://127.0.0.1:8080/ping
-> wrk -t8 -c100  -d15s http://127.0.0.1:8080/        # Todo UI
-> wrk -t8 -c100  -d15s http://127.0.0.1:8080/api/todos
+> ./scripts/stress_test.sh          # macOS/Linux host, needs wrk; builds the demo, runs all phases, reports memory
+> ./scripts/docker_stress_test.sh   # Linux epoll in Docker (CEXPRESS_EVENT_LOOP=io_uring for io_uring)
+> make bench                        # request path without sockets
 > ```
-> Seed 20 todos first for the `/api/todos` rows (see the `POST` examples below).
-> `scripts/stress_test.sh` automates a sweep, but as of this writing it starts the server from the repository root, where the demo cannot find `public/` (so its `GET /` rows measure a 404) and its memory rows disagree with direct measurements; see [`scripts/CLAUDE.md`](scripts/CLAUDE.md) before trusting its output.
+> Both scripts take `PHASES`, `CONNS`, `DURATION`, `WORKERS` and more as env vars; see [`scripts/CLAUDE.md`](scripts/CLAUDE.md).
 
 ---
 
