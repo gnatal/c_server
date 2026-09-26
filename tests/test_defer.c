@@ -682,6 +682,101 @@ static void test_watched_peer_hangup_is_reported(void) {
     teardown(&app);
 }
 
+/* ---- app_on_turn_end ---- */
+
+static int turn_end_calls;
+static int pending_at_turn_end; /* how many requests had deferred when the hook last ran */
+
+static void count_turn_end(App *app, void *udata) {
+    (void)app;
+    assert(udata == &turn_end_calls);
+    turn_end_calls++;
+    pending_at_turn_end = pending_tail;
+}
+
+/* resumes and answers every pending query: a turn-end "flush" that finishes work itself */
+static void answer_at_turn_end(App *app, void *udata) {
+    (void)udata;
+    turn_end_calls++;
+    while (pending_head != pending_tail) {
+        Response *res = res_resume(app, pending[pending_head++].h);
+        assert(res != NULL);
+        res_send(res, "from-turn-end");
+    }
+}
+
+/* The hook runs exactly once per turn, after every handler of that turn (three pipelined requests deferred in one
+ * read event), also on a turn with no events, with its udata; replaced or removed, the old one no longer runs. */
+static void test_turn_end_hook_runs_once_per_turn_after_handlers(void) {
+    App app;
+    setup(&app);
+    assert(app.turn_end_hook == NULL);
+    Client c;
+    open_client(&app, &c);
+    turn_end_calls = 0;
+    pending_at_turn_end = -1;
+    app_on_turn_end(&app, count_turn_end, &turn_end_calls);
+
+    send_str(&c, "GET /db?id=1 HTTP/1.1\r\nHost: x\r\n\r\nGET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
+    Client d, e;
+    open_client(&app, &d);
+    open_client(&app, &e);
+    send_str(&d, "GET /db?id=2 HTTP/1.1\r\nHost: x\r\n\r\n");
+    send_str(&e, "GET /db?id=3 HTTP/1.1\r\nHost: x\r\n\r\n");
+    int turns = 0;
+    int idle_turns = 0;
+    while ((pending_tail < 3 || idle_turns == 0) && turns < 100) {
+        const int n = app_run_once(&app, 0);
+        assert(n >= 0);
+        turns++;
+        idle_turns += n == 0;
+        assert(turn_end_calls == turns);             /* once per turn, idle turns included */
+        assert(pending_at_turn_end == pending_tail); /* after every handler of its turn */
+    }
+    assert(pending_tail == 3 && idle_turns > 0);
+
+    answer_db(3);
+    pump(&app);
+    receive(&c);
+    assert(strstr(c.rx, "note-1") != NULL && strstr(c.rx, "pong") != NULL);
+    const int before = turn_end_calls;
+    assert(before > turns);
+
+    app_on_turn_end(&app, NULL, &turn_end_calls);
+    assert(app.turn_end_hook == NULL && app.turn_end_udata == NULL);
+    assert(app_run_once(&app, 0) == 0);
+    assert(turn_end_calls == before);
+    teardown(&app);
+}
+
+/* A response resumed inside the hook is written by the next turn before it polls, even with nothing else to do;
+ * not during the hook's own turn. */
+static void test_resume_in_turn_end_hook_goes_out_next_turn(void) {
+    App app;
+    setup(&app);
+    Client c;
+    open_client(&app, &c);
+    turn_end_calls = 0;
+    app_on_turn_end(&app, count_turn_end, &turn_end_calls);
+    app_on_turn_end(&app, answer_at_turn_end, NULL); /* replaces the counter's udata too */
+    assert(app.turn_end_udata == NULL);
+
+    send_str(&c, "GET /db?id=7 HTTP/1.1\r\nHost: x\r\n\r\n");
+    for (int turns = 0; pending_tail == 0 && turns < 100; turns++) {
+        assert(app_run_once(&app, 0) >= 0);
+    }
+    assert(pending_tail == 1 && pending_head == 1); /* deferred and resumed in the same turn */
+    receive(&c);
+    assert(c.rx_len == 0 && c.conn->deferred != NULL);
+
+    assert(app_run_once(&app, 0) == 0);
+    receive(&c);
+    assert(strncmp(c.rx, "HTTP/1.1 200 ", 13) == 0 && strstr(c.rx, "from-turn-end") != NULL);
+    assert(c.conn->deferred == NULL && is_open(&app, &c));
+    app_on_turn_end(&app, NULL, NULL);
+    teardown(&app);
+}
+
 int main(void) {
     test_deferred_response_waits_for_the_watched_fd();
     test_pipelined_request_waits_behind_deferred();
@@ -697,6 +792,8 @@ int main(void) {
     test_resume_without_sending_answers_500();
     test_watch_fd_interest_and_refusals();
     test_watched_peer_hangup_is_reported();
+    test_turn_end_hook_runs_once_per_turn_after_handlers();
+    test_resume_in_turn_end_hook_goes_out_next_turn();
     printf("all defer tests passed\n");
     return 0;
 }

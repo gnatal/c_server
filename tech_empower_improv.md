@@ -10,37 +10,51 @@ code, not profiled. ESTIMATED: the gain is an estimate.
 **Effort.** S = up to half a day, including the regression test. M = 1–2 days. L = 3 days or more.
 
 **Setup, in short.** TFB's own harness on one Apple Silicon Mac: a Colima VM with 10 CPUs / 12 GB running the
-server, TFB's Postgres and wrk together; 2 full runs plus a worker-count sweep, 2026-09-25/26. Linux, epoll backend.
+server, TFB's Postgres and wrk together; 2 full runs plus a worker-count sweep, 2026-09-25/26, then a plaintext-only
+run after T1 and a third full DB run (db, query, fortune, update) after T2–T4. Linux, epoll backend.
 Zero non-2xx responses anywhere; all entries pass TFB verification. Compared against Actix, Axum, h2o and Fiber.
 
 ---
 
 ## Where CExpress stands
 
-| Test | CExpress best req/s (2 runs) | Place of 5 | vs. leader |
-|---|---:|---|---|
-| JSON | 764k / 771k | **1st** | ahead of Actix (720k / 753k) |
-| Plaintext (pipelined ×16) | 1.59M / 1.60M → **4.91M after T1** | 5th → **1st** (one run) | 35–40% of Actix → 105% (4.69M in the same run) |
-| Single query | 155k / 178k | 4th | ~55% (Actix-http 289k / 338k) |
-| Multiple queries (20) | 152k / 170k | 4th | ~55% (Axum-pg / Actix-http ~300k) |
-| Fortunes | 170k / 181k | 4th | ~60% (h2o / Actix-http ~300k) |
-| Updates (20) | 75k / 78k | 4th | ~50% (Actix-http 142k / 169k) |
+MEASURED. Best req/s across levels. Runs 1 / 2: before any fix. After: plaintext from the plaintext-only run after
+T1 and full run 4 (`20260926145131`); DB tests from full runs 3 (`20260926132736`) and 4, both after T2–T4 with the
+same code; JSON from run 4.
 
-The per-request path (parse, route, build a response, write it) is competitive. JSON, one small request per
-round trip, is won outright. The losses come from two places: writing pipelined responses, and waiting on the database.
+| Test | Runs 1 / 2 | Place | After (runs 3 / 4) | Place | vs. best other (after) |
+|---|---:|---|---:|---|---|
+| JSON | 764k / 771k | **1st** | 788k (run 4) | **1st** | 107% of Actix (739k) |
+| Plaintext (pipelined ×16) | 1.59M / 1.60M | 5th | 4.91M / 4.81M | **1st / 1st** | 105% / 109% of Actix |
+| Single query (db) | 155k / 178k | 4th | 298k / 300k | 4th / 4th | 97% / 96%; top four within 3.2% / 3.8% |
+| Multiple queries, 1 query | 152k / 170k | 4th | 301k / 303k | 1st / 3rd | 101% / 98%; top four within 2.5% / 3.8% |
+| Multiple queries, 20 queries | – | – | 65.5k / 66.1k | **1st / 1st** | 2.30× / 2.27× the best other |
+| Fortunes | 170k / 181k | 4th | 283k / 275k | 3rd / 4th | 96% / 93% of h2o (295k / 296k) |
+| Updates, 1 query | 75k / 78k | 4th | 159k / 157k | 1st / 1st (tie) | 105% / 100% of Actix-http |
+| Updates, 20 queries | – | – | 34.3k / 33.3k | **1st / 1st** | 1.81× / 1.69× Actix-http |
+
+The per-request path (parse, route, build a response, write it) is competitive: JSON is won in all three runs that
+had it. The two losses found in runs 1 / 2, pipelined writes (T1) and waiting on the database (T2–T4), are fixed,
+and run 4 confirms it. Plaintext is 1st in both runs since T1. db and query at one query are a four-way tie
+(within 4%, well under the ~15% run-to-run noise). Query and update lead at every count from 5 queries on,
+1.35–2.3×, because a request's queries cost one round trip and requests share the connection. Fortunes is the one DB
+test where CExpress is behind the leader by more than a few percent in both runs (4% / 7% behind h2o). Next: retune
+workers (T5), and one `send` per event-loop turn to Postgres instead of one per request (see T4's status).
 
 ## Summary
 
 | ID | Problem | Tests affected | Impact | Effort | Evidence |
 |---|---|---|---|---|---|
 | **T1** | ~~Pipelined responses are written with one `write` syscall each~~ **Done** (2026-09-26) | plaintext | **High** (2.5–3× gap) | M | MEASURED symptom, CODE cause |
-| **T2** | ~~Handlers can't wait on I/O: a DB query blocks the whole worker~~ **Engine done** (2026-09-26); the TFB app still to switch (T4) | db, query, fortune, update | **High** (~2× gap) | L | MEASURED symptom, CODE cause |
+| **T2** | ~~Handlers can't wait on I/O: a DB query blocks the whole worker~~ **Done** (2026-09-26), used by T4 | db, query, fortune, update | **High** (~2× gap) | L | MEASURED symptom, CODE cause |
 | **T3** | ~~No per-request memory that outlives the shared arena reset~~ **Done** (2026-09-26), with T2 | db, query, fortune, update | (part of T2) | M | CODE |
-| **T4** | TFB app: one blocking libpq connection per worker, no multiplexing | db, query, fortune, update | High, after T2 | M | CODE |
-| **T5** | Worker count is a blunt tool; best setting differs per test | db tests | Low–Medium | S | MEASURED |
+| **T4** | ~~TFB app: one blocking libpq connection per worker, no multiplexing~~ **Done** (2026-09-26); full run 3: db/fortune at parity, query/update 1st | db, query, fortune, update | High, after T2 | M | CODE, MEASURED (1 run) |
+| **T5** | ~~Worker count is a blunt tool; best setting differs per test~~ **Done** (2026-09-26): 1 per core stays, beats 2 per core by 5–6% on db/query (one run) | db tests | Low–Medium | S | MEASURED |
 | **T6** | `MAX_PIPELINED_PER_EVENT` (16) equals wrk's pipeline depth | plaintext | Low | S | CODE |
 
 Order to do them: **T1** (self-contained, big payoff), then **T3 → T2 → T4** as one project, then retune **T5**.
+T1–T5 are done, and full run 4 confirms the ranking. One `send` per event-loop turn to Postgres is implemented and
+measured once (T4's status): +10–13% on db and single-query, −8–16% on updates at 1–5 queries, not yet explained.
 
 ---
 
@@ -100,7 +114,7 @@ No effect on non-pipelined traffic (a batch of one is flushed exactly as today).
 
 ## T2. Handlers can't wait on I/O
 
-**Status: engine done (2026-09-26); T4 (the TFB app) not started.** API: `res_defer(res)` → `DeferHandle`,
+**Status: done (2026-09-26); the TFB app uses it since T4.** API: `res_defer(res)` → `DeferHandle`,
 `res_resume(app, h)` → `Response *` (NULL once the request is gone), `req_deferred(app, h)`, `app_watch_fd(app, fd,
 WATCH_READ | WATCH_WRITE, cb, udata)` / `app_unwatch_fd`, and `app_run_once` (one loop turn; `app_listen_worker` loops
 over it). Differences from the sketch below: `res_resume` takes a generation-checked handle, not a `Connection *`, and
@@ -195,6 +209,38 @@ fills the budget and checks for 503.
 
 ## T4. TFB app: one blocking connection per worker
 
+**Status: done (2026-09-26), in `Rest_in_c/techempower/cexpress/src/db.c` + `main.c`.** As planned below:
+non-blocking libpq in pipeline mode, `PQsocket` watched with `app_watch_fd` (registered from the worker-start hook,
+applied when the loop opens), one connection per worker shared by every request, a FIFO of jobs in send order (each
+request's queries end with a sync, so each `PGRES_PIPELINE_SYNC` completes the head job), write interest only while
+`PQflush` returns 1. `/updates` is a two-phase job: its UPDATE goes to the back of the pipeline when its SELECTs'
+sync arrives. Jobs come from an app-owned free list, never the request arena (the client may leave mid-query; its
+result is then dropped via `res_resume` returning NULL). A broken connection answers every queued and later request 500.
+Workers: one per core (`CEXPRESS_WORKERS` overrides). TFB verify: all PASS. MEASURED (one run, DB tests only, against
+actix-http alone, same setup as above; `Rest_in_c/benchmark_techempower.md`, "Run 3", last paragraph): db 295k vs
+307k (was 155-178k), query 294k vs 308k at 1 query and 65k vs 29k at 20, fortune 280k vs 299k (was 170-181k), update
+167k vs 156k at 1 query and 34k vs 19k at 20 (was 75-78k). Zero non-2xx. **MEASURED in full run 3** (`20260926132736`, all five
+frameworks, DB tests only, one run): db 297,671 (4th; Actix-http 307,632, Axum-pg 302,879, h2o 301,387), query 301,411
+(1st), fortune 282,844 (3rd; h2o 295,283), update 158,507 (1st; Actix-http 151,049). At 20 queries 65.5k vs 28.5k (best
+other), at 20 updates 34.3k vs 18.9k. Zero non-2xx; wrk timeouts in the same range as the other entries. Per-level
+numbers: `Rest_in_c/benchmark_techempower.md`, "Run 3". **Full run 4** (`20260926145131`, same code, all six tests):
+db 299,887 (4th, top four within 3.8%), query 302,805 at 1 query (3rd, within 3.8%) and 66,051 at 20 (2.27×),
+fortune 275,448 (4th, 93% of h2o), update 157,191 at 1 query (tied 1st with Actix-http at 157,190) and 33,306 at 20
+(1.69×). Zero non-2xx. Open: at 16 connections Actix-http is ~2× every other entry
+(db 146k vs cexpress 79k, axum 71k, h2o 63k; fortune 169k vs 78k), so this is Actix-specific rather than a CExpress
+gap; from 32 connections the top four track each other.
+**One flush per event-loop turn (2026-09-26).** Engine: `app_on_turn_end` (a hook called once at the end of every
+`app_run_once`, after all its events and resumed responses; `lib/CLAUDE.md`, "Event-loop turn"). App: libpq 18.6 from
+the PostgreSQL apt repository (Ubuntu 24.04 ships 16, whose `PQpipelineSync` flushes per request); every sync is
+`PQsendPipelineSync` (buffered), and the hook does one `PQflush` per turn. Each request keeps its own sync, so the FIFO,
+per-request error isolation and one implicit transaction per request are unchanged. `CEXPRESS_PG_FLUSH_EACH=1`
+restores a flush per request (A/B only, to be removed). **MEASURED** (run 5, `20260926163928`, one run, batched vs
+flush-each in the same run, 1 worker per core): db 321,196 vs 291,353 (1.10×), query 325,489 vs 286,777 at 1 query
+(1.13×) and 1.04× at 20, fortune 292,644 vs 286,124 (1.02×), update 139,560 vs 151,470 at 1 query (**0.92×**; 0.84× at
+5, even from 10). actix-http in the same run: db 322,366, query 316,781, fortune 280,625, update 163,504. Update loss
+not explained; suspected (CODE): the `/updates` UPDATE is queued from the result callback and now waits for the end of
+the turn instead of being flushed at once, adding a wait to its second round trip.
+
 **Cause (CODE).** `Rest_in_c/techempower/cexpress/src/db.c` opens one libpq connection per worker and already uses
 pipeline mode (`PQenterPipelineMode`, `PQsendQueryPrepared` ×N, `PQpipelineSync`) so the 20 queries of `/queries`
 and `/updates` go out in one round trip. That was a good call. But it still ends in a blocking `PQgetResult`, and
@@ -227,8 +273,13 @@ the pipeline only ever carries one HTTP request's queries.
 
 Reads prefer fewer workers (less contention with wrk and Postgres on shared cores); updates prefer more (each
 worker spends longer blocked on row locks). No setting passes ~70% of the leaders, so this is a symptom of T2, not a
-fix. **After T2/T4, retune from 1× per core.** Until then, 2× is a better default for the read tests if the entry
-is submitted before T2 lands. Single runs, so treat differences under ~10% as noise.
+fix. **After T2/T4, retune from 1× per core.** The table above is from the blocking app and doesn't carry over.
+
+**Status: done (2026-09-26).** MEASURED, run 5 (`20260926163928`, one run, batched per-turn flush, same run): 1× vs 2×
+per core: db 321,196 vs 305,382 (1×, +5%), query 325,489 vs 306,823 at 1 query (+6%), fortune 292,644 vs 290,215 (tie),
+update 139,560 vs 152,828 at 1 query (2× +9.5%, the same as flush-each at 1×, so it tracks the update loss above, not
+the worker count). From 10 queries on both are within 4%. The default stays at one worker per core; with one
+non-blocking connection per worker, more workers only add Postgres backends and context switches. Single runs, so treat differences under ~10% as noise.
 
 ---
 

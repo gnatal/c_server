@@ -22,6 +22,8 @@ void app_init(App *app) {
     app->body_limit_count = 0;
     app->error_handler = NULL;
     app->worker_init_hook_count = 0;
+    app->turn_end_hook = NULL;
+    app->turn_end_udata = NULL;
     app->server_fd = -1;
     app->accept_via_fd_passing = 0;
 #if defined(__linux__)

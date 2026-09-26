@@ -2070,6 +2070,11 @@ static int handle_event(App *app, const LoopEvent *ev) {
     return 0;
 }
 
+void app_on_turn_end(App *app, const TurnEndHook fn, void *const udata) {
+    app->turn_end_hook = fn;
+    app->turn_end_udata = fn != NULL ? udata : NULL;
+}
+
 int app_run_once(App *app, const int timeout_ms) {
     if (app->defer_ready_len > 0) {
         serve_resumed(app); /* resumed outside any event (before the loop started, or by code between turns) */
@@ -2088,6 +2093,9 @@ int app_run_once(App *app, const int timeout_ms) {
         if (app->defer_ready_len > 0) {
             serve_resumed(app);
         }
+    }
+    if (app->turn_end_hook != NULL) {
+        app->turn_end_hook(app, app->turn_end_udata);
     }
     if (app->is_shutting_down && app_count_connections(app) == 0) {
         printf("All connections drained. Server shutting down.\n");

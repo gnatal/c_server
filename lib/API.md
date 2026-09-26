@@ -68,6 +68,7 @@ and, for anything on a `Request` or `Response`, die when the handler returns (se
 - `req_deferred(app, h)` → the kept `const Request *` (params, query, headers, body) until the response is written; `NULL` when gone, and inside the deferring handler (use its `req`).
 - `app_watch_fd(app, fd, WATCH_READ | WATCH_WRITE, FdReadyFn, udata)` — watch your own non-blocking fd (database socket, pipe) on this worker's loop; the callback gets `WATCH_READ` / `WATCH_WRITE` / `WATCH_ERROR`; call again to change interest (e.g. add `WATCH_WRITE` while output is unsent). Works from a worker-start hook. `-1` for a client/listen fd or bad args. `app_unwatch_fd(app, fd)` before closing it; after `WATCH_ERROR`, unwatch.
 - `app_run_once(app, timeout_ms)` — one event-loop turn (poll, handle, write resumed responses); `LOOP_TURN_EXIT` when the worker should stop. `app_listen` loops over it; tests drive it directly.
+- `app_on_turn_end(app, TurnEndHook, udata)` — run a hook once at the end of every loop turn, after all of that turn's handlers and callbacks (e.g. send a database client's buffered queries in one flush); a `res_resume` inside it is written next turn, before the poll. One per App; `NULL` removes it.
 
 - `stream_release(Connection *)` — engine: detach a producer stream and free its ctx.
 - `shared_body_detach(Connection *)` — engine: drop a connection's pinned shared body.

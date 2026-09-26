@@ -489,8 +489,13 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   re-checks `watched[fd].fn` before calling it, so a callback unwatched earlier in the same batch is never called.
   io_uring does not re-arm a poll after an error: after `WATCH_ERROR` the application unwatches.
 - **Event-loop turn (`app_run_once`).** Drain resumed responses, `event_loop_poll`, then for each event `handle_event`
-  followed by `serve_resumed` if anything was resumed; after the batch, `LOOP_TURN_EXIT` once shutting down with no
-  connection left. `app_listen_worker` is a loop over it (EINTR retried, EBADF during shutdown ends it).
+  followed by `serve_resumed` if anything was resumed; after the batch, the turn-end hook (`App.turn_end_hook`, set by
+  `app_on_turn_end`, one per App, no allocation) if set, also on a turn with no events; then `LOOP_TURN_EXIT` once
+  shutting down with no connection left. The hook is skipped when the poll fails or an event returns
+  `LOOP_TURN_EXIT`. A `res_resume` made in it is queued in `defer_ready` and written by the drain at the top of the
+  next turn, before that turn's poll, so it cannot wait on an unrelated event. It exists so an application can batch
+  per-turn work (the TFB app sends every request's Postgres queries of one turn in one `PQflush`) instead of once
+  per request. `app_listen_worker` is a loop over it (EINTR retried, EBADF during shutdown ends it).
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length`, `Connection` and `Date` are engine-owned.
   Header and trailer values are never shortened: `set_named_value` (`response.c`) copies them whole into `conn->arena`

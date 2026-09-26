@@ -124,6 +124,16 @@ int app_unwatch_fd(App *app, int fd);
 int app_run_once(App *app, int timeout_ms);
 
 /*
+ * Runs fn(app, udata) once at the end of every app_run_once turn, after every event it handled and every
+ * response those events resumed, before the next poll; also on a turn with no events. For work that should
+ * happen once per batch of handlers rather than once per request, e.g. flushing a database client's buffered
+ * output in one send. A res_resume made inside fn is written at the start of the next turn, before its poll.
+ * Skipped when a poll fails or an event cuts the turn short (second signal, drain deadline). One hook per App: a second call
+ * replaces it, NULL removes it. Per worker process; register it from a worker-start hook or before listening.
+ */
+void app_on_turn_end(App *app, TurnEndHook fn, void *udata);
+
+/*
  * Engine internals (called from the event loop; exposed for tests).
  *
  * handle_readable: recv() into conn->in_buf until EAGAIN (into the worker's shared App.read_buf

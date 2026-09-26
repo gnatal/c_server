@@ -491,6 +491,10 @@ typedef struct {
  * May be called spuriously (the fd must be non-blocking). May call res_resume, app_watch_fd, app_unwatch_fd. */
 typedef void (*FdReadyFn)(struct App *app, int fd, unsigned events, void *udata);
 
+/* app_on_turn_end: called once at the end of every event-loop turn, after every event and resumed response of
+ * that turn, before the next poll. */
+typedef void (*TurnEndHook)(struct App *app, void *udata);
+
 /* App.watched[fd]: an application-owned fd the event loop watches. fn == NULL = slot unused. */
 typedef struct {
     FdReadyFn fn;
@@ -790,6 +794,10 @@ typedef struct App {
 
     WorkerInitHook worker_init_hooks[MAX_WORKER_INIT_HOOKS];
     int worker_init_hook_count;
+
+    /* app_on_turn_end: one per App, NULL when none; called by app_run_once. Set by app_init to NULL. */
+    TurnEndHook turn_end_hook;
+    void *turn_end_udata;
 
     int is_shutting_down;  /* set by app_stop: no new connections, responses carry Connection: close */
 
