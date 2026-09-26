@@ -5,7 +5,8 @@
  *     static void name(const Request *req, Response *res);
  *
  * and must produce exactly one response with res_send / res_json / res_send_bytes / res_redirect /
- * res_send_file (or res_write ... res_end, or res_stream for large/endless bodies - recipe 14). Handlers are terminal: they cannot call chain_next or
+ * res_send_file (or res_write ... res_end, or res_stream for large/endless bodies - recipe 14), or res_defer it and
+ * answer later with res_resume when it must wait on I/O (recipe 15). Handlers are terminal: they cannot call chain_next or
  * chain_error (only Middleware can). A second res_send in the same request replaces the first.
  *
  * DON'T (each of these is a real bug pattern, see lib/CLAUDE.md "Ownership"):
@@ -36,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 #include "cexpress.h"
 #include "cookbook.h"
 
@@ -507,6 +509,115 @@ static void recipe_events_publish(const Request *req, Response *res) {
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * RECIPE 15 - wait on I/O without blocking the worker (a database, a job queue, another service).
+ * A handler that would block (libpq's PQgetResult, a socket round trip) stalls every connection on the
+ * worker. Instead: res_defer, start the I/O, return; the event loop watches the I/O's fd (app_watch_fd) and
+ * the callback answers with res_resume. Keep the DeferHandle, never the Response or Request: res_resume and
+ * req_deferred return NULL once the request is gone (client left, 504 after DEFER_TIMEOUT_SECONDS, shutdown),
+ * and then the result is simply dropped. Everything set on res before res_defer (headers, status, arena
+ * allocations) is kept. The answer is written right after the callback returns.
+ *   A) Job queue over a socket: send "<handle> <n>\n", the worker replies "<handle> <n*n>\n" in any order.
+ *      With libpq, the same shape: PQsetnonblocking, app_watch_fd(PQsocket(conn)), PQconsumeInput in the
+ *      callback, and a FIFO of handles because the replies come back in order (PQpipelineSync per request).
+ *   B) Long poll: GET /wait parks until POST /notify resumes every waiter (resumed from another handler).
+ * ------------------------------------------------------------------------------------------- */
+static int g_jobs_fd = -1;           /* connected, non-blocking; opened per worker (see recipe 13) */
+static char g_jobs_in[4096];         /* partial reply lines between callbacks */
+static size_t g_jobs_in_len;
+
+static void on_job_replies(App *app, int fd, unsigned events, void *udata) {
+    (void)udata;
+    const ssize_t n = read(fd, g_jobs_in + g_jobs_in_len, sizeof(g_jobs_in) - 1 - g_jobs_in_len);
+    if (n <= 0 && (events & WATCH_ERROR)) {
+        app_unwatch_fd(app, fd); /* the worker is gone; pending requests get 504 at their deadline */
+        return;
+    }
+    if (n > 0) {
+        g_jobs_in_len += (size_t)n;
+    }
+    g_jobs_in[g_jobs_in_len] = '\0';
+    char *line = g_jobs_in;
+    char *end;
+    while ((end = memchr(line, '\n', g_jobs_in_len - (size_t)(line - g_jobs_in))) != NULL) {
+        *end = '\0';
+        unsigned long long handle = 0;
+        long long result = 0;
+        if (sscanf(line, "%llx %lld", &handle, &result) == 2) {
+            Response *res = res_resume(app, (DeferHandle)handle);
+            if (res != NULL) { /* NULL: that client is gone, drop the result */
+                yyjson_alc alc = arena_yyjson_alc(res->conn->arena); /* made after resuming: see res_defer */
+                yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+                yyjson_mut_val *root = yyjson_mut_obj(doc);
+                yyjson_mut_doc_set_root(doc, root);
+                yyjson_mut_obj_add_int(doc, root, "result", result);
+                yyjson_mut_obj_add_str(doc, root, "job", req_get_param(req_deferred(app, (DeferHandle)handle), "n"));
+                send_json(res, 200, doc);
+            }
+        }
+        line = end + 1;
+    }
+    g_jobs_in_len -= (size_t)(line - g_jobs_in);
+    memmove(g_jobs_in, line, g_jobs_in_len);
+}
+
+static void recipe_job(const Request *req, Response *res) {
+    char *end;
+    const long long n = strtoll(req_get_param(req, "n"), &end, 10);
+    if (*end != '\0' || g_jobs_fd < 0) {
+        send_error(res, g_jobs_fd < 0 ? 503 : 400, g_jobs_fd < 0 ? "no job worker" : "n must be an integer");
+        return;
+    }
+    const DeferHandle h = res_defer(res);
+    if (h == 0) {
+        return; /* over the worker's memory budget: a 503 is already built */
+    }
+    char job[64];
+    const int len = snprintf(job, sizeof(job), "%llx %lld\n", (unsigned long long)h, n);
+    if (write(g_jobs_fd, job, (size_t)len) != len) {
+        /* a real client keeps an output buffer and watches WATCH_WRITE until it drains (PQflush) */
+        send_error(res_resume(g_cookbook_app, h), 503, "job queue full");
+    }
+}
+
+/* Called once the worker's job socket is connected (tests/test_cookbook.c plays the worker). */
+void cookbook_attach_jobs(App *app, int fd) {
+    g_jobs_fd = fd;
+    g_jobs_in_len = 0;
+    app_watch_fd(app, fd, WATCH_READ, on_job_replies, NULL);
+}
+
+#define MAX_WAITERS 64
+static DeferHandle g_waiters[MAX_WAITERS];
+static int g_waiter_count;
+
+static void recipe_wait(const Request *req, Response *res) {
+    (void)req;
+    if (g_waiter_count == MAX_WAITERS) {
+        send_error(res, 503, "too many waiters");
+        return;
+    }
+    const DeferHandle h = res_defer(res);
+    if (h != 0) {
+        g_waiters[g_waiter_count++] = h;
+    }
+}
+
+static void recipe_notify(const Request *req, Response *res) {
+    int woken = 0;
+    for (int i = 0; i < g_waiter_count; i++) {
+        Response *waiter = res_resume(g_cookbook_app, g_waiters[i]);
+        if (waiter != NULL) { /* written after this handler returns, in order */
+            res_send_bytes(waiter, "text/plain", (const unsigned char *)req->body, (size_t)req->content_length);
+            woken++;
+        }
+    }
+    g_waiter_count = 0;
+    char text[32];
+    snprintf(text, sizeof(text), "woke %d", woken);
+    res_send(res, text);
+}
+
+/* ---------------------------------------------------------------------------------------------
  * RECIPE 13 - per-worker resource (database, cache, anything with OS-level state).
  * fork() copies main()'s memory into every cluster worker, so never open such a resource before
  * app_listen. Validate and migrate in main(), close it, and open the real one in a hook:
@@ -558,6 +669,9 @@ void cookbook_register(App *app) {
     app_get(app, "/export", recipe_export);
     app_get(app, "/events", recipe_events_subscribe);
     app_post(app, "/events", recipe_events_publish);
+    app_get(app, "/jobs/:n", recipe_job);
+    app_get(app, "/wait", recipe_wait);
+    app_post(app, "/notify", recipe_notify);
 }
 
 /* Exposed for tests/test_cookbook.c only. */

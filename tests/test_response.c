@@ -782,7 +782,56 @@ static void test_unstorable_header_is_dropped_not_cut(void) {
     free_conn(conn);
 }
 
+/* Fills a response the way a handler would before deferring: status, headers, cookies, a trailer. */
+static void prepare_deferred_shape(Response *res) {
+    res_status(res, 201);
+    res_set_header(res, "Content-Type", "application/json");
+    res_set_header(res, "X-Request-Id", "abc123");
+    res_set_cookie(res, "sid", "s1", NULL);
+    res_set_cookie(res, "theme", "dark", NULL);
+    res_set_trailer(res, "X-Checksum", "ff");
+}
+
+static void test_response_clone_used_sends_identical_bytes(void) {
+    /* direct: built and sent from the handler's own Response */
+    Connection *direct_conn = make_conn();
+    Response direct;
+    res_init(&direct, direct_conn);
+    prepare_deferred_shape(&direct);
+    res_write(&direct, "{\"a\":1}", 7);
+    res_end(&direct);
+
+    /* cloned: the same state moved into a garbage-filled Response (only used slots may be read), the original
+     * then overwritten, the body sent from the clone */
+    Connection *clone_conn = make_conn();
+    Response original;
+    res_init(&original, clone_conn);
+    prepare_deferred_shape(&original);
+    Response *clone = malloc(sizeof(Response));
+    assert(clone != NULL);
+    memset(clone, 0xAB, sizeof(Response));
+    response_clone_used(clone, &original);
+    memset(&original, 0x5A, sizeof(original));
+    assert(clone->conn == clone_conn && clone->status == 201 && clone->header_count == 2);
+    assert(clone->set_cookie_count == 2 && clone->trailer_count == 1 && !clone->headers_sent);
+    res_write(clone, "{\"a\":1}", 7);
+    res_end(clone);
+
+    size_t direct_len;
+    size_t clone_len;
+    char *const want = without_date(direct_conn->out_buf, direct_conn->out_len, &direct_len);
+    char *const got = without_date(clone_conn->out_buf, clone_conn->out_len, &clone_len);
+    assert(direct_len == clone_len && memcmp(want, got, direct_len) == 0);
+    assert(strstr(got, "Set-Cookie: theme=dark") != NULL && strstr(got, "X-Checksum: ff") != NULL);
+    free(want);
+    free(got);
+    free(clone);
+    free_conn(direct_conn);
+    free_conn(clone_conn);
+}
+
 int main(void) {
+    test_response_clone_used_sends_identical_bytes();
     test_date_header_present_and_reserved();
     test_bodiless_statuses_send_head_only();
     test_custom_header_is_sent();

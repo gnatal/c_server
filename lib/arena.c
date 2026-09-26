@@ -14,6 +14,7 @@ void arena_init(Arena *a, char *buf, size_t cap) {
     a->cap = cap;
     a->offset = 0;
     a->large = NULL;
+    a->large_bytes = 0;
 }
 
 void *arena_alloc(Arena *a, size_t size) {
@@ -38,7 +39,8 @@ void *arena_alloc(Arena *a, size_t size) {
     
     node->next = a->large;
     a->large = node;
-    
+    a->large_bytes += size;
+
     return node->data;
 }
 
@@ -69,6 +71,7 @@ void *arena_grow(Arena *a, void *ptr, size_t old_size, size_t new_size) {
             return NULL;
         }
         a->large = node;
+        a->large_bytes = a->large_bytes - old_size + new_size;
         return node->data;
     }
 
@@ -90,10 +93,61 @@ void arena_reset(Arena *a) {
         curr = next;
     }
     a->large = NULL;
+    a->large_bytes = 0;
 }
 
 void arena_destroy(Arena *a) {
     arena_reset(a);
+}
+
+void arena_hand_over(Arena *from, Arena *to, char *fresh_buf, size_t cap) {
+    *to = *from;
+    arena_init(from, fresh_buf, cap);
+}
+
+void arena_pool_init(ArenaPool *pool, size_t block_size, size_t max_spare) {
+    pool->free_head = NULL;
+    pool->block_size = block_size;
+    pool->spare = 0;
+    pool->max_spare = max_spare;
+}
+
+char *arena_pool_take(ArenaPool *pool) {
+    char *const block = pool->free_head;
+    if (block == NULL) {
+        return malloc(pool->block_size); /* given back by arena_pool_give, freed there or by arena_pool_destroy */
+    }
+    memcpy(&pool->free_head, block, sizeof(char *));
+    pool->spare--;
+    return block;
+}
+
+void arena_pool_give(ArenaPool *pool, char *block) {
+    if (block == NULL) {
+        return;
+    }
+    if (pool->spare >= pool->max_spare) {
+        free(block);
+        return;
+    }
+    memcpy(block, &pool->free_head, sizeof(char *));
+    pool->free_head = block;
+    pool->spare++;
+}
+
+void arena_pool_destroy(ArenaPool *pool) {
+    while (pool->free_head != NULL) {
+        char *const block = pool->free_head;
+        memcpy(&pool->free_head, block, sizeof(char *));
+        free(block);
+    }
+    pool->spare = 0;
+}
+
+void arena_release_to_pool(Arena *a, ArenaPool *pool) {
+    arena_destroy(a);
+    arena_pool_give(pool, a->buf);
+    arena_init(a, NULL, 0);
 }
 
 /* yyjson integration */

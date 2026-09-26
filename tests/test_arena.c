@@ -199,6 +199,94 @@ static void test_grow_failure_leaves_block_intact(void) {
     arena_destroy(&a);
 }
 
+static void test_large_bytes_tracks_fallback_blocks(void) {
+    static char buf[64];
+    Arena a;
+    arena_init(&a, buf, sizeof(buf));
+    assert(a.large_bytes == 0);
+
+    arena_alloc(&a, 48); /* in the buffer: not counted */
+    assert(a.large_bytes == 0);
+    char *const big = arena_alloc(&a, 100);
+    assert(big != NULL && a.large_bytes == 100);
+    char *const grown = arena_grow(&a, big, 100, 300); /* newest fallback block: realloc'd */
+    assert(grown != NULL && a.large_bytes == 300);
+    arena_alloc(&a, 50);
+    assert(a.large_bytes == 350);
+
+    arena_reset(&a);
+    assert(a.large_bytes == 0);
+    arena_destroy(&a);
+}
+
+static void test_hand_over_keeps_allocations_and_restarts_source(void) {
+    static char old_buf[128];
+    static char fresh_buf[128];
+    Arena shared;
+    Arena kept;
+    arena_init(&shared, old_buf, sizeof(old_buf));
+    char *const small = arena_alloc(&shared, 16);
+    memcpy(small, "survives reset", 15);
+    char *const big = arena_alloc(&shared, 500); /* fallback block: moves with the hand-over */
+    memset(big, 'b', 500);
+
+    arena_hand_over(&shared, &kept, fresh_buf, sizeof(fresh_buf));
+    assert(kept.buf == old_buf && kept.offset == 16 && kept.large != NULL && kept.large_bytes == 500);
+    assert(shared.buf == fresh_buf && shared.offset == 0 && shared.large == NULL && shared.large_bytes == 0);
+
+    /* the source is reset as usual: the handed-over allocations are untouched */
+    assert(arena_alloc(&shared, 8) == fresh_buf);
+    arena_reset(&shared);
+    assert(strcmp(small, "survives reset") == 0);
+    assert(big[0] == 'b' && big[499] == 'b');
+
+    /* the new owner keeps bump-allocating after what was already there */
+    assert(arena_alloc(&kept, 8) == old_buf + 16);
+    arena_destroy(&kept);
+    arena_destroy(&shared);
+}
+
+static void test_pool_reuses_blocks_and_caps_spares(void) {
+    ArenaPool pool;
+    arena_pool_init(&pool, 256, 2);
+    char *const a = arena_pool_take(&pool);
+    char *const b = arena_pool_take(&pool);
+    char *const c = arena_pool_take(&pool);
+    assert(a != NULL && b != NULL && c != NULL && pool.spare == 0);
+    memset(a, 'a', 256);
+
+    arena_pool_give(&pool, a);
+    arena_pool_give(&pool, b);
+    arena_pool_give(&pool, c); /* past max_spare: freed, not kept (ASan would report a leak otherwise) */
+    assert(pool.spare == 2);
+    arena_pool_give(&pool, NULL);
+    assert(pool.spare == 2);
+
+    /* LIFO reuse, no malloc */
+    assert(arena_pool_take(&pool) == b);
+    assert(arena_pool_take(&pool) == a);
+    assert(pool.spare == 0);
+    arena_pool_give(&pool, a);
+    arena_pool_give(&pool, b);
+    arena_pool_destroy(&pool);
+    assert(pool.spare == 0 && pool.free_head == NULL);
+}
+
+static void test_release_to_pool_frees_fallbacks_and_returns_buffer(void) {
+    ArenaPool pool;
+    arena_pool_init(&pool, 128, 4);
+    Arena a;
+    char *const block = arena_pool_take(&pool);
+    arena_init(&a, block, pool.block_size);
+    arena_alloc(&a, 64);
+    arena_alloc(&a, 1000); /* fallback: freed by the release */
+
+    arena_release_to_pool(&a, &pool);
+    assert(pool.spare == 1 && pool.free_head == block);
+    assert(a.buf == NULL && a.cap == 0 && a.large == NULL && a.large_bytes == 0);
+    arena_pool_destroy(&pool);
+}
+
 int main(void) {
     test_bump_allocations_are_aligned_and_in_buffer();
     test_exact_fit_stays_in_buffer();
@@ -210,6 +298,10 @@ int main(void) {
     test_grow_past_capacity_reuses_fallback_node();
     test_grow_foreign_pointer_is_copied();
     test_grow_failure_leaves_block_intact();
+    test_large_bytes_tracks_fallback_blocks();
+    test_hand_over_keeps_allocations_and_restarts_source();
+    test_pool_reuses_blocks_and_caps_spares();
+    test_release_to_pool_frees_fallbacks_and_returns_buffer();
     printf("test_arena: all tests passed\n");
     return 0;
 }

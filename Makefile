@@ -66,13 +66,14 @@ BODY_LIMIT_TEST_BIN  = $(BIN_DIR)/test_body_limit
 LISTEN_TEST_BIN      = $(BIN_DIR)/test_listen
 BUFFER_BUDGET_TEST_BIN = $(BIN_DIR)/test_buffer_budget
 ARENA_TEST_BIN       = $(BIN_DIR)/test_arena
+DEFER_TEST_BIN       = $(BIN_DIR)/test_defer
 
 TEST_BINS = $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
             $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN) $(URLENCODED_TEST_BIN) \
             $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) \
             $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN) $(PIPELINING_TEST_BIN) \
             $(READ_BUF_TEST_BIN) $(STREAM_TEST_BIN) $(ANSWERED_TEST_BIN) $(BODY_LIMIT_TEST_BIN) \
-            $(LISTEN_TEST_BIN) $(BUFFER_BUDGET_TEST_BIN) $(ARENA_TEST_BIN)
+            $(LISTEN_TEST_BIN) $(BUFFER_BUDGET_TEST_BIN) $(ARENA_TEST_BIN) $(DEFER_TEST_BIN)
 
 .PHONY: all demo test clean test_epoll bench fuzz check-docs
 
@@ -128,6 +129,10 @@ $(READ_BUF_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVE
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(STREAM_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT_LOOP_OBJS) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_stream.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(DEFER_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVENT_LOOP_OBJS) $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_defer.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -222,26 +227,27 @@ ifeq ($(shell test -d $(EPOLL_SHIM_PREFIX) && echo yes),yes)
     PIPELINING_EPOLL_TEST_BIN = $(BIN_DIR)/test_pipelining_epoll
     STREAM_EPOLL_TEST_BIN = $(BIN_DIR)/test_stream_epoll
     ANSWERED_EPOLL_TEST_BIN = $(BIN_DIR)/test_answered_epoll
+    DEFER_EPOLL_TEST_BIN = $(BIN_DIR)/test_defer_epoll
 
 $(OBJ_DIR)/lib/event_loop_epoll_shim.o: lib/event_loop_epoll.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(OBJ_DIR)/lib/event_loop_linux_shim.o: lib/event_loop_linux.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(OBJ_DIR)/tests/test_event_loop_shim.o: tests/test_event_loop.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(OBJ_DIR)/lib/connection_shim.o: lib/connection.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(OBJ_DIR)/tests/test_connection_shim.o: tests/test_connection.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_event_loop_shim.o
 	@mkdir -p $(BIN_DIR)
@@ -253,7 +259,7 @@ $(CONNECTION_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection
 
 $(OBJ_DIR)/tests/test_pipelining_shim.o: tests/test_pipelining.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(PIPELINING_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_pipelining_shim.o
 	@mkdir -p $(BIN_DIR)
@@ -261,26 +267,35 @@ $(PIPELINING_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection
 
 $(OBJ_DIR)/tests/test_stream_shim.o: tests/test_stream.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(STREAM_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_stream_shim.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
 
+$(OBJ_DIR)/tests/test_defer_shim.o: tests/test_defer.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -MMD -MP -c -o $@ $<
+
+$(DEFER_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_defer_shim.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
+
 $(OBJ_DIR)/tests/test_answered_shim.o: tests/test_answered.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(EPOLL_SHIM_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(ANSWERED_EPOLL_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection_shim.o $(OBJ_DIR)/lib/event_loop_epoll_shim.o $(OBJ_DIR)/lib/event_loop_linux_shim.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/router.o $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/middleware.o $(OBJ_DIR)/lib/static.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_answered_shim.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(EPOLL_SHIM_LDFLAGS) $(LDFLAGS)
 
-test_epoll: $(EPOLL_TEST_BIN) $(CONNECTION_EPOLL_TEST_BIN) $(PIPELINING_EPOLL_TEST_BIN) $(STREAM_EPOLL_TEST_BIN) $(ANSWERED_EPOLL_TEST_BIN)
+test_epoll: $(EPOLL_TEST_BIN) $(CONNECTION_EPOLL_TEST_BIN) $(PIPELINING_EPOLL_TEST_BIN) $(STREAM_EPOLL_TEST_BIN) $(ANSWERED_EPOLL_TEST_BIN) $(DEFER_EPOLL_TEST_BIN)
 	./$(EPOLL_TEST_BIN)
 	./$(CONNECTION_EPOLL_TEST_BIN)
 	./$(PIPELINING_EPOLL_TEST_BIN)
 	./$(STREAM_EPOLL_TEST_BIN)
 	./$(ANSWERED_EPOLL_TEST_BIN)
+	./$(DEFER_EPOLL_TEST_BIN)
 endif
 
 test: $(TEST_BINS)
@@ -305,6 +320,7 @@ test: $(TEST_BINS)
 	./$(LISTEN_TEST_BIN)
 	./$(BUFFER_BUDGET_TEST_BIN)
 	./$(ARENA_TEST_BIN)
+	./$(DEFER_TEST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR) cexpress httpServer

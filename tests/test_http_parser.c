@@ -907,6 +907,89 @@ static void test_http_date_for_caches_per_second(void) {
     assert(c == a && strcmp(c, "Sun, 06 Nov 1994 08:49:38 GMT") == 0);
 }
 
+/* Parses the first request of `raw` in place (as the engine does, saved byte restored), copies its wire
+ * bytes to a fresh buffer, clones the Request onto it, then overwrites the original buffer: every
+ * accessor on the clone must still answer from the copy. */
+static void check_clone_survives_buffer_reuse(const char *raw, const char *want_body, const size_t want_body_len) {
+    const size_t raw_len = strlen(raw);
+    char *in_buf = malloc(raw_len + 1);
+    assert(in_buf != NULL);
+    memcpy(in_buf, raw, raw_len + 1);
+    arena_reset(&test_arena);
+
+    ParsedHead head;
+    size_t head_scan = 0;
+    parse_request_head_resume(in_buf, raw_len, &head, &head_scan);
+    ChunkScanState chunk_scan = {0};
+    assert(request_head_is_complete(&head, in_buf, raw_len, &chunk_scan) == 1);
+    Request req;
+    char saved;
+    assert(parse_http_request_in_place(in_buf, raw_len, &head, &req, &test_arena, &saved) == 0);
+    req.param_count = 1; /* match_route's job; filled by hand here */
+    snprintf(req.param_names[0], sizeof(req.param_names[0]), "id");
+    snprintf(req.param_values[0], sizeof(req.param_values[0]), "42");
+    req.body[req.content_length] = saved;
+    const size_t wire_len = request_wire_len(&head, &chunk_scan);
+
+    char *wire = malloc(wire_len + 1);
+    assert(wire != NULL);
+    memcpy(wire, in_buf, wire_len);
+    Request *clone = malloc(sizeof(Request));
+    assert(clone != NULL);
+    memset(clone, 0xAB, sizeof(Request)); /* unused slots must never be read */
+    static char other_buf[256];
+    Arena other;
+    arena_init(&other, other_buf, sizeof(other_buf));
+    request_clone_used(clone, &req, in_buf, wire_len, wire, &other);
+    clone->body[clone->content_length] = '\0';
+
+    memset(in_buf, 'Z', raw_len); /* the next recv on another connection */
+    free(in_buf);
+
+    assert(strcmp(clone->method, "POST") == 0);
+    assert(strcmp(clone->path, "/u") == 0);
+    assert(clone->param_count == 1 && strcmp(clone->param_names[0], "id") == 0 &&
+           strcmp(clone->param_values[0], "42") == 0);
+    assert(strcmp(req_get_query(clone, "q"), "a b") == 0);
+    assert(req_get_query(clone, "missing") == NULL);
+    assert(strcmp(req_get_header(clone, "x-token"), "t0k") == 0);
+    assert(strcmp(req_get_cookie(clone, "sid"), "s1") == 0);
+    assert(clone->arena == &other && other.offset > 0); /* materialized into the clone's arena */
+    assert(clone->content_length == (int)want_body_len);
+    assert(memcmp(clone->body, want_body, want_body_len) == 0 && clone->body[want_body_len] == '\0');
+    assert(clone->body >= wire && clone->body <= wire + wire_len);
+    assert(request_wants_close(clone) == 0);
+    free(clone);
+    free(wire);
+}
+
+static void test_request_clone_used(void) {
+    check_clone_survives_buffer_reuse("POST /u?q=a+b HTTP/1.1\r\nHost: x\r\nX-Token: t0k\r\nCookie: sid=s1\r\n"
+                                      "Content-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\nHost: x\r\n\r\n",
+                                      "hello", 5);
+    check_clone_survives_buffer_reuse("POST /u?q=a+b HTTP/1.1\r\nHost: x\r\nX-Token: t0k\r\nCookie: sid=s1\r\n"
+                                      "Transfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"
+                                      "GET /next HTTP/1.1\r\nHost: x\r\n\r\n",
+                                      "Wikipedia", 9);
+
+    /* cookies split before the clone are copied, not re-split; a view outside the old range is kept */
+    Request src;
+    arena_reset(&test_arena);
+    const char *raw = "GET /c HTTP/1.1\r\nHost: x\r\nCookie: a=1; b=2\r\n\r\n";
+    assert(parse_http_request(raw, strlen(raw), &src, &test_arena) == 0);
+    assert(strcmp(req_get_cookie(&src, "b"), "2") == 0);
+    Request *clone = malloc(sizeof(Request));
+    assert(clone != NULL);
+    memset(clone, 0xAB, sizeof(Request));
+    static char unrelated[16];
+    request_clone_used(clone, &src, unrelated, sizeof(unrelated), unrelated, &test_arena);
+    assert(clone->cookies_parsed == 1 && clone->cookie_count == 2);
+    assert(strcmp(req_get_cookie(clone, "a"), "1") == 0);
+    assert(clone->body == src.body); /* in the arena, not in [unrelated, +16): untouched */
+    assert(clone->headers[0].name == src.headers[0].name);
+    free(clone);
+}
+
 int main(void) {
     test_format_http_date();
     test_http_date_for_caches_per_second();
@@ -929,6 +1012,7 @@ int main(void) {
     test_parse_headers();
     test_parse_cookies();
     test_parse_query_string();
+    test_request_clone_used();
 
     printf("all http parser tests passed\n");
     return 0;

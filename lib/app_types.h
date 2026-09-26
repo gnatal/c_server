@@ -69,6 +69,7 @@
 
 #define ARENA_SIZE (64 * 1024)        /* App.arena's fixed buffer: one shared per-worker bump allocator, not one
                                         * per connection; reset once per request, falls back to malloc beyond this */
+#define ARENA_POOL_MAX_SPARE 64       /* App.arena_pool: free ARENA_SIZE blocks kept for reuse (4 MiB); more are freed */
 #define BUF_SIZE 8192                 /* App.read_buf, and the request-header limit (431 beyond) */
 #define BATCH_BUF_SIZE (16 * 1024)    /* App.batch_buf: pipelined responses coalesced into one write (connection.c) */
 #define IN_BUF_GRANULE 512            /* an owned in_buf for a partial request is its bytes + NUL rounded up to this */
@@ -94,6 +95,8 @@
                                         * this long is closed: a slow reader is fine, one making zero progress at
                                         * all is a client that stopped reading and would otherwise pin the
                                         * connection (fd, arena, out_buf) forever */
+#define DEFER_TIMEOUT_SECONDS 30      /* a deferred request (res_defer) not resumed within this long is answered 504 and
+                                        * closed by the idle sweep */
 #define IDLE_SWEEP_INTERVAL_MS 1000   /* how often idle connections are checked */
 #define SHUTDOWN_TIMEOUT_SECONDS 5    /* graceful-drain deadline before force close */
 #define INITIAL_CONNECTION_TABLE_CAP 1024 /* App.connections slots at start; doubles on demand (bounded by RLIMIT_NOFILE) */
@@ -269,6 +272,8 @@ typedef struct {
 /* ---- connection and event loop ---- */
 
 struct EventLoopOps; /* defined in event_loop_backend.h (private to the Linux event loop) */
+struct App;
+struct DeferredRequest;
 
 /*
  * io_uring backend: what event_loop_io_uring.c has registered for one fd. Polls are one-shot and
@@ -427,6 +432,15 @@ typedef struct Connection {
 
     int events_watched;     /* EVENT_READ | EVENT_WRITE currently registered with the event loop */
 
+    /* The App this connection belongs to (connection_create). res_defer reaches the arena pool, the budget and
+     * the handle table through it. NULL on a hand-built test Connection: res_defer then refuses. */
+    struct App *app;
+
+    /* Non-NULL from res_defer until the deferred response is finished (written, or the connection closed).
+     * While set, response_pending is true: nothing is read or served on this connection, only a peer
+     * hang-up is watched for. See DeferredRequest. */
+    struct DeferredRequest *deferred;
+
     /* Per-request bump allocator: a pointer to the single arena shared by every connection this
      * worker process serves (`App.arena`), not one embedded per connection - set once, at
      * connection_create, and never reassigned. Safe because the event loop is single-threaded and
@@ -455,7 +469,8 @@ typedef enum {
     LOOP_EVENT_SIGNAL,
     LOOP_EVENT_TIMER_IDLE,
     LOOP_EVENT_TIMER_SHUTDOWN,
-    LOOP_EVENT_ERROR
+    LOOP_EVENT_ERROR,
+    LOOP_EVENT_EXTERNAL     /* an fd registered with app_watch_fd; `ready` says what happened */
 } LoopEventType;
 
 typedef struct {
@@ -463,7 +478,26 @@ typedef struct {
     int fd;
     Connection *conn;
     int signo;
+    unsigned ready;         /* LOOP_EVENT_EXTERNAL only: WATCH_READ | WATCH_WRITE | WATCH_ERROR */
 } LoopEvent;
+
+/* ---- external fds (app_watch_fd) ---- */
+
+#define WATCH_READ 1u
+#define WATCH_WRITE 2u
+#define WATCH_ERROR 4u   /* reported only: the kernel saw an error or hang-up (reads may still return buffered bytes) */
+
+/* Called from the event loop when a watched fd is ready. `events` is WATCH_READ / WATCH_WRITE / WATCH_ERROR.
+ * May be called spuriously (the fd must be non-blocking). May call res_resume, app_watch_fd, app_unwatch_fd. */
+typedef void (*FdReadyFn)(struct App *app, int fd, unsigned events, void *udata);
+
+/* App.watched[fd]: an application-owned fd the event loop watches. fn == NULL = slot unused. */
+typedef struct {
+    FdReadyFn fn;
+    void *udata;
+    unsigned wanted;        /* WATCH_READ | WATCH_WRITE the application asked for */
+    int events_watched;     /* EVENT_READ | EVENT_WRITE registered with the backend (same role as Connection's) */
+} WatchedFd;
 
 /* ---- response ---- */
 
@@ -518,6 +552,45 @@ typedef struct {
     int headers_sent;
     int stream_ended;
 } Response;
+
+/* ---- deferred responses (res_defer / res_resume) ---- */
+
+/* 0 = no handle. Otherwise (generation << 32) | (slot index + 1) into App.defer_slots: a handle whose
+ * generation no longer matches its slot (request finished, client gone, deadline) resolves to nothing. */
+typedef uint64_t DeferHandle;
+
+typedef enum {
+    DEFER_IN_HANDLER = 0, /* res_defer called, the handler has not returned yet; `res` is the handler's own Response */
+    DEFER_WAITING,        /* parked: request and response copied into `arena`, nothing pending on the socket */
+    DEFER_READY           /* res_resume called: the response is being (or has been) built, written after this event */
+} DeferState;
+
+/*
+ * A request whose response is produced after its handler returned. Lives inside its own `arena` (the
+ * worker arena as it was at res_defer, taken over with arena_hand_over), so its address never moves and
+ * everything the handler allocated before deferring stays valid. Released (arena back to App.arena_pool,
+ * slot generation bumped) once the response is written or the connection closes.
+ */
+typedef struct DeferredRequest {
+    Arena arena;
+    Connection *conn;
+    Request *req;         /* NULL while DEFER_IN_HANDLER; then a copy in `arena` whose views point into its own
+                           * copy of the request's wire bytes */
+    Response *res;        /* the handler's stack Response while DEFER_IN_HANDLER, then a copy in `arena` */
+    char *prefix;         /* malloc'd: responses pipelined before this request that the socket did not take when
+                           * it was parked; written in front of this response. NULL if none */
+    size_t prefix_len;
+    time_t deadline;      /* res_defer time + DEFER_TIMEOUT_SECONDS */
+    uint32_t slot;        /* index in App.defer_slots */
+    DeferState state;
+} DeferredRequest;
+
+/* App.defer_slots entry: dr == NULL = free (then next_free links the free list). */
+typedef struct {
+    DeferredRequest *dr;
+    uint32_t gen;
+    uint32_t next_free;
+} DeferSlot;
 
 /* ---- handlers, middleware, routing ---- */
 
@@ -645,7 +718,7 @@ typedef struct {
 /* The whole server. About 4.6 KB on macOS, routes live on the heap: a local or static App is fine. A
  * Router is much larger (64 routes, about 88 KB on macOS): make it static if it is big. Create with
  * app_init, end with app_destroy. */
-typedef struct {
+typedef struct App {
     ServerConfig config;
     MethodTree method_trees[16];
     int method_tree_count;
@@ -728,6 +801,13 @@ typedef struct {
      * it mallocs" convention arena.h documents for a hand-built Arena). */
     Arena arena;
 
+    /* Spare ARENA_SIZE blocks for arena_hand_over: a request that must outlive its dispatch cycle takes
+     * over App.arena's current buffer (everything it allocated stays valid) and App.arena restarts on a
+     * block from here; the kept buffer comes back here once that request's response is finished. Every
+     * block, App.arena's own included, is a plain malloc of ARENA_SIZE, so whichever one App.arena holds
+     * at app_destroy is freed like the first. Initialized by app_init, spares freed by app_destroy. */
+    ArenaPool arena_pool;
+
     /* the receive buffer (BUF_SIZE) a connection with nothing buffered borrows in handle_readable
      * - one per worker process, not per connection. Only ever lent for the duration of one
      * handle_readable call (see Connection.in_buf), so a single buffer is enough under the
@@ -744,6 +824,21 @@ typedef struct {
      * malloc'd by app_init, freed by app_destroy. */
     char *batch_buf;
     size_t batch_len;
+
+    /* Deferred responses. defer_slots: handle table, grown by doubling (malloc'd by the first res_defer,
+     * freed by app_destroy); defer_free_head = first free slot, UINT32_MAX when none. defer_ready: handles
+     * res_resume marked ready during the current event, written by serve_resumed right after it (sized to
+     * defer_slots_cap, freed by app_destroy). */
+    DeferSlot *defer_slots;
+    uint32_t defer_slots_cap;
+    uint32_t defer_free_head;
+    DeferHandle *defer_ready;
+    size_t defer_ready_len;
+    size_t defer_ready_cap;
+
+    /* app_watch_fd registrations, indexed by fd, grown on demand (realloc), freed by app_destroy. */
+    WatchedFd *watched;
+    int watched_cap;
 } App;
 
 #endif /* APP_TYPES_H */

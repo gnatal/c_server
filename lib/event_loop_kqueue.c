@@ -77,16 +77,19 @@ void event_loop_close(App *app) {
     }
 }
 
-/* The Connection whose interest set is tracked for fd, or NULL (listen socket, or an fd
- * that is not a client connection). Tracking events_watched lets watch/unwatch skip the
- * kevent() syscall when the kernel already has the requested state: every keep-alive
- * response used to cost one failing EV_DELETE (ENOENT) for a write filter never added. */
-static Connection *tracked_conn(const App *app, const int fd, void *udata) {
+/* The tracked interest bits for fd: its Connection's, or its app_watch_fd entry's, or NULL (listen
+ * socket). Tracking events_watched lets watch/unwatch skip the kevent() syscall when the kernel already
+ * has the requested state: every keep-alive response used to cost one failing EV_DELETE (ENOENT) for a
+ * write filter never added. */
+static int *interest_bits(const App *app, const int fd, void *udata) {
     if (udata != NULL) {
-        return (Connection *)udata;
+        return &((Connection *)udata)->events_watched;
     }
-    if (app->connections != NULL && fd < app->connections_cap) {
-        return app->connections[fd];
+    if (app->connections != NULL && fd < app->connections_cap && app->connections[fd] != NULL) {
+        return &app->connections[fd]->events_watched;
+    }
+    if (fd < app->watched_cap && app->watched[fd].fn != NULL) {
+        return &app->watched[fd].events_watched;
     }
     return NULL;
 }
@@ -101,13 +104,13 @@ static int watch(App *app, const int fd, const int16_t filter, const int bit, vo
     if (app == NULL || app->kq < 0 || fd < 0) {
         return -1;
     }
-    Connection *conn = tracked_conn(app, fd, udata);
-    if (conn != NULL && (conn->events_watched & bit)) {
+    int *const bits = interest_bits(app, fd, udata);
+    if (bits != NULL && (*bits & bit)) {
         return 0;
     }
     const int rc = kevent_change(app, fd, filter, EV_ADD | EV_ENABLE, udata);
-    if (rc == 0 && conn != NULL) {
-        conn->events_watched |= bit;
+    if (rc == 0 && bits != NULL) {
+        *bits |= bit;
     }
     return rc;
 }
@@ -116,13 +119,13 @@ static int unwatch(App *app, const int fd, const int16_t filter, const int bit) 
     if (app == NULL || app->kq < 0 || fd < 0) {
         return -1;
     }
-    Connection *conn = tracked_conn(app, fd, NULL);
-    if (conn != NULL && !(conn->events_watched & bit)) {
+    int *const bits = interest_bits(app, fd, NULL);
+    if (bits != NULL && !(*bits & bit)) {
         return 0;
     }
     const int rc = kevent_change(app, fd, filter, EV_DELETE, NULL);
-    if (conn != NULL) {
-        conn->events_watched &= ~bit;
+    if (bits != NULL) {
+        *bits &= ~bit;
     }
     if (rc < 0 && (errno == ENOENT || errno == EBADF)) {
         return 0;
@@ -151,9 +154,9 @@ int event_loop_release_fd(App *app, int fd) {
     if (app == NULL || app->kq < 0 || fd < 0) {
         return -1;
     }
-    Connection *conn = tracked_conn(app, fd, NULL);
-    if (conn != NULL) {
-        conn->events_watched = 0;
+    int *const bits = interest_bits(app, fd, NULL);
+    if (bits != NULL) {
+        *bits = 0;
     }
     /* No EV_DELETE: the caller closes fd next, and close() drops every knote on it. */
     return 0;
@@ -195,6 +198,7 @@ int event_loop_poll(App *app, LoopEvent *out_events, int max_events, int timeout
         ev->fd = (int)kev->ident;
         ev->conn = (Connection *)kev->udata;
         ev->signo = 0;
+        ev->ready = 0;
 
         if (kev->filter == EVFILT_SIGNAL) {
             ev->type = LOOP_EVENT_SIGNAL;
@@ -209,6 +213,13 @@ int event_loop_poll(App *app, LoopEvent *out_events, int max_events, int timeout
             }
         } else if (app->server_fd >= 0 && (int)kev->ident == app->server_fd) {
             ev->type = LOOP_EVENT_ACCEPT;
+        } else if (kev->udata == NULL && ev->fd < app->watched_cap && app->watched[ev->fd].fn != NULL) {
+            /* app_watch_fd registers with NULL udata; a connection always carries its Connection */
+            ev->type = LOOP_EVENT_EXTERNAL;
+            ev->ready = kev->filter == EVFILT_WRITE ? WATCH_WRITE : WATCH_READ;
+            if (kev->flags & (EV_ERROR | EV_EOF)) {
+                ev->ready |= WATCH_ERROR;
+            }
         } else {
             if (kev->flags & EV_ERROR) {
                 ev->type = LOOP_EVENT_ERROR;

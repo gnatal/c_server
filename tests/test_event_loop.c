@@ -213,6 +213,42 @@ static void test_noop_interest_changes_skip_the_kernel(void) {
     app_destroy(&app);
 }
 
+static void ignore_ready(App *app, int fd, unsigned events, void *udata) {
+    (void)app;
+    (void)fd;
+    (void)events;
+    (void)udata;
+}
+
+/* The same rule for an app_watch_fd registration: its bits live in App.watched[fd]. Registered before the loop
+ * opens (stored only), then tracked as read-only without the kernel knowing: re-asking for the same interest
+ * returns 0 and changes nothing. On kqueue and epoll a syscall would have registered the fd, and the pending
+ * byte would be reported; io_uring decides from its own poll registry (App.poll_regs), so only the bits are checked. */
+static void test_noop_interest_changes_skip_the_kernel_for_watched_fds(void) {
+    App app;
+    app_init(&app);
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    assert(app_watch_fd(&app, fds[0], WATCH_READ, ignore_ready, NULL) == 0); /* loop not open: stored only */
+    assert(app.watched[fds[0]].events_watched == 0);
+    assert(event_loop_init(&app) == 0);
+
+    app.watched[fds[0]].events_watched = EVENT_READ;
+    assert(app_watch_fd(&app, fds[0], WATCH_READ, ignore_ready, NULL) == 0);
+    assert(app.watched[fds[0]].events_watched == EVENT_READ);
+    if (strcmp(event_loop_backend_name(&app), "io_uring") != 0) {
+        assert(write(fds[1], "x", 1) == 1);
+        LoopEvent events[8];
+        assert(event_loop_poll(&app, events, 8, 50) == 0);
+    }
+
+    app.watched[fds[0]].events_watched = 0; /* nothing registered: the unwatch is a no-op too */
+    assert(app_unwatch_fd(&app, fds[0]) == 0);
+    close(fds[0]);
+    close(fds[1]);
+    app_destroy(&app);
+}
+
 /* connection.c assumes level-triggered readiness: it serves one request and returns, expecting to be
  * called again while unread bytes remain, and yields a still-writable socket expecting a write event
  * next turn. Readiness left in place must be reported again on every poll. */
@@ -385,6 +421,7 @@ static void run_contract_tests(void) {
     test_event_loop_shutdown_timer_arm();
     test_interest_changes_are_never_errors();
     test_noop_interest_changes_skip_the_kernel();
+    test_noop_interest_changes_skip_the_kernel_for_watched_fds();
     test_readiness_is_level_triggered();
     test_reused_fd_gets_no_stale_events();
     test_release_fd_leaves_removal_to_close();

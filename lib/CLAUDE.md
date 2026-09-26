@@ -21,7 +21,8 @@ Linux, each opens its own listen socket sharing the port via `SO_REUSEPORT` (4-t
 only the master binds and `accept()`s; each accepted fd is handed to a worker over a private socketpair via `SCM_RIGHTS`,
 round-robin (see "Behavior reference, Workers and fork"). Either way, a master respawns any worker that dies, with backoff
 and a restart budget (same section). Handlers run synchronously on the loop: a blocking call (DB,
-sleep) stalls that whole worker, so scale with workers, not threads. State is per process; there is no shared memory.
+sleep) stalls that whole worker. A handler that must wait on I/O defers instead (`res_defer`, then `res_resume` from
+an `app_watch_fd` callback; see "Behavior reference, Deferred responses"), so the worker keeps serving meanwhile. State is per process; there is no shared memory.
 If io_uring is requested but refused (Docker's default seccomp profile does this: `EPERM`), `event_loop_init` logs why and fails, and `app_listen_worker` exits; it never falls back to epoll.
 
 Per request (`connection.c: handle_readable` → `serve_buffered_requests`, which repeats steps 1-6 for every complete request already in `in_buf`, starting at `conn->in_off` - pipelining, see "Behavior reference, Pipelining"):
@@ -41,12 +42,12 @@ response building never touch a socket, so tests drive them with a fake `Connect
 | File | Responsibility |
 |---|---|
 | `app_types.h` | every struct/typedef and every compile-time limit |
-| `arena.c/h` | bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`); one shared per worker process (`App.arena`), not one per connection |
+| `arena.c/h` | bump allocator (`arena_alloc`, `arena_reset`, `arena_yyjson_alc`); one shared per worker process (`App.arena`), not one per connection. Also `arena_hand_over` (move an arena's allocations to another `Arena` without copying) and `ArenaPool` (free list of `ARENA_SIZE` blocks, `App.arena_pool`) |
 | `http_parser.c/h` | request parsing on top of picohttpparser, framing (Content-Length / chunked), accessors, `status_text`. One `parse_request_head` pass feeds the body-limit check, completeness check and full parse; `request_framing`/`request_is_complete`/`parse_http_request` are thin wrappers kept for existing callers. Headers are stored as views into the input buffer and cookies are split lazily, on first access |
 | `router.c/h` | route registration, one Patricia (segment-radix) tree per method, `app_mount`, `app_serve_static`, `app_free_routes` |
 | `middleware.c/h` | pipeline (`chain_next`, `chain_error`, `dispatch`), 404/405/OPTIONS defaults |
 | `response.c/h` | response head assembly, cookies, chunked streaming (`res_write`, buffered), producer streaming (`res_stream`: builds the head and records the producer; `stream_write` frames chunks), file streaming |
-| `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen |
+| `connection.c/h` | accept, read/parse/dispatch/flush, buffer growth, idle timeout, shutdown, listen; deferred responses (`res_defer`/`res_resume`/`req_deferred`, handle table, park/finish), application fds (`app_watch_fd`), one loop turn (`app_run_once`) |
 | `event_loop.h` + `event_loop_kqueue.c` / `event_loop_io_uring.c` / `event_loop_epoll.c` | one API over three backends (fds, timers, signals). On Linux `event_loop_linux.c` implements `event_loop.h` by forwarding through `App.loop_ops` to the static functions behind `io_uring_loop_ops` / `epoll_loop_ops` (`event_loop_backend.h`, private); kqueue implements it directly |
 | `cluster.c/h` | fork workers, respawn (with backoff and a restart budget), drain; on macOS/BSD (`CEXPRESS_SINGLE_ACCEPTOR`) also the single acceptor - binds the one listen socket, `accept()`s, and hands fds to workers round-robin over per-worker socketpairs |
 | `static.c/h` | traversal-safe file serving, with an in-memory cache of recently served files |
@@ -65,7 +66,7 @@ body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 (name 63, value u
 form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB each, 64 MiB total per worker process, 1 s revalidation
 (`STATIC_CACHE_*`, `static.c`; a file over the per-entry cap is served but never cached; see "Static" below) ·
 producer stream output 16 KiB per producer call (`STREAM_CHUNK_SIZE`; one `stream_write` ≤ `STREAM_WRITE_MAX`) and no total cap · idle timeout 60 s · request header deadline 10 s · request body deadline 30 s ·
-pending-response write-stall deadline 30 s · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response, logged; the only bound on a response header value) ·
+pending-response write-stall deadline 30 s · deferred response (`res_defer`) 30 s, then 504 (`DEFER_TIMEOUT_SECONDS`) · spare arena blocks 64 (`ARENA_POOL_MAX_SPARE`) · drain deadline 5 s · response head 8 KiB (larger: the connection is closed without a response, logged; the only bound on a response header value) ·
 worker init hooks 4 · cluster workers 128 · arena 64 KiB, one per worker process, not per connection (see below; exceeding it falls back to malloc, it is not a limit) ·
 max connections 10,000 per worker (`ServerConfig.max_connections`, `DEFAULT_MAX_CONNECTIONS`; a runtime config field, not a compile-time-only limit like the others here - `0` opts out, uncapped) ·
 buffered memory 256 MiB per worker (`ServerConfig.max_buffered_bytes`, `DEFAULT_MAX_BUFFERED_BYTES`, runtime, `0` = no budget; see "Buffered-memory budget" below) ·
@@ -121,6 +122,19 @@ read-turn that leaves it incomplete; complete requests - the common case - are n
 Measured on macOS (demo, one worker, 5,000 connections, RSS delta): about **239 B per idle keep-alive connection**
 after one request and **216 B** for an accepted-but-silent one, down from about 8.4 KB each before the shared receive buffer (44 MB → 1.2 MB
 for 5,000). Kernel socket buffers are not in RSS. `/ping` throughput unchanged (wrk, 50 connections, three rounds).
+**Memory that outlives one dispatch cycle (arena hand-over).** A request that must keep its arena after its
+handler returns (the planned deferred responses) will not copy anything: `arena_hand_over(&app->arena, &kept, block,
+ARENA_SIZE)` moves the buffer, offset, fallback list and `large_bytes` into `kept`, and `App.arena` restarts on a block
+from `App.arena_pool`. Valid because `App.arena` holds only the current request's allocations at dispatch time (it is
+reset after every one). Every pointer into those allocations stays valid; a pointer *to the `App.arena` struct* (a
+`conn->arena`, a `yyjson_alc` made before the hand-over) keeps allocating from `App.arena`, i.e. from the fresh block.
+The kept arena goes back with `arena_release_to_pool` (fallback blocks freed, buffer back on the free list). Every block,
+`App.arena`'s own included, is a plain `malloc(ARENA_SIZE)`, so they are interchangeable and `app_destroy` frees whichever
+one `App.arena` holds. `Arena.large_bytes` (fallback bytes, maintained on the `malloc`/`realloc` fallback paths only)
+lets a kept arena be charged to the buffered-memory budget as `ARENA_SIZE + large_bytes`. `request_clone_used`
+(`http_parser.c`) and `response_clone_used` (`response.c`) copy only the used slots of the ~10 KB stack `Request` /
+`Response` into such an arena; the Request clone rebases header and body views from `in_buf` onto a copy of the
+request's wire bytes. Used by `res_defer` (see "Behavior reference, Deferred responses").
 The arena serves everything that lives for one request (except `Request.body`, a view into `in_buf` - see
 "Behavior reference, Request parsing"): the initial `conn->out_buf` build (`res_*`), response header and trailer
 values (`ResponseHeader.value`, copied by `res_set_header`/`res_set_trailer`; an overwrite leaves the old copy until reset),
@@ -147,6 +161,11 @@ and `res_send_file` never copies the body into the arena either (see above).
 | `conn->in_buf` (NULL while nothing is buffered) | not allocated while it borrows `App.read_buf` (during one `handle_readable`); owned copy: `stop_borrowing_read_buf` (unserved bytes left at the end of `handle_readable`, sized to them rounded up to `IN_BUF_GRANULE`), `grow_head_buf` (a header block filling that copy; realloc, up to `BUF_SIZE`) or `grow_in_buf` (a body past the buffer; realloc on further growth) | the owned copy: `flush_connection`'s keep-alive reset once nothing is buffered, or `connection_close`. The borrowed `App.read_buf`: never through `conn` |
 | `App.read_buf` (`BUF_SIZE`, one per worker process) | `app_init` | `app_destroy` |
 | `App.batch_buf` (`BATCH_BUF_SIZE`, one per worker process; non-empty only inside one `serve_buffered_requests` call) | `app_init` | `app_destroy`. Its bytes are never owned by a connection: `take_batch` points `out_buf` at it (or at an arena copy when batch + response exceed it), and an `EAGAIN` copies the unsent part into an owned tail like any arena response |
+| `App.arena_pool` spare blocks (`ARENA_SIZE` each, at most `ARENA_POOL_MAX_SPARE` = 64 kept) | `arena_pool_take` (`malloc` when the free list is empty) | `arena_pool_give` past `max_spare`, or `arena_pool_destroy` in `app_destroy`. A block taken out belongs to the taker until given back (a kept arena: `arena_release_to_pool`); `App.arena`'s current block is freed by `app_destroy` directly |
+| `DeferredRequest` (with its kept `Request`, `Response` and wire-byte copy) | `res_defer`: allocated from `App.arena` just before `arena_hand_over` moves that whole arena into `dr->arena`, so it lives inside its own arena; `park_deferred` allocates the copies there | `release_deferred`: after the response's `flush_connection` (`finish_deferred`, or the serve loop when answered inside the handler), or in `connection_close`. The arena's fallback blocks are freed and its buffer goes back to `App.arena_pool` (`arena_release_to_pool` on a copy of the `Arena` struct, since `dr` is inside it) |
+| `DeferredRequest.prefix` (unsent tail of the batch flushed when a request parks) | `keep_unsent_and_wait`'s tail copy, ownership moved by `park_deferred` | `detach_deferred` (joined in front of the response, then freed) or `release_deferred` |
+| `App.defer_slots`, `App.defer_ready` | `defer_slot_take` (first `res_defer`, grown by doubling; `defer_ready` sized along); `queue_resumed` grows `defer_ready` if needed | `app_destroy` |
+| `App.watched` (`WatchedFd` per fd) | `app_watch_fd` (grown by doubling) | `app_destroy`. The fds themselves belong to the application: `app_unwatch_fd` before closing them |
 | `conn->arena` | not allocated - always `&app->arena`, set once at `connection_create` | nobody frees it through `conn`; `app_destroy` frees the one underlying `App.arena` after every connection is already closed |
 | `conn->stream_buf` (a connection-owned `STREAM_CHUNK_SIZE` turn buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response on the `pread` fallback (`file_no_sendfile`; never on the `sendfile` path) or the first producer call of a `res_stream` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
 | `conn->stream_ctx` (the application's producer state, handed over by `res_stream`) | the handler (application code), before `res_stream` | `stream_release` (`response.c`) calls `stream_ctx_free(ctx)` exactly once: after `STREAM_END` (in `flush_connection`), on `STREAM_ABORT` or any close (`connection_close`), when a later `res_*` in the same handler replaces the stream, or inside `res_stream` for HEAD. If `res_stream` returns -1 the caller still owns it |
@@ -419,6 +438,59 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   worker, `curl --limit-rate 2M`): the same 8.4 MB CSV took the server from about 1.5 MB to 38 MB RSS through
   `res_write` (and was truncated, see Known gaps), and stayed at 1.6 MB through `res_stream`. A 63 MB export also
   stayed at 1.6 MB.
+- **Deferred responses (`res_defer` / `res_resume`, `connection.c`).** For handlers that wait on I/O. States
+  (`DeferredRequest.state`): `DEFER_IN_HANDLER` → `DEFER_WAITING` → `DEFER_READY` → released.
+  **`res_defer`** (inside the handler): refuses (0, nothing changed) if a response was started, the request is already
+  deferred, or the Connection has no `app`; refuses with a 503 built if `budget_allows(ARENA_SIZE + request_len)` fails
+  or an allocation fails. Otherwise allocates `dr` in `App.arena`, takes a pool block, gets a slot, and
+  `arena_hand_over(&app->arena, &dr->arena, block)`: everything the handler allocated (header values, JSON) moves with
+  `dr`, `App.arena` restarts on the block, and `conn->arena = &dr->arena`, so every later `res_*` builds there.
+  **After `dispatch`** (`serve_buffered_requests`): if the handler also answered (`res_resume` inside it, or a plain
+  send), `detach_deferred` and the response goes the ordinary way (coalesced or flushed), then `release_deferred`.
+  Otherwise **`park_deferred`**: copy the request's wire bytes, the used `Request` fields (views rebased onto the copy,
+  body NUL-terminated there, `req.arena` = `dr->arena`) and the `Response` into `dr->arena`; consume the request from
+  `in_buf` at once (`in_off += request_len`, `request_len = 0`: the final keep-alive reset consumes nothing more); flush
+  the coalesced batch in front of it with `keep_alive` forced to 1 (the batch belongs to earlier keep-alive requests;
+  with the deferred request's own `Connection: close` the flush would close before it is answered); if the socket does
+  not take the whole batch, its owned tail moves to `dr->prefix`. Invariant: **a `DEFER_WAITING` connection has no
+  `out_buf`**, so `res_*` at resume never overwrite pending bytes. Interest: read only (hang-up detection), no write.
+  **While deferred** `response_pending` is true (via `conn->deferred`): nothing is read or served, pipelined requests
+  wait in order, `app_stop` sets `keep_alive = 0` instead of closing, `stop_borrowing_read_buf` copies followers out of
+  `App.read_buf`. Read readiness goes to `watch_stream_peer` (as for a parked stream): EOF closes (the client left:
+  `release_deferred`, handle stale), real bytes drop read interest. `close_idle_connections` applies only
+  `dr->deadline` (`DEFER_TIMEOUT_SECONDS`, 30 s, from `res_defer`): past it, the kept Response is `res_init`'ed
+  (HEAD flag kept), 504 + `Connection: close`, written through `finish_deferred`. Idle, request and write-stall
+  deadlines do not apply. It counts as an open connection, so shutdown drains it within `SHUTDOWN_TIMEOUT_SECONDS`.
+  **`res_resume`** marks `DEFER_READY` and (from `WAITING`) queues the handle in `App.defer_ready`; it never writes.
+  **`serve_resumed`** runs from `app_run_once` after every event and once before each poll (a resume made outside any
+  event would otherwise wait for an unrelated one): for each queued handle still live and ready, `finish_deferred` -
+  `detach_deferred` (500 if nothing was built; `prefix` joined in front in one `dr->arena` block; `conn->deferred =
+  NULL`, `conn->arena` back to `App.arena`), `flush_connection`, `release_deferred`, then `serve_buffered_requests` for
+  whatever was pipelined behind it. Safe because it runs at the loop's top level: no other connection's serve loop is on
+  the stack, `batch_len == 0`, `App.arena` is empty. No syscall beyond the response's own write (the alternative,
+  waking through write readiness like `app_wake_streams`, costs two `epoll_ctl` per response). If `defer_ready` cannot
+  grow, `res_resume` arms write interest instead and `handle_writable` finishes a `DEFER_READY` request.
+  **Handles** (`DeferHandle`, `uint64_t`): `(gen << 32) | (slot + 1)`, 0 = none. `App.defer_slots[slot]` holds `dr`
+  and `gen`; `release_deferred` bumps `gen` (never 0) and frees the slot, so every copy of the handle resolves to NULL,
+  also after the slot is reused. The queue stores handles, not pointers, so a request closed between `res_resume` and
+  the drain is skipped. Applications never hold a pointer into engine memory, so `dr` can be freed the moment its
+  connection closes; there is no cancel callback (the stale-handle rule replaces it).
+  **Budget**: `owned_bytes` charges `ARENA_SIZE + dr->arena.large_bytes + prefix_len` per deferred connection.
+- **Application fds (`app_watch_fd`, `connection.c` + every backend).** `App.watched[fd]` (`WatchedFd`: callback,
+  udata, `wanted` interest, tracked `events_watched`). Refused for the listen socket and client connections: an fd
+  number is either a Connection or watched. `apply_watch` maps `wanted` onto `event_loop_watch_*`/`unwatch_*` with
+  udata NULL; each backend's `interest_bits` finds the tracked bits in the Connection (udata or `connections[fd]`),
+  else in `App.watched[fd]`, so the no-syscall-when-unchanged rule holds for watched fds too. Registered before the loop
+  exists (a worker-start hook runs before `event_loop_init`) = stored only; `app_listen_worker` applies them after
+  init (`apply_pending_watches`). `app_unwatch_fd` makes a real removal (the fd stays open), unlike
+  `event_loop_release_fd`. Poll: a ready fd with no Connection and a watched entry becomes `LOOP_EVENT_EXTERNAL` with
+  `LoopEvent.ready` = `WATCH_READ`/`WATCH_WRITE`/`WATCH_ERROR` (epoll ERR/HUP, io_uring POLLERR/HUP/NVAL or a negative
+  result, kqueue `EV_ERROR`/`EV_EOF`; kqueue reports one event per filter, the others one per fd). `handle_event`
+  re-checks `watched[fd].fn` before calling it, so a callback unwatched earlier in the same batch is never called.
+  io_uring does not re-arm a poll after an error: after `WATCH_ERROR` the application unwatches.
+- **Event-loop turn (`app_run_once`).** Drain resumed responses, `event_loop_poll`, then for each event `handle_event`
+  followed by `serve_resumed` if anything was resumed; after the batch, `LOOP_TURN_EXIT` once shutting down with no
+  connection left. `app_listen_worker` is a loop over it (EINTR retried, EBADF during shutdown ends it).
 - **Response safety.** Header names/values, trailers and cookie fields containing control characters are dropped
   (response-splitting defense); `res_redirect` with such a target answers 500. `Content-Length`, `Connection` and `Date` are engine-owned.
   Header and trailer values are never shortened: `set_named_value` (`response.c`) copies them whole into `conn->arena`
@@ -697,6 +769,9 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
 - **Multiple `res_send` calls leave dead copies in the arena** until the request ends, and so does chunked or yyjson growth when another arena allocation sits after the growing block (see Memory model). For large bodies use `res_stream`, which never touches the arena past the head.
 - **`res_write` silently truncates at its cap** (MEASURED 2026-09-23 while measuring `res_stream`): `append_to_out_buf` refuses anything past `MAX_BODY_SIZE + 8 KiB` of *wire* bytes, chunk framing included, and `res_write` ignores the failure. A CSV of 450,000 short lines (8,426,423 body bytes, about 11 MB framed) went out as 7,947,523 bytes with status 200 and no error anywhere. The handler cannot tell. `res_stream` has no such cap.
 - **A parked `res_stream` producer whose client vanished silently is only noticed on its next write**. A FIN/RST is caught at once (`watch_stream_peer`), but once a pipelined request has arrived behind the stream, read interest is dropped and only a write can fail. A producer that parks indefinitely without ever writing holds its connection and ctx until shutdown; long-lived streams should write a heartbeat (an SSE comment line, `:\n\n`) every so often - the idle sweep calls them about once a second, so they can check the time.
+- **No cancel callback for deferred requests**: an application learns that a request is gone only when `res_resume`
+  returns NULL, so work for a client that left still runs to completion (its result is dropped).
+- **A deferred request closes on a client half-close** (FIN after sending, e.g. `printf ... | nc`), like a parked stream.
 - **`app_wake_streams` is O(connection table) and wakes every paused stream on the worker**, not a channel's subscribers; producers with nothing new just park again. It is per process: in a cluster, a publish reaches only the worker that handled it.
 - The io_uring backend is used only as a readiness poller; sockets are still read and written with `recv` / `write`.
 - **wrk against Linux in Docker reports "timeout" counts close to the connection count** (for example 900-1650 at
@@ -710,5 +785,6 @@ Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUIL
 ## Where to change what
 Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`. Change producer streaming (`res_stream`, parking, waking) → `response.c` + `connection.c` (`flush_connection`, `park_stream`/`resume_stream`, `watch_stream_peer`) + `tests/test_stream.c`. Add a parser feature → `http_parser.c/h` +
 `tests/test_http_parser.c` (or `test_http_hardening.c` for a bug regression) + a case in `tests/fuzz_parser.c` seeds. Add a route feature → `router.c/h` + `tests/test_router.c`.
+Change deferred responses or application fds → `connection.c` (`res_defer`, `park_deferred`, `detach_deferred`, `finish_deferred`, `serve_resumed`, `app_watch_fd`, `handle_event`) + the three backends' `interest_bits`/poll classification + `tests/test_defer.c` (run it on epoll and io_uring too).
 Add middleware behavior → `middleware.c` + `tests/test_middleware.c`. New public function → declare it in the header and list it in
 `API.md` (`make check-docs` enforces this). New recipe → `examples/cookbook.c` + `tests/test_cookbook.c`. Anything allocated per request → the arena.

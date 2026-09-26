@@ -252,6 +252,7 @@ Connection *connection_create(App *app, int fd) {
      * otherwise-silent connection is bounded by IDLE_TIMEOUT_SECONDS below, same as before (targets
      * a request that is under way but moving too slowly, not one that never starts). */
     conn->arena = &app->arena; /* shared per-worker arena, not one allocated per connection */
+    conn->app = app;
     return conn;
 }
 
@@ -270,6 +271,10 @@ static size_t owned_bytes(const App *app, const Connection *conn) {
     if (conn->stream_buf != NULL) {
         n += STREAM_CHUNK_SIZE;
     }
+    if (conn->deferred != NULL) {
+        /* its whole arena (the handed-over worker buffer + fallback blocks) and a held batch tail */
+        n += ARENA_SIZE + conn->deferred->arena.large_bytes + conn->deferred->prefix_len;
+    }
     return n + shared_body_left(conn);
 }
 
@@ -284,6 +289,73 @@ static void sync_held_bytes(App *app, Connection *conn) {
 /* 1 if the worker may hold `extra` more bytes. */
 static int budget_allows(const App *app, const size_t extra) {
     return app->config.max_buffered_bytes == 0 || app->buffered_bytes + extra <= app->config.max_buffered_bytes;
+}
+
+/* ---- deferred-response handle table (App.defer_slots) ---- */
+
+static DeferHandle make_handle(const uint32_t gen, const uint32_t slot) {
+    return ((DeferHandle)gen << 32) | ((DeferHandle)slot + 1);
+}
+
+/* The live DeferredRequest `h` names, or NULL (0, out of range, or a generation that has moved on). */
+static DeferredRequest *defer_lookup(const App *app, const DeferHandle h) {
+    const uint64_t index = h & 0xFFFFFFFFu;
+    if (app == NULL || index == 0 || index > app->defer_slots_cap) {
+        return NULL;
+    }
+    const DeferSlot *const slot = &app->defer_slots[index - 1];
+    return slot->dr != NULL && slot->gen == (uint32_t)(h >> 32) ? slot->dr : NULL;
+}
+
+/* Gives dr a free slot, growing the table by doubling (and App.defer_ready with it, so queueing a resumed
+ * handle rarely needs to grow). Returns the slot index, or UINT32_MAX on OOM. */
+static uint32_t defer_slot_take(App *app, DeferredRequest *dr) {
+    if (app->defer_free_head == UINT32_MAX) {
+        const uint32_t old_cap = app->defer_slots_cap;
+        if (old_cap > UINT32_MAX / 4) {
+            return UINT32_MAX;
+        }
+        const uint32_t cap = old_cap == 0 ? 64 : old_cap * 2;
+        /* both freed by app_destroy */
+        DeferSlot *const slots = realloc(app->defer_slots, (size_t)cap * sizeof(DeferSlot));
+        if (slots == NULL) {
+            return UINT32_MAX;
+        }
+        app->defer_slots = slots;
+        if (app->defer_ready_cap < cap) {
+            DeferHandle *const ready = realloc(app->defer_ready, (size_t)cap * sizeof(DeferHandle));
+            if (ready == NULL) {
+                return UINT32_MAX; /* the grown slot array is kept, unused past defer_slots_cap */
+            }
+            app->defer_ready = ready;
+            app->defer_ready_cap = cap;
+        }
+        for (uint32_t i = old_cap; i < cap; i++) {
+            slots[i].dr = NULL;
+            slots[i].gen = 1;
+            slots[i].next_free = i + 1 < cap ? i + 1 : UINT32_MAX;
+        }
+        app->defer_free_head = old_cap;
+        app->defer_slots_cap = cap;
+    }
+    const uint32_t index = app->defer_free_head;
+    app->defer_free_head = app->defer_slots[index].next_free;
+    app->defer_slots[index].dr = dr;
+    return index;
+}
+
+/* Ends dr's life: the slot is freed and its generation bumped (every handle to it goes stale), the held batch
+ * tail is freed, the arena's fallback blocks are freed and its buffer goes back to App.arena_pool. dr itself
+ * lives in that arena: nothing may touch it afterwards. Does not touch dr->conn. */
+static void release_deferred(App *app, DeferredRequest *dr) {
+    DeferSlot *const slot = &app->defer_slots[dr->slot];
+    slot->dr = NULL;
+    slot->gen = slot->gen + 1 == 0 ? 1 : slot->gen + 1;
+    slot->next_free = app->defer_free_head;
+    app->defer_free_head = dr->slot;
+    free(dr->prefix);
+    Arena kept = dr->arena; /* copied out first: releasing it frees the memory dr is in */
+    arena_release_to_pool(&kept, &app->arena_pool);
 }
 
 void connection_close(App *app, Connection *conn) {
@@ -307,6 +379,12 @@ void connection_close(App *app, Connection *conn) {
         }
     }
 
+    if (conn->deferred != NULL && app != NULL) {
+        /* the client left (or a deadline, write error, shutdown): the handle goes stale, res_resume returns NULL */
+        DeferredRequest *const dr = conn->deferred;
+        conn->deferred = NULL;
+        release_deferred(app, dr);
+    }
     if (conn->file_fd >= 0) {
         close(conn->file_fd);
         conn->file_fd = -1;
@@ -365,11 +443,23 @@ void app_destroy(App *app) {
     arena_destroy(&app->arena);
     free(app->arena.buf);
     app->arena.buf = NULL;
+    arena_pool_destroy(&app->arena_pool); /* spares only: every block handed out came back with its connection */
     free(app->read_buf); /* no connection is left to have borrowed it */
     app->read_buf = NULL;
     free(app->batch_buf);
     app->batch_buf = NULL;
     app->batch_len = 0;
+    free(app->defer_slots); /* every connection is closed above, so no deferred request is left in it */
+    app->defer_slots = NULL;
+    app->defer_slots_cap = 0;
+    app->defer_free_head = UINT32_MAX;
+    free(app->defer_ready);
+    app->defer_ready = NULL;
+    app->defer_ready_len = 0;
+    app->defer_ready_cap = 0;
+    free(app->watched); /* the fds themselves belong to the application */
+    app->watched = NULL;
+    app->watched_cap = 0;
     free(app->connections);
     app->connections = NULL;
     app->connections_cap = 0;
@@ -388,10 +478,17 @@ int app_count_connections(const App *app) {
     return count;
 }
 
-/* whether a response is still being written (built but not fully queued on the socket). a
- * producer stream counts for its whole life, paused or not - it has not sent its last chunk yet. */
-static int response_pending(const Connection *conn) {
+/* whether a response has been started for the current request (bytes built, a body pinned, a file or a
+ * producer recorded). */
+static int response_started(const Connection *conn) {
     return conn->out_buf != NULL || conn->shared_body != NULL || conn->file_fd >= 0 || conn->stream_fn != NULL;
+}
+
+/* whether a response is still being written (built but not fully queued on the socket). a
+ * producer stream counts for its whole life, paused or not - it has not sent its last chunk yet. A deferred
+ * request counts from res_defer until its response is written. */
+static int response_pending(const Connection *conn) {
+    return response_started(conn) || conn->deferred != NULL;
 }
 
 void app_stop(App *app) {
@@ -1217,6 +1314,205 @@ static int flush_batch(App *app, Connection *conn) {
     return flush_connection(app, conn);
 }
 
+/* ---- deferred responses (res_defer / res_resume) ---- */
+
+static int serve_buffered_requests(App *app, Connection *conn, int *served_out);
+
+DeferHandle res_defer(Response *res) {
+    Connection *const conn = res->conn;
+    App *const app = conn != NULL ? conn->app : NULL;
+    if (app == NULL || conn->deferred != NULL || response_started(conn) || conn->arena != &app->arena) {
+        return 0; /* not an engine connection, already deferred, or already answered: nothing changes */
+    }
+    /* dr is allocated in the worker arena before the hand-over, so it moves with everything else the handler
+     * allocated and lives inside its own arena from then on */
+    DeferredRequest *const dr = budget_allows(app, ARENA_SIZE + conn->request_len)
+                                    ? arena_alloc(&app->arena, sizeof(DeferredRequest))
+                                    : NULL;
+    char *const block = dr != NULL ? arena_pool_take(&app->arena_pool) : NULL;
+    const uint32_t slot = block != NULL ? defer_slot_take(app, dr) : UINT32_MAX;
+    if (slot == UINT32_MAX) {
+        arena_pool_give(&app->arena_pool, block); /* NULL is a no-op */
+        res_status(res, 503);
+        res_send(res, status_text(503));
+        return 0;
+    }
+    arena_hand_over(&app->arena, &dr->arena, block, ARENA_SIZE);
+    dr->conn = conn;
+    dr->req = NULL;
+    dr->res = res;
+    dr->prefix = NULL;
+    dr->prefix_len = 0;
+    dr->deadline = time(NULL) + DEFER_TIMEOUT_SECONDS;
+    dr->slot = slot;
+    dr->state = DEFER_IN_HANDLER;
+    conn->deferred = dr;
+    conn->arena = &dr->arena; /* every res_* from now on builds into the kept arena */
+    return make_handle(app->defer_slots[slot].gen, slot);
+}
+
+/* Queues h for serve_resumed. 0, or -1 when the queue cannot grow (the caller falls back to write readiness). */
+static int queue_resumed(App *app, const DeferHandle h) {
+    if (app->defer_ready_len == app->defer_ready_cap) {
+        const size_t cap = app->defer_ready_cap == 0 ? 64 : app->defer_ready_cap * 2;
+        DeferHandle *const grown = realloc(app->defer_ready, cap * sizeof(DeferHandle)); /* freed by app_destroy */
+        if (grown == NULL) {
+            return -1;
+        }
+        app->defer_ready = grown;
+        app->defer_ready_cap = cap;
+    }
+    app->defer_ready[app->defer_ready_len++] = h;
+    return 0;
+}
+
+Response *res_resume(App *app, DeferHandle h) {
+    DeferredRequest *const dr = defer_lookup(app, h);
+    if (dr == NULL) {
+        return NULL;
+    }
+    if (dr->state == DEFER_WAITING && queue_resumed(app, h) != 0) {
+        /* no room to queue it: handle_writable finishes a ready deferred response instead */
+        event_loop_watch_write(app, dr->conn->fd, dr->conn);
+    }
+    dr->state = DEFER_READY; /* inside its own handler: serve_buffered_requests writes it after the handler */
+    return dr->res;
+}
+
+const Request *req_deferred(App *app, DeferHandle h) {
+    const DeferredRequest *const dr = defer_lookup(app, h);
+    return dr != NULL ? dr->req : NULL;
+}
+
+/*
+ * The handler returned with its request deferred and nothing sent. Copies the request's wire bytes, the
+ * Request and the Response into the deferred arena, consumes the request from in_buf (pipelined requests
+ * behind it stay buffered, unserved while it is pending), writes the responses coalesced before it (with
+ * keep-alive: they belong to earlier keep-alive requests), and leaves only read interest, to notice a hang-up.
+ * If the socket does not take that batch, its unsent tail moves to dr->prefix and goes out in front of this
+ * response, so nothing is pending on the socket while deferred. SERVE_WAIT, or SERVE_CLOSED (conn freed).
+ */
+static int park_deferred(App *app, Connection *conn, const Request *req, const Response *res) {
+    DeferredRequest *const dr = conn->deferred;
+    const size_t wire_len = conn->request_len;
+    char *const wire = arena_alloc(&dr->arena, wire_len + 1);
+    Request *const kept_req = arena_alloc(&dr->arena, sizeof(Request));
+    Response *const kept_res = arena_alloc(&dr->arena, sizeof(Response));
+    if (wire == NULL || kept_req == NULL || kept_res == NULL) {
+        app->batch_len = 0; /* the earlier responses are dropped with the connection */
+        connection_close(app, conn);
+        return SERVE_CLOSED;
+    }
+    const char *const req_start = conn->in_buf + conn->in_off;
+    memcpy(wire, req_start, wire_len);
+    request_clone_used(kept_req, req, req_start, wire_len, wire, &dr->arena);
+    kept_req->body[kept_req->content_length] = '\0'; /* in the original that byte was handed back to the next request */
+    response_clone_used(kept_res, res);
+    dr->req = kept_req;
+    dr->res = kept_res;
+    dr->state = DEFER_WAITING;
+
+    conn->in_off += wire_len;
+    conn->request_len = 0; /* the keep-alive reset that finishes this response consumes nothing more */
+    if (conn->in_off >= conn->in_len) {
+        release_in_buf(app, conn);
+    }
+    sync_held_bytes(app, conn);
+
+    if (app->batch_len > 0) {
+        const int keep_alive = conn->keep_alive;
+        conn->keep_alive = 1;
+        const int flushed = flush_batch(app, conn);
+        if (flushed == FLUSH_CLOSED) {
+            return SERVE_CLOSED;
+        }
+        conn->keep_alive = keep_alive;
+        if (flushed == FLUSH_PENDING && conn->out_buf_owned) {
+            const size_t left = conn->out_len - conn->out_sent;
+            memmove(conn->out_buf, conn->out_buf + conn->out_sent, left);
+            dr->prefix = conn->out_buf; /* ownership moves: freed by finish (joined) or release_deferred */
+            dr->prefix_len = left;
+        }
+        conn->out_buf = NULL;
+        conn->out_buf_owned = 0;
+        conn->out_len = 0;
+        conn->out_sent = 0;
+        conn->out_cap = 0;
+        conn->last_write_progress = 0;
+        sync_held_bytes(app, conn);
+    }
+    event_loop_unwatch_write(app, conn->fd, conn);
+    if (!(conn->events_watched & EVENT_READ)) {
+        event_loop_watch_read(app, conn->fd, conn);
+    }
+    return SERVE_WAIT;
+}
+
+/*
+ * The deferred response on conn is ready to write: answers 500 if nothing was built, puts a held batch tail
+ * in front, then detaches dr (conn->deferred = NULL, conn->arena back to the worker arena). The response
+ * bytes stay in dr's arena until the caller's flush_connection has written them or copied the unsent tail;
+ * the caller then release_deferred's dr. NULL if conn had to be closed (out of memory; dr released with it).
+ */
+static DeferredRequest *detach_deferred(App *app, Connection *conn) {
+    DeferredRequest *const dr = conn->deferred;
+    if (!response_started(conn)) {
+        res_status(dr->res, 500); /* resumed but never answered */
+        res_send(dr->res, status_text(500));
+    }
+    if (dr->prefix != NULL) {
+        const size_t out_left = conn->out_buf != NULL ? conn->out_len - conn->out_sent : 0;
+        const size_t total = dr->prefix_len + out_left;
+        char *const joined = arena_alloc(&dr->arena, total);
+        if (joined == NULL) {
+            connection_close(app, conn);
+            return NULL;
+        }
+        memcpy(joined, dr->prefix, dr->prefix_len);
+        if (out_left > 0) {
+            memcpy(joined + dr->prefix_len, conn->out_buf + conn->out_sent, out_left);
+        }
+        free(dr->prefix);
+        dr->prefix = NULL;
+        dr->prefix_len = 0;
+        conn->out_buf = joined;
+        conn->out_len = total;
+        conn->out_sent = 0;
+        conn->out_cap = total;
+    }
+    conn->deferred = NULL;
+    conn->arena = &conn->app->arena;
+    return dr;
+}
+
+/* Writes a ready deferred response, releases it, and serves the requests pipelined behind it. Only called
+ * from the event loop's top level (serve_resumed, handle_writable, close_idle_connections): no serve loop of
+ * another connection is running, App.batch_buf is empty and App.arena holds nothing. */
+static void finish_deferred(App *app, DeferredRequest *dr) {
+    Connection *const conn = dr->conn;
+    if (detach_deferred(app, conn) == NULL) {
+        return;
+    }
+    const int flushed = flush_connection(app, conn);
+    release_deferred(app, dr);
+    arena_reset(&app->arena);
+    if (flushed == FLUSH_DONE && conn->in_len > conn->in_off) {
+        int served;
+        serve_buffered_requests(app, conn, &served);
+    }
+}
+
+void serve_resumed(App *app) {
+    /* by index: a handler run below may resume another request, which appends (and may realloc) */
+    for (size_t i = 0; i < app->defer_ready_len; i++) {
+        DeferredRequest *const dr = defer_lookup(app, app->defer_ready[i]);
+        if (dr != NULL && dr->state == DEFER_READY) {
+            finish_deferred(app, dr);
+        }
+    }
+    app->defer_ready_len = 0;
+}
+
 /*
  * serves every complete request buffered in in_buf[in_off..in_len), in order, one response each,
  * up to MAX_PIPELINED_PER_EVENT per call; *served_out = how many were dispatched. Returns:
@@ -1306,6 +1602,17 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
          * in_buf or the next iteration parses from it. */
         req.body[req.content_length] = body_saved;
 
+        /* res_defer: park it unless the handler also answered (res_resume or a res_* send before returning) */
+        DeferredRequest *answered_deferred = NULL;
+        if (conn->deferred != NULL) {
+            if (conn->deferred->state == DEFER_IN_HANDLER && !response_started(conn)) {
+                const int parked = park_deferred(app, conn, &req, &res);
+                arena_reset(&app->arena);
+                return parked;
+            }
+            answered_deferred = detach_deferred(app, conn); /* never NULL here: no batch tail is held yet */
+        }
+
         if (can_coalesce(app, conn, served)) {
             /* queue it behind the batch instead of writing it: one write for the whole run (flush_batch,
              * or the next flush_connection, which puts the batch in front of its own response) */
@@ -1315,11 +1622,17 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
             conn->out_len = 0;
             conn->out_cap = 0;
             finish_request(app, conn);
+            if (answered_deferred != NULL) {
+                release_deferred(app, answered_deferred);
+            }
             arena_reset(&app->arena);
             continue;
         }
         /* any batch queued so far goes out in front of this response (flush_connection: take_batch) */
         const int flushed = flush_connection(app, conn);
+        if (answered_deferred != NULL) {
+            release_deferred(app, answered_deferred); /* after the flush: its response bytes were in its arena */
+        }
         /* conn may already be freed by flush_connection (a non-keep-alive response, or a
          * hard write error) - reset the shared arena through app, never conn, once this
          * dispatch-and-flush cycle that just used it is over (flush_connection has already
@@ -1425,7 +1738,7 @@ static int read_and_serve(App *app, Connection *conn) {
          * buffered pipelined requests are waiting for their handle_writable turn. Reading now would
          * append behind them; they are served first, in order. */
         if (response_pending(conn)) {
-            return conn->stream_fn != NULL ? watch_stream_peer(app, conn) : 0;
+            return conn->stream_fn != NULL || conn->deferred != NULL ? watch_stream_peer(app, conn) : 0;
         }
         int served;
         const int status = serve_buffered_requests(app, conn, &served);
@@ -1509,6 +1822,16 @@ void handle_readable(App *app, Connection *conn) {
 }
 
 void handle_writable(App *app, Connection *conn) {
+    if (conn->deferred != NULL) {
+        /* nothing is pending on the socket while deferred; write readiness only finishes a response whose
+         * res_resume could not be queued */
+        if (conn->deferred->state == DEFER_READY) {
+            finish_deferred(app, conn->deferred);
+        } else {
+            event_loop_unwatch_write(app, conn->fd, conn);
+        }
+        return;
+    }
     if (response_pending(conn)) {
         if (flush_connection(app, conn) != FLUSH_DONE) {
             return; /* still draining, or closed */
@@ -1538,6 +1861,21 @@ void close_idle_connections(App *app) {
          * WRITE_TIMEOUT_SECONDS is a client that stopped reading, not a slow one - close it rather
          * than hold the fd, arena and out_buf forever. Still-progressing writes (however slowly) are
          * left for flush_connection()/EVFILT_WRITE to keep draining. */
+        if (conn->deferred != NULL) {
+            /* waiting on the application, not on the client: only its own deadline applies */
+            DeferredRequest *const dr = conn->deferred;
+            if (dr->state == DEFER_WAITING && now >= dr->deadline) {
+                const int is_head = dr->res->is_head_request;
+                conn->keep_alive = 0;
+                res_init(dr->res, conn); /* drop what the handler prepared for the real answer */
+                dr->res->is_head_request = is_head;
+                res_status(dr->res, 504);
+                res_send(dr->res, status_text(504));
+                dr->state = DEFER_READY;
+                finish_deferred(app, dr);
+            }
+            continue;
+        }
         if (response_pending(conn)) {
             if (conn->stream_paused) {
                 /* a parked producer stream is idle by its own choice, not stalled: poll it again
@@ -1616,6 +1954,148 @@ static void run_worker_init_hooks(App *app) {
     }
 }
 
+/* ---- application fds (app_watch_fd) ---- */
+
+/* Makes the backend's interest in watched fd match what the application asked for. 0, or -1. The backends find
+ * the tracked bits through App.watched (udata NULL), so an unchanged interest costs no syscall. */
+static int apply_watch(App *app, const int fd) {
+    const unsigned wanted = app->watched[fd].wanted;
+    const int read_rc = (wanted & WATCH_READ) ? event_loop_watch_read(app, fd, NULL) : event_loop_unwatch_read(app, fd);
+    const int write_rc = (wanted & WATCH_WRITE) ? event_loop_watch_write(app, fd, NULL)
+                                                : event_loop_unwatch_write(app, fd, NULL);
+    return read_rc == 0 && write_rc == 0 ? 0 : -1;
+}
+
+int app_watch_fd(App *app, int fd, unsigned events, FdReadyFn on_ready, void *udata) {
+    if (app == NULL || fd < 0 || on_ready == NULL || (events & ~(WATCH_READ | WATCH_WRITE)) != 0 ||
+        fd == app->server_fd || (fd < app->connections_cap && app->connections[fd] != NULL)) {
+        return -1;
+    }
+    if (fd >= app->watched_cap) {
+        int cap = app->watched_cap > 0 ? app->watched_cap : 16;
+        while (cap <= fd) {
+            cap *= 2;
+        }
+        WatchedFd *const grown = realloc(app->watched, (size_t)cap * sizeof(WatchedFd)); /* freed by app_destroy */
+        if (grown == NULL) {
+            return -1;
+        }
+        memset(grown + app->watched_cap, 0, (size_t)(cap - app->watched_cap) * sizeof(WatchedFd));
+        app->watched = grown;
+        app->watched_cap = cap;
+    }
+    WatchedFd *const w = &app->watched[fd];
+    w->fn = on_ready;
+    w->udata = udata;
+    w->wanted = events;
+    /* before the loop is open (an app_on_worker_start hook), app_listen_worker applies it once it is */
+    return event_loop_is_open(app) ? apply_watch(app, fd) : 0;
+}
+
+int app_unwatch_fd(App *app, int fd) {
+    if (app == NULL || fd < 0 || fd >= app->watched_cap || app->watched[fd].fn == NULL) {
+        return -1;
+    }
+    int rc = 0;
+    if (event_loop_is_open(app)) {
+        app->watched[fd].wanted = 0;
+        rc = apply_watch(app, fd); /* a real removal: the fd stays open, unlike event_loop_release_fd's case */
+    }
+    memset(&app->watched[fd], 0, sizeof(WatchedFd));
+    return rc;
+}
+
+static void apply_pending_watches(App *app) {
+    for (int fd = 0; fd < app->watched_cap; fd++) {
+        if (app->watched[fd].fn != NULL && apply_watch(app, fd) != 0) {
+            fprintf(stderr, "app_watch_fd: could not watch fd %d\n", fd);
+        }
+    }
+}
+
+/* ---- the event loop ---- */
+
+/* Handles one polled event. Returns 1 when the process must stop serving now (second signal, drain deadline,
+ * or a first signal with nothing left to drain), else 0. */
+static int handle_event(App *app, const LoopEvent *ev) {
+    if (ev->type == LOOP_EVENT_SIGNAL) {
+        if (!app->is_shutting_down) {
+            printf("\nReceived signal %d, draining connections...\n", ev->signo);
+            app_stop(app);
+            return app_count_connections(app) == 0;
+        }
+        fprintf(stderr, "\nReceived second signal %d, forcing shutdown\n", ev->signo);
+        return 1;
+    }
+    if (ev->type == LOOP_EVENT_TIMER_IDLE) {
+        close_idle_connections(app);
+        return 0;
+    }
+    if (ev->type == LOOP_EVENT_TIMER_SHUTDOWN) {
+        fprintf(stderr, "Shutdown timeout reached (%ds), force-closing remaining connections\n",
+                SHUTDOWN_TIMEOUT_SECONDS);
+        return 1;
+    }
+    if (ev->type == LOOP_EVENT_ACCEPT) {
+#ifdef CEXPRESS_SINGLE_ACCEPTOR
+        if (app->accept_via_fd_passing) {
+            accept_passed_connections(app);
+            return 0;
+        }
+#endif
+        accept_connections(app);
+        return 0;
+    }
+    const int fd = ev->fd;
+    if (ev->type == LOOP_EVENT_EXTERNAL) {
+        /* unwatched earlier in this batch (maybe by another callback): skip, never call a stale callback */
+        if (fd >= 0 && fd < app->watched_cap && app->watched[fd].fn != NULL) {
+            app->watched[fd].fn(app, fd, ev->ready, app->watched[fd].udata);
+        }
+        return 0;
+    }
+    if (fd < 0 || fd >= app->connections_cap || app->connections[fd] == NULL || app->connections[fd] != ev->conn) {
+        /* Connection was closed earlier in this event batch (e.g. by app_stop or close_idle_connections) - skip
+         * to avoid use-after-free. */
+        return 0;
+    }
+    Connection *conn = ev->conn;
+    if (ev->type == LOOP_EVENT_ERROR) {
+        connection_close(app, conn);
+    } else if (ev->type == LOOP_EVENT_READ) {
+        handle_readable(app, conn);
+    } else if (ev->type == LOOP_EVENT_WRITE) {
+        handle_writable(app, conn);
+    }
+    return 0;
+}
+
+int app_run_once(App *app, const int timeout_ms) {
+    if (app->defer_ready_len > 0) {
+        serve_resumed(app); /* resumed outside any event (before the loop started, or by code between turns) */
+    }
+    LoopEvent events[MAX_EVENTS];
+    const int n = event_loop_poll(app, events, MAX_EVENTS, timeout_ms);
+    if (n < 0) {
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        if (handle_event(app, &events[i])) {
+            return LOOP_TURN_EXIT;
+        }
+        /* responses resumed by that event (an app_watch_fd callback, another connection's handler, a
+         * producer) go out now, from the top level, before the next event */
+        if (app->defer_ready_len > 0) {
+            serve_resumed(app);
+        }
+    }
+    if (app->is_shutting_down && app_count_connections(app) == 0) {
+        printf("All connections drained. Server shutting down.\n");
+        return LOOP_TURN_EXIT;
+    }
+    return n;
+}
+
 void app_listen_worker(App *app, int port) {
     /* Ignore SIGPIPE so a write() to a socket the peer already closed
      * (a client disconnecting mid-response - routine under real load, not
@@ -1647,14 +2127,17 @@ void app_listen_worker(App *app, int port) {
         exit(EXIT_FAILURE);
     }
     event_loop_watch_read(app, app->server_fd, NULL);
+    apply_pending_watches(app); /* fds the worker-start hooks registered before the loop existed */
 
     if (!app->accept_via_fd_passing && (!cluster_is_worker() || cluster_worker_id() == 0)) {
         printf("Listening on port %d (%s)\n", port, event_loop_backend_name(app));
     }
 
-    LoopEvent events[MAX_EVENTS];
     while (1) {
-        int n = event_loop_poll(app, events, MAX_EVENTS, -1);
+        const int n = app_run_once(app, -1);
+        if (n == LOOP_TURN_EXIT) {
+            break;
+        }
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -1665,75 +2148,8 @@ void app_listen_worker(App *app, int port) {
             perror("event_loop_poll");
             break;
         }
-
-        for (int i = 0; i < n; i++) {
-            LoopEvent *ev = &events[i];
-
-            if (ev->type == LOOP_EVENT_SIGNAL) {
-                if (!app->is_shutting_down) {
-                    printf("\nReceived signal %d, draining connections...\n", ev->signo);
-                    app_stop(app);
-                    if (app_count_connections(app) == 0) {
-                        goto shutdown_complete;
-                    }
-                } else {
-                    fprintf(stderr, "\nReceived second signal %d, forcing shutdown\n", ev->signo);
-                    goto shutdown_complete;
-                }
-                continue;
-            }
-
-            if (ev->type == LOOP_EVENT_TIMER_IDLE) {
-                close_idle_connections(app);
-                continue;
-            }
-
-            if (ev->type == LOOP_EVENT_TIMER_SHUTDOWN) {
-                fprintf(stderr, "Shutdown timeout reached (%ds), force-closing remaining connections\n",
-                        SHUTDOWN_TIMEOUT_SECONDS);
-                goto shutdown_complete;
-            }
-
-            if (ev->type == LOOP_EVENT_ACCEPT) {
-#ifdef CEXPRESS_SINGLE_ACCEPTOR
-                if (app->accept_via_fd_passing) {
-                    accept_passed_connections(app);
-                    continue;
-                }
-#endif
-                accept_connections(app);
-                continue;
-            }
-
-            int fd = ev->fd;
-            if (fd < 0 || fd >= app->connections_cap || app->connections[fd] == NULL ||
-                app->connections[fd] != ev->conn) {
-                /* Connection was closed earlier in this event batch (e.g. by app_stop
-                 * or close_idle_connections) - skip to avoid use-after-free. */
-                continue;
-            }
-
-            Connection *conn = ev->conn;
-
-            if (ev->type == LOOP_EVENT_ERROR) {
-                connection_close(app, conn);
-                continue;
-            }
-
-            if (ev->type == LOOP_EVENT_READ) {
-                handle_readable(app, conn);
-            } else if (ev->type == LOOP_EVENT_WRITE) {
-                handle_writable(app, conn);
-            }
-        }
-
-        if (app->is_shutting_down && app_count_connections(app) == 0) {
-            printf("All connections drained. Server shutting down.\n");
-            break;
-        }
     }
 
-shutdown_complete:
     if (app->connections != NULL) {
         for (int fd = 0; fd < app->connections_cap; fd++) {
             if (app->connections[fd] != NULL) {

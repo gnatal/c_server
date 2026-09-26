@@ -50,6 +50,23 @@ void res_init(Response *res, Connection *conn) {
     res->stream_ended = 0;
 }
 
+void response_clone_used(Response *dst, const Response *src) {
+    dst->conn = src->conn;
+    dst->status = src->status;
+    dst->header_count = src->header_count;
+    memcpy(dst->headers, src->headers, (size_t)src->header_count * sizeof(ResponseHeader));
+    dst->set_cookie_count = src->set_cookie_count;
+    for (int i = 0; i < src->set_cookie_count; i++) {
+        memcpy(dst->set_cookies[i], src->set_cookies[i], strlen(src->set_cookies[i]) + 1);
+    }
+    dst->is_head_request = src->is_head_request;
+    dst->trailer_count = src->trailer_count;
+    memcpy(dst->trailers, src->trailers, (size_t)src->trailer_count * sizeof(ResponseHeader));
+    dst->is_chunked = src->is_chunked;
+    dst->headers_sent = src->headers_sent;
+    dst->stream_ended = src->stream_ended;
+}
+
 void res_status(Response *res, int status) {
     res->status = status;
 }

@@ -154,27 +154,39 @@ static void epoll_close(App *app) {
     }
 }
 
+/* The tracked interest bits for fd: its Connection's (udata, or the connections table), else its app_watch_fd
+ * entry's, else NULL (an fd nobody tracks: the listen socket). */
+static int *interest_bits(const App *app, const int fd, void *udata) {
+    if (udata != NULL) {
+        return &((Connection *)udata)->events_watched;
+    }
+    if (app->connections != NULL && fd < app->connections_cap && app->connections[fd] != NULL) {
+        return &app->connections[fd]->events_watched;
+    }
+    if (fd < app->watched_cap && app->watched[fd].fn != NULL) {
+        return &app->watched[fd].events_watched;
+    }
+    return NULL;
+}
+
 static int epoll_watch_read(App *app, int fd, void *udata) {
     if (app == NULL || app->epoll_fd < 0 || fd < 0) {
         return -1;
     }
 
-    Connection *conn = (Connection *)udata;
-    if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
-        conn = app->connections[fd];
-    }
+    int *const bits = interest_bits(app, fd, udata);
 
-    if (conn != NULL && (conn->events_watched & EVENT_READ)) {
+    if (bits != NULL && (*bits & EVENT_READ)) {
         return 0; /* already registered: no epoll_ctl */
     }
 
     int op = EPOLL_CTL_ADD;
     uint32_t events = EPOLLIN;
-    if (conn != NULL) {
-        if (conn->events_watched & EVENT_WRITE) {
+    if (bits != NULL) {
+        if (*bits & EVENT_WRITE) {
             events |= EPOLLOUT;
         }
-        if (conn->events_watched != 0) {
+        if (*bits != 0) {
             op = EPOLL_CTL_MOD;
         }
     }
@@ -194,8 +206,8 @@ static int epoll_watch_read(App *app, int fd, void *udata) {
         }
     }
 
-    if (conn != NULL) {
-        conn->events_watched |= EVENT_READ;
+    if (bits != NULL) {
+        *bits |= EVENT_READ;
     }
     return 0;
 }
@@ -205,13 +217,13 @@ static int epoll_unwatch_read(App *app, int fd) {
         return -1;
     }
 
-    Connection *conn = (fd < app->connections_cap && app->connections != NULL) ? app->connections[fd] : NULL;
-    if (conn != NULL && !(conn->events_watched & EVENT_READ)) {
+    int *const bits = interest_bits(app, fd, NULL);
+    if (bits != NULL && !(*bits & EVENT_READ)) {
         return 0; /* not registered for read: no epoll_ctl */
     }
-    if (conn != NULL) {
-        conn->events_watched &= ~EVENT_READ;
-        if (conn->events_watched == 0) {
+    if (bits != NULL) {
+        *bits &= ~EVENT_READ;
+        if (*bits == 0) {
             return epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
         } else {
             struct epoll_event ev;
@@ -230,22 +242,19 @@ static int epoll_watch_write(App *app, int fd, void *udata) {
         return -1;
     }
 
-    Connection *conn = (Connection *)udata;
-    if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
-        conn = app->connections[fd];
-    }
+    int *const bits = interest_bits(app, fd, udata);
 
-    if (conn != NULL && (conn->events_watched & EVENT_WRITE)) {
+    if (bits != NULL && (*bits & EVENT_WRITE)) {
         return 0; /* already registered: no epoll_ctl */
     }
 
     int op = EPOLL_CTL_ADD;
     uint32_t events = EPOLLOUT;
-    if (conn != NULL) {
-        if (conn->events_watched & EVENT_READ) {
+    if (bits != NULL) {
+        if (*bits & EVENT_READ) {
             events |= EPOLLIN;
         }
-        if (conn->events_watched != 0) {
+        if (*bits != 0) {
             op = EPOLL_CTL_MOD;
         }
     }
@@ -265,8 +274,8 @@ static int epoll_watch_write(App *app, int fd, void *udata) {
         }
     }
 
-    if (conn != NULL) {
-        conn->events_watched |= EVENT_WRITE;
+    if (bits != NULL) {
+        *bits |= EVENT_WRITE;
     }
     return 0;
 }
@@ -276,19 +285,16 @@ static int epoll_unwatch_write(App *app, int fd, void *udata) {
         return -1;
     }
 
-    Connection *conn = (Connection *)udata;
-    if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
-        conn = app->connections[fd];
-    }
+    int *const bits = interest_bits(app, fd, udata);
 
     /* flush_connection unwatches write after every keep-alive response, usually with write never
      * armed: skipping that no-op removed one epoll_ctl of the four syscalls per request. */
-    if (conn != NULL && !(conn->events_watched & EVENT_WRITE)) {
+    if (bits != NULL && !(*bits & EVENT_WRITE)) {
         return 0;
     }
-    if (conn != NULL) {
-        conn->events_watched &= ~EVENT_WRITE;
-        if (conn->events_watched == 0) {
+    if (bits != NULL) {
+        *bits &= ~EVENT_WRITE;
+        if (*bits == 0) {
             return epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
         } else {
             struct epoll_event ev;
@@ -307,8 +313,9 @@ static int epoll_release_fd(App *app, int fd) {
         return -1;
     }
 
-    if (fd < app->connections_cap && app->connections != NULL && app->connections[fd] != NULL) {
-        app->connections[fd]->events_watched = 0;
+    int *const bits = interest_bits(app, fd, NULL);
+    if (bits != NULL) {
+        *bits = 0;
     }
     /* No EPOLL_CTL_DEL: the caller closes fd next, and closing the last reference to the file
      * removes it from the epoll set. */
@@ -407,7 +414,16 @@ static int epoll_poll(App *app, LoopEvent *out_events, int max_events, int timeo
                                    ? app->connections[fd]
                                    : NULL;
 
-            if (ep_events[i].events & (EPOLLERR | EPOLLHUP)) {
+            if (conn == NULL && fd >= 0 && fd < app->watched_cap && app->watched[fd].fn != NULL) {
+                const uint32_t got = ep_events[i].events;
+                out_events[out_count].type = LOOP_EVENT_EXTERNAL;
+                out_events[out_count].fd = fd;
+                out_events[out_count].conn = NULL;
+                out_events[out_count].signo = 0;
+                out_events[out_count].ready = ((got & EPOLLIN) ? WATCH_READ : 0) | ((got & EPOLLOUT) ? WATCH_WRITE : 0) |
+                                              ((got & (EPOLLERR | EPOLLHUP)) ? WATCH_ERROR : 0);
+                out_count++;
+            } else if (ep_events[i].events & (EPOLLERR | EPOLLHUP)) {
                 out_events[out_count].type = LOOP_EVENT_ERROR;
                 out_events[out_count].fd = fd;
                 out_events[out_count].conn = conn;

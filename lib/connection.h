@@ -63,6 +63,67 @@ int app_count_connections(const App *app);
 void app_wake_streams(App *app);
 
 /*
+ * Deferred responses: a handler that must wait on I/O (a database, another service) without blocking the worker.
+ *
+ *   static void get_user(const Request *req, Response *res) {
+ *       const DeferHandle h = res_defer(res);
+ *       if (h == 0) return;                    // refused: 503 already built (over budget), or already answered
+ *       start_query(req_get_param(req, "id"), h); // your code keeps h, e.g. in a FIFO of pending queries
+ *   }
+ *   // later, from an app_watch_fd callback (or any code on this worker's event loop):
+ *   Response *res = res_resume(app, h);
+ *   if (res != NULL) res_json(res, body);      // NULL: the request is gone (client left, deadline, shutdown)
+ *
+ * res_defer: the response will be produced after the handler returns. Everything the handler allocated from
+ *   res->conn->arena stays valid until the response is written (it takes over the worker arena), and so do the
+ *   headers, cookies and status already set on res. Call it before creating a yyjson_alc you will use after
+ *   resuming (make it from res->conn->arena after res_resume instead): an allocator made earlier keeps
+ *   allocating from the worker arena, which is reset after the handler. Returns 0 without changing anything
+ *   when a response was already started, the request is already deferred or the Connection is not the
+ *   engine's; returns 0 with a 503 already built when the worker is over ServerConfig.max_buffered_bytes
+ *   (the deferred request is charged ARENA_SIZE + its bytes) or out of memory. The handler may still answer
+ *   itself after deferring (res_resume inside the handler, or any res_* send): it is then written at once.
+ *   While deferred, requests pipelined behind it wait (answered in order afterwards), nothing is read, a
+ *   client hang-up closes the connection, and after DEFER_TIMEOUT_SECONDS the client gets 504 and the
+ *   connection closes. Middleware code after chain_next runs when the handler returns, not when it resumes.
+ * res_resume: the deferred Response, ready for res_status / res_set_header / any sending call. It is written
+ *   right after the current event-loop callback returns (never from inside this call, so it is safe from
+ *   another connection's handler or a watch callback). A resumed response that sends nothing is answered 500.
+ *   Valid until control returns to the event loop. NULL when h is stale: the request was already answered,
+ *   its client disconnected, it timed out (504) or the worker drained - drop the result then. Calling it twice
+ *   returns the same Response until it is written.
+ * req_deferred: the deferred Request (params, query, headers, body), kept until the response is written; NULL
+ *   when h is stale, and while the handler that deferred is still running (use its own req there).
+ */
+DeferHandle res_defer(Response *res);
+Response *res_resume(App *app, DeferHandle h);
+const Request *req_deferred(App *app, DeferHandle h);
+
+/*
+ * Watches an application-owned fd (a database socket, a pipe) on this worker's event loop: on_ready(app, fd,
+ * ready, udata) runs when it is readable (WATCH_READ) / writable (WATCH_WRITE), with WATCH_ERROR added on an
+ * error or hang-up. events is WATCH_READ, WATCH_WRITE or both; calling again for the same fd replaces the
+ * callback and changes the interest (no syscall when it is unchanged), e.g. add WATCH_WRITE while a client
+ * library has unsent output. Readiness is level-triggered: it fires again while the condition holds, so after
+ * WATCH_ERROR, unwatch the fd (it keeps firing, or on io_uring stops firing). on_ready may be called
+ * spuriously: the fd must be non-blocking. Callable from a worker-start hook (applied once the loop starts) or
+ * from any handler or callback. -1 for a negative fd, a NULL callback, other bits in events, the listen socket,
+ * an fd that is a client connection, or a backend failure.
+ * app_unwatch_fd: stop watching (call it before closing the fd). -1 if fd is not watched. Per worker process.
+ */
+int app_watch_fd(App *app, int fd, unsigned events, FdReadyFn on_ready, void *udata);
+int app_unwatch_fd(App *app, int fd);
+
+/*
+ * One event-loop turn: waits up to timeout_ms (-1 = until something happens) for events, handles each, and after
+ * each one writes the deferred responses it resumed (serve_resumed). Returns the number of events, -1 on a poll
+ * error (errno set; EINTR means poll again), or LOOP_TURN_EXIT when the worker should stop serving (second
+ * signal, drain deadline, or draining finished). app_listen_worker is a loop over it; tests drive it directly.
+ */
+#define LOOP_TURN_EXIT (-2)
+int app_run_once(App *app, int timeout_ms);
+
+/*
  * Engine internals (called from the event loop; exposed for tests).
  *
  * handle_readable: recv() into conn->in_buf until EAGAIN (into the worker's shared App.read_buf
@@ -118,6 +179,9 @@ void accept_passed_connections(App *app);
 #define FLUSH_PENDING 1
 #define FLUSH_CLOSED -1
 int flush_connection(App *app, Connection *conn);
+/* serve_resumed: writes every deferred response res_resume marked ready since the last call, then serves
+ *   the requests pipelined behind each. Called by app_run_once after each event. */
+void serve_resumed(App *app);
 void handle_readable(App *app, Connection *conn);
 void handle_writable(App *app, Connection *conn);
 void close_idle_connections(App *app);

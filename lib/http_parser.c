@@ -769,6 +769,54 @@ void parse_cookies(const char *cookie_header, Request *req) {
     }
 }
 
+/* p moved from [old_base, old_base + old_len) to the same offset from new_base; other pointers unchanged.
+ * The end address itself counts as inside: a zero-length view may sit there. */
+static const char *rebase_view(const char *p, const char *old_base, const size_t old_len, char *new_base) {
+    if (p == NULL || p < old_base || p > old_base + old_len) {
+        return p;
+    }
+    return new_base + (p - old_base);
+}
+
+/* strlen(src) + 1 bytes (src is a NUL-terminated slot of the same size as dst). */
+static void copy_slot(char *dst, const char *src) {
+    memcpy(dst, src, strlen(src) + 1);
+}
+
+void request_clone_used(Request *dst, const Request *src, const char *old_base, const size_t old_len,
+                        char *new_base, Arena *arena) {
+    copy_slot(dst->method, src->method);
+    copy_slot(dst->path, src->path);
+    copy_slot(dst->query, src->query);
+    copy_slot(dst->version, src->version);
+    dst->param_count = src->param_count;
+    for (int i = 0; i < src->param_count; i++) {
+        copy_slot(dst->param_names[i], src->param_names[i]);
+        copy_slot(dst->param_values[i], src->param_values[i]);
+    }
+    dst->query_count = src->query_count;
+    for (int i = 0; i < src->query_count; i++) {
+        copy_slot(dst->query_names[i], src->query_names[i]);
+        copy_slot(dst->query_values[i], src->query_values[i]);
+    }
+    dst->header_count = src->header_count;
+    for (int i = 0; i < src->header_count; i++) {
+        dst->headers[i].name = rebase_view(src->headers[i].name, old_base, old_len, new_base);
+        dst->headers[i].name_len = src->headers[i].name_len;
+        dst->headers[i].value = rebase_view(src->headers[i].value, old_base, old_len, new_base);
+        dst->headers[i].value_len = src->headers[i].value_len;
+    }
+    dst->cookies_parsed = src->cookies_parsed;
+    dst->cookie_count = src->cookies_parsed ? src->cookie_count : 0;
+    for (int i = 0; i < dst->cookie_count; i++) {
+        copy_slot(dst->cookie_names[i], src->cookie_names[i]);
+        copy_slot(dst->cookie_values[i], src->cookie_values[i]);
+    }
+    dst->content_length = src->content_length;
+    dst->body = (char *)rebase_view(src->body, old_base, old_len, new_base);
+    dst->arena = arena;
+}
+
 const char *req_get_cookie(const Request *req, const char *name) {
     if (!req->cookies_parsed) {
         /* split the Cookie header on first access instead of on every parsed request - a mutable-

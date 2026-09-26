@@ -204,64 +204,71 @@ static int uring_is_open(const App *app) {
     return app != NULL && app->ring != NULL;
 }
 
+/* The tracked interest bits for fd: its Connection's (udata, or the connections table), else its app_watch_fd
+ * entry's, else NULL (an fd nobody tracks: the listen socket, signalfd, timerfds). */
+static int *interest_bits(const App *app, const int fd, void *udata) {
+    if (udata != NULL) {
+        return &((Connection *)udata)->events_watched;
+    }
+    if (app->connections != NULL && fd < app->connections_cap && app->connections[fd] != NULL) {
+        return &app->connections[fd]->events_watched;
+    }
+    if (fd < app->watched_cap && app->watched[fd].fn != NULL) {
+        return &app->watched[fd].events_watched;
+    }
+    return NULL;
+}
+
 static int uring_watch_read(App *app, int fd, void *udata) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
-    Connection *conn = (Connection *)udata;
-    if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
-        conn = app->connections[fd];
-    }
+    int *const bits = interest_bits(app, fd, udata);
 
     uint32_t mask = POLLIN;
-    if (conn != NULL) {
-        if (conn->events_watched & EVENT_WRITE) mask |= POLLOUT;
-        conn->events_watched |= EVENT_READ;
+    if (bits != NULL) {
+        if (*bits & EVENT_WRITE) mask |= POLLOUT;
+        *bits |= EVENT_READ;
     }
     return update_poll(app, fd, mask);
 }
 
 static int uring_unwatch_read(App *app, int fd) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
-    Connection *conn = (fd < app->connections_cap && app->connections != NULL) ? app->connections[fd] : NULL;
+    int *const bits = interest_bits(app, fd, NULL);
     uint32_t mask = 0;
-    if (conn != NULL) {
-        conn->events_watched &= ~EVENT_READ;
-        if (conn->events_watched & EVENT_WRITE) mask |= POLLOUT;
+    if (bits != NULL) {
+        *bits &= ~EVENT_READ;
+        if (*bits & EVENT_WRITE) mask |= POLLOUT;
     }
     return update_poll(app, fd, mask);
 }
 
 static int uring_watch_write(App *app, int fd, void *udata) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
-    Connection *conn = (Connection *)udata;
-    if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
-        conn = app->connections[fd];
-    }
+    int *const bits = interest_bits(app, fd, udata);
     uint32_t mask = POLLOUT;
-    if (conn != NULL) {
-        if (conn->events_watched & EVENT_READ) mask |= POLLIN;
-        conn->events_watched |= EVENT_WRITE;
+    if (bits != NULL) {
+        if (*bits & EVENT_READ) mask |= POLLIN;
+        *bits |= EVENT_WRITE;
     }
     return update_poll(app, fd, mask);
 }
 
 static int uring_unwatch_write(App *app, int fd, void *udata) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
-    Connection *conn = (Connection *)udata;
-    if (conn == NULL && fd < app->connections_cap && app->connections != NULL) {
-        conn = app->connections[fd];
-    }
+    int *const bits = interest_bits(app, fd, udata);
     uint32_t mask = 0;
-    if (conn != NULL) {
-        conn->events_watched &= ~EVENT_WRITE;
-        if (conn->events_watched & EVENT_READ) mask |= POLLIN;
+    if (bits != NULL) {
+        *bits &= ~EVENT_WRITE;
+        if (*bits & EVENT_READ) mask |= POLLIN;
     }
     return update_poll(app, fd, mask);
 }
 
 static int uring_release_fd(App *app, int fd) {
     if (app == NULL || app->ring == NULL || fd < 0) return -1;
-    if (fd < app->connections_cap && app->connections != NULL && app->connections[fd] != NULL) {
-        app->connections[fd]->events_watched = 0;
+    int *const bits = interest_bits(app, fd, NULL);
+    if (bits != NULL) {
+        *bits = 0;
     }
     return update_poll(app, fd, 0);
 }
@@ -385,7 +392,16 @@ static int uring_poll(App *app, LoopEvent *out_events, int max_events, int timeo
             Connection *conn = (fd >= 0 && fd < app->connections_cap && app->connections != NULL)
                                    ? app->connections[fd] : NULL;
 
-            if (res < 0) {
+            if (conn == NULL && fd < app->watched_cap && app->watched[fd].fn != NULL) {
+                out_events[out_count].type = LOOP_EVENT_EXTERNAL;
+                out_events[out_count].fd = fd;
+                out_events[out_count].conn = NULL;
+                out_events[out_count].signo = 0;
+                out_events[out_count].ready = res < 0 ? WATCH_ERROR
+                                                      : ((res & POLLIN) ? WATCH_READ : 0) | ((res & POLLOUT) ? WATCH_WRITE : 0) |
+                                                            ((res & (POLLERR | POLLHUP | POLLNVAL)) ? WATCH_ERROR : 0);
+                out_count++;
+            } else if (res < 0) {
                 out_events[out_count].type = LOOP_EVENT_ERROR;
                 out_events[out_count].fd = fd;
                 out_events[out_count].conn = conn;

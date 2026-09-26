@@ -36,6 +36,14 @@ void app_init(App *app) {
     app->timer_shutdown_fd = -1;
     app->signal_fd = -1;
     app->is_shutting_down = 0;
+    app->defer_slots = NULL; /* res_defer allocates the handle table on first use */
+    app->defer_slots_cap = 0;
+    app->defer_free_head = UINT32_MAX;
+    app->defer_ready = NULL;
+    app->defer_ready_len = 0;
+    app->defer_ready_cap = 0;
+    app->watched = NULL;
+    app->watched_cap = 0;
 
     /* Starting allocation for the fd-indexed connections table (app_types.h)
      * - grown later by ensure_connection_capacity (connection.c) as needed.
@@ -58,6 +66,7 @@ void app_init(App *app) {
         exit(EXIT_FAILURE);
     }
     arena_init(&app->arena, arena_buf, ARENA_SIZE);
+    arena_pool_init(&app->arena_pool, ARENA_SIZE, ARENA_POOL_MAX_SPARE); /* no block until one is taken */
 
     /* the one receive buffer idle connections borrow (App.read_buf), instead of each owning one. */
     app->read_buf = malloc(BUF_SIZE);

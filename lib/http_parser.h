@@ -178,6 +178,16 @@ int request_has_chunked_encoding(const char *header_block);
 int request_wants_close(const Request *req);
 
 /*
+ * Copies what a handler can read from `src` into `dst` without touching unused slots (Request is ~10 KB,
+ * mostly fixed arrays read only up to their *_count): the strings, params, query and cookie entries in
+ * use, the header views, body and content_length. Views (header name/value, body) that point into
+ * [old_base, old_base + old_len) are moved to the same offset from new_base; anything else is kept as is.
+ * dst->arena = arena (where req_get_header materializes from now on). Pure: nothing else is written.
+ */
+void request_clone_used(Request *dst, const Request *src, const char *old_base, size_t old_len, char *new_base,
+                        Arena *arena);
+
+/*
  * Chunked request bodies (RFC 7230 4.1). chunked_body_scan validates framing without copying:
  *   1 complete (*decoded_len_out = decoded size), 0 need more bytes,
  *  -1 malformed framing, -2 decoded size would exceed max_decoded_len.

@@ -34,8 +34,8 @@ round trip, is won outright. The losses come from two places: writing pipelined 
 | ID | Problem | Tests affected | Impact | Effort | Evidence |
 |---|---|---|---|---|---|
 | **T1** | ~~Pipelined responses are written with one `write` syscall each~~ **Done** (2026-09-26) | plaintext | **High** (2.5–3× gap) | M | MEASURED symptom, CODE cause |
-| **T2** | Handlers can't wait on I/O: a DB query blocks the whole worker | db, query, fortune, update | **High** (~2× gap) | L | MEASURED symptom, CODE cause |
-| **T3** | No per-request memory that outlives the shared arena reset (prerequisite for T2) | db, query, fortune, update | (part of T2) | M | CODE |
+| **T2** | ~~Handlers can't wait on I/O: a DB query blocks the whole worker~~ **Engine done** (2026-09-26); the TFB app still to switch (T4) | db, query, fortune, update | **High** (~2× gap) | L | MEASURED symptom, CODE cause |
+| **T3** | ~~No per-request memory that outlives the shared arena reset~~ **Done** (2026-09-26), with T2 | db, query, fortune, update | (part of T2) | M | CODE |
 | **T4** | TFB app: one blocking libpq connection per worker, no multiplexing | db, query, fortune, update | High, after T2 | M | CODE |
 | **T5** | Worker count is a blunt tool; best setting differs per test | db tests | Low–Medium | S | MEASURED |
 | **T6** | `MAX_PIPELINED_PER_EVENT` (16) equals wrk's pipeline depth | plaintext | Low | S | CODE |
@@ -100,6 +100,22 @@ No effect on non-pipelined traffic (a batch of one is flushed exactly as today).
 
 ## T2. Handlers can't wait on I/O
 
+**Status: engine done (2026-09-26); T4 (the TFB app) not started.** API: `res_defer(res)` → `DeferHandle`,
+`res_resume(app, h)` → `Response *` (NULL once the request is gone), `req_deferred(app, h)`, `app_watch_fd(app, fd,
+WATCH_READ | WATCH_WRITE, cb, udata)` / `app_unwatch_fd`, and `app_run_once` (one loop turn; `app_listen_worker` loops
+over it). Differences from the sketch below: `res_resume` takes a generation-checked handle, not a `Connection *`, and
+there is no cancel callback (a stale handle resolves to NULL, after a client close, the 504 deadline or shutdown).
+Resumed responses are written from a queue drained after every event and before every poll, with no extra
+syscall, instead of through write readiness. External fds live in `App.watched[fd]` (every backend is fd-indexed except kqueue's
+udata), not in a tagged udata. A coalesced batch in front of a deferred request is flushed when it parks; a tail the
+socket does not take is held and written in front of the deferred answer. Details: `lib/CLAUDE.md`, "Behavior
+reference, Deferred responses" and "Application fds". Tests: `tests/test_defer.c` (14 cases, including every scenario
+listed below plus a batch tail held across the deferral, slot reuse with a stale handle, over-budget 503, 100 connections
+× 3 rounds), passing on kqueue, epoll (epoll-shim and Linux) and io_uring (Linux, Docker), plain and under ASan + UBSan;
+mutation-checked with 19 injected bugs; cookbook recipe 15 (job queue over a socket, long poll). MEASURED no regression
+(macOS loopback, one worker, `scripts/tfb_plaintext.sh HEAD`, 10 s per level): pipelined ×16 0.99x / 0.99x at 256 / 1,024
+connections, then 1.03x at 256; non-pipelined 1.00x at 64, and 0.94x / 1.03x / 1.00x in three runs at 256 (noise).
+
 **Symptom (MEASURED).** On all four DB tests CExpress runs at 50–60% of Actix-http, Axum-pg and h2o. It still beats Fiber.
 
 **Cause (CODE).** `lib/CLAUDE.md`, "Model": *handlers run synchronously on the loop: a blocking call (DB, sleep)
@@ -145,6 +161,16 @@ within 10–20% of them. The engine itself, as JSON shows, isn't the bottleneck.
 ---
 
 ## T3. Deferred responses need memory that outlives `arena_reset`
+
+**Status: done (2026-09-26), used by `res_defer` (T2).** Differences from the plan below: nothing is
+copied out of the shared arena. `arena_hand_over` gives the deferred request the whole `App.arena` (buffer, fallback
+list), and `App.arena` restarts on a block from `App.arena_pool`, a free list of `ARENA_SIZE` blocks (at most 64 spares
+kept). So headers set and JSON built before deferring stay valid. `Arena.large_bytes` makes the kept arena chargeable
+to `max_buffered_bytes`. `request_clone_used` and `response_clone_used` copy only the used slots of the stack
+`Request`/`Response`; the Request clone rebases header and body views onto a copy of the request's wire bytes. The
+deferred request is charged `ARENA_SIZE + large_bytes` (+ a held batch tail) and released to the pool after its flush. Tests: `test_arena.c`,
+`test_http_parser.c: test_request_clone_used`, `test_response.c: test_response_clone_used_sends_identical_bytes`, each
+mutation-checked.
 
 **Cause (CODE).** `lib/CLAUDE.md`, Files: the arena is *one shared per worker process (`App.arena`), not one per
 connection*, and `serve_buffered_requests` resets it after every dispatch. `Request` fields are views into

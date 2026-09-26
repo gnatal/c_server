@@ -26,6 +26,11 @@ void res_init(Response *res, Connection *conn);
  * no body bytes, no trailers), whatever body it was given. */
 void res_status(Response *res, int status);
 
+/* Engine-internal: copies the used part of `src` into `dst` (the scalars and each header, Set-Cookie and
+ * trailer slot up to its count; a Response is ~10 KB of mostly unused fixed slots). Header and trailer values
+ * are pointers, copied as pointers: they must live in memory that outlives `src` (the arena that built it). */
+void response_clone_used(Response *dst, const Response *src);
+
 /*
  * Sets a response header. Same name (case-insensitive) overwrites. Content-Length, Connection and Date are
  * computed by the engine and rejected here (logged). A custom Content-Type replaces the default one.

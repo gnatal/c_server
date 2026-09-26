@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
 #include "cexpress.h"
 #include "arena.h"
 
@@ -310,6 +312,91 @@ static void test_worker_hook_recipe(App *app) {
     assert(cookbook_worker_resource_opened() == 1);
 }
 
+/* ---- recipe 15 needs the real engine (res_defer refuses a fake Connection): socketpairs + app_run_once ---- */
+
+static void pump(App *app) {
+    for (int i = 0; i < 20; i++) {
+        app_run_once(app, 0);
+    }
+}
+
+static Connection *connect_client(App *app, int fds[2]) {
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    assert(set_nonblocking(fds[0]) == 0 && set_nonblocking(fds[1]) == 0);
+    Connection *conn = connection_create(app, fds[0]);
+    assert(conn != NULL);
+    app->connections[fds[0]] = conn;
+    app->open_connections++;
+    assert(event_loop_watch_read(app, fds[0], conn) == 0);
+    return conn;
+}
+
+static void say(const int fd, const char *text) {
+    assert(write(fd, text, strlen(text)) == (ssize_t)strlen(text));
+}
+
+static void hear(const int fd, char *buf, const size_t cap) {
+    const ssize_t n = read(fd, buf, cap - 1);
+    buf[n > 0 ? n : 0] = '\0';
+}
+
+static void test_deferred_recipes(void) {
+    static App app;
+    app_init(&app);
+    assert(event_loop_init(&app) == 0);
+    cookbook_register(&app);
+    int jobs[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, jobs) == 0);
+    assert(set_nonblocking(jobs[0]) == 0 && set_nonblocking(jobs[1]) == 0);
+    cookbook_attach_jobs(&app, jobs[0]);
+    int a[2];
+    int b[2];
+    connect_client(&app, a);
+    connect_client(&app, b);
+    char buf[2048];
+
+    /* A) two jobs in flight, answered out of order by the worker (this test) */
+    say(a[1], "GET /jobs/12 HTTP/1.1\r\nHost: x\r\n\r\n");
+    say(b[1], "GET /jobs/-3 HTTP/1.1\r\nHost: x\r\n\r\n");
+    pump(&app);
+    hear(a[1], buf, sizeof(buf));
+    assert(buf[0] == '\0'); /* nothing until the worker answers */
+    char job_lines[256];
+    hear(jobs[1], job_lines, sizeof(job_lines));
+    unsigned long long h12 = 0;
+    unsigned long long h3 = 0;
+    long long n1 = 0;
+    long long n2 = 0;
+    assert(sscanf(job_lines, "%llx %lld\n%llx %lld", &h12, &n1, &h3, &n2) == 4 && n1 == 12 && n2 == -3);
+    char reply[128];
+    snprintf(reply, sizeof(reply), "%llx 9\n%llx 1", h3, h12); /* second line split across two reads */
+    say(jobs[1], reply);
+    pump(&app);
+    hear(b[1], buf, sizeof(buf));
+    assert(starts_with(buf, "HTTP/1.1 200 OK") && strcmp(body_of(buf), "{\"result\":9,\"job\":\"-3\"}") == 0);
+    say(jobs[1], "44\n");
+    pump(&app);
+    hear(a[1], buf, sizeof(buf));
+    assert(strcmp(body_of(buf), "{\"result\":144,\"job\":\"12\"}") == 0);
+
+    /* B) long poll: a waits, b notifies from its own handler */
+    say(a[1], "GET /wait HTTP/1.1\r\nHost: x\r\n\r\n");
+    pump(&app);
+    say(b[1], "POST /notify HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nping");
+    pump(&app);
+    hear(b[1], buf, sizeof(buf));
+    assert(strcmp(body_of(buf), "woke 1") == 0);
+    hear(a[1], buf, sizeof(buf));
+    assert(starts_with(buf, "HTTP/1.1 200 OK") && strcmp(body_of(buf), "ping") == 0);
+
+    assert(app_unwatch_fd(&app, jobs[0]) == 0);
+    close(jobs[0]);
+    close(jobs[1]);
+    close(a[1]);
+    close(b[1]);
+    app_destroy(&app);
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     static App app; /* App is ~48 KB */
@@ -324,6 +411,7 @@ int main(void) {
     test_form_and_upload_recipes(&app);
     test_redirect_status_and_stream_recipes(&app);
     test_worker_hook_recipe(&app);
+    test_deferred_recipes(); /* last: it points the cookbook's app pointer at its own App */
 
     app_destroy(&app);
     printf("all cookbook tests passed\n");
