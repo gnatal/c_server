@@ -367,6 +367,9 @@ void app_destroy(App *app) {
     app->arena.buf = NULL;
     free(app->read_buf); /* no connection is left to have borrowed it */
     app->read_buf = NULL;
+    free(app->batch_buf);
+    app->batch_buf = NULL;
+    app->batch_len = 0;
     free(app->connections);
     app->connections = NULL;
     app->connections_cap = 0;
@@ -699,9 +702,79 @@ static void release_drained_out_buf(Connection *conn) {
     }
 }
 
+/*
+ * Puts the coalesced responses in App.batch_buf in front of conn's unsent out_buf, so they go out in the
+ * same write (and in order). The joined bytes stay in batch_buf when they fit, else in one exact-size arena
+ * block; either way out_buf is not owned, so an EAGAIN copies the unsent part out like any arena response.
+ * batch_len is 0 afterwards. Returns 0, or -1 once conn has been closed (out of memory).
+ */
+static int take_batch(App *app, Connection *conn) {
+    const size_t batch = app->batch_len;
+    const size_t out_left = conn->out_buf != NULL ? conn->out_len - conn->out_sent : 0;
+    const size_t total = batch + out_left;
+    app->batch_len = 0;
+    char *joined = app->batch_buf;
+    if (total > BATCH_BUF_SIZE) {
+        joined = arena_alloc(conn->arena, total); /* reclaimed by the caller's arena_reset */
+        if (joined == NULL) {
+            connection_close(app, conn);
+            return -1;
+        }
+        memcpy(joined, app->batch_buf, batch);
+    }
+    if (out_left > 0) {
+        memcpy(joined + batch, conn->out_buf + conn->out_sent, out_left);
+    }
+    if (conn->out_buf_owned) {
+        free(conn->out_buf);
+        conn->out_buf_owned = 0;
+    }
+    conn->out_buf = joined;
+    conn->out_len = total;
+    conn->out_sent = 0;
+    conn->out_cap = total;
+    return 0;
+}
+
+/*
+ * The response for the request at in_off is fully queued (written, or coalesced into App.batch_buf) on a
+ * keep-alive connection: consume that request (request_len bytes; 0 = nothing left to consume, e.g. a
+ * coalesced batch flushed on its own, whose requests were consumed as they were queued) and reset the
+ * per-request state for the next one. Event-loop interest is the caller's business.
+ */
+static void finish_request(App *app, Connection *conn) {
+    const size_t consumed = conn->request_len;
+    conn->request_len = 0;
+    if (conn->in_off + consumed >= conn->in_len) {
+        conn->in_len = 0;
+        conn->in_off = 0;
+    } else {
+        conn->in_off += consumed;
+    }
+    /* Back to idle between requests - unless pipelined bytes are already waiting, which
+     * start the next request's clock now. */
+    conn->request_started = conn->in_len > 0 ? time(NULL) : 0;
+    conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying */
+    conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check */
+    conn->continue_sent = 0; /* ... and its own 100 Continue */
+    conn->chunk_scan = (ChunkScanState){0}; /* next request's chunked body scans from its own start */
+    conn->head_scan = 0; /* ... and its head's blank-line search too */
+
+    /* nothing buffered - free the input buffer (however far it grew for a large body) or hand
+     * App.read_buf back, so an idle keep-alive connection owns no input memory. Pipelined
+     * leftovers keep the buffer as it is. */
+    if (conn->in_len == 0) {
+        release_in_buf(app, conn);
+    }
+}
+
 int flush_connection(App *app, Connection *conn) {
     size_t bytes_written_this_flush = 0;
     const size_t max_flush_bytes = 4 * STREAM_CHUNK_SIZE;
+
+    if (app->batch_len > 0 && take_batch(app, conn) != 0) {
+        return FLUSH_CLOSED;
+    }
 
     if (conn->last_write_progress == 0) {
         /* First time flush_connection runs for this response: start the write-stall clock now, even
@@ -924,31 +997,8 @@ int flush_connection(App *app, Connection *conn) {
         conn->out_sent = 0;
         conn->out_cap = 0;
         /* keep whatever follows the request just answered (a pipelined next request, whole or
-         * partial) instead of discarding the buffer. request_len == 0 means nobody recorded how long
-         * the request was (a direct flush_connection call): drop everything, the old behavior. */
-        const size_t consumed = conn->request_len;
-        conn->request_len = 0;
-        if (consumed == 0 || conn->in_off + consumed >= conn->in_len) {
-            conn->in_len = 0;
-            conn->in_off = 0;
-        } else {
-            conn->in_off += consumed;
-        }
-        /* Back to idle between requests - unless pipelined bytes are already waiting, which
-         * start the next request's clock now. */
-        conn->request_started = conn->in_len > 0 ? time(NULL) : 0;
-        conn->last_write_progress = 0; /* no response pending: WRITE_TIMEOUT_SECONDS stops applying */
-        conn->body_limit_checked = 0; /* next request on this connection gets its own body-limit check */
-        conn->continue_sent = 0; /* ... and its own 100 Continue */
-        conn->chunk_scan = (ChunkScanState){0}; /* next request's chunked body scans from its own start */
-        conn->head_scan = 0; /* ... and its head's blank-line search too */
-
-        /* nothing buffered - free the input buffer (however far it grew for a large body) or hand
-         * App.read_buf back, so an idle keep-alive connection owns no input memory. Pipelined
-         * leftovers keep the buffer as it is. */
-        if (conn->in_len == 0) {
-            release_in_buf(app, conn);
-        }
+         * partial) instead of discarding the buffer. */
+        finish_request(app, conn);
         sync_held_bytes(app, conn); /* tail copy and stream_buf are freed above */
         return FLUSH_DONE;
     }
@@ -1140,6 +1190,34 @@ static void compact_in_buf(Connection *conn) {
 }
 
 /*
+ * 1 if the response just built for the request at in_off can wait in App.batch_buf instead of being
+ * written now: another request is already buffered behind it (a batch of one is written as before),
+ * it is not the last one this serve call may dispatch (so the batch never outlives the loop), the
+ * connection stays open, and the response is plain bytes in out_buf that fit what is left of the
+ * batch (a file, shared_body or producer stream is written by flush_connection, batch in front).
+ */
+static int can_coalesce(const App *app, const Connection *conn, const int served) {
+    return app->batch_buf != NULL && conn->keep_alive && served + 1 < MAX_PIPELINED_PER_EVENT &&
+           conn->in_off + conn->request_len < conn->in_len && conn->out_buf != NULL && !conn->out_buf_owned &&
+           conn->out_sent == 0 && conn->shared_body == NULL && conn->file_fd < 0 && conn->stream_fn == NULL &&
+           conn->out_len <= BATCH_BUF_SIZE - app->batch_len;
+}
+
+/*
+ * Writes the coalesced responses in App.batch_buf on their own (the serve loop stopped with no response
+ * of its own to carry them). Their requests were consumed as they were queued, so request_len 0: the
+ * keep-alive reset consumes nothing. A partial write keeps the rest as conn's pending response, exactly
+ * as for any response (FLUSH_PENDING). FLUSH_DONE with nothing queued.
+ */
+static int flush_batch(App *app, Connection *conn) {
+    if (app->batch_len == 0) {
+        return FLUSH_DONE;
+    }
+    conn->request_len = 0;
+    return flush_connection(app, conn);
+}
+
+/*
  * serves every complete request buffered in in_buf[in_off..in_len), in order, one response each,
  * up to MAX_PIPELINED_PER_EVENT per call; *served_out = how many were dispatched. Returns:
  *   SERVE_NEED_MORE  no complete request left (in_buf compacted: any partial request now starts at 0)
@@ -1151,6 +1229,10 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
     *served_out = 0;
     for (int served = 0; served < MAX_PIPELINED_PER_EVENT; served++, (*served_out)++) {
         if (conn->in_off == conn->in_len) {
+            const int flushed = flush_batch(app, conn);
+            if (flushed != FLUSH_DONE) {
+                return flushed == FLUSH_CLOSED ? SERVE_CLOSED : SERVE_WAIT;
+            }
             conn->in_off = 0;
             conn->in_len = 0;
             return SERVE_NEED_MORE;
@@ -1173,6 +1255,11 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
             return SERVE_CLOSED;
         }
         if (!complete) {
+            /* the coalesced responses go out before anything else is written (a 100 Continue) */
+            const int flushed = flush_batch(app, conn);
+            if (flushed != FLUSH_DONE) {
+                return flushed == FLUSH_CLOSED ? SERVE_CLOSED : SERVE_WAIT;
+            }
             if (send_continue_if_expected(app, conn, &head) != 0) {
                 return SERVE_CLOSED;
             }
@@ -1219,6 +1306,19 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
          * in_buf or the next iteration parses from it. */
         req.body[req.content_length] = body_saved;
 
+        if (can_coalesce(app, conn, served)) {
+            /* queue it behind the batch instead of writing it: one write for the whole run (flush_batch,
+             * or the next flush_connection, which puts the batch in front of its own response) */
+            memcpy(app->batch_buf + app->batch_len, conn->out_buf, conn->out_len);
+            app->batch_len += conn->out_len;
+            conn->out_buf = NULL;
+            conn->out_len = 0;
+            conn->out_cap = 0;
+            finish_request(app, conn);
+            arena_reset(&app->arena);
+            continue;
+        }
+        /* any batch queued so far goes out in front of this response (flush_connection: take_batch) */
         const int flushed = flush_connection(app, conn);
         /* conn may already be freed by flush_connection (a non-keep-alive response, or a
          * hard write error) - reset the shared arena through app, never conn, once this
@@ -1233,6 +1333,7 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
             return SERVE_WAIT; /* in_off still marks the next request; handle_writable resumes */
         }
     }
+    /* the cap's last request is never coalesced (can_coalesce), so the batch is already empty here */
     if (conn->in_off == conn->in_len) {
         conn->in_off = 0;
         conn->in_len = 0;

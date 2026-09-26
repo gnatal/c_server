@@ -70,6 +70,7 @@
 #define ARENA_SIZE (64 * 1024)        /* App.arena's fixed buffer: one shared per-worker bump allocator, not one
                                         * per connection; reset once per request, falls back to malloc beyond this */
 #define BUF_SIZE 8192                 /* App.read_buf, and the request-header limit (431 beyond) */
+#define BATCH_BUF_SIZE (16 * 1024)    /* App.batch_buf: pipelined responses coalesced into one write (connection.c) */
 #define IN_BUF_GRANULE 512            /* an owned in_buf for a partial request is its bytes + NUL rounded up to this */
 #define MAX_BODY_SIZE (10 * 1024 * 1024)        /* request body (Content-Length or decoded chunked) and streamed response buffer; 413 beyond */
 #define MAX_STATIC_FILE_SIZE (50 * 1024 * 1024) /* static_serve_file refuses larger files with 500 */
@@ -732,6 +733,17 @@ typedef struct {
      * handle_readable call (see Connection.in_buf), so a single buffer is enough under the
      * single-threaded event loop. malloc'd by app_init, freed by app_destroy. */
     char *read_buf;
+
+    /* Pipelined responses coalesced into one write (serve_buffered_requests): a plain in-memory
+     * response (out_buf only - no file, shared_body or producer) whose request has another behind it
+     * is copied here instead of written, and its request is consumed at once. The next flush_connection
+     * on the same connection writes the batch in front of its own response, or alone (request_len 0)
+     * when the serve loop stops. Non-empty only inside one serve_buffered_requests call, for that one
+     * connection: like the arena, never holds anything across event-loop turns (a batch that can't be
+     * fully written is copied into a connection-owned tail, as any response is). BATCH_BUF_SIZE,
+     * malloc'd by app_init, freed by app_destroy. */
+    char *batch_buf;
+    size_t batch_len;
 } App;
 
 #endif /* APP_TYPES_H */

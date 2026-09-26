@@ -82,8 +82,9 @@ void app_wake_streams(App *app);
  *   output, 64 KB per turn; a producer that returns STREAM_PAUSE is parked: FLUSH_PENDING with write
  *   interest dropped, read interest kept only to notice the peer closing).
  *   On EAGAIN it waits for writability and stops reading. When done: keep-alive resets the connection
- *   for the next request (advancing conn->in_off past conn->request_len bytes, or discarding in_buf
- *   when request_len is 0), otherwise it closes. Returns FLUSH_DONE (fully queued, connection kept),
+ *   for the next request (advancing conn->in_off past conn->request_len bytes; request_len 0 consumes
+ *   nothing), otherwise it closes. Responses coalesced in App.batch_buf by the serve loop go out first,
+ *   in the same write. Returns FLUSH_DONE (fully queued, connection kept),
  *   FLUSH_PENDING (waiting for write readiness) or FLUSH_CLOSED (conn has been freed: don't touch it).
  * close_idle_connections: run once per second; a connection with no received bytes for
  *   IDLE_TIMEOUT_SECONDS (60) is closed (408 first if a request was half-received). A connection

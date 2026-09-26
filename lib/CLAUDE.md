@@ -31,7 +31,7 @@ Per request (`connection.c: handle_readable` → `serve_buffered_requests`, whic
 4. `match_route` (per-method Patricia tree; the walk only finds the `Route`, then `:params` are filled from that Route's own pattern via `match_path` - so routes may name the same tree position differently; skipped when `Route.has_params` is 0) → `dispatch` (`middleware.c`): app-wide middleware
    (prefix-filtered) → route middleware → handler, or the default 404 / 405 / OPTIONS answer, or a static file.
 5. The handler calls `res_*` (`response.c`), which only builds bytes into `conn->out_buf` (allocated from the arena). `res_stream` builds only the head there and records a producer on the `Connection`; the body is produced later, by `flush_connection` (see "Behavior reference, Producer streaming").
-6. `flush_connection` writes. Keep-alive: `arena_reset`, advance `in_off` past this request's `request_len` (or `in_len = 0` when nothing follows it), zero `chunk_scan` and `head_scan`, free `in_buf` (or hand back the borrowed `App.read_buf`) when nothing is buffered. Otherwise `connection_close`, dropping anything pipelined behind it.
+6. Coalesce or flush. A plain in-memory response (`out_buf` only) with another request already buffered behind it is copied into the per-worker `App.batch_buf` instead of written, and its request is consumed at once (`finish_request`, the same keep-alive reset `flush_connection` does); see "Behavior reference, Pipelining, Coalesced writes". Otherwise `flush_connection` writes, with any queued batch in front (`take_batch`). Keep-alive: `arena_reset`, advance `in_off` past this request's `request_len` (or `in_len = 0` when nothing follows it), zero `chunk_scan` and `head_scan`, free `in_buf` (or hand back the borrowed `App.read_buf`) when nothing is buffered. Otherwise `connection_close`, dropping anything pipelined behind it.
 
 Only `connection.c`, `event_loop_*.c`, `cluster.c` do I/O. Parsing, routing, dispatch and
 response building never touch a socket, so tests drive them with a fake `Connection` whose arena is a static buffer
@@ -60,7 +60,7 @@ Routes: no fixed cap per App (each is malloc'd into a tree), 64 per Router (`MAX
 path params 8 (value 63) · query params 16 (63) · request headers 32 (`MAX_HEADERS`; **a 33rd header is a 400**; a
 header name/value has no length cap of its own - it is a view into the input buffer, not a fixed-size copy -
 only the whole header block fitting `BUF_SIZE` bounds it) ·
-cookies 16 (255) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
+cookies 16 (255) · coalesced pipelined responses 16 KiB per write (`BATCH_BUF_SIZE`; a response that doesn't fit is written with the batch in front, never dropped) · request headers total 8 KiB (`BUF_SIZE`, else 431) · path 255 (else 414) · query 255 ·
 body 10 MiB (`MAX_BODY_SIZE`, else 413) · response headers 16 (name 63, value uncapped: copied into the arena) · Set-Cookie 16 (512 each) · trailers 8 (same as headers) · multipart parts 16 ·
 form fields 32 · static file 50 MiB · static file cache 256 entries, 256 KiB each, 64 MiB total per worker process, 1 s revalidation
 (`STATIC_CACHE_*`, `static.c`; a file over the per-entry cap is served but never cached; see "Static" below) ·
@@ -146,6 +146,7 @@ and `res_send_file` never copies the body into the arena either (see above).
 | `Connection` | `connection_create` (one calloc; no arena buffer behind it any more) | `connection_close` (exactly once) |
 | `conn->in_buf` (NULL while nothing is buffered) | not allocated while it borrows `App.read_buf` (during one `handle_readable`); owned copy: `stop_borrowing_read_buf` (unserved bytes left at the end of `handle_readable`, sized to them rounded up to `IN_BUF_GRANULE`), `grow_head_buf` (a header block filling that copy; realloc, up to `BUF_SIZE`) or `grow_in_buf` (a body past the buffer; realloc on further growth) | the owned copy: `flush_connection`'s keep-alive reset once nothing is buffered, or `connection_close`. The borrowed `App.read_buf`: never through `conn` |
 | `App.read_buf` (`BUF_SIZE`, one per worker process) | `app_init` | `app_destroy` |
+| `App.batch_buf` (`BATCH_BUF_SIZE`, one per worker process; non-empty only inside one `serve_buffered_requests` call) | `app_init` | `app_destroy`. Its bytes are never owned by a connection: `take_batch` points `out_buf` at it (or at an arena copy when batch + response exceed it), and an `EAGAIN` copies the unsent part into an owned tail like any arena response |
 | `conn->arena` | not allocated - always `&app->arena`, set once at `connection_create` | nobody frees it through `conn`; `app_destroy` frees the one underlying `App.arena` after every connection is already closed |
 | `conn->stream_buf` (a connection-owned `STREAM_CHUNK_SIZE` turn buffer, lazily malloc'd, reused chunk to chunk - never the shared arena) | `flush_connection`, on the first chunk of a `res_send_file` response on the `pread` fallback (`file_no_sendfile`; never on the `sendfile` path) or the first producer call of a `res_stream` response | `flush_connection` when streaming ends (success or a mid-stream error) or `connection_close` (a still-streaming connection closed some other way) |
 | `conn->stream_ctx` (the application's producer state, handed over by `res_stream`) | the handler (application code), before `res_stream` | `stream_release` (`response.c`) calls `stream_ctx_free(ctx)` exactly once: after `STREAM_END` (in `flush_connection`), on `STREAM_ABORT` or any close (`connection_close`), when a later `res_*` in the same handler replaces the stream, or inside `res_stream` for HEAD. If `res_stream` returns -1 the caller still owns it |
@@ -351,7 +352,7 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   *declared* rather than what it had actually sent), and freed once nothing is buffered. No header
   terminator within `BUF_SIZE` (8 KiB) → 431.
 - **Pipelining.** Several requests may sit in `in_buf` at once. `serve_buffered_requests` answers them strictly in
-  order, one `flush_connection` each, starting at `Connection.in_off`; `request_wire_len` (`http_parser.c`: `header_len` +
+  order, one response each (written by `flush_connection`, or coalesced - below), starting at `Connection.in_off`; `request_wire_len` (`http_parser.c`: `header_len` +
   `Content-Length`, or + `ChunkScanState.body_end` for chunked, which ends after the trailer's blank line) records where
   the next one starts (`Connection.request_len`), and `flush_connection`'s keep-alive reset advances `in_off` by it.
   Bytes after a `Content-Length` body are the next request, never part of this body. The unserved tail is moved to the
@@ -361,6 +362,23 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   (cap hit, or a response pending), `stop_borrowing_read_buf` copies `[in_off, in_len)` into an owned buffer at offset
   0, so `in_off` is 0 again once `handle_readable` returns; it only goes above 0 inside an owned buffer while
   `handle_writable` serves from it.
+  **Coalesced writes (TechEmpower plaintext: 16 pipelined requests per `recv`).** One `write` per response made the
+  syscall the cost (MEASURED ~1.6M req/s against 3.4-4.6M for Actix/Axum/Fiber on the same TFB run). After `dispatch`,
+  `can_coalesce` copies the response into `App.batch_buf` and consumes its request (`finish_request`) without writing when:
+  another request's bytes follow it in `in_buf` (a lone request is written exactly as before), it is not the last request
+  this call may dispatch (`served + 1 < MAX_PIPELINED_PER_EVENT`, so the batch never outlives the loop), the connection
+  stays open, the response is `out_buf` only (no `file_fd`, `shared_body`, `stream_fn`, owned tail) and it fits what is
+  left of `BATCH_BUF_SIZE`. Every `flush_connection` call starts with `take_batch` when the batch is non-empty: the batch
+  goes in front of the unsent `out_buf` (joined in `batch_buf`, or in one exact-size arena block when it doesn't fit), so
+  the next written response - a file, a shared body, a stream head, a `Connection: close` answer, a 400/413 rejection,
+  or one too big to queue - carries it in the same `write`/`writev`/`sendfile`, in order. When the loop stops with no
+  response of its own (a partial request follows: before any `100 Continue` is written; or nothing is left),
+  `flush_batch` flushes it alone with `request_len = 0`, which the keep-alive reset reads as "consume nothing" (the
+  batch's requests were consumed as they were queued; `request_len == 0` used to mean "drop all of `in_buf`"). A batch
+  that hits `EAGAIN` becomes the connection's pending owned tail like any response, so `FLUSH_PENDING` rules are
+  unchanged. Invariant: `App.batch_len == 0` whenever `serve_buffered_requests` returns. MEASURED (macOS loopback, one
+  worker, `wrk -t2 -c64`, 16-deep pipeline, 13-byte `text/plain`, 3 rounds): 440-465k → 1.77-1.81M req/s (~3.9x);
+  without pipelining 247-256k → 259k (unchanged).
   **Fairness:** at most `MAX_PIPELINED_PER_EVENT` (16) requests per readiness event; past that the connection arms write
   interest and the rest is served by `handle_writable` on the next poll (a connected socket is almost always writable).
   **Backpressure:** while a response is pending (`EAGAIN`), `flush_connection` (`wait_for_writable`) drops read interest

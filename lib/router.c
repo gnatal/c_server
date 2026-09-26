@@ -65,6 +65,14 @@ void app_init(App *app) {
         perror("app_init: malloc (read_buf)");
         exit(EXIT_FAILURE);
     }
+
+    /* the coalescing buffer for pipelined responses (App.batch_buf), one per worker process. */
+    app->batch_buf = malloc(BATCH_BUF_SIZE);
+    if (app->batch_buf == NULL) {
+        perror("app_init: malloc (batch_buf)");
+        exit(EXIT_FAILURE);
+    }
+    app->batch_len = 0;
 }
 
 /* Shared fill logic for one route slot, used by both app_add_route_mw and
