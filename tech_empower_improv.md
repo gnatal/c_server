@@ -20,7 +20,7 @@ Zero non-2xx responses anywhere; all entries pass TFB verification. Compared aga
 | Test | CExpress best req/s (2 runs) | Place of 5 | vs. leader |
 |---|---:|---|---|
 | JSON | 764k / 771k | **1st** | ahead of Actix (720k / 753k) |
-| Plaintext (pipelined ×16) | 1.59M / 1.60M | 5th | 35–40% of Actix (4.27M / 4.62M) |
+| Plaintext (pipelined ×16) | 1.59M / 1.60M → **4.91M after T1** | 5th → **1st** (one run) | 35–40% of Actix → 105% (4.69M in the same run) |
 | Single query | 155k / 178k | 4th | ~55% (Actix-http 289k / 338k) |
 | Multiple queries (20) | 152k / 170k | 4th | ~55% (Axum-pg / Actix-http ~300k) |
 | Fortunes | 170k / 181k | 4th | ~60% (h2o / Actix-http ~300k) |
@@ -55,7 +55,12 @@ batch in its own `write`/`writev`/`sendfile`; and `request_len == 0` now means "
 (it used to drop `in_buf`), which is what a batch flushed alone needs. Tests: 7 new cases in `tests/test_pipelining.c`
 counting writes on a `SOCK_DGRAM` socketpair (16 pipelined GETs = 1 write, byte-identical to answering them one by
 one). MEASURED locally (macOS loopback, one worker, `wrk -t2 -c64 -d6s`, 16-deep pipeline, 13-byte body, 3 rounds):
-440–465k → 1.77–1.81M req/s (~3.9×); non-pipelined unchanged (247–256k → 259k). Not yet re-measured in TFB.
+440–465k → 1.77–1.81M req/s (~3.9×); non-pipelined unchanged (247–256k → 259k).
+**MEASURED in TFB (2026-09-26, plaintext only, one run, same setup, same competitors):** 1st at every pipelined level,
+with the lowest average latency at each. req/s at 256 / 1,024 / 4,096 / 16,384 connections: cexpress 4,894,116 /
+4,910,252 / 4,095,808 / 3,361,283; actix 4,689,204 / 4,588,299 / 3,865,569 / 3,119,534; axum 3.69M best; fiber 3.65M
+best; h2o 1.62M best. Best-level result 1.60M → 4.91M (3.07×). One run: the 4–8% lead over Actix is inside the
+run-to-run noise seen before (Actix 4.27M / 4.62M in the two full runs), so repeat before quoting a ranking.
 
 **Symptom (MEASURED).** Plaintext tops out at ~1.6M req/s at every pipelined concurrency level (1.37M, 1.57M,
 1.59M, 1.41M at 256/1024/4096/16384 connections). Actix, Axum and Fiber reach 3.4–4.6M on the same run. JSON (not
