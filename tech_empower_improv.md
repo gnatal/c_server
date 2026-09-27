@@ -11,7 +11,8 @@ code, not profiled. ESTIMATED: the gain is an estimate.
 
 **Setup, in short.** TFB's own harness on one Apple Silicon Mac: a Colima VM with 10 CPUs / 12 GB running the
 server, TFB's Postgres and wrk together; 2 full runs plus a worker-count sweep, 2026-09-25/26, then a plaintext-only
-run after T1 and a third full DB run (db, query, fortune, update) after T2–T4. Linux, epoll backend.
+run after T1, full runs 3 and 4 after T2–T4, and two A/B runs of the Postgres flush strategy (runs 5 and 6, DB
+tests only, all variants in the same run). Linux, epoll backend.
 Zero non-2xx responses anywhere; all entries pass TFB verification. Compared against Actix, Axum, h2o and Fiber.
 
 ---
@@ -20,26 +21,34 @@ Zero non-2xx responses anywhere; all entries pass TFB verification. Compared aga
 
 MEASURED. Best req/s across levels. Runs 1 / 2: before any fix. After: plaintext from the plaintext-only run after
 T1 and full run 4 (`20260926145131`); DB tests from full runs 3 (`20260926132736`) and 4, both after T2–T4 with the
-same code; JSON from run 4.
+same code; JSON from run 4. Now: DB tests from full run 7 (`20260927005504`, all five frameworks, shipped code with
+one Postgres flush per event-loop turn); JSON and plaintext unchanged since run 4.
 
-| Test | Runs 1 / 2 | Place | After (runs 3 / 4) | Place | vs. best other (after) |
-|---|---:|---|---:|---|---|
-| JSON | 764k / 771k | **1st** | 788k (run 4) | **1st** | 107% of Actix (739k) |
-| Plaintext (pipelined ×16) | 1.59M / 1.60M | 5th | 4.91M / 4.81M | **1st / 1st** | 105% / 109% of Actix |
-| Single query (db) | 155k / 178k | 4th | 298k / 300k | 4th / 4th | 97% / 96%; top four within 3.2% / 3.8% |
-| Multiple queries, 1 query | 152k / 170k | 4th | 301k / 303k | 1st / 3rd | 101% / 98%; top four within 2.5% / 3.8% |
-| Multiple queries, 20 queries | – | – | 65.5k / 66.1k | **1st / 1st** | 2.30× / 2.27× the best other |
-| Fortunes | 170k / 181k | 4th | 283k / 275k | 3rd / 4th | 96% / 93% of h2o (295k / 296k) |
-| Updates, 1 query | 75k / 78k | 4th | 159k / 157k | 1st / 1st (tie) | 105% / 100% of Actix-http |
-| Updates, 20 queries | – | – | 34.3k / 33.3k | **1st / 1st** | 1.81× / 1.69× Actix-http |
+| Test | Runs 1 / 2 | Place | After (runs 3 / 4) | Place | Now (run 7) | Place | vs. best other (now) |
+|---|---:|---|---:|---|---:|---|---|
+| JSON | 764k / 771k | **1st** | 788k (run 4) | **1st** | (run 4) | **1st** | 107% of Actix (739k) |
+| Plaintext (pipelined ×16) | 1.59M / 1.60M | 5th | 4.91M / 4.81M | **1st / 1st** | (run 4) | **1st** | 109% of Actix |
+| Single query (db) | 155k / 178k | 4th | 298k / 300k | 4th / 4th | 331k | **1st** | 100.7% of Actix-http (329k) |
+| Multiple queries, 1 query | 152k / 170k | 4th | 301k / 303k | 1st / 3rd | 328k | **1st** | 102.2% of Actix-http (321k) |
+| Multiple queries, 20 queries | – | – | 65.5k / 66.1k | **1st / 1st** | 67.1k | **1st** | 2.22× Actix-http |
+| Fortunes | 170k / 181k | 4th | 283k / 275k | 3rd / 4th | 304k | 2nd | 98.4% of Actix-http (309k); h2o 300k |
+| Updates, 1 query | 75k / 78k | 4th | 159k / 157k | 1st / 1st (tie) | 165k | 2nd | 98.3% of Actix-http (168k) |
+| Updates, 20 queries | – | – | 34.3k / 33.3k | **1st / 1st** | 33.8k | **1st** | 1.72× Actix-http |
 
 The per-request path (parse, route, build a response, write it) is competitive: JSON is won in all three runs that
 had it. The two losses found in runs 1 / 2, pipelined writes (T1) and waiting on the database (T2–T4), are fixed,
 and run 4 confirms it. Plaintext is 1st in both runs since T1. db and query at one query are a four-way tie
 (within 4%, well under the ~15% run-to-run noise). Query and update lead at every count from 5 queries on,
 1.35–2.3×, because a request's queries cost one round trip and requests share the connection. Fortunes is the one DB
-test where CExpress is behind the leader by more than a few percent in both runs (4% / 7% behind h2o). Next: retune
-workers (T5), and one `send` per event-loop turn to Postgres instead of one per request (see T4's status).
+test where CExpress is behind the leader by more than a few percent in both runs (4% / 7% behind h2o). Since then:
+workers retuned (T5, one per core stays) and one `send` per event-loop turn to Postgres (T4's status). Run 7 (all
+five frameworks): 1st on db and single query, 2nd on fortune and single update, each within 2% of Actix-http (a tie
+at this noise level), and 1.4–2.2× ahead of everyone on query and update from 5 queries on.
+Against Round 23's DB leaders (runs 8 and 9, `20260927062404` / `20260927075426`, average of two runs; may-minihttp,
+xitca-web, xitca-web-barebone added): db and single query are a four-way tie within 2.5% (cexpress 3rd on the average,
+98% of may-minihttp); multiple queries and updates are won at every count from 5 on by 1.4–2.3×, and single update
+narrowly in both runs; **fortune is the one consistent gap: 4th, 92% of xitca-web-barebone** (7–9% behind both leaders
+in both runs). Full table: `Rest_in_c/benchmark_techempower.md`, "Runs 8 and 9".
 
 ## Summary
 
@@ -53,8 +62,9 @@ workers (T5), and one `send` per event-loop turn to Postgres instead of one per 
 | **T6** | `MAX_PIPELINED_PER_EVENT` (16) equals wrk's pipeline depth | plaintext | Low | S | CODE |
 
 Order to do them: **T1** (self-contained, big payoff), then **T3 → T2 → T4** as one project, then retune **T5**.
-T1–T5 are done, and full run 4 confirms the ranking. One `send` per event-loop turn to Postgres is implemented and
-measured once (T4's status): +10–13% on db and single-query, −8–16% on updates at 1–5 queries, not yet explained.
+T1–T5 are done, and full run 4 confirms the ranking. One `send` per event-loop turn to Postgres is the shipped
+behavior (T4's status): +10–13% on db and single-query in run 5. Run 5's update loss (−8–16% at 1–5 queries) did not
+reproduce in run 6, and flushing an `/updates` UPDATE at once instead of at turn end made no measurable difference.
 
 ---
 
@@ -233,13 +243,19 @@ gap; from 32 connections the top four track each other.
 `app_run_once`, after all its events and resumed responses; `lib/CLAUDE.md`, "Event-loop turn"). App: libpq 18.6 from
 the PostgreSQL apt repository (Ubuntu 24.04 ships 16, whose `PQpipelineSync` flushes per request); every sync is
 `PQsendPipelineSync` (buffered), and the hook does one `PQflush` per turn. Each request keeps its own sync, so the FIFO,
-per-request error isolation and one implicit transaction per request are unchanged. `CEXPRESS_PG_FLUSH_EACH=1`
-restores a flush per request (A/B only, to be removed). **MEASURED** (run 5, `20260926163928`, one run, batched vs
+per-request error isolation and one implicit transaction per request are unchanged. The Postgres socket is flushed
+from the readiness callback only on write readiness (the rest of a partial send). **MEASURED** (run 5, `20260926163928`, one run, batched vs
 flush-each in the same run, 1 worker per core): db 321,196 vs 291,353 (1.10×), query 325,489 vs 286,777 at 1 query
 (1.13×) and 1.04× at 20, fortune 292,644 vs 286,124 (1.02×), update 139,560 vs 151,470 at 1 query (**0.92×**; 0.84× at
-5, even from 10). actix-http in the same run: db 322,366, query 316,781, fortune 280,625, update 163,504. Update loss
-not explained; suspected (CODE): the `/updates` UPDATE is queued from the result callback and now waits for the end of
-the turn instead of being flushed at once, adding a wait to its second round trip.
+5, even from 10). actix-http in the same run: db 322,366, query 316,781, fortune 280,625, update 163,504. The
+flush-each baseline was an env toggle of the same binary, since removed.
+**MEASURED** (run 6, `20260926224646`, one run, db and update only): the unchanged batched build, in the same position
+of the same test order, did 160,909 at 1 update and 85,093 at 5 (run 5: 139,560 and 69,951), ahead of run 5's
+flush-each numbers and of actix-http (154,827 and 61,086); run 5's update loss did not reproduce. The suspected cause
+was tested in the same run: a variant that flushes right after reading Postgres results whenever those results queued
+new queries (the `/updates` UPDATE), instead of waiting for the end of the turn. Updates +0.5% to +2.8% at every
+count, inside noise; not kept. On `/db` that variant runs the batched code exactly, so its db column is an A/A
+measure of noise: 1–3% apart from 32 connections, 12% at 16.
 
 **Cause (CODE).** `Rest_in_c/techempower/cexpress/src/db.c` opens one libpq connection per worker and already uses
 pipeline mode (`PQenterPipelineMode`, `PQsendQueryPrepared` ×N, `PQpipelineSync`) so the 20 queries of `/queries`
@@ -277,8 +293,8 @@ fix. **After T2/T4, retune from 1× per core.** The table above is from the bloc
 
 **Status: done (2026-09-26).** MEASURED, run 5 (`20260926163928`, one run, batched per-turn flush, same run): 1× vs 2×
 per core: db 321,196 vs 305,382 (1×, +5%), query 325,489 vs 306,823 at 1 query (+6%), fortune 292,644 vs 290,215 (tie),
-update 139,560 vs 152,828 at 1 query (2× +9.5%, the same as flush-each at 1×, so it tracks the update loss above, not
-the worker count). From 10 queries on both are within 4%. The default stays at one worker per core; with one
+update 139,560 vs 152,828 at 1 query (2× +9.5%, the same as flush-each at 1×; run 6 did not reproduce the batched
+update loss, see T4's status). From 10 queries on both are within 4%. The default stays at one worker per core; with one
 non-blocking connection per worker, more workers only add Postgres backends and context switches. Single runs, so treat differences under ~10% as noise.
 
 ---
