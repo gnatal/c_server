@@ -38,6 +38,13 @@ Modern backend applications often rely on high-level runtimes like Node.js or Go
 
 ## Performance & Benchmarks
 
+**TechEmpower (TFB).** Run with TechEmpower's own harness, Postgres image and wrk, against Actix, Axum, h2o, Fiber and Round 23's database leaders (may-minihttp, xitca-web). All three share one laptop's 10-CPU VM, so rankings within a run matter more than absolute numbers. Latest runs, 26-27 Sep 2026:
+- **1st:** JSON (788k req/s vs Actix 739k) and pipelined plaintext (4.81M vs Actix 4.41M); updates at every query count (2.7-6.6% ahead) and multiple queries at every count (0.4-6.4% ahead).
+- **Tied:** single query and db, within 2.4% of may-minihttp and xitca-web-barebone.
+- **Behind:** fortunes, 91-94% of xitca-web-barebone over three runs.
+
+The database app sends every SQL statement with its own Sync, as TFB's rules require. Setup, per-run tables and the rules check: [`techEmpV1.md`](techEmpV1.md).
+
 **Method.** Measured on 24 Sep 2026 with `scripts/stress_test.sh` at its defaults: `wrk` (8 threads, keep-alive, 15 s per row) against the demo started as `QUIET=1 WORKERS=4 ./cexpress_demo` from `examples/todo_sqlite/`, on an Apple M3 Pro laptop (macOS, gcc-16 -O2), with `wrk` running on the same machine so both compete for the same cores. **Each row is a single run.** The machine was busy during this run (load average 7-8 before it started, `sysmond` at ~76% CPU), and results move with whatever else the laptop is doing. On 21-23 Sep the same `/ping` test reached 250,055 req/sec at 100 connections and 256,864 at 1,000 (best of 3); on 24 Sep two shorter re-runs gave 175-180k at 100 connections and 191-193k at 1,000.
 
 **`GET /ping`**: a fixed 4-byte reply, no database, no JSON. This is the engine's connection and request path on its own.
@@ -188,14 +195,12 @@ The codebase is split into two distinct tiers:
 
 ## Known Gaps
 
-Verified against the current code on 21 Sep 2026 and not yet fixed (details and suggested fixes in [`lib/CLAUDE.md`](lib/CLAUDE.md), "Known gaps"):
-- A request with a malformed request line (no HTTP version, `HTTP/2.0`, garbage) gets **no response**; the connection stays open until 8 KiB arrive or the 60 s idle timeout fires.
-- Path parameters are stored per tree position: `/orders/:id/items` plus `/orders/:oid/notes` capture both under `id`.
-- HTTP pipelining is dropped: a second request already in the buffer is discarded.
-- Chunked request bodies are re-scanned from the start on every `recv`.
-- About 25 KB resident per connection on macOS (72 KB allocated), up from about 7 KB before the arena.
-- `scripts/stress_test.sh` measures a 404 for `GET /` and its memory sampler output is not credible (see `scripts/CLAUDE.md`).
-- No HTTP/2, `Expect: 100-continue`, compression, `Range`, or WebSocket.
+Verified against the current code on 27 Sep 2026 and not yet fixed (details in [`lib/CLAUDE.md`](lib/CLAUDE.md), "Known gaps"):
+- `res_write` silently truncates a chunked body past `MAX_BODY_SIZE` + 8 KiB of wire bytes; the handler cannot tell. Use `res_stream` for large bodies.
+- Path parameters and query values over 63 characters, and single cookie values over 255, are truncated silently.
+- Deferred requests (`res_defer`) have no cancel callback: work for a client that left runs to completion, and `res_resume` returns NULL.
+- The io_uring backend is a readiness poller only; sockets are still read and written with `recv` / `write`.
+- No HTTP/2, compression, `Range`, or WebSocket. `Expect` values other than `100-continue` are ignored (no `417`).
 
 ---
 
@@ -270,7 +275,7 @@ make test
 ```
 
 builds and runs every suite (stops at the first failure; each prints `all ... tests passed`). Plain C `assert`
-tests, no framework, no network access needed except loopback. All 13 suites passed on macOS (gcc-16) on 22 Sep 2026, plain and under ASan + UBSan; the Linux build was not run for this update. **13 suites:**
+tests, no framework, no network access needed except loopback. All 22 suites passed on macOS (gcc-16) on 27 Sep 2026, plain and under ASan + UBSan; the Linux build was not run for this update. **22 suites:**
 
 | Binary (`build/bin/`) | Covers |
 |---|---|
@@ -286,6 +291,15 @@ tests, no framework, no network access needed except loopback. All 13 suites pas
 | `test_cluster` | worker count, `SO_REUSEPORT` multi-bind, concurrent serving, graceful drain |
 | `test_ping` | a minimal `/ping` route through parse → route → dispatch (the connection stress-test target's shape) |
 | `test_cookbook` | every recipe in `lib/examples/cookbook.c`, driven through the real parse → route → dispatch path (this is also the only automated JSON coverage) |
+| `test_pipelining` | several requests in one buffer answered in order on one connection; a pipelined batch coalesced into one `write` |
+| `test_read_buf` | input borrowed from the worker's shared receive buffer; only unserved bytes are copied into a connection-owned buffer |
+| `test_stream` | producer streaming (`res_stream`, `stream_write`, `app_wake_streams`): framing, parking, waking |
+| `test_answered` | "every input is answered or closed", end to end, with inputs split at every byte |
+| `test_body_limit` | `app_use_body_limit` on the canonical path, chunked bodies included |
+| `test_listen` | `ServerConfig.bind_address`: a loopback listener refuses non-loopback connections |
+| `test_buffer_budget` | `ServerConfig.max_buffered_bytes`, the per-worker budget for memory held across event-loop turns |
+| `test_arena` | the arena allocator: bump allocation, fallback past capacity, reset, overflow rejection |
+| `test_defer` | deferred responses (`res_defer` / `res_resume`) and application fds (`app_watch_fd`) through the real event loop |
 
 ### Run one suite
 ```bash

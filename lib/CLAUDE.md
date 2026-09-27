@@ -755,7 +755,7 @@ this update). What to keep:
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
 - Allocate per-request data from `conn->arena`, not `malloc`. Emit JSON through yyjson with `arena_yyjson_alc`.
 - No syscall on a path that changes nothing (`events_watched`; enforced on every backend, see Event loop).
-Verification tools: `make bench`, `make test` (13 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
+Verification tools: `make bench`, `make test` (22 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
 `make fuzz` (mutation fuzzer over parser/router/response, then an end-to-end "every input is answered or closed" check through the real connection code), `make check-docs`. Run sanitizers and fuzz after touching
 `http_parser.c`, `router.c`, `response.c` or `arena.c`. The Makefile tracks header dependencies (`-MMD`).
 

@@ -2,7 +2,7 @@
 
 Findings from running the TechEmpower Framework Benchmarks (TFB) against CExpress, `lib/` as of commit `bf91ef7`
 (identical to the copy vendored in `Rest_in_c/vendor/cexpress/lib`). Full numbers, setup and raw result folders:
-`Rest_in_c/benchmark_techempower.md`; the TFB entry itself lives in `Rest_in_c/techempower/cexpress/`.
+`techEmpV1.md`; the TFB entry itself lives in `Rest_in_c/techempower/cexpress/`.
 
 **Evidence labels** (same as `improvements.md`). MEASURED: from the TFB runs. CODE: cause found by reading the
 code, not profiled. ESTIMATED: the gain is an estimate.
@@ -19,36 +19,27 @@ Zero non-2xx responses anywhere; all entries pass TFB verification. Compared aga
 
 ## Where CExpress stands
 
-MEASURED. Best req/s across levels. Runs 1 / 2: before any fix. After: plaintext from the plaintext-only run after
-T1 and full run 4 (`20260926145131`); DB tests from full runs 3 (`20260926132736`) and 4, both after T2–T4 with the
-same code; JSON from run 4. Now: DB tests from full run 7 (`20260927005504`, all five frameworks, shipped code with
-one Postgres flush per event-loop turn); JSON and plaintext unchanged since run 4.
+MEASURED. Best req/s across levels; full tables in `techEmpV1.md`. Runs 1 / 2: before any fix. After: plaintext from
+the plaintext-only run after T1 and full run 4 (`20260926145131`); DB tests from full runs 3 (`20260926132736`) and
+4. Now: DB tests from run 10 (`20260927113740`, eight entries including Round 23's leaders), the first run with one
+Sync per SQL statement (TFB general requirement #7); JSON and plaintext unchanged since run 4.
 
-| Test | Runs 1 / 2 | Place | After (runs 3 / 4) | Place | Now (run 7) | Place | vs. best other (now) |
+| Test | Runs 1 / 2 | Place | After (runs 3 / 4) | Place | Now (run 10) | Place | vs. best other (now) |
 |---|---:|---|---:|---|---:|---|---|
-| JSON | 764k / 771k | **1st** | 788k (run 4) | **1st** | (run 4) | **1st** | 107% of Actix (739k) |
-| Plaintext (pipelined ×16) | 1.59M / 1.60M | 5th | 4.91M / 4.81M | **1st / 1st** | (run 4) | **1st** | 109% of Actix |
-| Single query (db) | 155k / 178k | 4th | 298k / 300k | 4th / 4th | 331k | **1st** | 100.7% of Actix-http (329k) |
-| Multiple queries, 1 query | 152k / 170k | 4th | 301k / 303k | 1st / 3rd | 328k | **1st** | 102.2% of Actix-http (321k) |
-| Multiple queries, 20 queries | – | – | 65.5k / 66.1k | **1st / 1st** | 67.1k | **1st** | 2.22× Actix-http |
-| Fortunes | 170k / 181k | 4th | 283k / 275k | 3rd / 4th | 304k | 2nd | 98.4% of Actix-http (309k); h2o 300k |
-| Updates, 1 query | 75k / 78k | 4th | 159k / 157k | 1st / 1st (tie) | 165k | 2nd | 98.3% of Actix-http (168k) |
-| Updates, 20 queries | – | – | 34.3k / 33.3k | **1st / 1st** | 33.8k | **1st** | 1.72× Actix-http |
+| JSON | 764k / 764k | **1st** | 788k (run 4) | **1st** | (run 4) | **1st** | 107% of Actix (739k) |
+| Plaintext (pipelined ×16) | 1.59M / 1.60M | 4th | 4.91M / 4.81M | **1st / 1st** | (run 4) | **1st** | 109% of Actix |
+| Single query (db) | 155k / 171k | 4th | 298k / 300k | 4th / 4th | 328k | 2nd | 98.8% of xitca-web-barebone (332k) |
+| Multiple queries, 1 query | 152k / 170k | 4th | 301k / 303k | 1st / 3rd | 329k | **1st** | 100.3% of may-minihttp (328k) |
+| Multiple queries, 20 queries | – | – | (not compliant) | – | 29.7k | **1st** | 100.4% of Actix-http (29.6k) |
+| Fortunes | 163k / 181k | 4th | 283k / 275k | 3rd / 4th | 311k | 4th | 94.2% of xitca-web-barebone (330k) |
+| Updates, 1 query | 70k / 73k | 4th | 159k / 157k | 1st / 1st (tie) | 165k | **1st** | 106.6% of Actix-http (155k) |
+| Updates, 20 queries | – | – | (not compliant) | – | 20.6k | **1st** | 102.7% of xitca-web (20.1k) |
 
-The per-request path (parse, route, build a response, write it) is competitive: JSON is won in all three runs that
-had it. The two losses found in runs 1 / 2, pipelined writes (T1) and waiting on the database (T2–T4), are fixed,
-and run 4 confirms it. Plaintext is 1st in both runs since T1. db and query at one query are a four-way tie
-(within 4%, well under the ~15% run-to-run noise). Query and update lead at every count from 5 queries on,
-1.35–2.3×, because a request's queries cost one round trip and requests share the connection. Fortunes is the one DB
-test where CExpress is behind the leader by more than a few percent in both runs (4% / 7% behind h2o). Since then:
-workers retuned (T5, one per core stays) and one `send` per event-loop turn to Postgres (T4's status). Run 7 (all
-five frameworks): 1st on db and single query, 2nd on fortune and single update, each within 2% of Actix-http (a tie
-at this noise level), and 1.4–2.2× ahead of everyone on query and update from 5 queries on.
-Against Round 23's DB leaders (runs 8 and 9, `20260927062404` / `20260927075426`, average of two runs; may-minihttp,
-xitca-web, xitca-web-barebone added): db and single query are a four-way tie within 2.5% (cexpress 3rd on the average,
-98% of may-minihttp); multiple queries and updates are won at every count from 5 on by 1.4–2.3×, and single update
-narrowly in both runs; **fortune is the one consistent gap: 4th, 92% of xitca-web-barebone** (7–9% behind both leaders
-in both runs). Full table: `Rest_in_c/benchmark_techempower.md`, "Runs 8 and 9".
+Runs 1-9 sent all of a request's SELECTs with one Sync, which TFB's rules forbid, so their 5-20 query results (1.4-2.3×
+ahead of every other entry) do not count; db, fortune and the 1-query cases send one statement per request and are
+unaffected. With one Sync per statement, query and update stay 1st at every count but by 0.4-6.6%. The two losses
+found in runs 1 / 2, pipelined writes (T1) and waiting on the database (T2-T4), are fixed. **Fortune is the one
+consistent gap: 91-94% of xitca-web-barebone in runs 8, 9 and 10** (T7).
 
 ## Summary
 
@@ -60,6 +51,7 @@ in both runs). Full table: `Rest_in_c/benchmark_techempower.md`, "Runs 8 and 9".
 | **T4** | ~~TFB app: one blocking libpq connection per worker, no multiplexing~~ **Done** (2026-09-26); full run 3: db/fortune at parity, query/update 1st | db, query, fortune, update | High, after T2 | M | CODE, MEASURED (1 run) |
 | **T5** | ~~Worker count is a blunt tool; best setting differs per test~~ **Done** (2026-09-26): 1 per core stays, beats 2 per core by 5–6% on db/query (one run) | db tests | Low–Medium | S | MEASURED |
 | **T6** | `MAX_PIPELINED_PER_EVENT` (16) equals wrk's pipeline depth | plaintext | Low | S | CODE |
+| **T7** | Fortune 3-9% behind the Round 23 leaders; workers not pinned to CPUs. Pinning **implemented as an A/B toggle** (2026-09-27), awaiting a TFB run | fortune | Medium (+4% locally) | S | MEASURED (perf, local A/B) |
 
 Order to do them: **T1** (self-contained, big payoff), then **T3 → T2 → T4** as one project, then retune **T5**.
 T1–T5 are done, and full run 4 confirms the ranking. One `send` per event-loop turn to Postgres is the shipped
@@ -227,13 +219,13 @@ request's queries end with a sync, so each `PGRES_PIPELINE_SYNC` completes the h
 sync arrives. Jobs come from an app-owned free list, never the request arena (the client may leave mid-query; its
 result is then dropped via `res_resume` returning NULL). A broken connection answers every queued and later request 500.
 Workers: one per core (`CEXPRESS_WORKERS` overrides). TFB verify: all PASS. MEASURED (one run, DB tests only, against
-actix-http alone, same setup as above; `Rest_in_c/benchmark_techempower.md`, "Run 3", last paragraph): db 295k vs
+actix-http alone, same setup as above; `techEmpV1.md`, "Run 3"): db 295k vs
 307k (was 155-178k), query 294k vs 308k at 1 query and 65k vs 29k at 20, fortune 280k vs 299k (was 170-181k), update
 167k vs 156k at 1 query and 34k vs 19k at 20 (was 75-78k). Zero non-2xx. **MEASURED in full run 3** (`20260926132736`, all five
 frameworks, DB tests only, one run): db 297,671 (4th; Actix-http 307,632, Axum-pg 302,879, h2o 301,387), query 301,411
 (1st), fortune 282,844 (3rd; h2o 295,283), update 158,507 (1st; Actix-http 151,049). At 20 queries 65.5k vs 28.5k (best
 other), at 20 updates 34.3k vs 18.9k. Zero non-2xx; wrk timeouts in the same range as the other entries. Per-level
-numbers: `Rest_in_c/benchmark_techempower.md`, "Run 3". **Full run 4** (`20260926145131`, same code, all six tests):
+numbers: `techEmpV1.md`, "Run 3". **Full run 4** (`20260926145131`, same code, all six tests):
 db 299,887 (4th, top four within 3.8%), query 302,805 at 1 query (3rd, within 3.8%) and 66,051 at 20 (2.27×),
 fortune 275,448 (4th, 93% of h2o), update 157,191 at 1 query (tied 1st with Actix-http at 157,190) and 33,306 at 20
 (1.69×). Zero non-2xx. Open: at 16 connections Actix-http is ~2× every other entry
@@ -242,8 +234,7 @@ gap; from 32 connections the top four track each other.
 **One flush per event-loop turn (2026-09-26).** Engine: `app_on_turn_end` (a hook called once at the end of every
 `app_run_once`, after all its events and resumed responses; `lib/CLAUDE.md`, "Event-loop turn"). App: libpq 18.6 from
 the PostgreSQL apt repository (Ubuntu 24.04 ships 16, whose `PQpipelineSync` flushes per request); every sync is
-`PQsendPipelineSync` (buffered), and the hook does one `PQflush` per turn. Each request keeps its own sync, so the FIFO,
-per-request error isolation and one implicit transaction per request are unchanged. The Postgres socket is flushed
+`PQsendPipelineSync` (buffered), and the hook does one `PQflush` per turn. Syncs are unchanged by the batching (at the time one per request; one per statement since run 10, see below). The Postgres socket is flushed
 from the readiness callback only on write readiness (the rest of a partial send). **MEASURED** (run 5, `20260926163928`, one run, batched vs
 flush-each in the same run, 1 worker per core): db 321,196 vs 291,353 (1.10×), query 325,489 vs 286,777 at 1 query
 (1.13×) and 1.04× at 20, fortune 292,644 vs 286,124 (1.02×), update 139,560 vs 151,470 at 1 query (**0.92×**; 0.84× at
@@ -256,6 +247,14 @@ was tested in the same run: a variant that flushes right after reading Postgres 
 new queries (the `/updates` UPDATE), instead of waiting for the end of the turn. Updates +0.5% to +2.8% at every
 count, inside noise; not kept. On `/db` that variant runs the batched code exactly, so its db column is an A/A
 measure of noise: 1–3% apart from 32 connections, 12% at 16.
+
+**Rules compliance (2026-09-27).** Until run 9 each request's SELECTs shared one sync, which TFB general requirement
+#7 forbids ("If using PostgreSQL's extended query protocol, each query must be separated by a Sync message"): it runs
+them in one implicit transaction, where an error skips the rest. TFB verify cannot see this (it counts statements
+with `pg_stat_statements`). Since run 10 every statement gets its own sync (`send_selects`, `DbJob.syncs_left`), and
+the lazy PREPARE of the `/updates` UPDATE too. MEASURED (run 10, `20260927113740`, one run): query at 20 went from
+66k (runs 7-9) to 29.7k, 1st by 0.4%; update at 20 from 33k to 20.6k, 1st by 2.7%. db, fortune and single-query
+numbers match runs 7-9. The 1.4-2.3× leads at 5-20 queries quoted below and in runs 3-9 came from the shared sync.
 
 **Cause (CODE).** `Rest_in_c/techempower/cexpress/src/db.c` opens one libpq connection per worker and already uses
 pipeline mode (`PQenterPipelineMode`, `PQsendQueryPrepared` ×N, `PQpipelineSync`) so the 20 queries of `/queries`
@@ -308,6 +307,64 @@ extra `epoll_ctl` plus one extra wakeup.
 
 **Fix.** Keep the fairness cap, but count bytes or batches, not requests, or raise it to 64. Measure the change
 with T1 in place, since T1 changes the per-request cost the cap is balancing. Not worth doing alone.
+
+---
+
+## T7. Fortune: behind the Round 23 leaders
+
+**Symptom (MEASURED).** Fortune is the one DB test where CExpress trails: 91.2-94.2% of xitca-web-barebone and
+92.9-97.0% of may-minihttp in runs 8, 9 and 10, while db, which runs the same request path except the 12-row result
+and the HTML render, is at parity.
+
+**Profile (MEASURED, 2026-09-27).** Each server run alone in the Colima VM with TFB's Postgres image and wrk image
+(`wrk -c 512 -t 10`, TFB's headers), `perf record -a -g -F 999` for 10 s in the middle of a 25 s load, the run-10
+image. 999 samples ≈ one CPU-second.
+
+| Per request | cexpress fortune | xitca-web-barebone fortune | cexpress db | xitca-web-barebone db |
+|---|---:|---:|---:|---:|
+| req/s | 299,057 | 314,498 | 319,868 | 317,845 |
+| server CPU (user + kernel) | 9.40 µs | 9.31 µs | 7.61 µs | 8.18 µs |
+| Postgres CPU | 9.88 µs | 9.85 µs | 10.49 µs | 10.08 µs |
+| wrk CPU | 6.49 µs | 6.62 µs | 6.05 µs | 6.58 µs |
+| idle (`swapper`) samples | 7,820 | 843 | 8,930 | 1,261 |
+
+- Per-request CPU is the same for both servers on fortune; CExpress leaves more of the VM idle (on db too, where
+  its lower server CPU per request makes up for it). Fortune adds 1.79 µs of server CPU per request to CExpress
+  (fortune minus db) and 1.13 µs to xitca, which cancels the db advantage.
+- Postgres work per request is equal (9.88 vs 9.85 µs), so libpq's per-execute Describe (xitca-postgres and
+  may_postgres skip it) costs nothing measurable here.
+- Inside `tfb-cexpress`: `done_fortunes` is the top user symbol (2,139 samples, 0.72 µs per request); with
+  `snprintf`, `cmp_fortune` and the sort's `memcmp` the render is ~0.88 µs per request, 3.1% of all VM CPU. libpq
+  2,007 samples, the app's kernel time 17,612 (TCP).
+- Syscalls (`perf stat`, 5 s): 0.96 `write` per response, 1.10 `recvfrom`, 0.16 `sendto` to Postgres (one flush per
+  ~6 requests), 0.20 `epoll_pwait`; 2.4 syscalls and 0.16 context switches per request. Nothing to remove.
+- Render microbenchmark (macOS M3, gcc-16 -O2, TFB's 12 rows + 1, the code of `done_fortunes`): 2.05 µs total:
+  escape loop 1.40 µs (1.5 ns per byte: the byte store through `char *` may alias `HtmlOut`, so `o->len` and
+  `o->buf` are reloaded per byte), 13× `snprintf("%d")` 0.44 µs, `qsort` 0.16 µs, body copy in `res_send_bytes`
+  0.04 µs, 12× `atoi` 0.08 µs.
+- The leaders' code (TFB checkout): the same query shape (one prepared statement, one Sync), zero-copy message
+  views, a sort, and escaped rendering into a preallocated buffer (yarte / sailfish). xitca-web-barebone pins each
+  thread to one core (`core_affinity`); CExpress's workers were not pinned.
+
+**Candidates, ranked.**
+
+| # | Fix | Evidence | Gain | Effort |
+|---|---|---|---|---|
+| 1 | Pin each worker to one CPU | MEASURED, `taskset` on the running workers, 3 alternating pairs: fortune 298.3k → 310.1k (+4.0%); db 2 pairs, no effect (302.3k / 303.3k unpinned, 295.6k / 306.1k pinned) | +4% | S |
+| 2 | Faster render: integer formatter, escape that copies runs between special bytes, insertion sort | perf 0.88 µs per request; microbenchmark 2.05 µs → ~0.3 µs (ESTIMATED) | ≤ 2.5% (its CPU share; the VM is not fully busy) | S |
+| 3 | Render into the response buffer (no body copy) | microbenchmark 0.04 µs | ~0.2% | M (engine API) |
+| 4 | Binary result format (no `atoi`) | microbenchmark 0.08 µs | ~0.3% | S |
+| 5 | No Describe per execute | Postgres CPU equal to xitca's | ~0 | L (own wire protocol) |
+| 6 | Fewer syscalls | already one `write` per response | ~0 | – |
+
+**Status: #1 implemented (2026-09-27), as an A/B toggle.** `src/pin.c`: `pin_worker(cluster_worker_id())` from an
+`app_on_worker_start` hook registered before `db_setup`'s (so each worker connects to Postgres from its own CPU);
+worker i gets the i-th CPU of its startup affinity (`pin_cpu_for_worker`, pure, `tests/test_pin.c`, mutation-checked).
+Only the `cexpress-postgres` entry; `CEXPRESS_PIN_WORKERS=0` turns it off, and the `cexpress-postgres-nopin` TFB
+entry is the same binary with that set. MEASURED (same local setup, the built image, the toggle itself, 3
+alternating pairs): fortune 294.6k off → 307.6k on (+4.4%); response bytes identical. TFB verify passes both entries.
+Next: a TFB run with `cexpress-postgres` and `cexpress-postgres-nopin` in the same run (all four DB tests), then keep
+or drop it. Candidate #2 is the next one if the gap remains.
 
 ---
 
