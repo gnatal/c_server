@@ -15,7 +15,7 @@ Here is the recommended structure for your new application:
 ```text
 my_app/
 ├── vendor/
-│   └── cexpress/          # Git submodule or copy of the c_server repository
+│   └── cexpress/          # Git submodule or copy of the cexpress repository
 ├── public/                # (Optional) Static files (HTML, CSS, images)
 │   └── index.html
 ├── AGENTS.md              # (Optional but recommended) AI context rules
@@ -156,7 +156,7 @@ static void handle_square(const Request *req, Response *res) {
         return;
     }
 
-    /* Build the document over the per-connection arena: nothing to free but the serialized text. */
+    /* Build the document over the worker's arena: nothing to free but the serialized text. */
     yyjson_alc alc = arena_yyjson_alc(&res->conn->arena);
     yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
     yyjson_mut_val *obj = yyjson_mut_obj(doc);
@@ -241,7 +241,7 @@ This project builds on top of the CExpress HTTP engine located in `vendor/cexpre
 ## Coding Rules:
 - Include `"cexpress.h"` for all CExpress types and functions.
 - Memory ownership:
-  - DO NOT free `req->body` or strings returned by `req_get_*` (they live in the per-connection arena and die when the handler returns; copy what you need to keep).
+  - DO NOT free `req->body` or strings returned by `req_get_*` (they live in the worker's arena or input buffer and die when the handler returns; copy what you need to keep).
   - DO NOT allocate `Response`; handlers receive a pointer and call `res_*` functions.
   - For JSON, use yyjson over the arena: `arena_yyjson_alc(&res->conn->arena)`. ALWAYS `free()` the string returned by `yyjson_mut_write` (it is libc-malloc'd).
   - Use the same `:name` for a path parameter at the same position in every route.

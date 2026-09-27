@@ -1,6 +1,34 @@
 # CExpress
 
-A lightweight, high-performance HTTP/1.1 server and web framework written entirely in C (C11), designed with a developer experience inspired by [Express.js](https://expressjs.com/). Each process runs a single-threaded, non-blocking event loop; a cluster of such processes scales across cores.
+**Express.js-style routing and middleware for C: an HTTP/1.1 server that beat actix and xitca-web in the TechEmpower harness.**
+
+[![CI](https://github.com/gnatal/cexpress/actions/workflows/ci.yml/badge.svg)](https://github.com/gnatal/cexpress/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/gnatal/cexpress)](https://github.com/gnatal/cexpress/releases)
+
+```c
+#include "cexpress.h"
+
+static void hello(const Request *req, Response *res) {
+    (void)req;
+    res_send(res, "Hello, world!\n");
+}
+
+int main(void) {
+    App app;
+    app_init(&app);
+    app_get(&app, "/", hello);
+    app_listen(&app, 8080);   /* runs until SIGINT/SIGTERM */
+    app_destroy(&app);
+    return 0;
+}
+```
+
+Build it against `libcexpress.a` with the Makefile in [`importing.md`](importing.md), then `curl localhost:8080/`.
+
+**TechEmpower benchmarks: 1st on updates, multiple queries, JSON and plaintext against actix and xitca-web, same harness, same run.** Each test compares every framework within one run of TechEmpower's toolset: updates and queries against actix, xitca-web and Round 23's other database leaders; JSON and plaintext (an earlier run) against actix, axum, h2o and Fiber. Tied on single query, 4th on fortunes. The runs use TechEmpower's own toolset, Postgres image and wrk, on one laptop VM rather than TechEmpower's three dedicated servers, so the ranking within a run is fair but the absolute numbers are not comparable with official rounds: see [method and caveats](techEmpV1.md) and [Performance & Benchmarks](#performance--benchmarks).
+
+A lightweight, high-performance HTTP/1.1 server and web framework written entirely in C (C11), designed with a developer experience inspired by [Express.js](https://expressjs.com/). Each process runs a single-threaded, non-blocking event loop; a cluster of such processes scales across cores. MIT licensed.
 
 > [!NOTE]
 > **Library Architecture:**
@@ -23,6 +51,7 @@ A lightweight, high-performance HTTP/1.1 server and web framework written entire
 - [Quick Start & Example Usage](#quick-start--example-usage)
 - [Project Layout](#project-layout)
 - [Roadmap](#roadmap)
+- [License](#license)
 
 ---
 
@@ -115,13 +144,13 @@ The codebase is split into two distinct tiers:
                             │ links against
 ┌───────────────────────────▼────────────────────────────────┐
 │           lib/ (Core Engine - libcexpress.a)               │
-│   - connection.c : Socket I/O, lifecycle, 64 KiB arena     │
-│   - arena.c      : Per-connection bump allocator           │
+│   - connection.c : Socket I/O, lifecycle, pipelining       │
+│   - arena.c      : Per-worker 64 KiB bump allocator        │
 │   - cluster.c/h  : Multi-worker SO_REUSEPORT supervisor    │
 │   - event_loop.h : Cross-platform event-loop interface     │
 │   - event_loop_kqueue.c   : macOS/BSD kqueue loop          │
-│   - event_loop_io_uring.c : Linux io_uring readiness loop  │
-│   - event_loop_epoll.c    : epoll backend (opt-in)         │
+│   - event_loop_epoll.c    : Linux epoll loop (default)     │
+│   - event_loop_io_uring.c : Linux io_uring (opt-in)        │
 │   - http_parser.c: Framing, query, dechunking, Request     │
 │   - router.c     : Per-method Patricia trees, sub-routers  │
 │   - middleware.c : Dispatch & middleware pipeline          │
@@ -159,6 +188,7 @@ The codebase is split into two distinct tiers:
 - **Cross-Platform Event Loop**: Native `kqueue` on macOS/BSD and `epoll` (with `timerfd` / `signalfd`) on Linux; `io_uring` readiness polling is built in on Linux but only used with `CEXPRESS_EVENT_LOOP=io_uring`, since it measured 20-25% slower than epoll. `make NO_URING=1` builds epoll only.
 - **Dynamic Connection Table**: Bounded only by `RLIMIT_NOFILE`, growing dynamically via `ensure_connection_capacity`.
 - **HTTP/1.1 Keep-Alive**: Persistent connections with idle connection timeout sweeps.
+- **HTTP/1.1 Pipelining**: Several requests arriving in one read are answered in order, and their responses are coalesced into a single `write` (the source of the pipelined-plaintext result above).
 - **Graceful Shutdown**: Synchronous signal trapping (`SIGINT`/`SIGTERM`), stops accepting new connections, drains in-flight responses, and enforces a 5-second deadline timer before clean exit.
 
 ### 4. HTTP/1.1 Parser & Security Guards
@@ -187,9 +217,9 @@ The codebase is split into two distinct tiers:
 - **Cookie Parsing**: Access request cookies via `req_get_cookie(req, "session")`.
 - **Cookie Setting & Clearing**: `res_set_cookie(res, name, val, &opts)` and `res_clear_cookie(res, name, path)` supporting `Path`, `Domain`, `Max-Age`, `HttpOnly`, `Secure`, and `SameSite` (`Strict`/`Lax`/`None`).
 
-### 9. JSON (yyjson) and the Per-Connection Arena
+### 9. JSON (yyjson) and the Per-Worker Arena
 - JSON reading and writing use the vendored [yyjson](https://github.com/ibireme/yyjson) library, included by `cexpress.h`. There is no separate engine JSON layer.
-- Each connection owns a 64 KiB arena allocated with it. `arena_yyjson_alc(&res->conn->arena)` makes yyjson allocate from it, so documents, the request body and the response bytes need no individual `free`; the arena is reset when a keep-alive response has been written. The one exception: the string returned by `yyjson_mut_write` is libc-allocated and must be `free`d. See [DOC.md](DOC.md#5-memory-model) and [`lib/CLAUDE.md`](lib/CLAUDE.md).
+- Each worker process has one 64 KiB arena that every request it serves allocates from (`res->conn->arena` points at it). `arena_yyjson_alc(&res->conn->arena)` makes yyjson allocate from it, so documents and the response bytes need no individual `free`; the arena is reset after every response. The one exception: the string returned by `yyjson_mut_write` is libc-allocated and must be `free`d. See [DOC.md](DOC.md#5-memory-model) and [`lib/CLAUDE.md`](lib/CLAUDE.md).
 
 ---
 
@@ -229,9 +259,9 @@ All commands run from the repository root unless noted. Build output goes to `bu
 ```bash
 make                # the library only: build/lib/libcexpress.a
 make demo           # library + demo app: examples/todo_sqlite/cexpress_demo
-make clean          # remove build/ and the demo's objects and binary (cexpress_demo is tracked by git, so this shows as a deletion)
+make clean          # remove build/ and the demo's objects and binary
 ```
-The Makefile tracks header dependencies, so editing a header rebuilds everything that includes it. The demo's own `Makefile` does not track the library: after changing `lib/`, rebuild it with `make -B -C examples/todo_sqlite`. Note that `examples/todo_sqlite/cexpress_demo` is committed to the repository: `make demo` rewrites it and `make clean` deletes it.
+The Makefile tracks header dependencies, so editing a header rebuilds everything that includes it. The demo's own `Makefile` does not track the library: after changing `lib/`, rebuild it with `make -B -C examples/todo_sqlite`.
 
 ### 2. Run the server
 The demo opens `public/index.html` and the default `todos.db` relative to its working directory, so start it from `examples/todo_sqlite/`:
@@ -275,7 +305,7 @@ make test
 ```
 
 builds and runs every suite (stops at the first failure; each prints `all ... tests passed`). Plain C `assert`
-tests, no framework, no network access needed except loopback. All 22 suites passed on macOS (gcc-16) on 27 Sep 2026, plain and under ASan + UBSan; the Linux build was not run for this update. **22 suites:**
+tests, no framework, no network access needed except loopback. All 22 suites passed on macOS (gcc-16 and clang) and on Linux (gcc, Ubuntu 24.04 in Docker) on 27 Sep 2026; CI runs them on every push to `main` (Linux gcc, macOS clang). **22 suites:**
 
 | Binary (`build/bin/`) | Covers |
 |---|---|
@@ -329,7 +359,7 @@ make check-docs        # fails if lib/API.md and the lib/*.h headers disagree ab
 ```
 
 ### Linux from a Mac
-The Docker build compiles the Linux engine but does not run the tests. To run `make test` on Linux use a Linux host or container with `gcc`, `make`, `liburing-dev` and `sqlite-dev` (the builder stage of the `Dockerfile` lists the packages); this was not done for this update. On macOS, `make test_epoll` additionally exercises the epoll backend through `epoll-shim` when it is installed (`brew install epoll-shim`).
+The Docker build compiles the Linux engine but does not run the tests. To run `make test` on Linux use a Linux host or container with `gcc`, `make`, `liburing-dev` and `libsqlite3-dev` (`.github/workflows/ci.yml` is the reference). On macOS, `make test_epoll` additionally exercises the epoll backend through `epoll-shim` when it is installed (`brew install epoll-shim`).
 
 ---
 
@@ -360,7 +390,7 @@ PORT=3000 API_KEY=super-secret-token ./cexpress_demo
 - `MAX_PARAMS`: Maximum path parameters captured per route (default: `8`).
 - `MAX_HEADERS`: Request headers kept; a 33rd header is a `400` (default: `32`).
 - `INITIAL_CONNECTION_TABLE_CAP`: Starting size of the connection table (default: `1024`, grows dynamically).
-- Per-connection arena: 64 KiB (`ARENA_SIZE` in `lib/connection.c`).
+- Per-worker arena: 64 KiB (`ARENA_SIZE`), shared by that worker's requests; overflow falls back to `malloc`.
 
 ---
 
@@ -457,10 +487,10 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 ├── importing.md          # Using CExpress from another project (tested Makefile + main.c)
 ├── concurrency.md        # Multi-worker concurrency & SO_REUSEPORT architecture guide
 ├── tradeoffs.md          # Arena, yyjson, picohttpparser, Patricia router, io_uring: costs and measurements
-├── todo.md               # Cheat sheet for running the demo (not a task list)
-├── finds.md              # Point-in-time review notes on the docs (2026-09-21)
-├── improvements.md       # Prioritized list of speed, security and memory fixes, with measured or estimated gains
-├── CLAUDE.md             # Project standards, coding guidelines, and workflow rules (AGENTS.md is a symlink to it)
+├── CHANGELOG.md          # Release notes, per version
+├── techEmpV1.md          # TechEmpower runs: setup, per-run tables, rules check
+├── .claude/CLAUDE.md     # Project standards and workflow rules for coding agents (.github/AGENTS.md links to it)
+├── .github/workflows/    # CI: build and test on Linux and macOS
 ├── docs/                 # index.html: static documentation and benchmark site
 ├── lib/                  # Reusable CExpress engine (builds to build/lib/libcexpress.a)
 │   ├── CLAUDE.md         # Engine map: lifecycle, memory model, limits, ownership, hot-path rules, known gaps
@@ -468,13 +498,14 @@ The server stops accepting new connections, finishes in-flight requests, and shu
 │   ├── examples/         # cookbook.c: tested recipes (JSON, params, middleware, cookies, uploads, streaming)
 │   ├── cexpress.h        # Umbrella header (includes yyjson)
 │   ├── app_types.h       # Struct definitions, event loop types, function pointer signatures, limits
-│   ├── arena.h/c         # Per-connection bump allocator (+ yyjson allocator adapter)
+│   ├── arena.h/c         # Per-worker bump allocator (+ yyjson allocator adapter)
 │   ├── cluster.h/c       # Multi-process master supervisor & worker lifecycle
 │   ├── event_loop.h      # Cross-platform event-loop abstraction
 │   ├── event_loop_kqueue.c   # Native BSD/macOS kqueue backend
-│   ├── event_loop_io_uring.c # Linux io_uring readiness backend (liburing; timerfd + signalfd)
-│   ├── event_loop_epoll.c    # epoll backend, compiled with -DCEXPRESS_USE_EPOLL
-│   ├── connection.h/c    # Non-blocking socket I/O, buffers, arena lifetime & graceful shutdown
+│   ├── event_loop_linux.c    # Linux backend selection: epoll unless CEXPRESS_EVENT_LOOP=io_uring
+│   ├── event_loop_epoll.c    # Linux epoll backend (default; timerfd + signalfd)
+│   ├── event_loop_io_uring.c # Linux io_uring readiness backend (opt-in; liburing)
+│   ├── connection.h/c    # Non-blocking socket I/O, pipelining, buffers, arena lifetime & graceful shutdown
 │   ├── http_parser.h/c   # Request parsing on picohttpparser, framing, query string, chunked decoding
 │   ├── router.h/c        # Route registration, per-method Patricia trees, sub-routers
 │   ├── response.h/c      # Response builder, streaming chunks & trailers, file streaming
@@ -548,10 +579,16 @@ All 11 original architectural milestones have been completed:
 
 Engine changes since then (see [`tradeoffs.md`](tradeoffs.md)):
 - [x] yyjson replaces the in-house JSON library
-- [x] Per-connection arena allocator
+- [x] Arena allocator (one per worker process)
 - [x] picohttpparser replaces the handwritten request parser
 - [x] Patricia-tree router (no fixed route cap)
 - [x] io_uring event loop on Linux (opt-in since 2026-09-24; epoll is the default)
 - [x] TLS / HTTPS support (OpenSSL/LibreSSL non-blocking handshake integration) added, then removed (2026-09-22): TLS termination belongs at a gateway or reverse proxy in front of this engine, not inside a library that only parses HTTP/1.1
 
 Open items are listed under [Known Gaps](#known-gaps).
+
+---
+
+## License
+
+MIT, see [LICENSE](LICENSE). Versions from v0.1.0 on are MIT licensed; earlier commits were published under GPL-3.0.

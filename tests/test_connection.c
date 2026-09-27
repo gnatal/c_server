@@ -2084,19 +2084,27 @@ static void test_accept_connections_emfile_frees_a_slot_and_recovers(void) {
 
     assert(setrlimit(RLIMIT_NOFILE, &original) == 0); /* restore before anything else can fail the test */
 
-    assert(app_count_connections(&app) == 0);
+    /* MEASURED (Linux, Docker, 2026-09-27): Linux leaves the connection that hit EMFILE queued, so the
+     * retry after freeing the spare fd accepts it. macOS/BSD destroy it inside accept() (see above). */
+#ifdef __linux__
+    const int recovered = 1;
+#else
+    const int recovered = 0;
+#endif
+    assert(app_count_connections(&app) == recovered);
     assert(app.spare_fd < 0); /* consumed, not yet re-armed - nothing has closed to trigger that */
 
-    char resp[16];
-    ssize_t n = read(doomed_client, resp, sizeof(resp));
-    assert(n <= 0); /* closed, not a live connection waiting for a request */
-    close(doomed_client);
+    if (!recovered) {
+        char resp[16];
+        ssize_t n = read(doomed_client, resp, sizeof(resp));
+        assert(n <= 0); /* closed, not a live connection waiting for a request */
+    }
 
     /* The real point of the fix: a *later* connection, once descriptors are no longer scarce, is
      * accepted normally - the worker recovered instead of staying stuck refusing everything. */
     int later_client = connect_loopback_client(&app);
     drain_accept_connections(&app);
-    assert(app_count_connections(&app) == 1);
+    assert(app_count_connections(&app) == recovered + 1);
 
     /* Closing it frees a descriptor; connection_close should opportunistically re-arm the spare. */
     Connection *conn = NULL;
@@ -2111,6 +2119,7 @@ static void test_accept_connections_emfile_frees_a_slot_and_recovers(void) {
     assert(app.spare_fd >= 0);
 
     close(later_client);
+    close(doomed_client);
     app_destroy(&app);
 }
 

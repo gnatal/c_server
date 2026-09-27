@@ -635,9 +635,8 @@ void accept_connections(App *app) {
              * that triggered *this* failure is already gone by the time we see the error - accept()
              * dequeues it off the listen backlog and destroys it when it can't allocate an fd,
              * rather than leaving it there for a retry, so there is nobody left here to answer with
-             * a 503 (not verified on Linux; a kernel that instead leaves it queued would make a
-             * retry-accept recover it, which is harmless to also attempt, but this codebase doesn't
-             * rely on that). What the spare fd can still do is free up exactly one slot so the
+             * a 503. Linux instead leaves it queued (MEASURED 2026-09-27, tests/test_connection.c), so
+             * the `continue` below accepts it on the retry; nothing here relies on either behavior. What the spare fd can still do is free up exactly one slot so the
              * *next* accept() call - for whatever connection comes after this one, now or on a later
              * call to accept_connections - succeeds instead of the worker staying stuck at the limit
              * indefinitely. connection_close re-arms the spare fd opportunistically once anything

@@ -781,7 +781,7 @@ Verification tools: `make bench`, `make test` (22 suites), `make SANITIZE=1 BUIL
 - The io_uring backend is used only as a readiness poller; sockets are still read and written with `recv` / `write`.
 - **wrk against Linux in Docker reports "timeout" counts close to the connection count** (for example 900-1650 at
   `-c1000`), on epoll and io_uring alike, with max latency in milliseconds and none on macOS/kqueue. Same size either
-  backend, so not an engine-backend defect; not explained (see `improvements.md`).
+  backend, so not an engine-backend defect; not explained.
 - No HTTP/2, compression, `Range`, or WebSocket. `Expect` values other than `100-continue` are ignored (no `417`).
 - **File bodies on Linux still send the head in its own `write`** before `sendfile` (no `MSG_MORE`/`TCP_CORK`); macOS
   carries it in the `sendfile` call. The write-stall deadline fires only on zero progress, so a client reading a large file a

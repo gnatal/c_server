@@ -55,7 +55,7 @@ CExpress provides a single umbrella header:
 #include "cexpress.h"
 ```
 
-This includes all core subsystems: routing, response helpers, middleware chains, HTTP parser, static files, multipart, URL-encoded forms, the per-connection arena, and the vendored yyjson JSON library. There is no TLS: this engine is plaintext HTTP/1.1 only, and TLS termination belongs at a gateway or reverse proxy in front of it.
+This includes all core subsystems: routing, response helpers, middleware chains, HTTP parser, static files, multipart, URL-encoded forms, the per-worker arena, and the vendored yyjson JSON library. There is no TLS: this engine is plaintext HTTP/1.1 only, and TLS termination belongs at a gateway or reverse proxy in front of it.
 
 ### Compiling & Linking
 Build the library once with `make` in the CExpress checkout (it produces `build/lib/libcexpress.a`), then compile your application files and link against it. On Linux, also link liburing:
@@ -338,7 +338,7 @@ res_redirect(res, 301, "https://example.com");
 
 ## 5. Memory Model
 
-Each connection owns a 64 KiB **arena** (a bump allocator) that lives inside the same allocation as the connection. The engine allocates everything that lives for one request from it: the request body, the response bytes, and any yyjson document you build with `arena_yyjson_alc(&res->conn->arena)`. When a keep-alive response has been fully written the arena is reset in O(1); when the connection closes it is destroyed. A request that needs more than the arena has left transparently falls back to `malloc`, freed at the same moment.
+Each worker process owns one 64 KiB **arena** (a bump allocator), shared by every request that worker serves; `res->conn->arena` points at it. The engine allocates everything that lives for one request from it: the response bytes, parsed request fields, and any yyjson document you build with `arena_yyjson_alc(&res->conn->arena)`. (The request body is a view into the connection's input buffer; it has the same lifetime.) The arena is reset in O(1) after each response. A request that needs more than the arena has left transparently falls back to `malloc`, freed at the same moment.
 
 What that means for handler code:
 - Never `free` `req->body`, `req_get_*` results, or anything from `arena_alloc` / an arena-backed yyjson document.
@@ -532,12 +532,12 @@ All limits are compile-time constants in `lib/app_types.h`. Input past a limit i
 | Invalid, duplicate-conflicting or negative `Content-Length`; `Content-Length` together with `Transfer-Encoding: chunked`; bad chunk framing | `400`, connection closed |
 | Method longer than 7 characters | `400` |
 | Connection silent for 60 s (mid-request) | `408`, then closed; an idle keep-alive connection is closed without a response |
-| Header values over 255 characters, path params over 63, queries over 255 | truncated silently |
+| Path params and query values over 63 characters, single cookie values over 255 | truncated silently (header values are not truncated) |
 | No route for the path | `404` |
 | Route exists for the path under another method | `405` with `Allow` |
 | Response headers larger than 8 KiB | connection closed without a response |
 
-Known behavior to be aware of: a request whose request line is not valid HTTP (no version, `HTTP/2.0`, plain garbage) currently gets **no response**; the connection stays open until 8 KiB arrive or the 60 s idle timeout fires. Pipelined requests (a second request sent before the first response) are not supported: only the first is answered. Both are tracked in [`lib/CLAUDE.md`](lib/CLAUDE.md) under "Known gaps".
+Known behavior to be aware of: a request whose request line is not valid HTTP (no version, `HTTP/2.0`, plain garbage) currently gets **no response**; the connection stays open until 8 KiB arrive or the 60 s idle timeout fires. This is tracked in [`lib/CLAUDE.md`](lib/CLAUDE.md) under "Known gaps". Pipelined requests (a second request sent before the first response) are supported: they are answered in order on the same connection, and consecutive in-memory responses are coalesced into one `write`.
 
 ---
 

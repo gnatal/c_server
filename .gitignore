@@ -72,3 +72,6 @@ todos.db-wal
 *.db
 *.db-shm
 *.db-wal
+
+# --- Demo binary (built by `make demo`) ---
+examples/todo_sqlite/cexpress_demo
