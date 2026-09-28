@@ -563,7 +563,10 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   `400`/`413`/`501` instead of being masked by a `417`. Before this, the member was ignored: the client was left
   holding back a body it had been told to send, and `100-continue, foo` got no interim response at all because the
   field as a whole was not exactly `100-continue`. An empty member names no expectation and is skipped, so an empty
-  `Expect` field never fails a request.
+  `Expect` field never fails a request. Cost: the members are classified once, inside the framing pass
+  (`compute_content_length_and_chunked`, which already walks every header for `Content-Length`/`Transfer-Encoding`),
+  into `ParsedHead.expect` (`EXPECT_MEMBER_*` bits); both predicates only test that field, so the per-request `417`
+  check adds no header walk.
   Mutation-checked (`tests/test_connection.c: test_handle_readable_unsupported_expectation_417`,
   `tests/test_http_hardening.c: test_expect_members`, and the `test_answered.c` model: removing the call makes both
   suites fail).

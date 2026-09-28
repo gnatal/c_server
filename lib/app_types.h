@@ -206,6 +206,7 @@ typedef struct {
     size_t num_headers;
     int content_length;      /* request_framing's code: 0 absent/zero, >0 value, -1 malformed/conflicting, -2 oversized */
     int chunked;
+    unsigned expect;         /* EXPECT_MEMBER_* bits seen across every Expect field member (http_parser.c), 0 if none */
 } ParsedHead;
 
 /*

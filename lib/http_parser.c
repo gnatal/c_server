@@ -264,12 +264,53 @@ static int has_blank_line_from(const char *buf, const size_t len, size_t *scan_f
 
 /* ---- message framing (Content-Length / Transfer-Encoding) ---- */
 
+/* Expect header field members. RFC 9110 §10.1.1 defines "Expect = #expectation": one field may name
+ * several comma-separated members ("100-continue, foo"). This engine implements exactly one
+ * expectation - 100-continue - so every member is either that one or one it cannot meet. */
+#define EXPECT_MEMBER_CONTINUE 0x1u
+#define EXPECT_MEMBER_OTHER 0x2u
+
+/*
+ * Classifies the members of one Expect field value: a bitwise OR of EXPECT_MEMBER_*, or 0 when it has
+ * no non-empty member. Members are split on commas and OWS-trimmed, and the name is compared
+ * token-exactly and case-insensitively (the same rule is_sole_token applies to Transfer-Encoding - not a
+ * substring search). An empty member ("" between two commas, or an empty field) names no expectation
+ * and is skipped rather than counted as an unknown one, so an empty or whitespace-only Expect field
+ * cannot fail a request. Pure.
+ */
+static unsigned classify_expect_value(const char *const value, const size_t value_len) {
+    unsigned seen = 0;
+    const char *member = value;
+    const char *const field_end = value + value_len;
+    while (member <= field_end) {
+        const char *const comma = memchr(member, ',', (size_t)(field_end - member));
+        const char *member_end = comma != NULL ? comma : field_end;
+        while (member < member_end && is_ows(*member)) member++;
+        while (member_end > member && is_ows(member_end[-1])) member_end--;
+        if (member_end > member) {
+            if ((size_t)(member_end - member) == 12 && strncasecmp(member, "100-continue", 12) == 0) {
+                seen |= EXPECT_MEMBER_CONTINUE;
+            } else {
+                seen |= EXPECT_MEMBER_OTHER;
+            }
+        }
+        if (comma == NULL) {
+            break; /* last member of this field */
+        }
+        member = comma + 1;
+    }
+    return seen;
+}
+
 /* Shared by parse_request_head: derives the Content-Length / Transfer-Encoding framing verdict from an
  * already-tokenized header array (this used to be inlined once in request_framing and duplicated,
- * differently, a second time inside parse_http_request; now there is exactly one copy). */
+ * differently, a second time inside parse_http_request; now there is exactly one copy). The Expect
+ * members are classified in the same pass (*expect_out, EXPECT_MEMBER_* bits), so the 417 / 100 Continue
+ * decisions never walk the headers again. */
 static int compute_content_length_and_chunked(const struct phr_header *headers, const size_t num_headers,
-                                               int *chunked_out) {
+                                               int *chunked_out, unsigned *expect_out) {
     *chunked_out = 0;
+    *expect_out = 0;
     int content_length = 0;
     int has_cl = 0;
     int te_unsupported = 0;
@@ -308,6 +349,8 @@ static int compute_content_length_and_chunked(const struct phr_header *headers, 
             } else {
                 te_unsupported = 1;
             }
+        } else if (headers[i].name_len == 6 && strncasecmp(headers[i].name, "Expect", 6) == 0) {
+            *expect_out |= classify_expect_value(headers[i].value, headers[i].value_len);
         }
     }
 
@@ -330,6 +373,7 @@ int parse_request_head_resume(const char *buf, const size_t len, ParsedHead *hea
     head->minor_version = 0;
     head->content_length = 0;
     head->chunked = 0;
+    head->expect = 0;
     head->num_headers = MAX_FRAMING_HEADERS;
 
     /* Incomplete until a blank line has arrived: past the first look at a request, picohttpparser only
@@ -374,7 +418,8 @@ int parse_request_head_resume(const char *buf, const size_t len, ParsedHead *hea
     }
 
     head->header_len = (size_t)res;
-    head->content_length = compute_content_length_and_chunked(head->headers, head->num_headers, &head->chunked);
+    head->content_length = compute_content_length_and_chunked(head->headers, head->num_headers, &head->chunked,
+                                                               &head->expect);
     return head->content_length;
 }
 
@@ -500,56 +545,11 @@ size_t request_wire_len(const ParsedHead *head, const ChunkScanState *chunk_scan
     return head->header_len + (size_t)head->content_length;
 }
 
-/* Expect header field members. RFC 9110 §10.1.1 defines "Expect = #expectation": one field may name
- * several comma-separated members ("100-continue, foo"). This engine implements exactly one
- * expectation - 100-continue - so every member is either that one or one it cannot meet. */
-#define EXPECT_MEMBER_CONTINUE 0x1u
-#define EXPECT_MEMBER_OTHER 0x2u
-
-/*
- * Classifies every Expect member of an already-parsed head: a bitwise OR of EXPECT_MEMBER_*, or 0
- * when there is no parsed HTTP/1.1+ head or no non-empty member at all. Members are split on commas
- * and OWS-trimmed, and the name is compared token-exactly and case-insensitively (the same rule
- * request_has_chunked_encoding uses - not a substring search). An empty member ("" between two
- * commas, or an empty field) names no expectation and is skipped rather than counted as an unknown
- * one, so an empty or whitespace-only Expect field cannot fail a request. Pure: reads head only.
- */
-static unsigned scan_expect_members(const ParsedHead *head) {
-    if (head->header_len == 0 || head->minor_version < 1) {
-        /* incomplete/malformed, or HTTP/1.0 - whose expectations RFC 9110 §10.1.1 says to ignore */
-        return 0;
-    }
-    unsigned seen = 0;
-    for (size_t i = 0; i < head->num_headers; i++) {
-        const struct phr_header *h = &head->headers[i];
-        if (h->name == NULL || h->name_len != 6 || strncasecmp(h->name, "Expect", 6) != 0) {
-            continue;
-        }
-        const char *member = h->value;
-        const char *const field_end = h->value + h->value_len;
-        while (member <= field_end) {
-            const char *const comma = memchr(member, ',', (size_t)(field_end - member));
-            const char *member_end = comma != NULL ? comma : field_end;
-            while (member < member_end && is_ows(*member)) member++;
-            while (member_end > member && is_ows(member_end[-1])) member_end--;
-            if (member_end > member) {
-                if ((size_t)(member_end - member) == 12 && strncasecmp(member, "100-continue", 12) == 0) {
-                    seen |= EXPECT_MEMBER_CONTINUE;
-                } else {
-                    seen |= EXPECT_MEMBER_OTHER;
-                }
-            }
-            if (comma == NULL) {
-                break; /* last member of this field */
-            }
-            member = comma + 1;
-        }
-    }
-    return seen;
-}
-
+/* head->expect is filled by the framing pass, so both predicates below are O(1). HTTP/1.0 expectations
+ * are ignored (RFC 9110 §10.1.1); an incomplete or malformed head never reaches the framing pass, so its
+ * head->expect is 0. */
 int request_head_expects_continue(const ParsedHead *head) {
-    if ((scan_expect_members(head) & EXPECT_MEMBER_CONTINUE) == 0) {
+    if ((head->expect & EXPECT_MEMBER_CONTINUE) == 0 || head->minor_version < 1) {
         return 0;
     }
     if (head->content_length < 0 || (!head->chunked && head->content_length == 0)) {
@@ -559,7 +559,7 @@ int request_head_expects_continue(const ParsedHead *head) {
 }
 
 int request_head_expects_unsupported(const ParsedHead *head) {
-    if ((scan_expect_members(head) & EXPECT_MEMBER_OTHER) == 0) {
+    if ((head->expect & EXPECT_MEMBER_OTHER) == 0 || head->minor_version < 1) {
         return 0;
     }
     if (head->content_length < 0) {
