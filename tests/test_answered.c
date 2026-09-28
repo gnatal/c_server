@@ -135,6 +135,18 @@ static void model_run(const char *in, const size_t len, Model *m) {
         a->is_head = 0;
         a->may_continue = request_head_expects_continue(&h);
 
+        /* an Expect member other than 100-continue is refused at the head, before the body (417).
+         * The engine's reject_if_unsupported_expectation runs before its body-limit check, so this
+         * must come first here too. */
+        if (request_head_expects_unsupported(&h)) {
+            a->status = 417;
+            a->may_continue = 0;
+            m->count++;
+            m->closes = 1;
+            free(p);
+            return;
+        }
+
         /* the route's limit comes from the canonical path; a declared Content-Length over it is
          * refused once the head is in. */
         const size_t limit = h.header_len > 0 && h.content_length >= 0
@@ -380,6 +392,10 @@ static const char *seeds[] = {
     "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\n\r\n",
     "POST /limited HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\n123456789",
     "POST /limited HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nok",
+    /* 417: the head names an expectation this engine cannot meet, refused before the body is read. */
+    "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 42-continue\r\nContent-Length: 3\r\n\r\nabc",
+    /* a mixed list is unmeetable as a whole: 417, and the 100-continue member never invites the body. */
+    "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue, foo\r\nContent-Length: 3\r\n\r\nabc",
     /* body-limit bypass shapes: the limit applies to the canonical path and to chunked bodies. */
     "POST /limited?x=1 HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\n123456789",
     "POST //limited HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\n123456789",

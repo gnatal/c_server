@@ -760,6 +760,46 @@ static void test_handle_readable_expect_continue_not_sent(void) {
     teardown_test_connection(&app, fds, conn);
 }
 
+/* An Expect member this engine does not implement gets 417 Expectation Failed as soon as the head is
+ * parsed - before the body is read or invited (RFC 9110 §10.1.1: "A server that receives an Expect
+ * field value containing a member other than 100-continue MAY respond with a 417"). Before this, the
+ * member was ignored: the client was left holding back a body it had been told to send (or waited for a
+ * 100 Continue that was never coming because the field as a whole was not exactly "100-continue").
+ * The connection closes with the answer, which is required rather than incidental - the body behind a
+ * head the engine refuses to process is never read, so the connection cannot carry another request. */
+static void test_handle_readable_unsupported_expectation_417(void) {
+    /* Each case answers 417 and closes, so each needs its own connection. */
+    const char *cases[] = {
+        /* an unknown expectation, with the body still to come */
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 42-continue\r\n\r\n",
+        /* a mixed list: the 100-continue member must not launder the member that cannot be met, and
+         * no 100 Continue may be sent for it */
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue, foo\r\n\r\n",
+        /* token-exact, not a substring match */
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continuex\r\n\r\n",
+        /* chunked body, no Content-Length */
+        "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nExpect: foo\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        App app;
+        int fds[2];
+        Connection *conn;
+        setup_test_connection(&app, fds, &conn);
+        app_post(&app, "/upload", echo_len_handler);
+
+        assert(write(fds[1], cases[i], strlen(cases[i])) == (ssize_t)strlen(cases[i]));
+        handle_readable(&app, conn);
+
+        char resp[256];
+        read_pending(fds[1], resp, sizeof(resp));
+        assert(strncmp(resp, "HTTP/1.1 417 Expectation Failed", 31) == 0);
+        assert(strstr(resp, "100 Continue") == NULL); /* the body is never invited */
+        assert(app.connections[fds[0]] == NULL);      /* closed: the body is not read */
+
+        teardown_test_connection(&app, fds, conn);
+    }
+}
+
 static void test_handle_readable_chunked_round_trip(void) {
     App app;
     int fds[2];
@@ -2143,6 +2183,7 @@ int main(void) {
     test_handle_readable_expect_continue_sends_100_once();
     test_handle_readable_expect_continue_chunked();
     test_handle_readable_expect_continue_not_sent();
+    test_handle_readable_unsupported_expectation_417();
     test_handle_readable_chunked_round_trip();
     test_handle_readable_head_scan_resumes_and_resets();
     test_handle_readable_chunked_scan_resumes_and_resets();

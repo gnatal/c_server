@@ -541,14 +541,32 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   `send_continue_if_expected` (`connection.c`) writes `HTTP/1.1 100 Continue\r\n\r\n` straight to the socket, at
   most once per request (`Connection.continue_sent`, cleared with `body_limit_checked` in `flush_connection`'s
   keep-alive branch). The decision is the pure `request_head_expects_continue` (`http_parser.c`): HTTP/1.1+ only
-  (never a 1xx to 1.0), a body to wait for (`Content-Length > 0` or chunked), valid framing, and an `Expect` value
-  of exactly `100-continue`. Ordering: it runs after `reject_if_over_body_limit`, so an over-limit
-  `Content-Length` gets `413` and the body is never invited; a head whose body already arrived is complete and never
-  gets a 100. It is never queued in `out_buf`: the loop only reaches it with no response pending, so a pipelined
-  request's 100 always follows the previous response. `EAGAIN` on that write is ignored (the client falls back to
-  its own timeout, as it did before 100-continue support); a short write or hard error closes the connection, since half a status line
-  would corrupt the stream. The route is not matched first: a 404/405 is still sent after the body, as Node does by
-  default.
+  (never a 1xx to 1.0), a body to wait for (`Content-Length > 0` or chunked), valid framing, and an `Expect` field
+  carrying a `100-continue` member. RFC 9110 §10.1.1 defines `Expect` as a comma-separated list (`#expectation`), so
+  both predicates match per member, OWS-trimmed and case-insensitively, token-exactly (not a substring search, the
+  `Transfer-Encoding` rule): `100-continue, foo` still asks for the interim response. Ordering: it runs after
+  `reject_if_over_body_limit`, so an over-limit `Content-Length` gets `413` and the body is never invited; a head whose
+  body already arrived is complete and never gets a 100. It is never queued in `out_buf`: the loop only reaches it with
+  no response pending, so a pipelined request's 100 always follows the previous response. `EAGAIN` on that write is
+  ignored (the client falls back to its own timeout, as it did before 100-continue support); a short write or hard
+  error closes the connection, since half a status line would corrupt the stream. The route is not matched first: a
+  404/405 is still sent after the body, as Node does by default.
+- **Any other `Expect` member gets `417` (`reject_if_unsupported_expectation`).** An `Expect` field naming an
+  expectation this engine does not implement (`request_head_expects_unsupported`: `http_parser.c`) is answered
+  `417 Expectation Failed` as soon as the head is parsed, before the body is read or invited - RFC 9110 §10.1.1 lets a
+  server answer `417` for "an `Expect` field value containing a member other than `100-continue`". The connection
+  closes with it, which is required rather than incidental: the body behind a head the engine refuses to process is
+  never read, so the connection cannot carry another request. It runs *before* `reject_if_over_body_limit`, so a
+  request that both names a bad expectation and declares an over-limit `Content-Length` hears about the expectation
+  (both are head-only answers). Like 100-continue, the check needs a parsed HTTP/1.1+ head and valid framing: HTTP/1.0
+  expectations are ignored (RFC 9110 §10.1.1), and an invalid or conflicting framing is left to the parse path's
+  `400`/`413`/`501` instead of being masked by a `417`. Before this, the member was ignored: the client was left
+  holding back a body it had been told to send, and `100-continue, foo` got no interim response at all because the
+  field as a whole was not exactly `100-continue`. An empty member names no expectation and is skipped, so an empty
+  `Expect` field never fails a request.
+  Mutation-checked (`tests/test_connection.c: test_handle_readable_unsupported_expectation_417`,
+  `tests/test_http_hardening.c: test_expect_members`, and the `test_answered.c` model: removing the call makes both
+  suites fail).
 - **Body limits.** `app_use_body_limit(app, prefix, max_bytes)` (`router.c`) registers a `BodyLimitEntry` in
   `App.body_limits` (same segment-boundary prefix match as app-wide middleware; `max_bytes` clamped down to
   `MAX_BODY_SIZE`, never loosened past it). `connection.c`'s `reject_if_over_body_limit`, called from
@@ -782,7 +800,7 @@ Verification tools: `make bench`, `make test` (22 suites), `make SANITIZE=1 BUIL
 - **wrk against Linux in Docker reports "timeout" counts close to the connection count** (for example 900-1650 at
   `-c1000`), on epoll and io_uring alike, with max latency in milliseconds and none on macOS/kqueue. Same size either
   backend, so not an engine-backend defect; not explained.
-- No HTTP/2, compression, `Range`, or WebSocket. `Expect` values other than `100-continue` are ignored (no `417`).
+- No HTTP/2, compression, `Range`, or WebSocket.
 - **File bodies on Linux still send the head in its own `write`** before `sendfile` (no `MSG_MORE`/`TCP_CORK`); macOS
   carries it in the `sendfile` call. The write-stall deadline fires only on zero progress, so a client reading a large file a
   byte at a time holds its fd indefinitely (no minimum-rate rule). No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.

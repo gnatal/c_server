@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **`Expect` is now treated as the comma-separated list RFC 9110 §10.1.1 defines** (`#expectation`), not as a
+  single value: classification is per member, OWS-trimmed and case-insensitive, and token-exact like
+  `Transfer-Encoding` (so `X-Expect` and `100-continuex` are not `100-continue`).
+- **A member other than `100-continue` is refused with `417 Expectation Failed`** as soon as the head is parsed,
+  before the body is read or invited, and the connection is closed. Previously such an `Expect` field was ignored,
+  which left the client holding back a body it had been told to send, and made `Expect: 100-continue, foo` get no
+  interim response at all. HTTP/1.0 expectations stay ignored, an empty field names no expectation, and an invalid
+  framing is still answered `400`/`413`/`501` by the parse path rather than masked by a `417`.
+
 ## v0.1.0 (2026-09-27)
 
 First tagged release.

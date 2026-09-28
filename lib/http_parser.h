@@ -93,13 +93,26 @@ int parse_request_head_resume(const char *buf, size_t len, ParsedHead *head, siz
 int request_head_is_complete(const ParsedHead *head, const char *buf, size_t len, ChunkScanState *chunk_scan);
 
 /*
- * request_head_expects_continue: 1 when a complete head asks for "100 Continue" before its body -
- * an "Expect" header whose value is "100-continue" (case-insensitive, OWS-trimmed), on an HTTP/1.1+
- * request with a valid framing that has a body to wait for (Content-Length > 0, or chunked). 0 for
- * anything else, including HTTP/1.0 (a 1xx must not be sent to it) and an incomplete or malformed head.
- * Other expectations are ignored (no 417). Pure: reads head only.
+ * request_head_expects_continue: 1 when a complete head asks for "100 Continue" before its body - a
+ * "100-continue" member of an "Expect" header field, on an HTTP/1.1+ request with valid framing that
+ * has a body to wait for (Content-Length > 0, or chunked). 0 for anything else, including HTTP/1.0 (a
+ * 1xx must not be sent to it), an incomplete or malformed head, and a request whose framing is invalid.
+ * RFC 9110 section 10.1.1 defines Expect as a comma-separated list, so a member is matched - name and
+ * OWS trimmed, case-insensitive - rather than the whole field: "100-continue, foo" still asks for the
+ * interim response (and is refused as a whole by request_head_expects_unsupported below). A field with
+ * no non-empty member does not count. Pure: reads head only.
  */
 int request_head_expects_continue(const ParsedHead *head);
+
+/*
+ * request_head_expects_unsupported: 1 when a complete head names an expectation this engine cannot
+ * meet - any Expect member other than "100-continue", on an HTTP/1.1+ request with valid framing -
+ * i.e. exactly the case RFC 9110 section 10.1.1 lets a server answer with 417 (Expectation Failed).
+ * 0 for a head that carries no Expect field, an empty one, only "100-continue" members, HTTP/1.0
+ * (whose expectations are ignored), an incomplete or malformed head, or invalid framing (which the
+ * parse path already answers 400/413/501, and which must not be masked by a 417). Pure: reads head only.
+ */
+int request_head_expects_unsupported(const ParsedHead *head);
 
 /*
  * request_wire_len: bytes the request occupies on the wire - headers plus its framed body, so

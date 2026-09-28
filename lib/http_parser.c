@@ -500,27 +500,75 @@ size_t request_wire_len(const ParsedHead *head, const ChunkScanState *chunk_scan
     return head->header_len + (size_t)head->content_length;
 }
 
-int request_head_expects_continue(const ParsedHead *head) {
+/* Expect header field members. RFC 9110 §10.1.1 defines "Expect = #expectation": one field may name
+ * several comma-separated members ("100-continue, foo"). This engine implements exactly one
+ * expectation - 100-continue - so every member is either that one or one it cannot meet. */
+#define EXPECT_MEMBER_CONTINUE 0x1u
+#define EXPECT_MEMBER_OTHER 0x2u
+
+/*
+ * Classifies every Expect member of an already-parsed head: a bitwise OR of EXPECT_MEMBER_*, or 0
+ * when there is no parsed HTTP/1.1+ head or no non-empty member at all. Members are split on commas
+ * and OWS-trimmed, and the name is compared token-exactly and case-insensitively (the same rule
+ * request_has_chunked_encoding uses - not a substring search). An empty member ("" between two
+ * commas, or an empty field) names no expectation and is skipped rather than counted as an unknown
+ * one, so an empty or whitespace-only Expect field cannot fail a request. Pure: reads head only.
+ */
+static unsigned scan_expect_members(const ParsedHead *head) {
     if (head->header_len == 0 || head->minor_version < 1) {
-        return 0; /* incomplete/malformed, or HTTP/1.0: RFC 9110 §15.2 - never send a 1xx to a 1.0 client */
+        /* incomplete/malformed, or HTTP/1.0 - whose expectations RFC 9110 §10.1.1 says to ignore */
+        return 0;
     }
-    if (head->content_length < 0 || (!head->chunked && head->content_length == 0)) {
-        return 0; /* no body to wait for, or framing already invalid (answered without reading a body) */
-    }
+    unsigned seen = 0;
     for (size_t i = 0; i < head->num_headers; i++) {
         const struct phr_header *h = &head->headers[i];
         if (h->name == NULL || h->name_len != 6 || strncasecmp(h->name, "Expect", 6) != 0) {
             continue;
         }
-        const char *v = h->value;
-        const char *end = h->value + h->value_len;
-        while (v < end && is_ows(*v)) v++;
-        while (end > v && is_ows(end[-1])) end--;
-        if ((size_t)(end - v) == 12 && strncasecmp(v, "100-continue", 12) == 0) {
-            return 1;
+        const char *member = h->value;
+        const char *const field_end = h->value + h->value_len;
+        while (member <= field_end) {
+            const char *const comma = memchr(member, ',', (size_t)(field_end - member));
+            const char *member_end = comma != NULL ? comma : field_end;
+            while (member < member_end && is_ows(*member)) member++;
+            while (member_end > member && is_ows(member_end[-1])) member_end--;
+            if (member_end > member) {
+                if ((size_t)(member_end - member) == 12 && strncasecmp(member, "100-continue", 12) == 0) {
+                    seen |= EXPECT_MEMBER_CONTINUE;
+                } else {
+                    seen |= EXPECT_MEMBER_OTHER;
+                }
+            }
+            if (comma == NULL) {
+                break; /* last member of this field */
+            }
+            member = comma + 1;
         }
     }
-    return 0;
+    return seen;
+}
+
+int request_head_expects_continue(const ParsedHead *head) {
+    if ((scan_expect_members(head) & EXPECT_MEMBER_CONTINUE) == 0) {
+        return 0;
+    }
+    if (head->content_length < 0 || (!head->chunked && head->content_length == 0)) {
+        return 0; /* no body to wait for, or framing already invalid (answered without reading a body) */
+    }
+    return 1;
+}
+
+int request_head_expects_unsupported(const ParsedHead *head) {
+    if ((scan_expect_members(head) & EXPECT_MEMBER_OTHER) == 0) {
+        return 0;
+    }
+    if (head->content_length < 0) {
+        /* An invalid or conflicting framing is answered 400/413/501 by the parse path, which stays the
+         * first thing such a request sees - the same guard request_head_expects_continue uses above, so
+         * a 417 never masks the framing error. */
+        return 0;
+    }
+    return 1;
 }
 
 int request_is_complete(const char *buf, const size_t len) {
@@ -860,6 +908,7 @@ const char *status_text(const int status) {
         case 413: return "Payload Too Large";
         case 414: return "URI Too Long";
         case 415: return "Unsupported Media Type";
+        case 417: return "Expectation Failed";
         case 422: return "Unprocessable Entity";
         case 429: return "Too Many Requests";
         case 431: return "Request Header Fields Too Large";

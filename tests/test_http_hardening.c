@@ -834,6 +834,81 @@ static void test_host_header_count(void) {
     }
 }
 
+/* RFC 9110 §10.1.1 defines "Expect = #expectation", a comma-separated list, so a member - not the whole
+ * field - is what counts. This engine implements exactly one expectation (100-continue); any other
+ * member makes the field unmeetable and the engine answers 417 (request_head_expects_unsupported). The
+ * two predicates are independent: a mixed list asks for the interim response AND is refused. */
+static void test_expect_members(void) {
+    struct { const char *expect; int cont; int unsupported; } cases[] = {
+        {NULL, 0, 0},
+        {"Expect: 100-continue\r\n", 1, 0},
+        {"expect: 100-Continue\r\n", 1, 0},
+        {"Expect:   100-continue  \r\n", 1, 0},
+        {"Expect: \t100-continue\t\r\n", 1, 0},
+        {"Expect: 100-continue,100-continue\r\n", 1, 0},
+        {"Expect: 100-continue, 100-continue\r\n", 1, 0},
+        /* A mixed list: the member asking for the interim response must not launder the other one. */
+        {"Expect: 100-continue, foo\r\n", 1, 1},
+        {"Expect: foo,100-continue\r\n", 1, 1},
+        {"Expect: foo\r\n", 0, 1},
+        /* Token-exact, like Transfer-Encoding: a lookalike is an unknown expectation, not 100-continue. */
+        {"Expect: 100-continuex\r\n", 0, 1},
+        {"Expect: x100-continue\r\n", 0, 1},
+        {"Expect: 100-continue=x\r\n", 0, 1},
+        /* An empty member names no expectation and cannot fail a request. */
+        {"Expect: \r\n", 0, 0},
+        {"Expect: ,\r\n", 0, 0},
+        /* A lookalike header name is not Expect at all. */
+        {"X-Expect: foo\r\n", 0, 0},
+        /* Two fields: one supported, one not. */
+        {"Expect: 100-continue\r\nExpect: foo\r\n", 1, 1},
+        {"Expect: 100-continue\r\nExpect: 100-continue\r\n", 1, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char raw[512];
+        const int n = snprintf(raw, sizeof(raw), "POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n%s\r\n",
+                               cases[i].expect != NULL ? cases[i].expect : "");
+        assert(n > 0 && (size_t)n < sizeof(raw));
+        ParsedHead h;
+        parse_request_head(raw, (size_t)n, &h);
+        assert(h.header_len > 0); /* every case above is a well-framed HTTP/1.1 head */
+        assert(request_head_expects_continue(&h) == cases[i].cont);
+        assert(request_head_expects_unsupported(&h) == cases[i].unsupported);
+    }
+
+    ParsedHead h;
+    /* No body to wait for: nothing to invite, and nothing unmeetable either. */
+    const char *no_body = "POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n";
+    parse_request_head(no_body, strlen(no_body), &h);
+    assert(request_head_expects_continue(&h) == 0);
+    assert(request_head_expects_unsupported(&h) == 0);
+
+    /* Chunked is a body to wait for, with no Content-Length. */
+    const char *chunked = "POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
+    parse_request_head(chunked, strlen(chunked), &h);
+    assert(request_head_expects_continue(&h) == 1);
+    assert(request_head_expects_unsupported(&h) == 0);
+
+    /* HTTP/1.0 expectations are ignored (never a 1xx, never a 417). */
+    const char *v10 = "POST /u HTTP/1.0\r\nContent-Length: 5\r\nExpect: foo\r\n\r\n";
+    parse_request_head(v10, strlen(v10), &h);
+    assert(request_head_expects_continue(&h) == 0);
+    assert(request_head_expects_unsupported(&h) == 0);
+
+    /* Conflicting framing is answered by the parse path (400/413/501); a 417 must not mask it. */
+    const char *conflict = "POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+                           "Transfer-Encoding: chunked\r\nExpect: foo\r\n\r\n";
+    parse_request_head(conflict, strlen(conflict), &h);
+    assert(request_head_expects_unsupported(&h) == 0);
+
+    /* Not a parsed HTTP/1.x head at all. */
+    const char *h2 = "POST /u HTTP/2.0\r\nHost: x\r\nExpect: foo\r\n\r\n";
+    parse_request_head(h2, strlen(h2), &h);
+    assert(h.header_len == 0);
+    assert(request_head_expects_continue(&h) == 0);
+    assert(request_head_expects_unsupported(&h) == 0);
+}
+
 int main(void) {
     arena_init(&test_arena, test_arena_buf, sizeof(test_arena_buf));
     test_framing_is_line_anchored();
@@ -858,6 +933,7 @@ int main(void) {
     test_path_prefix_helpers();
     test_request_path_is_canonical();
     test_host_header_count();
+    test_expect_members();
     printf("all http hardening tests passed\n");
     return 0;
 }

@@ -230,7 +230,7 @@ Verified against the current code on 27 Sep 2026 and not yet fixed (details in [
 - Path parameters and query values over 63 characters, and single cookie values over 255, are truncated silently.
 - Deferred requests (`res_defer`) have no cancel callback: work for a client that left runs to completion, and `res_resume` returns NULL.
 - The io_uring backend is a readiness poller only; sockets are still read and written with `recv` / `write`.
-- No HTTP/2, compression, `Range`, or WebSocket. `Expect` values other than `100-continue` are ignored (no `417`).
+- No HTTP/2, compression, `Range`, or WebSocket. An `Expect` field naming anything other than `100-continue` is refused with `417` before its body is read (RFC 9110 §10.1.1).
 
 ---
 

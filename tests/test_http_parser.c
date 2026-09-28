@@ -582,6 +582,7 @@ static void test_status_text(void) {
     assert(strcmp(status_text(413), "Payload Too Large") == 0);
     assert(strcmp(status_text(414), "URI Too Long") == 0);
     assert(strcmp(status_text(415), "Unsupported Media Type") == 0);
+    assert(strcmp(status_text(417), "Expectation Failed") == 0);
     assert(strcmp(status_text(422), "Unprocessable Entity") == 0);
     assert(strcmp(status_text(429), "Too Many Requests") == 0);
     assert(strcmp(status_text(431), "Request Header Fields Too Large") == 0);

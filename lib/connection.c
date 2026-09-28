@@ -1242,6 +1242,29 @@ static int reject_if_chunked_over_body_limit(App *app, Connection *conn, const P
 }
 
 /*
+ * the request's head names an expectation this engine cannot meet (an Expect field with a member
+ * other than 100-continue, request_head_expects_unsupported): answer 417 Expectation Failed as soon
+ * as the head is parsed, before any body is read or invited. RFC 9110 §10.1.1: "A server that receives
+ * an Expect field value containing a member other than 100-continue MAY respond with a 417". The
+ * alternative - what this engine did before - is to ignore the expectation and let the client send a
+ * body it was told to hold back, or (for "100-continue, foo") to ask for the body while silently
+ * dropping the member that made the field unmeetable. reject_request closes the connection, which is
+ * required, not incidental: the body that follows a head we refuse to process is never read, so the
+ * connection cannot be reused for another request.
+ * Runs before reject_if_over_body_limit, so a request making both mistakes hears "your expectation is
+ * the problem" rather than a 413 about a body this engine had already decided not to read; both are
+ * head-only answers, so neither invites a body.
+ * Returns 1 if rejected (conn closed), 0 otherwise.
+ */
+static int reject_if_unsupported_expectation(App *app, Connection *conn, const ParsedHead *head) {
+    if (!request_head_expects_unsupported(head)) {
+        return 0;
+    }
+    reject_request(app, conn, 417);
+    return 1;
+}
+
+/*
  * the request's headers are complete, its body is not, and it carries "Expect: 100-continue"
  * (request_head_expects_continue): write "HTTP/1.1 100 Continue" once so the client sends the body now
  * instead of after its own fallback timeout (curl: 1 s). Runs after reject_if_over_body_limit, so a
@@ -1541,6 +1564,9 @@ static int serve_buffered_requests(App *app, Connection *conn, int *served_out) 
         ParsedHead head;
         parse_request_head_resume(req_start, req_avail, &head, &conn->head_scan);
 
+        if (reject_if_unsupported_expectation(app, conn, &head)) {
+            return SERVE_CLOSED;
+        }
         if (reject_if_over_body_limit(app, conn, &head)) {
             return SERVE_CLOSED;
         }

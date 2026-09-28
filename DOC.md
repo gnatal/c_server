@@ -531,6 +531,7 @@ All limits are compile-time constants in `lib/app_types.h`. Input past a limit i
 | More than 32 request headers | `400`, connection closed |
 | Invalid, duplicate-conflicting or negative `Content-Length`; `Content-Length` together with `Transfer-Encoding: chunked`; bad chunk framing | `400`, connection closed |
 | Method longer than 7 characters | `400` |
+| `Expect` field naming anything other than `100-continue` | `417`, connection closed, body never read (RFC 9110 §10.1.1) |
 | Connection silent for 60 s (mid-request) | `408`, then closed; an idle keep-alive connection is closed without a response |
 | Path params and query values over 63 characters, single cookie values over 255 | truncated silently (header values are not truncated) |
 | No route for the path | `404` |
