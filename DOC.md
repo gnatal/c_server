@@ -538,7 +538,7 @@ All limits are compile-time constants in `lib/app_types.h`. Input past a limit i
 | Route exists for the path under another method | `405` with `Allow` |
 | Response headers larger than 8 KiB | connection closed without a response |
 
-Known behavior to be aware of: a request whose request line is not valid HTTP (no version, `HTTP/2.0`, plain garbage) currently gets **no response**; the connection stays open until 8 KiB arrive or the 60 s idle timeout fires. This is tracked in [`lib/CLAUDE.md`](lib/CLAUDE.md) under "Known gaps". Pipelined requests (a second request sent before the first response) are supported: they are answered in order on the same connection, and consecutive in-memory responses are coalesced into one `write`.
+Known behavior to be aware of: a request whose request line is not valid HTTP (no version, `HTTP/2.0`, plain garbage) is answered `400` and the connection closed as soon as its header block's blank line arrives - `HTTP/2.0` is a bad request line here, not an upgrade. Only an *unterminated* head is held: nothing is answered until its blank line arrives, the 8 KiB header cap is hit, or the request-header deadline fires, which is the same rule any partial request follows. Pipelined requests (a second request sent before the first response) are supported: they are answered in order on the same connection, and consecutive in-memory responses are coalesced into one `write`.
 
 ---
 

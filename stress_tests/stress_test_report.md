@@ -59,7 +59,7 @@ A separate one-worker measurement (5,000 connections, idle or after one request 
 1. **Connections were not spread across workers on macOS.** With 5,000 connections from one client, the largest worker held 124.3 of 133.7 MB (about 93%), and at 100 connections 7.7 of 17.1 MB. `SO_REUSEPORT` does not appear to balance TCP connections between the four sockets here. Linux was not tested. See `concurrency.md`.
 2. **`wrk` read errors at 5,000 connections persist**: 2,219 errors on `/ping` in this session (no connect errors). Part B and Part C recorded the same symptom, including 1,624 to 2,393 errors per run in the `stress_test.sh` run. The cause is still unidentified, and it may be the load generator or the operating system rather than the server.
 3. **No worker crashed** in the final run's log (`POST`, 4 workers); logs from the earlier runs of the session were not kept.
-4. **Malformed requests are not answered.** Not a stress-test result, but found while checking the server's behavior under bad input: a request line without a version, `HTTP/2.0` or plain garbage gets no reply and the connection stays open (`lib/CLAUDE.md`, "Known gaps").
+4. **Malformed requests were not answered** (fixed since this run). Not a stress-test result, but found while checking the server's behavior under bad input: a request line without a version, `HTTP/2.0` or plain garbage got no reply and the connection stayed open. A terminated malformed head is now answered `400` and closed as soon as its blank line arrives; only an unterminated head waits, bounded by the 8 KiB header cap and the request-header deadline.
 
 ---
 
