@@ -199,7 +199,7 @@ The codebase is split into two distinct tiers:
 - **Response-splitting defense**: header names/values, cookies and redirect targets containing control characters are dropped or refused.
 
 ### 5. Streaming & Chunked Responses
-- **Procedural Chunked Response API**: `res_write(res, data, len)` and `res_end(res)` emit HTTP/1.1 chunked framing (`<hex>\r\n<data>\r\n`) with buffer growth up to about 10 MB while preserving pure handler testability.
+- **Procedural Chunked Response API**: `res_write(res, data, len)` and `res_end(res)` emit HTTP/1.1 chunked framing (`<hex>\r\n<data>\r\n`) with buffer growth up to about 10 MB while preserving pure handler testability. Past that cap `res_write` returns `-1` and the whole response becomes a `500` instead of a truncated `200`; use `res_stream` for larger bodies.
 - **RFC 7230 Chunked Trailers**: `res_set_trailer(res, name, value)` declares `Trailer:` in headers and outputs trailers after the terminal `0\r\n` chunk.
 - **Bounded 16KB File Streaming**: `res_send_file(res, content_type, filepath)` streams files in 16KB chunks directly through `flush_connection` with 64KB cooperative yielding per event-loop turn, never buffering whole files into RAM.
 
@@ -225,12 +225,11 @@ The codebase is split into two distinct tiers:
 
 ## Known Gaps
 
-Verified against the current code on 27 Sep 2026 and not yet fixed (details in [`lib/CLAUDE.md`](lib/CLAUDE.md), "Known gaps"):
-- `res_write` silently truncates a chunked body past `MAX_BODY_SIZE` + 8 KiB of wire bytes; the handler cannot tell. Use `res_stream` for large bodies.
+Verified against the current code on 29 Sep 2026 and not yet fixed (details in [`lib/CLAUDE.md`](lib/CLAUDE.md), "Known gaps"):
 - Path parameters and query values over 63 characters, and single cookie values over 255, are truncated silently.
 - Deferred requests (`res_defer`) have no cancel callback: work for a client that left runs to completion, and `res_resume` returns NULL.
 - The io_uring backend is a readiness poller only; sockets are still read and written with `recv` / `write`.
-- No HTTP/2, compression, `Range`, or WebSocket. An `Expect` field naming anything other than `100-continue` is refused with `417` before its body is read (RFC 9110 §10.1.1).
+- No HTTP/2, compression, `Range`, or WebSocket.
 
 ---
 

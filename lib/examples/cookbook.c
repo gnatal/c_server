@@ -371,7 +371,8 @@ static void recipe_created(const Request *req, Response *res) {
  * RECIPE 12 - chunked streaming response (size unknown up front).
  *   GET /stream -> "part 0\npart 1\npart 2\n" as three chunks
  * Set headers first: the first res_write commits them. Output is buffered in the connection
- * (bounded by MAX_BODY_SIZE); the handler never blocks on the socket.
+ * (bounded by MAX_BODY_SIZE); the handler never blocks on the socket. res_write returns -1 once the
+ * body outgrows that bound: the response is already a 500 then, so stop producing and return.
  * ------------------------------------------------------------------------------------------- */
 static void recipe_stream(const Request *req, Response *res) {
     (void)req;
@@ -379,7 +380,9 @@ static void recipe_stream(const Request *req, Response *res) {
     for (int i = 0; i < 3; i++) {
         char line[32];
         const int n = snprintf(line, sizeof(line), "part %d\n", i);
-        res_write(res, line, (size_t)n);
+        if (res_write(res, line, (size_t)n) != 0) {
+            return;
+        }
     }
     res_end(res);
 }

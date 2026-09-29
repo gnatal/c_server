@@ -547,36 +547,59 @@ static int commit_chunked_headers(Response *res) {
     return 0;
 }
 
-void res_write(Response *res, const char *data, size_t len) {
+/*
+ * A chunked response that cannot be finished (past the out_buf cap, or out of memory) is replaced whole by a
+ * 500: out_buf holds only this response and nothing is written before the handler returns, so the client gets
+ * a well-formed error instead of a truncated 200 (or a chunk whose size line promises bytes that never come).
+ * The handler's headers, cookies and trailers described the lost body and are dropped with it; the dead
+ * out_buf stays in the arena until the request ends. stream_ended makes later res_write / res_end no-ops.
+ */
+static void fail_chunked_response(Response *res, const char *caller) {
+    fprintf(stderr, "%s: chunked response exceeds MAX_BODY_SIZE cap or out of memory, replaced by 500\n", caller);
+    Connection *const conn = res->conn;
+    conn->out_buf = NULL;
+    conn->out_len = 0;
+    conn->out_cap = 0;
+    conn->out_sent = 0;
+    res->header_count = 0;
+    res->set_cookie_count = 0;
+    res->trailer_count = 0;
+    res->is_chunked = 0;
+    res->status = 500;
+    const char *const body = status_text(500);
+    send_with_content_type(res, "text/plain", body, strlen(body)); /* on OOM: abort_response, connection dropped */
+    res->headers_sent = 1;
+    res->stream_ended = 1;
+}
+
+int res_write(Response *res, const char *data, size_t len) {
     if (res == NULL || res->conn == NULL || res->stream_ended) {
-        return;
+        return -1;
     }
     if (!res->headers_sent) {
         if (commit_chunked_headers(res) != 0) {
-            return;
+            return -1;
         }
     }
     if (body_suppressed(res)) {
-        return;
+        return 0;
     }
     if (len == 0 && data == NULL) {
-        return;
+        return 0;
     }
 
     char chunk_hdr[32];
     int n = snprintf(chunk_hdr, sizeof(chunk_hdr), "%zx\r\n", len);
     if (n <= 0) {
-        return;
+        return -1;
     }
-    if (append_to_out_buf(res->conn, chunk_hdr, (size_t)n) != 0) {
-        return;
+    if (append_to_out_buf(res->conn, chunk_hdr, (size_t)n) != 0 ||
+        (len > 0 && data != NULL && append_to_out_buf(res->conn, data, len) != 0) ||
+        append_to_out_buf(res->conn, "\r\n", 2) != 0) {
+        fail_chunked_response(res, "res_write");
+        return -1;
     }
-    if (len > 0 && data != NULL) {
-        if (append_to_out_buf(res->conn, data, len) != 0) {
-            return;
-        }
-    }
-    append_to_out_buf(res->conn, "\r\n", 2);
+    return 0;
 }
 
 void res_set_trailer(Response *res, const char *name, const char *value) {
@@ -612,6 +635,7 @@ void res_end(Response *res) {
         return;
     }
     if (append_to_out_buf(res->conn, "0\r\n", 3) != 0) {
+        fail_chunked_response(res, "res_end");
         return;
     }
     for (int i = 0; i < res->trailer_count; i++) {
@@ -620,10 +644,13 @@ void res_end(Response *res) {
             append_to_out_buf(res->conn, ": ", 2) != 0 ||
             append_to_out_buf(res->conn, tr->value, tr->value_len) != 0 ||
             append_to_out_buf(res->conn, "\r\n", 2) != 0) {
+            fail_chunked_response(res, "res_end");
             return;
         }
     }
-    append_to_out_buf(res->conn, "\r\n", 2);
+    if (append_to_out_buf(res->conn, "\r\n", 2) != 0) {
+        fail_chunked_response(res, "res_end");
+    }
 }
 
 int res_send_file(Response *res, const char *content_type, const char *filepath) {

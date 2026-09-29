@@ -436,8 +436,18 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   consumed"), so a long-lived subscriber holds no input buffer (the same applies to any pending response).
   Memory per streaming connection: one `STREAM_CHUNK_SIZE` buffer plus the application's ctx. MEASURED on macOS (one
   worker, `curl --limit-rate 2M`): the same 8.4 MB CSV took the server from about 1.5 MB to 38 MB RSS through
-  `res_write` (and was truncated, see Known gaps), and stayed at 1.6 MB through `res_stream`. A 63 MB export also
+  `res_write` (and was truncated then; it is a 500 now, see "Chunked cap" below), and stayed at 1.6 MB through `res_stream`. A 63 MB export also
   stayed at 1.6 MB.
+- **Chunked cap (`res_write` / `res_end`, `response.c`).** `append_to_out_buf` refuses to take `out_len` past
+  `MAX_BODY_SIZE + RESPONSE_HEADER_BUF_SIZE` wire bytes (head and chunk framing count), and fails on arena OOM.
+  Any such failure in `res_write` or `res_end` calls `fail_chunked_response`: `out_buf` is dropped (dead in the arena
+  until reset), header/cookie/trailer counts go to 0 (they described the lost body, e.g. `Content-Disposition`), and a
+  plain `500` is built with `send_with_content_type`; `headers_sent` and `stream_ended` are set, so later
+  `res_write` (returns -1) and `res_end` change nothing, while a later `res_send` still replaces it (last wins). Safe
+  because nothing reaches the socket before the handler returns and `out_buf` holds only this request's response
+  (a coalesced batch lives in `App.batch_buf`, a deferred prefix in `dr->prefix`). Before this (MEASURED 2026-09-23),
+  the failure was ignored: a 450,000-line CSV (8,426,423 body bytes) went out as 7,947,523 bytes with status 200, and a
+  chunk whose data did not fit kept its size line, so the framing itself was corrupt. `res_stream` has no such cap.
 - **Deferred responses (`res_defer` / `res_resume`, `connection.c`).** For handlers that wait on I/O. States
   (`DeferredRequest.state`): `DEFER_IN_HANDLER` → `DEFER_WAITING` → `DEFER_READY` → released.
   **`res_defer`** (inside the handler): refuses (0, nothing changed) if a response was started, the request is already
@@ -793,7 +803,6 @@ Verification tools: `make bench`, `make test` (22 suites), `make SANITIZE=1 BUIL
   whether a handler ever reads it, so there is no CPU to save by deferring the copy, only Request's overall size - and
   query/param storage together are under 3 KB, a small fraction of what headers used to cost).
 - **Multiple `res_send` calls leave dead copies in the arena** until the request ends, and so does chunked or yyjson growth when another arena allocation sits after the growing block (see Memory model). For large bodies use `res_stream`, which never touches the arena past the head.
-- **`res_write` silently truncates at its cap** (MEASURED 2026-09-23 while measuring `res_stream`): `append_to_out_buf` refuses anything past `MAX_BODY_SIZE + 8 KiB` of *wire* bytes, chunk framing included, and `res_write` ignores the failure. A CSV of 450,000 short lines (8,426,423 body bytes, about 11 MB framed) went out as 7,947,523 bytes with status 200 and no error anywhere. The handler cannot tell. `res_stream` has no such cap.
 - **A parked `res_stream` producer whose client vanished silently is only noticed on its next write**. A FIN/RST is caught at once (`watch_stream_peer`), but once a pipelined request has arrived behind the stream, read interest is dropped and only a write can fail. A producer that parks indefinitely without ever writing holds its connection and ctx until shutdown; long-lived streams should write a heartbeat (an SSE comment line, `:\n\n`) every so often - the idle sweep calls them about once a second, so they can check the time.
 - **No cancel callback for deferred requests**: an application learns that a request is gone only when `res_resume`
   returns NULL, so work for a client that left still runs to completion (its result is dropped).

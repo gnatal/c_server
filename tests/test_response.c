@@ -331,6 +331,91 @@ static void test_res_write_grows_out_buf_in_place(void) {
     free_conn(conn);
 }
 
+/* Past the out_buf cap res_write returns -1 and the response becomes a complete 500, never a truncated 200:
+ * the handler's headers and cookies go with the lost body, and later res_write / res_end change nothing. */
+static void test_res_write_past_cap_replaces_response_with_500(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+    const size_t piece_len = 1024 * 1024;
+    char *const piece = malloc(piece_len);
+    assert(piece != NULL);
+    memset(piece, 'c', piece_len);
+
+    res_set_header(&res, "Content-Disposition", "attachment; filename=\"export.csv\"");
+    res_set_cookie(&res, "sid", "abc", NULL);
+    int rc = 0;
+    int written = 0;
+    while ((rc = res_write(&res, piece, piece_len)) == 0) {
+        written++;
+    }
+    assert(written == MAX_BODY_SIZE / (int)piece_len); /* ten 1 MiB chunks fit the 8 KiB allowance, the 11th does not */
+    assert(rc == -1);
+
+    size_t len = 0;
+    char *const resp = without_date(conn->out_buf, conn->out_len, &len);
+    const char *const expected =
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 21\r\n"
+        "Connection: keep-alive\r\n\r\nInternal Server Error";
+    assert(len == strlen(expected) && memcmp(resp, expected, len) == 0);
+    free(resp);
+
+    char *const before = conn->out_buf;
+    const size_t before_len = conn->out_len;
+    assert(res_write(&res, "more", 4) == -1);
+    res_end(&res);
+    assert(conn->out_buf == before && conn->out_len == before_len);
+
+    free(piece);
+    free_conn(conn);
+}
+
+/* A body just under the cap is written whole: the cap refuses only what cannot fit. */
+static void test_res_write_up_to_cap_succeeds(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+    const size_t body_len = MAX_BODY_SIZE;
+    char *const body = malloc(body_len);
+    assert(body != NULL);
+    memset(body, 'd', body_len);
+
+    assert(res_write(&res, body, body_len) == 0);
+    res_end(&res);
+    assert(strncmp(conn->out_buf, "HTTP/1.1 200 OK\r\n", 17) == 0);
+    assert(conn->out_len > body_len);
+    assert(memcmp(conn->out_buf + conn->out_len - 7, "\r\n0\r\n\r\n", 7) == 0);
+
+    free(body);
+    free_conn(conn);
+}
+
+/* res_end that cannot fit its last chunk and trailers replaces the response the same way. */
+static void test_res_end_past_cap_replaces_response_with_500(void) {
+    Connection *conn = make_conn();
+    Response res = { .conn = conn, .status = 0 };
+    char trailer_value[4096];
+    memset(trailer_value, 't', sizeof(trailer_value) - 1);
+    trailer_value[sizeof(trailer_value) - 1] = '\0';
+    res_set_trailer(&res, "X-Checksum", trailer_value);
+
+    /* fill out_buf to a few bytes under the cap, so only the terminating chunk + trailer overflow */
+    assert(res_write(&res, "x", 1) == 0);
+    const size_t cap = (size_t)MAX_BODY_SIZE + 8192; /* + response.c's 8 KiB head allowance */
+    const size_t framing = 16; /* at least "<hex>\r\n" + "\r\n" for a ~10 MiB chunk (6 + 2 + 2) */
+    const size_t fill = cap - conn->out_len - framing;
+    char *const body = malloc(fill);
+    assert(body != NULL);
+    memset(body, 'e', fill);
+    assert(res_write(&res, body, fill) == 0);
+    assert(conn->out_len + 5 + sizeof(trailer_value) > cap);
+
+    res_end(&res);
+    assert(strncmp(conn->out_buf, "HTTP/1.1 500 Internal Server Error\r\n", 36) == 0);
+    assert(strstr(conn->out_buf, "Trailer:") == NULL);
+
+    free(body);
+    free_conn(conn);
+}
+
 static void test_chunked_streaming_trailers(void) {
     Connection *conn = make_conn();
     Response res = { .conn = conn, .status = 0 };
@@ -867,6 +952,9 @@ int main(void) {
     test_long_trailer_value_sent_whole();
     test_unstorable_header_is_dropped_not_cut();
     test_res_write_grows_out_buf_in_place();
+    test_res_write_past_cap_replaces_response_with_500();
+    test_res_write_up_to_cap_succeeds();
+    test_res_end_past_cap_replaces_response_with_500();
 
     printf("all response tests passed\n");
     return 0;
