@@ -826,6 +826,46 @@ Verification tools: `make bench`, `make test` (22 suites), `make SANITIZE=1 BUIL
 - **File bodies on Linux still send the head in its own `write`** before `sendfile` (no `MSG_MORE`/`TCP_CORK`); macOS
   carries it in the `sendfile` call. The write-stall deadline fires only on zero progress, so a client reading a large file a
   byte at a time holds its fd indefinitely (no minimum-rate rule). No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.
+- **Response framing (verified 2026-09-29, `response.c`).** `res_write(res, "", 0)` with a non-NULL pointer emits a
+  `0\r\n\r\n` last-chunk mid-body, so later chunks reach a keep-alive client as a bogus next response (only
+  `data == NULL` is treated as a no-op; `stream_write` already skips `len == 0`). Whole-body sends leave the chunked state
+  (`headers_sent`, `stream_ended`) as it was and `commit_chunked_headers` appends to whatever `out_buf` holds, so in
+  one handler `res_send` followed by `res_write`/`res_end`/`res_stream` sends two responses for one request,
+  `res_write` + `res_send` + `res_end` leaves a `0\r\n\r\n` after the `Content-Length` body, and `res_send_file` +
+  `res_write` puts chunk bytes between the head and the file body. `res_set_header` accepts `Transfer-Encoding`, and
+  `build_response_head` filters it only for chunked/bodiless heads, so a fixed-length response can carry both
+  `Content-Length` and `Transfer-Encoding: chunked`.
+- **Single acceptor, master gone (verified 2026-09-29; `cluster.c` + `accept_passed_connections` + kqueue).** If the master dies without
+  draining (SIGKILL, crash), each worker's control socket reports EOF; kqueue keeps it readable, `recvmsg` returns 0 and
+  `accept_passed_connections` just breaks, so the worker spins on `LOOP_EVENT_ACCEPT`. Nothing in the worker treats EOF
+  on the control socket as "stop accepting".
+- **SIGINT sent to the master alone is not forwarded (`cluster_listen`).** Only SIGTERM is relayed to workers, on the
+  assumption that SIGINT came from the terminal to the whole process group. `kill -INT <master>` (or a supervisor with
+  STOPSIGNAL SIGINT) leaves workers serving until the 6 s deadline SIGKILLs them, with no drain.
+- **Master accept loop is unbounded (`cluster_listen`, single acceptor).** It drains `accept` until `EAGAIN`; under a
+  sustained connection flood it never returns to `waitpid`, respawn or the shutdown flag.
+- **Head re-parsed on every recv while a body is pending (`parse_request_head_resume`).** `head_scan` is advanced only
+  while no blank line is found, so once the head is complete every later `recv` of the same request runs
+  `phr_parse_request`, `has_bare_lf` and the framing pass over the whole head again (up to `BUF_SIZE`). A client that
+  drips a body in small segments behind a large head costs a full head parse per segment: MEASURED 5.3 µs for a
+  7.3 KB, 99-header head, 26 ns for a minimal one. The framing verdict could
+  be kept on the Connection once `header_len > 0`.
+- **Chunked bodies are scanned twice.** `request_head_is_complete` validates the body incrementally
+  (`chunk_scan`), then `parse_http_request_in_place` runs `chunked_body_scan` from the start again before
+  `chunked_body_decode`; the resumed state already proves the same verdict.
+- **Static case variants (verified 2026-09-29 on macOS APFS; `static.c` + prefix middleware).** On a case-insensitive
+  filesystem `GET /static/PRIVATE/x` misses `app_use_prefix(app, "/static/private", ...)`, since prefix matching is
+  byte-exact, while `static_serve_file` resolves it to `private/x` and serves it. `realpath` returns the on-disk
+  spelling, so the resolved path differs from the candidate. Normalization variants of non-ASCII names on APFS have the
+  same shape. Case-sensitive filesystems (Linux ext4/xfs) are unaffected.
+- **Blocking file open (verified 2026-09-29).** `res_send_file` opens with plain `O_RDONLY`, so a FIFO blocks the
+  worker inside `open` before `fstat` can refuse it. `static_serve_file` stats first but reopens by path
+  (`res_send_file`, or `fopen` for cacheable sizes), so a file swapped for a FIFO in between does the same. The
+  streamed fd has no `O_CLOEXEC`.
+- **Listeners share ports silently (verified 2026-09-29).** `create_server_socket` sets `SO_REUSEPORT` on every
+  listener, not only for Linux cluster workers, so a second standalone server on the same port binds successfully and
+  splits traffic instead of failing with `EADDRINUSE`.
+- **Fix plans** for the entries dated 2026-09-29, in suggested order: `../roadmap.md`.
 
 ## Where to change what
 Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`. Change producer streaming (`res_stream`, parking, waking) → `response.c` + `connection.c` (`flush_connection`, `park_stream`/`resume_stream`, `watch_stream_peer`) + `tests/test_stream.c`. Add a parser feature → `http_parser.c/h` +
