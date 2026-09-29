@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CExpress — High-Performance C11 Web Framework</title>
   <meta name="description"
-    content="A lightweight, high-performance, single-threaded HTTP/1.1 web framework and server written in C11, inspired by Express.js and powered by native kqueue (macOS/BSD) and epoll (Linux).">
+    content="A lightweight, high-performance HTTP/1.1 web framework (one single-threaded event loop per worker process) and server written in C11, inspired by Express.js and powered by native kqueue (macOS/BSD) and epoll (Linux).">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link
@@ -1040,8 +1040,8 @@
         <div class="hero-tagline">Native C11 Web Framework</div>
         <h1>The Simplicity of Express.js.<br>The Speed of Native C.</h1>
         <p>
-          CExpress is a lightweight, single-threaded HTTP/1.1 web framework and server designed with Express.js
-          ergonomics, running directly on native BSD/macOS <code>kqueue</code> and Linux <code>epoll</code> (<code>io_uring</code> readiness polling opt-in).
+          CExpress is a lightweight HTTP/1.1 web framework and server designed with Express.js ergonomics, with one
+          single-threaded event loop per worker process, running directly on native BSD/macOS <code>kqueue</code> and Linux <code>epoll</code> (<code>io_uring</code> readiness polling opt-in).
         </p>
 
         <div class="stats-grid">
@@ -1070,7 +1070,7 @@
             <div class="stat-label">Passing Test Suites (CI: Linux + macOS)</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #ec4899;">171</div>
+            <div class="stat-val" style="color: #ec4899;">172</div>
             <div class="stat-label">Audited Engine Functions (Zero Drift)</div>
           </div>
         </div>
@@ -1237,7 +1237,7 @@
             <tbody>
                 <tr><td>JSON</td><td><strong>787,754</strong></td><td>actix 738,709</td><td><strong>1st</strong> of 5</td><td>4</td></tr>
                 <tr><td>Plaintext (pipelined ×16)</td><td><strong>4,813,888</strong></td><td>actix 4,412,559</td><td><strong>1st</strong> of 5</td><td>4</td></tr>
-                <tr><td>Single query (db)</td><td>328,331</td><td>xitca-web-barebone 332,258</td><td>2nd of 8 (98.8%)</td><td>10</td></tr>
+                <tr><td>db</td><td>328,331</td><td>xitca-web-barebone 332,258</td><td>2nd of 8 (98.8%)</td><td>10</td></tr>
                 <tr><td>Multiple queries, 1</td><td><strong>329,366</strong></td><td>may-minihttp 328,412</td><td><strong>1st</strong> of 8</td><td>10</td></tr>
                 <tr><td>Multiple queries, 5</td><td><strong>110,799</strong></td><td>xitca-web 104,086</td><td><strong>1st</strong> of 8 (+6.4%)</td><td>10</td></tr>
                 <tr><td>Multiple queries, 20</td><td><strong>29,713</strong></td><td>actix-http 29,582</td><td><strong>1st</strong> of 8 (+0.4%)</td><td>10</td></tr>
@@ -1250,7 +1250,8 @@
         <p style="font-size: 0.9rem;">
           Best req/s over TFB's concurrency levels. Run 10 had eight entries (CExpress, actix-http, axum-pg, h2o, Fiber,
           may-minihttp, xitca-web, xitca-web-barebone); run 4, the last run that measured JSON and plaintext, had five
-          (CExpress, actix, axum, h2o, Fiber). db and single query are a three-way tie within 2.4%; fortunes is the one
+          (CExpress, actix, axum, h2o, Fiber). On db and on multiple queries at 1, the top three (CExpress, may-minihttp,
+          xitca-web-barebone) are within 2.4% and 0.8%, a tie; fortunes is the one
           test where CExpress trails the Round 23 leaders.
         </p>
 
@@ -1270,27 +1271,25 @@
         <h2>📊 Performance & Stress Benchmarks</h2>
         <p>
           CExpress is engineered from the ground up for extreme throughput, deterministic microsecond latency, and tiny
-          memory consumption. All benchmarks below were executed on Apple Silicon (M3 Pro 12-core, 18 GB RAM, macOS) in
-          multi-worker cluster mode (<code>QUIET=1 WORKERS=4</code>) using <code>wrk</code> over 8 threads.
+          memory consumption. All benchmarks below were executed on one Apple Silicon machine (M3 Pro 12-core, 18 GB RAM),
+          either on macOS directly or in Docker Desktop's Linux VM where marked, in multi-worker cluster mode
+          (<code>QUIET=1 WORKERS=4</code>) using <code>wrk</code> over 8 threads.
         </p>
         <div class="alert alert-warn">
-          <strong>What was refreshed (21 Sep 2026):</strong> the <em>Standalone Engine Peak</em> cards, the <em>Memory</em>
-          tab and the <em>Hotpath</em> tab were re-measured on the current engine (arena allocator, yyjson,
-          picohttpparser, Patricia router), as single runs with <code>wrk</code> on the same machine as the server. The
-          framework comparison chart, the SQLite/static/churn tabs and the other throughput tables come from earlier
-          revisions and were <strong>not</strong> re-run, and no competitor was re-measured. The 5,000-connection runs
-          show intermittent <code>wrk</code> read errors of unidentified cause.
-          <br><strong>Refreshed again (23 Sep 2026):</strong> the <em>Memory</em> tab and the 1,000-connection
-          <code>/ping</code> card were re-measured after the switch to one arena per worker and one receive buffer per
-          worker, same method and machine as before.
-          <br><strong>Full re-run (24 Sep 2026):</strong> <code>scripts/stress_test.sh</code> (macOS, defaults: 15 s per
-          row, churn 2 s per row) and <code>scripts/docker_stress_test.sh</code> (Linux epoll in Docker, defaults: 10 s
-          per row, 100 and 1,000 connections) were run end to end, plus <code>make bench</code>. The <em>Ping</em>,
-          <em>SQLite</em>, <em>Static</em> and <em>Churn</em> tabs and the <em>Hotpath</em> tab now show those runs.
-          The macOS machine was busy during this run (load average 7–8 before the benchmark started, <code>sysmond</code>
-          at ~76% CPU), and <code>wrk</code> shares its cores, so the macOS <code>/ping</code> figures are lower than
-          the 21–23 Sep ones. Two shorter re-runs gave 176–180k req/s at 100 connections and 191–193k at 1,000. The
-          framework comparison chart is still from an earlier revision.
+          <strong>When each figure was measured.</strong> All runs are single runs with <code>wrk</code> on the same
+          machine as the server.
+          <br>• <em>Standalone Engine Peak</em> cards: 21 Sep 2026 (100 and 5,000 connections) and 23 Sep 2026
+          (1,000 connections, after the switch to one arena and one receive buffer per worker).
+          <br>• <em>Memory</em> tab: 21 Sep 2026 (before that switch) and 23 Sep 2026 (after it).
+          <br>• <em>Ping</em>, <em>SQLite</em>, <em>Static</em>, <em>Churn</em> and <em>Hotpath</em> tabs and the
+          Linux spotlight: 24 Sep 2026, from <code>scripts/stress_test.sh</code> (macOS, 15 s per row, churn 2 s per row),
+          <code>scripts/docker_stress_test.sh</code> (Linux epoll in Docker, 10 s per row, 100 and 1,000 connections) and
+          <code>make bench</code>. The macOS machine was busy during this run (load average 7–8 before the benchmark
+          started, <code>sysmond</code> at ~76% CPU), and <code>wrk</code> shares its cores, so the macOS
+          <code>/ping</code> figures are lower than the 21–23 Sep ones. Two shorter re-runs gave 176–180k req/s at 100
+          connections and 191–193k at 1,000.
+          <br>• Framework comparison chart: an earlier engine revision; no competitor was re-measured since.
+          <br>The 5,000-connection runs show intermittent <code>wrk</code> read errors of unidentified cause.
         </div>
 
         <!-- Spotlight: Linux epoll inside Docker -->
@@ -1435,24 +1434,6 @@
           <!-- Memory & Latency Footprint Comparison -->
           <div
             style="margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border-subtle); display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0.75rem;">
-            <div
-              style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
-              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">
-                Memory (4 Workers)</div>
-              <div style="font-size: 1.15rem; font-weight: 800; color: var(--primary); margin-top: 0.2rem;">20.0 MB
-                <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">CExpress</span></div>
-              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Rust: 58 MB · Go: 45 MB ·
-                Express: 507 MB</div>
-            </div>
-            <div
-              style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
-              <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">
-                5,000 Conns Max Latency</div>
-              <div style="font-size: 1.15rem; font-weight: 800; color: #34d399; margin-top: 0.2rem;">58.26 ms <span
-                  style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">CExpress</span></div>
-              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem;">Rust Actix: 769 ms (13x
-                lower spike)</div>
-            </div>
             <div
               style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
               <div style="font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; font-weight: 700;">
@@ -1629,7 +1610,7 @@
         <div id="tab-static" class="bench-pane">
           <p>
             Serves the responsive single-page Todo application HTML directly from disk via CExpress's bounded streaming
-            engine (<code>res_send_file_custom</code>). The page is 6,481 bytes. macOS, <code>scripts/stress_test.sh</code>,
+            engine (<code>res_send_file</code>). The page is 6,481 bytes. macOS, <code>scripts/stress_test.sh</code>,
             24 Sep 2026, 15 s per row.
           </p>
           <div class="table-container">
@@ -1677,8 +1658,8 @@
             </table>
           </div>
           <div class="alert alert-note">
-            <strong>Bounded Buffer Streaming:</strong> File content is streamed in 64 KB chunks directly from disk
-            descriptor to client socket, ensuring RAM consumption stays bounded even when saturation pushes throughput
+            <strong>Bounded Buffer Streaming:</strong> File content goes from the disk descriptor to the client socket
+            with <code>sendfile</code>, or in 16 KB chunks where <code>sendfile</code> is unavailable, ensuring RAM consumption stays bounded even when saturation pushes throughput
             past 740 megabytes per second.
           </div>
         </div>
@@ -1821,8 +1802,8 @@
             the Linux Docker run the whole cluster stayed between 11.2 and 11.8 MB. Zero worker crashes in either run.
           </div>
           <div class="alert alert-tip">
-            <strong>Memory safety:</strong> all 22 suites pass under AddressSanitizer and UndefinedBehaviorSanitizer and a
-            300,000-iteration mutation fuzz run finished clean. LeakSanitizer is not available on macOS, so no leak check has
+            <strong>Memory safety:</strong> all 22 suites pass under AddressSanitizer and UndefinedBehaviorSanitizer and the
+            <code>make fuzz</code> mutation fuzz run finished clean. LeakSanitizer is not available on macOS, so no leak check has
             been run on this platform.
           </div>
         </div>
@@ -1924,17 +1905,17 @@ make bench</code></pre>
         <h2>🛡️ Reliability, Hardening & Test Matrix</h2>
         <p>
           High throughput is meaningless without correctness and rock-solid memory safety. CExpress is rigorously
-          verified across 21 dedicated automated test suites, AddressSanitizer and UndefinedBehaviorSanitizer
+          verified across 22 dedicated automated test suites, AddressSanitizer and UndefinedBehaviorSanitizer
           instrumentation, continuous mutation fuzzing, and automated API documentation audits.
         </p>
 
         <div class="stats-grid" style="margin-bottom: 2rem;">
           <div class="stat-card">
-            <div class="stat-val" style="color: #10b981;">21 / 21</div>
+            <div class="stat-val" style="color: #10b981;">22 / 22</div>
             <div class="stat-label">Automated Test Suites Passing</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #38bdf8;">155 / 155</div>
+            <div class="stat-val" style="color: #38bdf8;">172 / 172</div>
             <div class="stat-label">Public APIs Audited (check_docs.sh)</div>
           </div>
           <div class="stat-card">
@@ -1942,8 +1923,8 @@ make bench</code></pre>
             <div class="stat-label">Mutation Fuzz Iterations Clean</div>
           </div>
           <div class="stat-card">
-            <div class="stat-val" style="color: #fb923c;">0 Leaks</div>
-            <div class="stat-label">ASan & UBSan Sanitizer Verified</div>
+            <div class="stat-val" style="color: #fb923c;">ASan + UBSan</div>
+            <div class="stat-label">All Suites Clean Under Sanitizers</div>
           </div>
         </div>
 
@@ -2074,7 +2055,7 @@ make bench</code></pre>
           the entire public C API against the documentation:
         </p>
         <div class="alert alert-tip">
-          <strong>154 of 154 Public Functions Covered:</strong> Fails immediately if any function declared in
+          <strong>172 of 172 Public Functions Covered:</strong> Fails immediately if any function declared in
           <code>lib/*.h</code> is missing from the documentation, or if the documentation references any function not
           declared in a header.
         </div>
@@ -2122,7 +2103,7 @@ make fuzz</code></pre>
             <span class="code-lang">bash</span>
             <button class="btn-copy" onclick="copyCode(this)">Copy</button>
           </div>
-          <pre><code>gcc-16 -Wall -Wextra -std=c11 -O2 -Ipath/to/lib -o my_app main.c path/to/libcexpress.a -lssl -lcrypto   # Linux: add -D_GNU_SOURCE and -luring</code></pre>
+          <pre><code>gcc-16 -Wall -Wextra -std=c11 -O2 -Ipath/to/lib -o my_app main.c path/to/libcexpress.a   # Linux: add -D_GNU_SOURCE and -luring</code></pre>
         </div>
       </section>
 
@@ -2185,7 +2166,7 @@ make fuzz</code></pre>
           <strong>Automatic Protocol Conformance:</strong><br>
           • <strong>HEAD Requests:</strong> Executes the matching <code>GET</code> handler while automatically
           suppressing the message body.<br>
-          • <strong>OPTIONS Requests:</strong> Returns <code>204 No Content</code> with the computed <code>Allow</code>
+          • <strong>OPTIONS Requests:</strong> Returns <code>200 OK</code> with the computed <code>Allow</code>
           header.<br>
           • <strong>405 Method Not Allowed:</strong> Emitted automatically if the route path exists but the verb is not
           registered.
@@ -2395,7 +2376,7 @@ make fuzz</code></pre>
       <section id="file-streaming">
         <h3>Bounded File Streaming (res_send_file)</h3>
         <p>
-          Stream large files directly from the filesystem in bounded 16KB chunks through the non-blocking event loop.
+          Stream large files directly from the filesystem through the non-blocking event loop (<code>sendfile</code>, or bounded 16KB chunks where it is unavailable).
           Memory is bounded and whole files are never buffered into RAM:
         </p>
 
@@ -2445,11 +2426,17 @@ make fuzz</code></pre>
           </div>
           <pre><code><span class="com">/* Multipart File Uploads */</span>
 <span class="kw">const char</span> *content_type = <span class="fn">req_get_header</span>(req, <span class="str">"Content-Type"</span>);
+<span class="kw">char</span> boundary[<span class="num">128</span>];
 <span class="type">MultipartForm</span> form;
-<span class="fn">parse_multipart_body</span>(content_type, req->body, req->content_length, &form);
+<span class="kw">if</span> (content_type == NULL || !<span class="fn">multipart_parse_boundary</span>(content_type, boundary, <span class="kw">sizeof</span>(boundary)) ||
+    <span class="fn">parse_multipart_body</span>(req->body, (<span class="kw">size_t</span>)req->content_length, boundary, &form) &lt; <span class="num">0</span>) {
+    <span class="fn">res_status</span>(res, <span class="num">400</span>);
+    <span class="fn">res_send</span>(res, <span class="str">"Bad multipart body"</span>);
+    <span class="kw">return</span>;
+}
 
 <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; form.part_count; i++) {
-    <span class="kw">if</span> (form.parts[i].is_file) {
+    <span class="kw">if</span> (form.parts[i].filename[<span class="num">0</span>] != <span class="str">'\0'</span>) {
         printf(<span class="str">"File uploaded: %s (%zu bytes)\n"</span>, form.parts[i].filename, form.parts[i].data_len);
     }
 }</code></pre>
@@ -2461,7 +2448,8 @@ make fuzz</code></pre>
         <h2>⚡ JSON with yyjson</h2>
         <p>
           CExpress vendors <a href="https://github.com/ibireme/yyjson">yyjson</a> and includes it from <code>cexpress.h</code>.
-          Give it the connection arena as its allocator so documents need no freeing; the string returned by
+          Give it the shared per-worker arena (<code>res->conn->arena</code>, already a pointer) as its allocator so
+          documents need no freeing; the string returned by
           <code>yyjson_mut_write</code> comes from libc and must be freed:
         </p>
 
@@ -2471,7 +2459,7 @@ make fuzz</code></pre>
             <button class="btn-copy" onclick="copyCode(this)">Copy</button>
           </div>
           <pre><code><span class="com">/* Parse incoming JSON */</span>
-yyjson_alc alc = <span class="fn">arena_yyjson_alc</span>(&amp;res-&gt;conn-&gt;arena);
+yyjson_alc alc = <span class="fn">arena_yyjson_alc</span>(res-&gt;conn-&gt;arena);
 yyjson_doc *doc = <span class="fn">yyjson_read_opts</span>(req-&gt;body, (<span class="kw">size_t</span>)req-&gt;content_length, <span class="num">0</span>, &amp;alc, NULL);
 <span class="kw">if</span> (doc != NULL) {
     <span class="kw">const char</span> *name = <span class="fn">yyjson_get_str</span>(<span class="fn">yyjson_obj_get</span>(<span class="fn">yyjson_doc_get_root</span>(doc), <span class="str">"name"</span>));
@@ -2639,7 +2627,7 @@ yyjson_mut_val *obj = <span class="fn">yyjson_mut_obj</span>(out);
               <tr data-cat="response">
                 <td><code>res_send_file(res, type, filepath)</code></td>
                 <td><code>response.h</code></td>
-                <td>Streams file in bounded 16KB chunks through event loop.</td>
+                <td>Streams a file through the event loop (sendfile, or bounded 16KB chunks).</td>
               </tr>
               <tr data-cat="parser">
                 <td><code>req_get_param(req, name)</code></td>
