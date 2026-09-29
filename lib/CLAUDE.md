@@ -10,6 +10,10 @@ mixing the two coupled OpenSSL's lifecycle (handshake state, buffer release, ren
 every connection's state machine for a concern the engine has no business owning. An OpenSSL-based
 non-blocking TLS layer (`tls.c/h`, `TLS_CERT`/`TLS_KEY` in the demo) existed through 2026-09-22 and was
 removed for this reason; see `../improvements_progress.md` for the removal record.
+**Also gateway-owned, by the same reasoning:** HTTP/2 (browsers use it only over TLS, so it terminates where TLS
+does and the gateway speaks HTTP/1.1 upstream; `HTTP/2.0` on the request line is a 400 here, not an upgrade) and
+response compression (the gateway compresses proxied responses). Neither is a known gap; do not add either to the
+engine.
 
 ## Model
 A process runs one single-threaded, non-blocking event loop: kqueue on macOS/BSD, epoll on Linux, or io_uring on Linux
@@ -812,7 +816,13 @@ Verification tools: `make bench`, `make test` (22 suites), `make SANITIZE=1 BUIL
 - **wrk against Linux in Docker reports "timeout" counts close to the connection count** (for example 900-1650 at
   `-c1000`), on epoll and io_uring alike, with max latency in milliseconds and none on macOS/kqueue. Same size either
   backend, so not an engine-backend defect; not explained.
-- No HTTP/2, compression, `Range`, or WebSocket.
+- **No `Range` requests** (`206 Partial Content`). Only relevant when large files are served by this engine
+  (`app_serve_static` / `res_send_file`) rather than directly by the gateway: nginx passes a proxied request's `Range`
+  through, so the engine would have to answer it. The file path already sends from `Connection.file_offset` with a
+  `file_remaining` count, which is what a single-range answer needs.
+- **No WebSocket.** Not an HTTP exchange after the upgrade, so it does not fit the request/response model; the intended
+  shape is an add-on: an engine hook that detaches the fd from the Connection after the handshake, with framing in a
+  separate module. Server-to-client push is covered by `res_stream` (SSE).
 - **File bodies on Linux still send the head in its own `write`** before `sendfile` (no `MSG_MORE`/`TCP_CORK`); macOS
   carries it in the `sendfile` call. The write-stall deadline fires only on zero progress, so a client reading a large file a
   byte at a time holds its fd indefinitely (no minimum-rate rule). No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.

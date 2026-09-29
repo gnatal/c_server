@@ -55,7 +55,7 @@ CExpress provides a single umbrella header:
 #include "cexpress.h"
 ```
 
-This includes all core subsystems: routing, response helpers, middleware chains, HTTP parser, static files, multipart, URL-encoded forms, the per-worker arena, and the vendored yyjson JSON library. There is no TLS: this engine is plaintext HTTP/1.1 only, and TLS termination belongs at a gateway or reverse proxy in front of it.
+This includes all core subsystems: routing, response helpers, middleware chains, HTTP parser, static files, multipart, URL-encoded forms, the per-worker arena, and the vendored yyjson JSON library. There is no TLS: this engine is plaintext HTTP/1.1 only, and TLS termination belongs at a gateway or reverse proxy in front of it. The same goes for HTTP/2 and response compression: the gateway handles both.
 
 ### Compiling & Linking
 Build the library once with `make` in the CExpress checkout (it produces `build/lib/libcexpress.a`), then compile your application files and link against it. On Linux, also link liburing:

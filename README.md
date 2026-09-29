@@ -229,7 +229,15 @@ Verified against the current code on 29 Sep 2026 and not yet fixed (details in [
 - Path parameters and query values over 63 characters, and single cookie values over 255, are truncated silently.
 - Deferred requests (`res_defer`) have no cancel callback: work for a client that left runs to completion, and `res_resume` returns NULL.
 - The io_uring backend is a readiness poller only; sockets are still read and written with `recv` / `write`.
-- No HTTP/2, compression, `Range`, or WebSocket.
+- No `Range` requests (`206 Partial Content`: resuming a download, seeking in a video). Matters only when this engine serves large files itself; a gateway that serves them directly handles it.
+- No WebSocket. It could come as an add-on: a hook that hands the connection over after the upgrade handshake, with the protocol in its own module. For server-to-client push, `res_stream` with server-sent events already works.
+
+### Out of scope (handled by the gateway)
+
+This engine is an HTTP/1.1 application server meant to sit behind a gateway or reverse proxy (nginx, an ALB, a sidecar). These belong to that layer and are not planned here:
+- **TLS**: see the note under [Prerequisites](#prerequisites).
+- **HTTP/2**: browsers use it only over TLS, so it is terminated where TLS is; the gateway speaks HTTP/1.1 to this engine.
+- **Response compression**: nginx `gzip on` (or the gateway's equivalent) compresses what this engine sends.
 
 ---
 
