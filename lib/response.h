@@ -88,12 +88,13 @@ void res_clear_cookie(Response *res, const char *name, const char *path);
  * line and headers with Transfer-Encoding: chunked, so set headers and trailers-to-declare first.
  * Chunks accumulate in conn->out_buf and nothing is sent until the handler returns; the handler never
  * blocks on the socket. For large or unbounded bodies use res_stream. HEAD requests get the headers only.
- * res_end writes the last chunk plus any trailers.
- * res_write returns 0, or -1 when nothing was written: after res_end / res_stream, a head that did not fit
- * (connection dropped), or the response outgrew its cap. The cap is MAX_BODY_SIZE + 8 KiB of wire bytes
- * (head and chunk framing count); past it (or out of memory, also in res_end) the whole response is
- * replaced by a 500 with no custom headers, cookies or trailers, never sent truncated, and later
- * res_write / res_end are no-ops. A later res_send still replaces the 500 (last wins).
+ * res_end writes the last chunk plus any trailers. len == 0 writes no chunk (a zero-size chunk would end
+ * the body), whatever `data` is; the first call still commits the head.
+ * res_write returns 0, or -1 when nothing was written: data NULL with len > 0, after res_end / res_stream,
+ * a head that did not fit (connection dropped), or the response outgrew its cap. The cap is
+ * MAX_BODY_SIZE + 8 KiB of wire bytes (head and chunk framing count); past it (or out of memory, also in
+ * res_end) the whole response is replaced by a 500 with no custom headers, cookies or trailers, never
+ * sent truncated, and later res_write / res_end are no-ops. A later res_send still replaces the 500 (last wins).
  * res_set_trailer: same-name overwrites; Transfer-Encoding, Content-Length and Trailer are rejected;
  * MAX_RESPONSE_TRAILERS; names and values follow res_set_header's rules (value copied whole, never cut).
  */

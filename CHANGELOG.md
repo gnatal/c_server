@@ -10,6 +10,12 @@
   which left the client holding back a body it had been told to send, and made `Expect: 100-continue, foo` get no
   interim response at all. HTTP/1.0 expectations stay ignored, an empty field names no expectation, and an invalid
   framing is still answered `400`/`413`/`501` by the parse path rather than masked by a `417`.
+- **An empty `res_write` no longer ends a chunked body early.** `res_write(res, "", 0)` used to frame a zero-size
+  chunk, which is the last-chunk marker: the client saw the body end there, and every later chunk, `res_end`'s
+  terminator included, reached a keep-alive client as the start of a bogus next response. Once the head is committed,
+  `len == 0` now writes nothing whatever `data` is (the first call still commits the head), as `stream_write` already
+  did. `res_write(res, NULL, n)` with `n > 0` now returns `-1` with nothing written, instead of a size line with no
+  bytes behind it.
 
 ## v0.1.0 (2026-09-27)
 

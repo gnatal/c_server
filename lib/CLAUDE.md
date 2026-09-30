@@ -442,6 +442,11 @@ Accessors return `NULL` for "absent". Nothing in the engine uses exceptions or `
   worker, `curl --limit-rate 2M`): the same 8.4 MB CSV took the server from about 1.5 MB to 38 MB RSS through
   `res_write` (and was truncated then; it is a 500 now, see "Chunked cap" below), and stayed at 1.6 MB through `res_stream`. A 63 MB export also
   stayed at 1.6 MB.
+- **Empty chunks (`res_write`, `stream_write`).** A zero-size chunk is the last-chunk marker, so neither ever frames
+  one: `res_write` with `len == 0` commits the head if it is the first call and otherwise writes nothing, whatever
+  `data` is; `stream_write` with `len == 0` writes nothing. The only zero-size chunk on the wire is the last one,
+  appended by `res_end` or on a producer's `STREAM_END`. `res_write` with `data == NULL` and `len > 0` returns -1 before
+  committing anything (a size line with no bytes behind it would desync the client).
 - **Chunked cap (`res_write` / `res_end`, `response.c`).** `append_to_out_buf` refuses to take `out_len` past
   `MAX_BODY_SIZE + RESPONSE_HEADER_BUF_SIZE` wire bytes (head and chunk framing count), and fails on arena OOM.
   Any such failure in `res_write` or `res_end` calls `fail_chunked_response`: `out_buf` is dropped (dead in the arena
@@ -790,7 +795,7 @@ this update). What to keep:
 - Response head is assembled with bounded `memcpy` appends and an integer formatter, not `snprintf`.
 - Allocate per-request data from `conn->arena`, not `malloc`. Emit JSON through yyjson with `arena_yyjson_alc`.
 - No syscall on a path that changes nothing (`events_watched`; enforced on every backend, see Event loop).
-Verification tools: `make bench`, `make test` (22 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
+Verification tools: `make bench`, `make test` (23 suites), `make SANITIZE=1 BUILD_DIR=build-asan test` (ASan + UBSan),
 `make fuzz` (mutation fuzzer over parser/router/response, then an end-to-end "every input is answered or closed" check through the real connection code), `make check-docs`. Run sanitizers and fuzz after touching
 `http_parser.c`, `router.c`, `response.c` or `arena.c`. The Makefile tracks header dependencies (`-MMD`).
 
@@ -826,9 +831,7 @@ Verification tools: `make bench`, `make test` (22 suites), `make SANITIZE=1 BUIL
 - **File bodies on Linux still send the head in its own `write`** before `sendfile` (no `MSG_MORE`/`TCP_CORK`); macOS
   carries it in the `sendfile` call. The write-stall deadline fires only on zero progress, so a client reading a large file a
   byte at a time holds its fd indefinitely (no minimum-rate rule). No `ETag`/`Last-Modified`/`304`/`Cache-Control` on any response, static or otherwise.
-- **Response framing (verified 2026-09-29, `response.c`).** `res_write(res, "", 0)` with a non-NULL pointer emits a
-  `0\r\n\r\n` last-chunk mid-body, so later chunks reach a keep-alive client as a bogus next response (only
-  `data == NULL` is treated as a no-op; `stream_write` already skips `len == 0`). Whole-body sends leave the chunked state
+- **Response framing (verified 2026-09-29, `response.c`).** Whole-body sends leave the chunked state
   (`headers_sent`, `stream_ended`) as it was and `commit_chunked_headers` appends to whatever `out_buf` holds, so in
   one handler `res_send` followed by `res_write`/`res_end`/`res_stream` sends two responses for one request,
   `res_write` + `res_send` + `res_end` leaves a `0\r\n\r\n` after the `Content-Length` body, and `res_send_file` +
@@ -868,7 +871,7 @@ Verification tools: `make bench`, `make test` (22 suites), `make SANITIZE=1 BUIL
 - **Fix plans** for the entries dated 2026-09-29, in suggested order: `../roadmap.md`.
 
 ## Where to change what
-Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`. Change producer streaming (`res_stream`, parking, waking) → `response.c` + `connection.c` (`flush_connection`, `park_stream`/`resume_stream`, `watch_stream_peer`) + `tests/test_stream.c`. Add a parser feature → `http_parser.c/h` +
+Add a response helper → `response.c/h` + `tests/test_response.c` + `API.md`; wire-framing rules (what one handler's call sequence may put on the wire) → `tests/test_response_framing.c`. Change producer streaming (`res_stream`, parking, waking) → `response.c` + `connection.c` (`flush_connection`, `park_stream`/`resume_stream`, `watch_stream_peer`) + `tests/test_stream.c`. Add a parser feature → `http_parser.c/h` +
 `tests/test_http_parser.c` (or `test_http_hardening.c` for a bug regression) + a case in `tests/fuzz_parser.c` seeds. Add a route feature → `router.c/h` + `tests/test_router.c`.
 Change deferred responses or application fds → `connection.c` (`res_defer`, `park_deferred`, `detach_deferred`, `finish_deferred`, `serve_resumed`, `app_watch_fd`, `handle_event`) + the three backends' `interest_bits`/poll classification + `tests/test_defer.c` (run it on epoll and io_uring too).
 Add middleware behavior → `middleware.c` + `tests/test_middleware.c`. New public function → declare it in the header and list it in

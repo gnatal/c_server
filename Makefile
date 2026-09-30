@@ -50,6 +50,7 @@ HTTP_PARSER_TEST_BIN = $(BIN_DIR)/test_http_parser
 HTTP_HARDENING_TEST_BIN = $(BIN_DIR)/test_http_hardening
 CONNECTION_TEST_BIN  = $(BIN_DIR)/test_connection
 RESPONSE_TEST_BIN    = $(BIN_DIR)/test_response
+RESPONSE_FRAMING_TEST_BIN = $(BIN_DIR)/test_response_framing
 MULTIPART_TEST_BIN   = $(BIN_DIR)/test_multipart
 URLENCODED_TEST_BIN  = $(BIN_DIR)/test_urlencoded
 STATIC_TEST_BIN      = $(BIN_DIR)/test_static
@@ -69,8 +70,8 @@ ARENA_TEST_BIN       = $(BIN_DIR)/test_arena
 DEFER_TEST_BIN       = $(BIN_DIR)/test_defer
 
 TEST_BINS = $(MIDDLEWARE_TEST_BIN) $(ROUTER_TEST_BIN) $(HTTP_PARSER_TEST_BIN) \
-            $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(MULTIPART_TEST_BIN) $(URLENCODED_TEST_BIN) \
-            $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) \
+            $(CONNECTION_TEST_BIN) $(RESPONSE_TEST_BIN) $(RESPONSE_FRAMING_TEST_BIN) $(MULTIPART_TEST_BIN) \
+            $(URLENCODED_TEST_BIN) $(STATIC_TEST_BIN) $(EVENT_LOOP_TEST_BIN) $(CLUSTER_TEST_BIN) \
             $(COOKBOOK_TEST_BIN) $(HTTP_HARDENING_TEST_BIN) $(PING_TEST_BIN) $(PIPELINING_TEST_BIN) \
             $(READ_BUF_TEST_BIN) $(STREAM_TEST_BIN) $(ANSWERED_TEST_BIN) $(BODY_LIMIT_TEST_BIN) \
             $(LISTEN_TEST_BIN) $(BUFFER_BUDGET_TEST_BIN) $(ARENA_TEST_BIN) $(DEFER_TEST_BIN)
@@ -141,6 +142,10 @@ $(ANSWERED_TEST_BIN): $(OBJ_DIR)/lib/cluster.o $(OBJ_DIR)/lib/connection.o $(EVE
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(RESPONSE_TEST_BIN): $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_response.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(RESPONSE_FRAMING_TEST_BIN): $(OBJ_DIR)/lib/response.o $(OBJ_DIR)/lib/http_parser.o $(OBJ_DIR)/lib/vendor/picohttpparser/picohttpparser.o $(OBJ_DIR)/lib/arena.o $(OBJ_DIR)/tests/test_response_framing.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -304,6 +309,7 @@ test: $(TEST_BINS)
 	./$(HTTP_PARSER_TEST_BIN)
 	./$(CONNECTION_TEST_BIN)
 	./$(RESPONSE_TEST_BIN)
+	./$(RESPONSE_FRAMING_TEST_BIN)
 	./$(MULTIPART_TEST_BIN)
 	./$(URLENCODED_TEST_BIN)
 	./$(STATIC_TEST_BIN)

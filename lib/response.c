@@ -573,7 +573,7 @@ static void fail_chunked_response(Response *res, const char *caller) {
 }
 
 int res_write(Response *res, const char *data, size_t len) {
-    if (res == NULL || res->conn == NULL || res->stream_ended) {
+    if (res == NULL || res->conn == NULL || res->stream_ended || (data == NULL && len > 0)) {
         return -1;
     }
     if (!res->headers_sent) {
@@ -581,10 +581,8 @@ int res_write(Response *res, const char *data, size_t len) {
             return -1;
         }
     }
-    if (body_suppressed(res)) {
-        return 0;
-    }
-    if (len == 0 && data == NULL) {
+    /* a zero-size chunk is the last-chunk marker: framing one here would end the body early */
+    if (body_suppressed(res) || len == 0) {
         return 0;
     }
 
@@ -594,7 +592,7 @@ int res_write(Response *res, const char *data, size_t len) {
         return -1;
     }
     if (append_to_out_buf(res->conn, chunk_hdr, (size_t)n) != 0 ||
-        (len > 0 && data != NULL && append_to_out_buf(res->conn, data, len) != 0) ||
+        append_to_out_buf(res->conn, data, len) != 0 ||
         append_to_out_buf(res->conn, "\r\n", 2) != 0) {
         fail_chunked_response(res, "res_write");
         return -1;

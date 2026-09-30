@@ -29,7 +29,7 @@ function names are the stable reference.
 ## Checklist
 
 Security, all confirmed:
-- [ ] [An empty res_write ends a chunked body early](#an-empty-res_write-ends-a-chunked-body-early)
+- [x] [An empty res_write ends a chunked body early](#an-empty-res_write-ends-a-chunked-body-early)
 - [ ] [Mixing whole-body and chunked sends corrupts framing](#mixing-whole-body-and-chunked-sends-corrupts-framing)
 - [ ] [res_set_header accepts Transfer-Encoding](#res_set_header-accepts-transfer-encoding)
 - [ ] [Opening a file to stream can block the worker](#opening-a-file-to-stream-can-block-the-worker)
@@ -60,7 +60,8 @@ Lower priority: [Minor backlog](#minor-backlog). Reference: [No action planned](
 
 ### An empty res_write ends a chunked body early
 
-**Status:** confirmed. **Where:** `res_write`, [lib/response.c:587](lib/response.c#L587).
+**Status:** fixed 2026-09-29; test in `tests/test_response_framing.c`. **Where:** `res_write`,
+[lib/response.c:587](lib/response.c#L587).
 
 `res_write(res, "", 0)` frames a zero-length chunk, and `0\r\n\r\n` is the last-chunk marker, so the client sees the
 body end there. Everything written afterwards, `res_end`'s real terminator included, reaches a keep-alive client as
@@ -105,7 +106,7 @@ reset `out_buf` rather than append, as a guard.
 **Decision to confirm:** the alternative, last wins for everything, would let a stray `res_end` after an error
 `res_send` replace the error with an empty chunked 200.
 
-**Test:** in the new response suite: every row above yields exactly one response; `res_stream` after `res_send`
+**Test:** in `tests/test_response_framing.c`: every row above yields exactly one response; `res_stream` after `res_send`
 returns -1 and never calls `ctx_free`; a second `res_send` still replaces the first; `test_stream.c`'s "a later
 `res_send` replaces a stream" case still passes. Update the contract comment at the top of `lib/response.h`, and
 `lib/API.md` if a one-liner states it.
@@ -124,7 +125,7 @@ returns -1 and never calls `ctx_free`; a second `res_send` still replaces the fi
 `Content-Length` and `Connection` checks in `build_response_head`'s loop are already unreachable, since
 `res_set_header` refuses both.
 
-**Test:** in the new response suite: `res_set_header(res, "transfer-encoding", "chunked")`, in any letter case, then
+**Test:** in `tests/test_response_framing.c`: `res_set_header(res, "transfer-encoding", "chunked")`, in any letter case, then
 `res_send`: no `Transfer-Encoding` line, `Content-Length` present.
 
 ### Opening a file to stream can block the worker
